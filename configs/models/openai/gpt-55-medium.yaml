@@ -1,0 +1,18 @@
+model: gpt-5.5--medium
+api: openai
+max_tokens: 200000
+cache_read_cost: 0.25
+read_cost: 2.5
+write_cost: 15
+concurrent_requests: 128
+temperature: null
+top_p: null
+batch_processing: false
+background: true
+use_openai_responses_api: true
+# Per-attempt timeout. Without this the OpenAI SDK inherits APIClient's
+# default of 30000s (8h20m) and a hung socket would stall the call for
+# hours. 30 min is plenty for non-Pro reasoning tiers.
+timeout: 1800
+reasoning:
+  summary: "auto"

@@ -1,0 +1,225 @@
+{% extends "dev_base.html" %}
+{% set active_tab = 'run_agent' %}
+{% block title %}Run Agent — ProofStack{% endblock %}
+{% block content %}
+    <div class="page-header-row">
+        <h1>Run Agent</h1>
+        <span id="run-agent-status" class="dim"></span>
+    </div>
+
+    <div class="run-agent-layout">
+        <div class="run-agent-top">
+            <section class="card run-agent-panel">
+                <h2>Agent</h2>
+                <label class="run-agent-field">
+                    Agent to run
+                    <select id="run-agent-preset">
+                        {% for preset in presets %}
+                            <option value="{{ preset.name }}">{{ preset.label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label class="run-agent-field compact">
+                    Max parallel runs
+                    <input id="run-agent-max-parallel" type="number" min="1" value="1">
+                </label>
+            </section>
+
+            <section class="card run-agent-panel">
+                <h2>API Keys</h2>
+                <p class="dim">Keys are used only for this launch. Already configured keys can be left blank.</p>
+                <div id="api-key-list" class="api-key-list"></div>
+            </section>
+        </div>
+
+        <section class="card run-agent-panel">
+            <h2>Problems</h2>
+            <div id="problem-picker" class="problem-picker">
+                {% if problems %}
+                    {% for problem in problems %}
+                        <label class="problem-choice">
+                            <input type="checkbox" data-problem-id="{{ problem.id }}">
+                            <span>
+                                <strong>{{ problem.title }}</strong>
+                                {% if problem.preview %}<small class="problem-preview latex-text">{{ problem.preview }}</small>{% endif %}
+                            </span>
+                        </label>
+                    {% endfor %}
+                {% else %}
+                    <p id="empty-problems-message" class="dim">No saved problems yet.</p>
+                {% endif %}
+            </div>
+
+            <details class="new-problem-box" open>
+                <summary>Create a new problem</summary>
+                <label class="run-agent-field">
+                    Problem id
+                    <input id="new-problem-id" autocomplete="off" spellcheck="false" placeholder="sqrt2">
+                </label>
+                <label class="run-agent-field">
+                    Problem statement
+                    <textarea id="new-problem-text" rows="8" placeholder="State the problem here."></textarea>
+                </label>
+                <button type="button" class="button-action secondary" onclick="addProblemToList()">Add problem</button>
+            </details>
+        </section>
+    </div>
+
+    <div class="run-agent-actions">
+        <button type="button" class="button-action" onclick="startAgentRun()">Run Agent</button>
+    </div>
+
+    <script>
+        const presetsDataUrl = {{ url_for('presets_data') | tojson }};
+        let presetSignature = {{ preset_signature | tojson }};
+        let keyRequirements = {{ key_requirements | tojson }};
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
+        }
+        function escapeAttr(value) {
+            return escapeHtml(value).replace(/`/g, '&#96;');
+        }
+
+        function selectedPresetName() {
+            return document.getElementById('run-agent-preset')?.value || '';
+        }
+
+        function renderPresetOptions(presets) {
+            const select = document.getElementById('run-agent-preset');
+            if (!select) return;
+            const previous = select.value;
+            const runnable = (presets || []).filter((preset) => !preset.error);
+            select.innerHTML = runnable.map((preset) => `
+                <option value="${escapeAttr(preset.name)}">${escapeHtml(preset.label || preset.name)}</option>
+            `).join('');
+            if (runnable.some((preset) => preset.name === previous)) {
+                select.value = previous;
+            }
+            renderApiKeys();
+        }
+
+        async function pollPresetRegistry() {
+            const status = document.getElementById('run-agent-status');
+            try {
+                const response = await fetch(`${presetsDataUrl}?signature=${encodeURIComponent(presetSignature || '')}&include_keys=1&t=${Date.now()}`, {cache: 'no-store'});
+                if (!response.ok) return;
+                const payload = await response.json();
+                if (payload.signature) presetSignature = payload.signature;
+                if (!payload.changed) return;
+                if (payload.key_requirements) keyRequirements = payload.key_requirements;
+                renderPresetOptions(payload.presets || []);
+                if (status) {
+                    status.textContent = 'Agent list updated';
+                    window.setTimeout(() => {
+                        if (status.textContent === 'Agent list updated') status.textContent = '';
+                    }, 1600);
+                }
+            } catch {
+                // The local dev server may be restarting; try again on the next tick.
+            }
+        }
+
+        function renderApiKeys() {
+            const target = document.getElementById('api-key-list');
+            const requirements = keyRequirements[selectedPresetName()] || [];
+            if (!target) return;
+            if (!requirements.length) {
+                target.innerHTML = '<p class="dim">No external model API key was inferred for this agent.</p>';
+                return;
+            }
+            target.innerHTML = requirements.map((req) => `
+                <label class="api-key-row">
+                    <span>
+                        <strong>${escapeHtml(req.env)}</strong>
+                        <small>${req.present ? 'Already configured; leave blank to use it.' : `Required for ${escapeHtml(req.label || req.provider || 'model calls')}.`}</small>
+                        ${req.models?.length ? `<small>${escapeHtml(req.models.join(', '))}</small>` : ''}
+                    </span>
+                    <input type="password" autocomplete="off" data-api-key="${escapeAttr(req.env)}" ${req.present ? '' : 'required'} placeholder="${req.present ? 'optional override' : 'required'}">
+                </label>
+            `).join('');
+        }
+
+        async function addProblemToList() {
+            const status = document.getElementById('run-agent-status');
+            const idInput = document.getElementById('new-problem-id');
+            const textInput = document.getElementById('new-problem-text');
+            const text = String(textInput?.value || '').trim();
+            if (!text) {
+                if (status) status.textContent = 'Problem statement is required.';
+                textInput?.focus();
+                return false;
+            }
+            if (status) status.textContent = 'Saving problem...';
+            const response = await fetch('{{ url_for("run_agent_problem") }}', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    id: idInput?.value || '',
+                    text,
+                }),
+            });
+            const result = await response.json();
+            if (!response.ok || !result.ok) {
+                if (status) status.textContent = (result.errors || ['Could not save problem']).join('; ');
+                return false;
+            }
+            appendProblemChoice({...result.problem, checked: true});
+            if (idInput) idInput.value = '';
+            if (textInput) textInput.value = '';
+            if (status) status.textContent = `Added problem ${result.problem.id}`;
+            return true;
+        }
+
+        function appendProblemChoice(problem) {
+            const picker = document.getElementById('problem-picker');
+            if (!picker) return;
+            document.getElementById('empty-problems-message')?.remove();
+            const row = document.createElement('label');
+            row.className = 'problem-choice';
+            row.innerHTML = `
+                <input type="checkbox" data-problem-id="${escapeAttr(problem.id)}" ${problem.checked ? 'checked' : ''}>
+                    <span>
+                        <strong>${escapeHtml(problem.title || problem.id)}</strong>
+                        ${problem.preview ? `<small class="problem-preview latex-text">${escapeHtml(problem.preview)}</small>` : ''}
+                    </span>
+            `;
+            picker.appendChild(row);
+            renderLatexElements(row);
+        }
+
+        async function startAgentRun() {
+            const status = document.getElementById('run-agent-status');
+            if (String(document.getElementById('new-problem-text')?.value || '').trim()) {
+                const saved = await addProblemToList();
+                if (!saved) return;
+            }
+            const apiKeys = {};
+            document.querySelectorAll('[data-api-key]').forEach((input) => {
+                if (input.value.trim()) apiKeys[input.dataset.apiKey] = input.value.trim();
+            });
+            const payload = {
+                preset: selectedPresetName(),
+                max_parallel: document.getElementById('run-agent-max-parallel')?.value || '1',
+                problems: [...document.querySelectorAll('[data-problem-id]:checked')].map((input) => input.dataset.problemId),
+                api_keys: apiKeys,
+            };
+            if (status) status.textContent = 'Starting...';
+            const response = await fetch('{{ url_for("run_agent_start") }}', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            });
+            const result = await response.json();
+            if (!response.ok || !result.ok) {
+                if (status) status.textContent = (result.errors || ['Run failed to start']).join('; ');
+                return;
+            }
+            window.location.href = result.url;
+        }
+
+        document.getElementById('run-agent-preset')?.addEventListener('change', renderApiKeys);
+        renderApiKeys();
+        window.setInterval(pollPresetRegistry, 1000);
+    </script>
+{% endblock %}

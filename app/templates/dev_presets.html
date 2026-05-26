@@ -1,0 +1,188 @@
+{% extends "dev_base.html" %}
+{% import "dev_macros.html" as ui %}
+{% set active_tab = 'edit' %}
+{% block title %}Edit Agents — ProofStack{% endblock %}
+{% block content %}
+    <div class="page-header-row">
+        <h1>Edit Agents</h1>
+        <div class="preset-actions">
+            <span id="agent-list-status" class="dim"></span>
+            <a class="button-action" href="{{ url_for('new_agent') }}">Create New Agent</a>
+        </div>
+    </div>
+
+    <div id="agent-list" data-signature="{{ preset_signature }}">
+        {% if not presets %}
+            <div class="card"><p class="dim">No agents found.</p></div>
+        {% endif %}
+
+        {% for p in presets %}
+            <div class="card">
+                <div class="card-header-row">
+                    <h3>
+                        <a class="agent-link" href="{{ url_for('preset_editor', name=p.name) }}">{{ p.label }}</a>
+                        {% if p.error %}<span class="pill status-error">invalid</span>{% endif %}
+                    </h3>
+                    <div class="preset-actions">
+                        <a class="button-action secondary" href="{{ url_for('preset_editor', name=p.name) }}">Edit</a>
+                        <button
+                            type="button"
+                            class="button-action danger"
+                            data-delete-agent
+                            data-agent-name="{{ p.name }}"
+                            data-agent-label="{{ p.label }}"
+                            data-delete-url="{{ url_for('preset_delete', name=p.name) }}"
+                        >Delete</button>
+                    </div>
+                </div>
+                {% if p.description %}<p>{{ p.description }}</p>{% endif %}
+                {% if p.error %}
+                    <pre style="color:#991b1b">{{ p.error }}</pre>
+                {% else %}
+                    <div class="grid">
+                        {% if p.inputs %}<div class="key">Inputs:</div><div class="val">{{ ui.render_fields(p.inputs) }}</div>{% endif %}
+                        {% if p.budget %}<div class="key">Budget:</div><div class="val">{{ ui.render_fields(p.budget) }}</div>{% endif %}
+                        {% if p.model_overrides %}<div class="key">Model overrides:</div><div class="val">{{ ui.render_fields(p.model_overrides) }}</div>{% endif %}
+                    </div>
+                {% endif %}
+            </div>
+        {% endfor %}
+    </div>
+    <script>
+        const presetsDataUrl = {{ url_for('presets_data') | tojson }};
+        let agentListSignature = {{ preset_signature | tojson }};
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[ch]));
+        }
+
+        function escapeAttr(value) {
+            return escapeHtml(value).replace(/`/g, '&#96;');
+        }
+
+        function renderFieldValue(value) {
+            if (value === null || value === undefined) return '<span class="dim">none</span>';
+            if (Array.isArray(value)) {
+                if (!value.length) return '<span class="dim">none</span>';
+                return `<ol class="field-list field-list-sequence">${value.map((item) => `<li>${renderFieldValue(item)}</li>`).join('')}</ol>`;
+            }
+            if (typeof value === 'object') {
+                const entries = Object.entries(value);
+                if (!entries.length) return '<span class="dim">none</span>';
+                return `<table class="field-table"><tbody>${entries.map(([key, item]) => `
+                    <tr>
+                        <th>${escapeHtml(key)}</th>
+                        <td>${renderFieldValue(item)}</td>
+                    </tr>
+                `).join('')}</tbody></table>`;
+            }
+            return `<span class="field-scalar">${escapeHtml(value)}</span>`;
+        }
+
+        function hasFields(value) {
+            return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+        }
+
+        function renderFieldBlock(label, value) {
+            if (!hasFields(value)) return '';
+            return `<div class="key">${escapeHtml(label)}:</div><div class="val">${renderFieldValue(value)}</div>`;
+        }
+
+        function renderAgentCard(preset) {
+            const name = preset.name || '';
+            const label = preset.label || preset.name || '';
+            const deleteUrl = preset.delete_url || `/preset/${encodeURIComponent(name)}/delete`;
+            const body = preset.error
+                ? `<pre style="color:#991b1b">${escapeHtml(preset.error)}</pre>`
+                : `<div class="grid">
+                    ${renderFieldBlock('Inputs', preset.inputs)}
+                    ${renderFieldBlock('Budget', preset.budget)}
+                    ${renderFieldBlock('Model overrides', preset.model_overrides)}
+                </div>`;
+            return `
+                <div class="card">
+                    <div class="card-header-row">
+                        <h3>
+                            <a class="agent-link" href="${escapeAttr(preset.edit_url || '#')}">${escapeHtml(preset.label || preset.name)}</a>
+                            ${preset.error ? '<span class="pill status-error">invalid</span>' : ''}
+                        </h3>
+                        <div class="preset-actions">
+                            <a class="button-action secondary" href="${escapeAttr(preset.edit_url || '#')}">Edit</a>
+                            <button
+                                type="button"
+                                class="button-action danger"
+                                data-delete-agent
+                                data-agent-name="${escapeAttr(name)}"
+                                data-agent-label="${escapeAttr(label)}"
+                                data-delete-url="${escapeAttr(deleteUrl)}"
+                            >Delete</button>
+                        </div>
+                    </div>
+                    ${preset.description ? `<p>${escapeHtml(preset.description)}</p>` : ''}
+                    ${body}
+                </div>
+            `;
+        }
+
+        function renderAgentList(presets) {
+            const target = document.getElementById('agent-list');
+            if (!target) return;
+            target.innerHTML = presets.length
+                ? presets.map(renderAgentCard).join('')
+                : '<div class="card"><p class="dim">No agents found.</p></div>';
+        }
+
+        async function refreshAgentList(options = {}) {
+            const status = document.getElementById('agent-list-status');
+            try {
+                const signature = options.force ? '' : agentListSignature;
+                const response = await fetch(`${presetsDataUrl}?signature=${encodeURIComponent(signature || '')}&t=${Date.now()}`, {cache: 'no-store'});
+                if (!response.ok) return;
+                const payload = await response.json();
+                if (payload.signature) agentListSignature = payload.signature;
+                if (!payload.changed) return;
+                renderAgentList(payload.presets || []);
+                if (status) {
+                    status.textContent = options.statusText || 'Agent list updated';
+                    window.setTimeout(() => {
+                        if (status.textContent === (options.statusText || 'Agent list updated')) status.textContent = '';
+                    }, 1600);
+                }
+            } catch {
+                // The local dev server may be restarting; try again on the next tick.
+            }
+        }
+
+        async function deleteAgent(name, label, deleteUrl = '') {
+            const status = document.getElementById('agent-list-status');
+            const ok = await confirmAction({
+                title: 'Delete agent?',
+                message: `Delete "${label || name}"? This cannot be undone.`,
+                confirmLabel: 'Delete agent'
+            });
+            if (!ok) return;
+            if (status) status.textContent = 'Deleting...';
+            const response = await fetch(deleteUrl || `/preset/${encodeURIComponent(name)}/delete`, {method: 'POST'});
+            const payload = await response.json();
+            if (!response.ok || !payload.ok) {
+                if (status) status.textContent = (payload.errors || ['Delete failed']).join('; ');
+                return;
+            }
+            await refreshAgentList({force: true, statusText: 'Agent deleted'});
+        }
+
+        document.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-delete-agent]');
+            if (!button) return;
+            event.preventDefault();
+            event.stopPropagation();
+            deleteAgent(
+                button.dataset.agentName || '',
+                button.dataset.agentLabel || '',
+                button.dataset.deleteUrl || ''
+            );
+        });
+
+        window.setInterval(refreshAgentList, 1000);
+    </script>
+{% endblock %}

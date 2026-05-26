@@ -1,0 +1,22 @@
+model: claude-opus-4-6
+api: anthropic
+max_tokens: 128000
+concurrent_requests: 32
+temperature: null
+top_p: null
+cache_write_cost: 6.25
+cache_read_cost: 0.5
+read_cost: 5
+write_cost: 25
+thinking:
+  type: enabled
+  budget_tokens: 120000
+output_config:
+  effort: high
+cache_control:
+  type: ephemeral
+batch_processing: false
+timeout: 900
+max_wallclock_per_call_s: 1200
+sleep_on_error: 10
+sleep_on_error_max: 60

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="only light">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/default.min.css">
+</head>
+<body>
+    <div style="display: flex; width: 100%; max-width: 2000px;">
+        <div class="sidebar" id="sidebar">
+            <button class="sidebar-toggle-button" id="sidebar-toggle-button" onclick="toggleSidebar()">
+                &times;
+            </button>
+            <div class="sidebar-content">
+                <select id="folder-dropdown" class="sidebar-item" name="folder-dropdown">
+                    {% for folder in sidebar.dropdown.all_folders %}
+                        <option value="{{ folder }}" {% if folder == sidebar.dropdown.current_folder %}selected{% endif %}>{{ folder }}</option>
+                    {% endfor %}
+                </select>
+                <a href="{{ sidebar.reload_url }}" class="sidebar-main-button">Reload Folder</a>
+                <a href="{{ url_for('index') }}" class="sidebar-main-button">Home</a>
+                {% block sidebar %}{% endblock %}
+            </div>
+        </div>
+        <div class="main" id="main-content">
+            {% block content %}{% endblock %}
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css"
+    integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV" crossorigin="anonymous">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"
+    integrity="sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8"
+    crossorigin="anonymous"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
+    integrity="sha384-+VBxd3r6XgURycqtZ117nYw44OOcIax56Z4dCRWbxyPt0Koah1uHoK0o4+/RRE05" crossorigin="anonymous"></script>
+</body>
+</html>

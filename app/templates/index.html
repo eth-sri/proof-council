@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block sidebar %}
+    {% for problem_name, problem in problems %}
+        <a href="{{ url_for('problem_view', problem_key=problem_name) }}" class="sidebar-item">
+            {{ problem_name }} ({{ problem.runs|length }} runs)
+        </a>
+    {% endfor %}
+{% endblock %}
+
+{% block content %}
+    <h3 style="text-align: left;">Output Folder: {{ folder_name }}</h3>
+    <div>
+        <p class="strong">Problems: {{ nb_problems }}</p>
+        <p class="strong">Runs: {{ total_runs }}</p>
+        <p class="strong">Cost: ${{ total_cost }}</p>
+    </div>
+
+    {% for problem_name, problem in problems %}
+        <details class="box metadata-box" open>
+            <summary><span class="strong">{{ problem_name }}</span> ({{ problem.runs|length }} runs)</summary>
+            <div style="margin-top: 1rem;">
+                <a href="{{ url_for('problem_view', problem_key=problem_name) }}" class="sidebar-main-button" style="display: inline-flex; width: auto; margin: 0;">Open Problem</a>
+            </div>
+            {% if problem.problem %}
+                <div class="box problem-box">
+                    <div class="marked">{{ problem.problem }}</div>
+                </div>
+            {% endif %}
+        </details>
+    {% endfor %}
+{% endblock %}

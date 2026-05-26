@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.venv/
+agent_checkpoints/
+logs/
+solutions/
+outputs/
+smoke-input/
+smoke-output/
+private_problems/
+uv.lock
+brainstorming
+.claude
+.codex
+.env
+# Local smoke secrets (real API keys). The .example template is tracked;
+# the filled-in copy must not be.
+smoke/secrets.env
+# Smoke run artifacts (per-problem .tex, solutions.json, logs, etc.).
+# The pre-existing ``smoke-input/`` / ``smoke-output/`` entries above
+# don't catch the actual paths the runners write to (``smoke/output``
+# and ``smoke/output_container``).
+smoke/output/
+smoke/output_container/
+smoke/output_*

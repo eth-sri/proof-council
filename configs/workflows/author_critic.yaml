@@ -1,0 +1,48 @@
+workflow: proofstack.agents.ac.ACWorkflow
+description: >
+  Author/Critic iterative loop. The Author (gpt-5.5-pro + code
+  interpreter + web search) writes the answer.tex / research_notes.tex
+  / references.bib triple directly each round. The Critic
+  (gpt-5.5-pro + web search + code interpreter) reviews paragraph by
+  paragraph in referee-report style, running stateful across
+  consecutive rounds and resetting to a fresh instance every
+  ``full_critic_interval`` rounds and before the last author round.
+  When the stateful Critic and Author both signal ready, the workflow
+  promotes to a forced-fresh Critic before shipping; if it agrees,
+  ship, otherwise feed both reports back to the Author. The optional
+  Advisory Council (Pro + Opus 4.7 max + Gemini by default; other models configurable)
+  is invoked at most once per round when the Author emits a
+  ``<council>...</council>`` block, fanned out in parallel with the
+  Critic. The optional Compute Worker (codex CLI, gpt-5.5 xhigh by
+  default, 60-min soft timeout, persistent docker workspace with
+  network and CAS systems) is invoked at most once per round when the
+  Author emits a ``<compute_agent>...</compute_agent>`` block; it fans
+  out alongside Critic + Council and the reply lands in the next
+  Author turn together with a workspace zip attachment.
+  ``enable_final_critic`` defaults to false (competition setting); set
+  to true for a dev-only forced-fresh audit pass after the final
+  compile.
+
+inputs:
+  n_rounds: 5
+  full_critic_interval: 3
+  enable_council: true
+  enable_compute: true
+  compute_model: gpt-5.5
+  compute_reasoning_effort: xhigh
+  compute_cost_config: models/openai/gpt-55-high
+  enable_final_critic: false
+  council_models:
+    - models/openai/gpt-55-pro
+    - models/anthropic/opus_47_max
+    - models/gemini/gemini-31-pro
+
+budget:
+  max_usd: 80.0
+  max_wallclock_s: 36000
+
+components:
+  Author:
+    model: models/openai/gpt-55-pro
+  ACCritic:
+    model: models/openai/gpt-55-pro

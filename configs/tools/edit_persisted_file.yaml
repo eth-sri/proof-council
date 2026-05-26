@@ -1,0 +1,21 @@
+name: edit_persisted_file
+description: Replace text in a file persisted for this workflow run.
+python_function: edit_persisted_file
+tool:
+  type: function
+  function:
+    name: edit_persisted_file
+    description: Replace the first exact occurrence of text_before in a text file by file_id.
+    parameters:
+      type: object
+      properties:
+        file_id:
+          type: string
+          description: Stable id of the file to edit within this workflow run.
+        text_before:
+          type: string
+          description: Exact text to replace. The first occurrence is replaced.
+        text_replace:
+          type: string
+          description: Replacement text.
+      required: [file_id, text_before, text_replace]

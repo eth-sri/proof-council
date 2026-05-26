@@ -1,0 +1,336 @@
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: 'Planner / Worker / Critic workflow over a persistent research workspace. The top-level graph
+  stays small by reusing the pwc_round subworkflow.
+
+  '
+export:
+  visible_as_node: true
+  label: PWC Workflow
+  description: Run reusable PWC rounds, compile, optionally critique, and stash the answer.
+inputs:
+  problem: ''
+  n_rounds: 5
+  enable_final_critic: true
+  page_limit: 12
+  max_compile_iterations: 6
+  ship_bib_alongside: false
+budget:
+  max_usd: 100
+  max_wallclock_s: 36000
+components:
+  cfg_compile_latex:
+    cmd:
+    - sh
+    - -c
+    - |
+      set +e
+      rm -f main.aux main.bbl main.blg main.log main.pdf pages.txt compile.log
+      pdflatex -interaction=nonstopmode -halt-on-error -file-line-error main.tex > compile.log 2>&1
+      if [ -s references.bib ]; then
+        bibtex main >> compile.log 2>&1 || true
+        pdflatex -interaction=nonstopmode -halt-on-error -file-line-error main.tex >> compile.log 2>&1
+        pdflatex -interaction=nonstopmode -halt-on-error -file-line-error main.tex >> compile.log 2>&1
+      fi
+      if [ -f main.pdf ]; then
+        pdfinfo main.pdf 2>/dev/null | awk '/^Pages:/ {print $2; found=1} END {if (!found) print 0}' > pages.txt || printf '0\n' > pages.txt
+        finish '{"status":"done","summary":"compiled"}'
+      else
+        printf '0\n' > pages.txt
+        finish '{"status":"error","summary":"LaTeX compile failed; see compile.log"}'
+      fi
+    sandbox:
+      timeout_s: 120
+      cpu_limit: 2
+      memory_gb: 2
+      docker_image: proofstack-pwc-sandbox:latest
+      docker_no_new_privileges: false
+    input_schema:
+      tex_body: string
+      bib_path: string
+    input_files:
+      main.tex:
+        from_input: tex_body
+      references.bib:
+        from_path_input: bib_path
+        default: ''
+    output_schema:
+      tex: string
+      tex_path: string
+      pdf_path: string
+      compiled: boolean
+      pages: integer
+      notes: string
+    output_files:
+      tex: main.tex
+      tex_path:
+        path: main.tex
+        type: path
+      pdf_path:
+        path: main.pdf
+        type: path
+      compiled:
+        path: main.pdf
+        type: exists
+      pages:
+        path: pages.txt
+        type: int
+        default: 0
+      notes:
+        path: compile.log
+        default: ''
+  cfg_pwc_critic:
+    model: models/openai/gpt-55-pro
+    system_prompt: |
+      Act as a strict final mathematical referee in a Planner / Worker /
+      Critic mathematical research loop. Review the final answer.tex for
+      mathematical correctness. Style is secondary.
+
+      Set answer_ready=true only if the final answer.tex fully solves the
+      stated problem as a complete rigorous solution, with no remaining open
+      gaps, no unproved essential lemmas, and no missing assumptions. If
+      answer.tex contains a "Remaining open issues" section, unresolved
+      essential lemmas, or partial progress only, set answer_ready=false. If
+      the original problem was ambiguous, answer.tex must explicitly record
+      the faithful interpretation in a "Problem statement and interpretation"
+      section; otherwise flag the ambiguity as a BLOCKER or CONCERN.
+
+      Return exactly one JSON object inside <critic_result>...</critic_result> with:
+      - findings: list of objects with tag, location, claim, issue, suggested_fix.
+      - review_md: markdown review grouped by Blockers, Concerns, and Nits.
+      - answer_ready: boolean.
+      - has_blockers_or_concerns: boolean.
+      - confidence: number from 0 to 1.
+      - rationale: one short paragraph.
+    user_prompt: |
+      Round {round} of {n_rounds}
+
+      Problem:
+      {problem}
+
+      Plan:
+      ```markdown
+      {plan_md}
+      ```
+
+      Final answer.tex:
+      ```tex
+      {answer_tex}
+      ```
+
+      Worker's report.md:
+      ```markdown
+      {report_md}
+      ```
+
+      research_notes.tex:
+      ```tex
+      {research_notes_tex}
+      ```
+
+      references.bib:
+      ```bibtex
+      {references_bib}
+      ```
+
+      Workspace listing:
+      ```
+      {workspace_listing}
+      ```
+    input_schema:
+      problem: string
+      plan_md: string
+      answer_tex: string
+      report_md: string
+      research_notes_tex: string
+      references_bib: string
+      workspace_listing: string
+      round: integer
+      n_rounds: integer
+    output:
+      json_tag: critic_result
+      json_merge: true
+      json_default:
+        findings: []
+        review_md: ''
+        answer_ready: false
+        has_blockers_or_concerns: true
+        confidence: 0
+        rationale: ''
+      default_field: review_md
+    output_schema:
+      findings:
+        type: array
+        items: {}
+      review_md: string
+      answer_ready: boolean
+      has_blockers_or_concerns: boolean
+      confidence: number
+      rationale: string
+    tools:
+    - type: web_search_preview
+    max_tool_calls: 8
+dag:
+  ui:
+    workflow_output:
+      x: 2473
+      y: -242
+  nodes:
+  - id: init_workspace
+    kind: agent
+    agent: proofstack.agents.pwc.workspace.PWCWorkspaceInit
+    inputs:
+      problem: $input.problem
+      problem_id: $input.problem_id
+    ui:
+      x: -360
+      y: 20
+      label: Init workspace
+  - id: pwc_loop
+    kind: repeat
+    needs:
+    - init_workspace
+    max_iterations:
+      add:
+      - $input.n_rounds
+      - 1
+    condition:
+      python: not bool(inputs.get("control", {}).get("stop"))
+    initial_state:
+      workspace: $node.init_workspace.workspace
+      control:
+        plan_md: ''
+        review_md: ''
+        critic_ready: false
+        has_blockers_or_concerns: true
+        had_prior_progress: false
+        rounds_completed: -1
+        early_stopped: false
+        stop: false
+    body:
+      nodes:
+      - id: pwc_round
+        kind: workflow_ref
+        preset: pwc_round
+        inputs:
+          problem: $input.problem
+          problem_id: $input.problem_id
+          workspace: $state.workspace
+          control: $state.control
+          round: $iteration
+          n_rounds: $input.n_rounds
+          page_limit: $input.page_limit
+        best_tex: $output.answer_tex
+        ui:
+          x: 520
+          y: -110
+          label: PWC Round
+      state_updates:
+        workspace: $node.pwc_round.workspace
+        control: $node.pwc_round.control
+    outputs:
+      workspace: $state.workspace
+      control: $state.control
+    best_tex: $output.answer_tex
+    ui:
+      x: 140
+      y: 20
+      label: PWC loop
+      managed_needs:
+      - init_workspace
+      repeat_input:
+        x: 160
+        y: -180
+      repeat_output:
+        x: 940
+        y: -180
+  - id: read_final_workspace
+    kind: agent
+    needs:
+    - pwc_loop
+    agent: proofstack.agents.pwc.workspace.PWCWorkspaceRead
+    inputs:
+      workspace: $node.pwc_loop.workspace
+    ui:
+      x: 1060
+      y: -110
+      label: Read final workspace
+      managed_needs:
+      - pwc_loop
+  - id: final_compile
+    kind: agent
+    needs:
+    - read_final_workspace
+    agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+    name: cfg_compile_latex
+    inputs:
+      tex_body: $node.read_final_workspace.answer_tex
+      bib_path: $node.read_final_workspace.references_bib_path
+    best_tex: $output.tex
+    ui:
+      x: 1365
+      y: -431
+      label: Final compile
+      managed_needs:
+      - read_final_workspace
+  - id: final_critic
+    kind: agent
+    needs:
+    - read_final_workspace
+    - final_compile
+    when:
+      inputs:
+        enable_final_critic: $input.enable_final_critic
+        early_stopped: $node.pwc_loop.control.early_stopped
+      python: bool(inputs.get("enable_final_critic", True)) and not bool(inputs.get("early_stopped"))
+    default:
+      findings: []
+      review_md: ''
+      answer_ready: false
+      has_blockers_or_concerns: true
+      confidence: 0
+      rationale: ''
+    agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+    name: cfg_pwc_critic
+    inputs:
+      problem: $input.problem
+      answer_tex: $node.final_compile.tex
+      plan_md: $node.pwc_loop.control.plan_md
+      report_md: $node.read_final_workspace.report_md
+      research_notes_tex: $node.read_final_workspace.research_notes_tex
+      references_bib: $node.read_final_workspace.references_bib
+      workspace_listing: $node.read_final_workspace.workspace_listing
+      round: $input.n_rounds
+      n_rounds: $input.n_rounds
+    ui:
+      x: 1740
+      y: 147
+      label: Final critic
+      managed_needs:
+      - read_final_workspace
+      - final_compile
+  - id: stash_answer
+    kind: agent
+    needs:
+    - read_final_workspace
+    - final_compile
+    agent: proofstack.agents.pwc.workspace.PWCStashAnswer
+    inputs:
+      problem_id: $input.problem_id
+      tex: $node.final_compile.tex
+      workspace: $node.read_final_workspace.workspace
+      compile_tex_path: $node.final_compile.tex_path
+      ship_bib_alongside: $input.ship_bib_alongside
+    ui:
+      x: 1821
+      y: -79
+      label: Stash answer
+      managed_needs:
+      - read_final_workspace
+      - final_compile
+  outputs:
+    solution_tex: $node.stash_answer.answer_tex
+    tex_path: $node.final_compile.tex_path
+    pdf_path: $node.final_compile.pdf_path
+    compiled: $node.final_compile.compiled
+    pages: $node.final_compile.pages
+    final_critic_findings: $node.final_critic.findings

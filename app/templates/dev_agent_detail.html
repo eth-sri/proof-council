@@ -1,0 +1,68 @@
+{% extends "dev_base.html" %}
+{% import "dev_macros.html" as ui %}
+{% set active_tab = 'catalog' %}
+{% block title %}{{ agent.qualname }} — ProofStack{% endblock %}
+
+{% macro render_schema(schema) %}
+    {% if schema.get("error") %}
+        <p class="dim">Schema introspection failed: {{ schema.error }}</p>
+    {% elif schema.get("properties") %}
+        {% for fname, fspec in schema.properties.items() %}
+            <div class="schema-field">
+                <span class="fname">{{ fname }}</span>
+                {% if fspec.type %}<span class="ftype">{{ fspec.type }}</span>
+                {% elif fspec.anyOf %}<span class="ftype">{{ fspec.anyOf|map(attribute='type')|reject('none')|join(' | ') }}</span>
+                {% elif fspec["$ref"] %}<span class="ftype">{{ fspec["$ref"].split("/")|last }}</span>
+                {% endif %}
+                {% if fname in (schema.required or []) %}<span class="pill" style="font-size:0.7em;">required</span>{% endif %}
+                {% if fspec.default is defined %}<span class="dim">= {{ fspec.default }}</span>{% endif %}
+                {% if fspec.description %}<div class="fdesc">{{ fspec.description }}</div>{% endif %}
+            </div>
+        {% endfor %}
+    {% else %}
+        {{ ui.render_fields(schema) }}
+    {% endif %}
+{% endmacro %}
+
+{% block content %}
+    <h1>
+        {{ agent.qualname }}
+        <span class="pill {{ agent.kind }}">{{ agent.kind }}</span>
+        <span class="pill {{ agent.execution_mode }}">{{ agent.execution_mode }}</span>
+    </h1>
+    <p class="dim"><code>{{ agent.module }}</code></p>
+    {% if agent.description %}
+        <p><strong>Description:</strong> {{ agent.description }}</p>
+    {% endif %}
+
+    {% if agent.class_attrs %}
+        <h2>Configuration</h2>
+        <div class="grid">
+            {% for key, val in agent.class_attrs.items() %}
+                {% if key not in ("SYSTEM_PROMPT", "USER_PROMPT") %}
+                    <div class="key">{{ key }}:</div>
+                    <div class="val">{{ val }}</div>
+                {% endif %}
+            {% endfor %}
+        </div>
+
+        {% if agent.class_attrs.get("SYSTEM_PROMPT") %}
+            <details>
+                <summary>SYSTEM_PROMPT</summary>
+                <pre>{{ agent.class_attrs["SYSTEM_PROMPT"] }}</pre>
+            </details>
+        {% endif %}
+        {% if agent.class_attrs.get("USER_PROMPT") %}
+            <details>
+                <summary>USER_PROMPT template</summary>
+                <pre>{{ agent.class_attrs["USER_PROMPT"] }}</pre>
+            </details>
+        {% endif %}
+    {% endif %}
+
+    <h2>Inputs</h2>
+    {{ render_schema(agent.inputs_schema) }}
+
+    <h2>Outputs</h2>
+    {{ render_schema(agent.outputs_schema) }}
+{% endblock %}

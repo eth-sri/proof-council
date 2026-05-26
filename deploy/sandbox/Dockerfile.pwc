@@ -1,0 +1,63 @@
+# Tier-1 PWC dev sandbox image.
+#
+# Builds on top of the existing proofstack-sandbox image (node + texlive
+# + Codex) by adding the math-research toolkit CLI workers need:
+# Python with the scientific stack, paper-extraction tools, and the
+# bibtex/biber binaries for BibTeX-aware compilation.
+#
+# Build:
+#
+#     docker build -t proofstack-sandbox:latest deploy/sandbox/
+#     docker build -t proofstack-pwc-sandbox:latest -f deploy/sandbox/Dockerfile.pwc deploy/sandbox/
+#
+# The base image (proofstack-sandbox:latest) is left untouched so the
+# generic sandbox remains smaller without the extra math tooling.
+
+FROM proofstack-sandbox:latest
+# inherits: node 20, ca-certificates, texlive-{base,latex-recommended,
+# latex-extra,fonts-recommended}, @openai/codex, USER node, WORKDIR /work.
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv \
+        curl wget jq ripgrep \
+        poppler-utils \
+        texlive-bibtex-extra biber \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bookworm provides python3.11; CLI workers do not strictly need 3.12
+# (only the host orchestrator does). Swap to a python:3.12-bookworm-
+# derived recipe if a future provider needs 3.12 inside the sandbox.
+#
+# --break-system-packages: the base node:20-bookworm image marks /usr
+# as PEP 668 externally-managed. We install scientific Python globally
+# inside the container because CLI workers need `python3 -c "import sympy"`
+# to just work without the model first having to source a venv.
+RUN pip install --break-system-packages \
+        numpy scipy sympy matplotlib networkx mpmath pandas \
+        requests pymupdf pdfminer.six
+
+RUN set -eux; \
+    { \
+        printf '%s\n' '#!/bin/sh'; \
+        printf '%s\n' 'set -eu'; \
+        printf '%s\n' 'TARGET="${FINISH_DONE_PATH:-${PWD}/done.json}"'; \
+        printf '%s\n' 'if [ "${1:-}" != "" ]; then'; \
+        printf '%s\n' '    if [ -f "$1" ]; then'; \
+        printf '%s\n' '        cp "$1" "$TARGET"'; \
+        printf '%s\n' '    else'; \
+        printf '%s\n' '        printf "%s" "$1" > "$TARGET"'; \
+        printf '%s\n' '    fi'; \
+        printf '%s\n' 'elif [ ! -t 0 ]; then'; \
+        printf '%s\n' '    cat > "$TARGET"'; \
+        printf '%s\n' 'else'; \
+        printf '%s\n' '    printf '"'"'{"status": "done", "summary": "(no body supplied)"}'"'"' > "$TARGET"'; \
+        printf '%s\n' 'fi'; \
+        printf '%s\n' 'echo "finish: wrote $TARGET" >&2'; \
+        printf '%s\n' 'exit 0'; \
+    } > /usr/local/bin/finish; \
+    chmod 0755 /usr/local/bin/finish
+
+USER node

@@ -1,0 +1,27 @@
+workflow: proofstack.agents.ac.ACWorkflow
+description: >
+  Cheap/fast wiring test for the Author/Critic loop. Uses gpt-5.4-mini
+  for Author and Critic, two rounds, no Advisory Council
+  (Pro/Opus/Gemini council members would dominate cost on a smoke
+  run) and no Compute Worker (60-min codex runs would dominate
+  wallclock on a smoke run). Intended for the counting-stable-graphs
+  question or any small problem; budget capped at $5.
+  ``enable_final_critic`` is left true here so the smoke test
+  exercises the post-loop forced-fresh audit path too.
+
+inputs:
+  n_rounds: 2
+  full_critic_interval: 1
+  enable_council: false
+  enable_compute: false
+  enable_final_critic: true
+
+budget:
+  max_usd: 5.0
+  max_wallclock_s: 3600
+
+components:
+  Author:
+    model: models/openai/gpt-54-mini
+  ACCritic:
+    model: models/openai/gpt-54-mini

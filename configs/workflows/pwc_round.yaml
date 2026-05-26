@@ -1,0 +1,720 @@
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: One reusable Planner / Worker / Critic round over a persistent PWC workspace.
+export:
+  visible_as_node: true
+  label: PWC Round
+  description: Plan one round, run the Worker, critique, and snapshot the workspace.
+inputs:
+  problem: ''
+  problem_id: ''
+  workspace: ''
+  control:
+    plan_md: ''
+    review_md: ''
+    critic_ready: false
+    has_blockers_or_concerns: true
+    had_prior_progress: false
+    rounds_completed: -1
+    early_stopped: false
+    stop: false
+  round: 0
+  n_rounds: 5
+  page_limit: 12
+components:
+  cfg_pwc_planner:
+    model: models/openai/gpt-55-pro
+    system_prompt: |
+      Act as the Planner in a Planner / Worker / Critic mathematical research
+      loop. Produce the next concrete work item for the Worker: a Codex-driven
+      sandbox that can search the web, download papers, run code, maintain
+      answer.tex, research_notes.tex, references.bib, and report.md, and
+      salvage useful files into papers/, code/, data/, notes/.
+
+      The Worker is not a planner. It needs concrete, ordered, executable
+      instructions. Examples of useful plan items:
+
+      - Run web searches for specific queries. Update references.bib with up
+        to N new entries; record abstracts in research_notes.tex.
+      - Implement and run a Python script that searches for counterexamples
+        to a claim; save results under data/ and summarize them.
+      - Use lemmas already established in research_notes.tex to draft a named
+        section of answer.tex.
+      - Verify that citations in answer.tex support the claims next to them.
+
+      You may use web_search_preview during reasoning, but distill search
+      results into concrete instructions.
+
+      Research ambition. The solution may require novel, creative, and
+      non-trivial elements. If a non-trivial lemma, computation, or reduction
+      appears necessary, plan concrete work that asks the Worker to prove the
+      lemma, run the computation, or carry out the reduction this round before
+      reporting it as a remaining gap. If rounds remain and any essential
+      mathematical gap is still open, spend the next Worker round trying to
+      close that gap or pursue an alternative approach.
+
+      Problem statement handling. If the problem statement is ambiguous,
+      inconsistent, missing definitions, or likely contains a typo, instruct
+      the Worker to begin answer.tex with a short section titled "Problem
+      statement and interpretation". That section must state the cleanest
+      faithful correction or restatement, list any assumptions, and avoid
+      silently solving a different problem. The same interpretation should be
+      recorded in research_notes.tex or report.md so later rounds preserve it.
+
+      Set answer_ready=true only if the current answer.tex is a complete
+      rigorous solution to the stated problem, with no remaining open gaps, no
+      unproved essential lemmas, and no missing assumptions. A document with a
+      "Remaining open issues" section, unresolved open_questions, or merely
+      partial progress is not answer-ready. answer_ready=true combined with
+      Critic agreement and a clean deterministic compile check causes the
+      workflow to short-circuit. Setting it prematurely is worse than setting
+      it late.
+
+      Output exactly two XML tags, in this order:
+
+      <plan>
+      A complete plan.md, in Markdown, with an ordered list of concrete tasks
+      for the Worker this round. Reference files by name. Quote exact text if
+      you ask for a specific edit. Be terse but unambiguous.
+      </plan>
+      <decision>
+      {"answer_ready": false, "confidence": 0.0, "rationale": "one short paragraph justifying the answer-ready vote"}
+      </decision>
+
+      If the workspace is empty, bootstrap it: ask the Worker to write a
+      problem-statement section, do an initial literature pass, and sketch a
+      strategy.
+    user_prompt: '### Round {round} of {n_rounds} ###
+
+
+      ### Problem ###
+
+      {problem}
+
+
+      ### Current answer.tex ###
+
+      ```tex
+
+      {answer_tex}
+
+      ```
+
+
+      ### Current research_notes.tex ###
+
+      ```tex
+
+      {research_notes_tex}
+
+      ```
+
+
+      ### Current references.bib ###
+
+      ```bibtex
+
+      {references_bib}
+
+      ```
+
+
+      ### Worker''s report.md from last round ###
+
+      ```markdown
+
+      {report_md}
+
+      ```
+
+
+      ### Critic''s review.md from last round ###
+
+      ```markdown
+
+      {prev_review_md}
+
+      ```
+
+
+      ### Workspace listing (papers/, code/, data/, notes/) ###
+
+      ```
+
+      {workspace_listing}
+
+      ```
+
+
+      Plan the next Worker round. Emit exactly the two tags described in the
+
+      system prompt.
+
+      '
+    input_schema:
+      problem: string
+      answer_tex: string
+      research_notes_tex: string
+      references_bib: string
+      report_md: string
+      prev_review_md: string
+      workspace_listing: string
+      round: integer
+      n_rounds: integer
+    output:
+      regex_fields:
+        plan_md: (?s)<plan>(.*?)</plan>
+      json_tag: decision
+      json_merge: true
+      json_default:
+        answer_ready: false
+        confidence: 0
+        rationale: ''
+      default_field: plan_md
+    output_schema:
+      plan_md: string
+      answer_ready: boolean
+      confidence: number
+      rationale: string
+    tools:
+    - type: web_search_preview
+    max_tool_calls: 8
+  cfg_pwc_critic:
+    model: models/openai/gpt-55-pro
+    system_prompt: |
+      Act as a strict mathematical referee in a Planner / Worker / Critic
+      mathematical research loop. Review the current answer.tex for
+      mathematical correctness. Style is secondary.
+
+      Classify each finding as exactly BLOCKER, CONCERN, or NIT.
+      A document with any BLOCKER or CONCERN is not answer-ready.
+
+      Set answer_ready=true only if the current answer.tex fully solves the
+      stated problem as a complete rigorous solution, with no remaining open
+      gaps, no unproved essential lemmas, and no missing assumptions. If
+      answer.tex contains a "Remaining open issues" section, unresolved
+      essential lemmas, or partial progress only, set answer_ready=false. If
+      the original problem was ambiguous, answer.tex must explicitly record
+      the faithful interpretation in a "Problem statement and interpretation"
+      section; otherwise flag the ambiguity as a BLOCKER or CONCERN.
+
+      Return exactly one JSON object inside <critic_result>...</critic_result> with:
+      - findings: list of objects with tag, location, claim, issue, suggested_fix.
+      - review_md: markdown review grouped by Blockers, Concerns, and Nits.
+      - answer_ready: boolean.
+      - has_blockers_or_concerns: boolean.
+      - confidence: number from 0 to 1.
+      - rationale: one short paragraph.
+
+      If there are no issues under this complete-solution standard, use [] for
+      findings, "No issues identified." for review_md, answer_ready=true, and
+      has_blockers_or_concerns=false.
+    user_prompt: 'Round {round} of {n_rounds}
+
+
+      Problem:
+
+      {problem}
+
+
+      Plan followed this round:
+
+      ```markdown
+
+      {plan_md}
+
+      ```
+
+
+      Current answer.tex:
+
+      ```tex
+
+      {answer_tex}
+
+      ```
+
+
+      Worker''s report.md:
+
+      ```markdown
+
+      {report_md}
+
+      ```
+
+
+      research_notes.tex:
+
+      ```tex
+
+      {research_notes_tex}
+
+      ```
+
+
+      references.bib:
+
+      ```bibtex
+
+      {references_bib}
+
+      ```
+
+
+      Workspace listing:
+
+      ```
+
+      {workspace_listing}
+
+      ```
+
+      '
+    input_schema:
+      problem: string
+      plan_md: string
+      answer_tex: string
+      report_md: string
+      research_notes_tex: string
+      references_bib: string
+      workspace_listing: string
+      round: integer
+      n_rounds: integer
+    output:
+      json_tag: critic_result
+      json_merge: true
+      json_default:
+        findings: []
+        review_md: ''
+        answer_ready: false
+        has_blockers_or_concerns: true
+        confidence: 0
+        rationale: ''
+      default_field: review_md
+    output_schema:
+      findings:
+        type: array
+        items: {}
+      review_md: string
+      answer_ready: boolean
+      has_blockers_or_concerns: boolean
+      confidence: number
+      rationale: string
+    tools:
+    - type: web_search_preview
+    max_tool_calls: 8
+  cfg_pwc_worker:
+    cmd:
+    - codex
+    - exec
+    - --skip-git-repo-check
+    - --json
+    model: gpt-5.5
+    model_reasoning_effort: xhigh
+    codex_sandbox: auto
+    copy_codex_auth: true
+    soft_timeout_s: 3600
+    sandbox:
+      cpu_limit: 4
+      memory_gb: 8
+      timeout_s: 4500
+      backend: docker
+      docker_image: proofstack-pwc-sandbox:latest
+      docker_no_new_privileges: false
+    input_schema:
+      workspace: string
+      problem_id: string
+      plan_md: string
+      prev_review_md: string
+      round: integer
+      n_rounds: integer
+      page_limit: integer
+    input_files:
+      .pwc/plan.md:
+        from_input: plan_md
+      .pwc/review.md:
+        from_input: prev_review_md
+    output_schema:
+      answer_tex: string
+      research_notes_tex: string
+      references_bib: string
+      report_md: string
+      workspace_listing: string
+      diff_summary: string
+      open_questions:
+        type: array
+        items: {}
+      status: string
+      workspace: string
+    output_files:
+      answer_tex: answer.tex
+      research_notes_tex: research_notes.tex
+      references_bib: references.bib
+      report_md: report.md
+      workspace_listing:
+        path: .
+        type: listing
+    done_outputs:
+      status: status
+      diff_summary: diff_summary
+      open_questions: open_questions
+    usage:
+      type: codex_jsonl
+      model: gpt-5.5
+      cost_config: models/openai/gpt-55-high
+    prompt: |
+      Act as a research-level mathematical proof worker in a Planner / Worker
+      / Critic mathematical research loop. Your sandbox is a persistent
+      workspace shared across rounds. Files you write now are visible to the
+      next Planner, Critic, and Worker call.
+
+      ## Round metadata
+
+      This is round {round} of {n_rounds}. After round {n_rounds}'s Worker
+      turn, answer.tex is submitted as the final solution. The submitted
+      answer.tex must compile to at most {page_limit} pages of standard
+      article-class output.
+
+      ## Research ambition
+
+      The solution may require novel, creative, and non-trivial elements. If a
+      non-trivial lemma, computation, or reduction appears necessary, attempt
+      to prove the lemma, run the computation, or carry out the reduction in
+      this round before listing it as a remaining gap. If rounds remain and
+      any essential mathematical gap is still open, use this round to close
+      that gap or pursue an alternative approach rather than merely restating
+      the obstruction.
+
+      ## Problem statement handling
+
+      If the problem statement is ambiguous, inconsistent, missing definitions,
+      or likely contains a typo, begin answer.tex with a short section titled
+      "Problem statement and interpretation". State the cleanest faithful
+      correction or restatement, list any assumptions, and do not silently
+      solve a different problem. Record the same interpretation in
+      research_notes.tex or report.md so later rounds preserve it. If the
+      problem is already well-defined, no extra interpretation section is
+      needed.
+
+      ## Workspace contract
+
+      The four files below are your contract with the rest of the system:
+
+      - answer.tex: the candidate final solution. It must be a complete LaTeX
+        document. Run pdflatex against it and fix errors before finishing.
+      - research_notes.tex: a persistent research log. Record lemmas,
+        definitions, paper summaries, experiments, and anything that should
+        survive across rounds. Cite references.bib with \cite{key}.
+      - references.bib: shared BibTeX. Prefer classic BibTeX:
+        \bibliographystyle{plain} and \bibliography{references}. Add new
+        entries; do not remove entries that are still cited.
+      - report.md: a fresh-each-round message to Planner and Critic. Summarize
+        what you did, open questions, dead ends, and promising leads.
+
+      Auxiliary files may go under papers/, code/, data/, and notes/.
+
+      The .pwc/ directory is framework state. Do not write to it. The files
+      .pwc/plan.md and .pwc/review.md are provided for you to read.
+
+      ## This round's plan
+
+      ```markdown
+      {plan_md}
+      ```
+
+      ## Last round's review
+
+      ```markdown
+      {prev_review_md}
+      ```
+
+      ## Suggested workflow
+
+      1. Read the plan, review, answer.tex, research_notes.tex, and
+         references.bib.
+      2. Execute the plan: search the web, download papers, run code, and
+         update the four canonical files.
+      3. Compile answer.tex with pdflatex. If it cites references.bib, run
+         bibtex and then pdflatex twice more.
+      4. Rewrite report.md to summarize the round. If answer.tex still has a
+         mathematical gap, include a "Remaining open issues" section and list
+         the concrete open questions in finish JSON.
+
+      ## Soft-timeout sentinel
+
+      If .pwc/runtime/WRAP_UP appears, stop new investigations immediately,
+      finalize report.md, make answer.tex as compilable as possible, and call
+      finish. Even in wrap-up, do not imply the answer is a complete rigorous
+      solution if essential gaps remain.
+
+      ## Finishing
+
+      Invoke the shell command finish when done. It is installed on PATH
+      inside this sandbox. Pass or pipe JSON like this:
+
+      finish '{"status": "done", "summary": "<round summary>", "artifacts": [{"role": "answer_tex", "path": "answer.tex"}, {"role": "research_notes_tex", "path": "research_notes.tex"}, {"role": "references_bib", "path": "references.bib"}, {"role": "report_md", "path": "report.md"}], "open_questions": ["..."], "diff_summary": "+lines/-lines per file"}'
+
+      Set status to "partial" if you ran out of time or the loop needs to
+      weigh in. The four canonical files must exist before finish.
+  cfg_compile_gate:
+    cmd:
+    - sh
+    - -c
+    - "set +e\nrm -f main.aux main.bbl main.blg main.log main.pdf pages.txt compile.log\npdflatex -interaction=nonstopmode\
+      \ -halt-on-error -file-line-error main.tex > compile.log 2>&1\nif [ -s references.bib ]; then\n\
+      \  bibtex main >> compile.log 2>&1 || true\n  pdflatex -interaction=nonstopmode -halt-on-error -file-line-error\
+      \ main.tex >> compile.log 2>&1\n  pdflatex -interaction=nonstopmode -halt-on-error -file-line-error\
+      \ main.tex >> compile.log 2>&1\nfi\nif [ -f main.pdf ]; then\n  pdfinfo main.pdf 2>/dev/null | awk\
+      \ '/^Pages:/ {print $2; found=1} END {if (!found) print 0}' > pages.txt || printf '0\\n' > pages.txt\n\
+      \  finish '{\"status\":\"done\",\"summary\":\"compiled\"}'\nelse\n  printf '0\\n' > pages.txt\n\
+      \  finish '{\"status\":\"error\",\"summary\":\"LaTeX compile failed; see compile.log\"}'\n\
+      fi\n"
+    sandbox:
+      timeout_s: 120
+      cpu_limit: 2
+      memory_gb: 2
+      docker_image: proofstack-pwc-sandbox:latest
+      docker_no_new_privileges: false
+    input_schema:
+      tex_body: string
+      bib_path: string
+    input_files:
+      main.tex:
+        from_input: tex_body
+      references.bib:
+        from_path_input: bib_path
+        default: ''
+    output_schema:
+      tex: string
+      tex_path: string
+      pdf_path: string
+      compiled: boolean
+      pages: integer
+      notes: string
+    output_files:
+      tex: main.tex
+      tex_path:
+        path: main.tex
+        type: path
+      pdf_path:
+        path: main.pdf
+        type: path
+      compiled:
+        path: main.pdf
+        type: exists
+      pages:
+        path: pages.txt
+        type: int
+        default: 0
+      notes:
+        path: compile.log
+        default: ''
+dag:
+  ui:
+    workflow_output:
+      x: 3239
+      y: 148
+  nodes:
+  - id: read_workspace
+    kind: agent
+    agent: proofstack.agents.pwc.workspace.PWCWorkspaceRead
+    inputs:
+      workspace: $input.workspace
+    ui:
+      x: -831
+      y: 177
+      label: Read workspace
+  - id: planner
+    kind: agent
+    needs:
+    - read_workspace
+    agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+    name: cfg_pwc_planner
+    inputs:
+      problem: $input.problem
+      answer_tex: $node.read_workspace.answer_tex
+      research_notes_tex: $node.read_workspace.research_notes_tex
+      references_bib: $node.read_workspace.references_bib
+      report_md: $node.read_workspace.report_md
+      workspace_listing: $node.read_workspace.workspace_listing
+      prev_review_md: $input.control.review_md
+      round: $input.round
+      n_rounds: $input.n_rounds
+    ui:
+      x: -220
+      y: -100
+      label: Planner
+      managed_needs:
+      - read_workspace
+  - id: compile_gate
+    kind: agent
+    needs:
+    - read_workspace
+    - planner
+    agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+    name: cfg_compile_gate
+    inputs:
+      tex_body: $node.read_workspace.answer_tex
+      bib_path: $node.read_workspace.references_bib_path
+    ui:
+      x: 565
+      y: -252
+      label: Compile gate
+      managed_needs:
+      - read_workspace
+      - planner
+  - id: worker
+    kind: agent
+    needs:
+    - read_workspace
+    - planner
+    - compile_gate
+    when:
+      inputs:
+        planner_ready: $node.planner.answer_ready
+        critic_ready: $input.control.critic_ready
+        has_blockers_or_concerns: $input.control.has_blockers_or_concerns
+        compiled: $node.compile_gate.compiled
+      python: not (bool(inputs.get("planner_ready")) and bool(inputs.get("critic_ready")) and not bool(inputs.get("has_blockers_or_concerns"))
+        and bool(inputs.get("compiled")))
+    default:
+      diff_summary: ''
+      open_questions: []
+      status: skipped
+      workspace: $node.read_workspace.workspace
+      answer_tex: $node.read_workspace.answer_tex
+      research_notes_tex: $node.read_workspace.research_notes_tex
+      references_bib: $node.read_workspace.references_bib
+      report_md: $node.read_workspace.report_md
+      workspace_listing: $node.read_workspace.workspace_listing
+    agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+    name: cfg_pwc_worker
+    inputs:
+      workspace: $node.read_workspace.workspace
+      problem_id: $input.problem_id
+      plan_md: $node.planner.plan_md
+      prev_review_md: $input.control.review_md
+      round: $input.round
+      n_rounds: $input.n_rounds
+      page_limit: $input.page_limit
+    best_tex: $output.answer_tex
+    ui:
+      x: 941
+      y: -709
+      label: Worker
+      managed_needs:
+      - read_workspace
+      - planner
+      - compile_gate
+  - id: critic
+    kind: agent
+    needs:
+    - planner
+    - worker
+    when:
+      inputs:
+        status: $node.worker.status
+        round: $input.round
+        n_rounds: $input.n_rounds
+      python: inputs.get("status") in ("done", "partial") and int(inputs.get("round") or 0) < int(inputs.get("n_rounds")
+        or 0)
+    default:
+      findings: []
+      review_md: $input.control.review_md
+      answer_ready: $input.control.critic_ready
+      has_blockers_or_concerns: $input.control.has_blockers_or_concerns
+      confidence: 0
+      rationale: ''
+    agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+    name: cfg_pwc_critic
+    inputs:
+      problem: $input.problem
+      plan_md: $node.planner.plan_md
+      answer_tex: $node.worker.answer_tex
+      report_md: $node.worker.report_md
+      research_notes_tex: $node.worker.research_notes_tex
+      references_bib: $node.worker.references_bib
+      workspace_listing: $node.worker.workspace_listing
+      round: $input.round
+      n_rounds: $input.n_rounds
+    ui:
+      x: 1861
+      y: 88
+      label: Critic
+      managed_needs:
+      - worker
+  - id: snapshot
+    kind: agent
+    needs:
+    - read_workspace
+    - worker
+    - critic
+    when:
+      inputs:
+        status: $node.worker.status
+      python: inputs.get("status") in ("done", "partial")
+    default:
+      round: $input.control.rounds_completed
+      workspace: $input.workspace
+      answer_tex: $node.read_workspace.answer_tex
+      research_notes_tex: $node.read_workspace.research_notes_tex
+      references_bib: $node.read_workspace.references_bib
+      report_md: $node.read_workspace.report_md
+      workspace_listing: $node.read_workspace.workspace_listing
+    agent: proofstack.agents.pwc.workspace.PWCWorkspaceSnapshot
+    inputs:
+      problem_id: $input.problem_id
+      round: $input.round
+      plan_md: $node.planner.plan_md
+      review_md: $node.critic.review_md
+      workspace: $node.worker.workspace
+      status: $node.worker.status
+      diff_summary: $node.worker.diff_summary
+      open_questions: $node.worker.open_questions
+    ui:
+      x: 2659
+      y: -256
+      label: Snapshot
+      managed_needs:
+      - read_workspace
+      - worker
+      - critic
+  outputs:
+    workspace: $node.snapshot.workspace
+    answer_tex: $node.snapshot.answer_tex
+    research_notes_tex: $node.snapshot.research_notes_tex
+    references_bib: $node.snapshot.references_bib
+    report_md: $node.snapshot.report_md
+    workspace_listing: $node.snapshot.workspace_listing
+    control:
+      plan_md: $node.planner.plan_md
+      review_md: $node.critic.review_md
+      planner_ready: $node.planner.answer_ready
+      critic_ready: $node.critic.answer_ready
+      has_blockers_or_concerns: $node.critic.has_blockers_or_concerns
+      compiled: $node.compile_gate.compiled
+      pages: $node.compile_gate.pages
+      stop:
+        inputs:
+          planner_ready: $node.planner.answer_ready
+          critic_ready: $input.control.critic_ready
+          has_blockers_or_concerns: $input.control.has_blockers_or_concerns
+          compiled: $node.compile_gate.compiled
+          worker_status: $node.worker.status
+        python: (bool(inputs.get("planner_ready")) and bool(inputs.get("critic_ready")) and not bool(inputs.get("has_blockers_or_concerns"))
+          and bool(inputs.get("compiled"))) or inputs.get("worker_status") not in ("done", "partial",
+          "skipped")
+      early_stopped:
+        inputs:
+          planner_ready: $node.planner.answer_ready
+          critic_ready: $input.control.critic_ready
+          has_blockers_or_concerns: $input.control.has_blockers_or_concerns
+          compiled: $node.compile_gate.compiled
+        python: bool(inputs.get("planner_ready")) and bool(inputs.get("critic_ready")) and not bool(inputs.get("has_blockers_or_concerns"))
+          and bool(inputs.get("compiled"))
+      rounds_completed: $node.snapshot.round
+      had_prior_progress:
+        inputs:
+          worker_status: $node.worker.status
+          prior: $input.control.had_prior_progress
+        python: inputs.get("worker_status") in ("done", "partial") or bool(inputs.get("prior"))

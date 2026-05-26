@@ -1,0 +1,23 @@
+model: gemini-3.1-pro-preview
+api: google
+temperature: null
+top_p: null
+concurrent_requests: 32
+max_tokens: 65536
+cache_read_cost: 0.2
+read_cost: 2
+tool_choice: auto
+write_cost: 12
+# Bounded timeouts. Without these the SDK / native HTTP layer inherits
+# APIClient's 30000s default and a wedged Gemini Council call would
+# otherwise stall a round for hours.
+timeout: 900
+max_wallclock_per_call_s: 1200
+sleep_on_error: 10
+sleep_on_error_max: 60
+extra_body:
+  extra_body:
+    google:
+      thinking_config:
+        include_thoughts: true
+        thinking_level: high

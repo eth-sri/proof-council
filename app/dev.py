@@ -1,0 +1,1026 @@
+"""Local developer dashboard for ProofStack.
+
+Localhost-only Flask app for editing workflow-backed agents and browsing
+run outputs.
+
+Run::
+
+    uv run python app/dev.py --port 5002
+    uv run python app/dev.py --runs-root outputs --runs-root smoke-output
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import yaml
+# Launching as a plain script (`uv run python app/dev.py …`) puts
+# `app/` first on sys.path, which makes `import app` resolve to the
+# viewer script at `app/app.py` instead of this package. Prepend the repo
+# root so `from app.dev_data …` finds the sibling module.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
+from mathagents.config_loader import load_solver_config
+
+from app.dev_data import (
+    create_tool_definition,
+    delete_preset,
+    discover_agent_palette_items,
+    discover_agents,
+    discover_exported_presets,
+    discover_model_options,
+    discover_presets,
+    discover_runs,
+    discover_tool_definitions,
+    find_agent,
+    find_preset,
+    find_run,
+    load_call_detail,
+    load_event_tree,
+    load_execution_graph,
+    mutate_preset_yaml,
+    presets_registry_version,
+    preset_file_version,
+    preset_dag_report,
+    render_recorded_messages,
+    safe_blob_path,
+    save_preset_yaml,
+    save_tool_definition,
+    tool_definition_to_dict,
+    validate_preset_yaml,
+    workflow_input_from_tree,
+    workflow_output_from_tree,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_RUNS_ROOTS = (REPO_ROOT / "outputs",)
+PROBLEMS_ROOT = REPO_ROOT / "problems"
+LOCAL_TIMEZONE = ZoneInfo(os.environ.get("PROOFSTACK_TIMEZONE") or "Europe/Zurich")
+PROVIDER_API_KEYS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "deepseek_special": "DEEPSEEK_API_KEY",
+    "glm": "GLM_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "sri": "SRI_API_KEY",
+    "stepfun": "STEPFUN_API_KEY",
+    "tiiuae": "TIIUAE_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "xai": "XAI_API_KEY",
+}
+
+
+def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
+    app = Flask(
+        __name__,
+        template_folder=str(Path(__file__).parent / "templates"),
+        static_folder=str(Path(__file__).parent / "static"),
+    )
+    app.config["RUNS_ROOTS"] = list(runs_roots)
+
+    @app.template_filter("display_scalar")
+    def display_scalar(value):
+        if value is True:
+            return "true"
+        if value is False:
+            return "false"
+        if value is None:
+            return "none"
+        return str(value)
+
+    @app.template_filter("display_time")
+    def display_time(value):
+        if not value:
+            return "—"
+        text = str(value)
+        try:
+            is_utc = text.endswith("Z")
+            parsed = datetime.fromisoformat(text[:-1] + "+00:00" if is_utc else text)
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(LOCAL_TIMEZONE)
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            cleaned = text.replace("T", " ").replace("Z", "").split(".", 1)[0]
+            return re.sub(r"(\d{1,2}:\d{2}):\d{2}\b", r"\1", cleaned)
+
+    @app.template_filter("display_duration")
+    def display_duration(value):
+        if value is None:
+            return "—"
+        try:
+            total_seconds = max(0.0, float(value))
+        except (TypeError, ValueError):
+            return "—"
+        total_minutes = int(round(total_seconds / 60.0))
+        if total_seconds > 0 and total_minutes == 0:
+            return "<1 min"
+        hours, minutes = divmod(total_minutes, 60)
+        if hours and minutes:
+            return f"{hours} h {minutes} min"
+        if hours:
+            return f"{hours} h"
+        return f"{total_minutes} min"
+
+    @app.route("/")
+    def index():
+        return render_template("dev_home.html")
+
+    @app.route("/catalog")
+    def catalog():
+        agents = discover_agents()
+        return render_template("dev_agents.html", agents=agents)
+
+    @app.route("/agent/<qualname>")
+    def agent_detail(qualname: str):
+        match = find_agent(qualname)
+        if match is None:
+            abort(404)
+        return render_template("dev_agent_detail.html", agent=match)
+
+    # --- UI-2: workflow presets ----------------------------------------------
+
+    @app.route("/presets")
+    def presets_index():
+        presets = discover_presets()
+        return render_template(
+            "dev_presets.html",
+            presets=presets,
+            preset_signature=presets_registry_version(),
+        )
+
+    @app.route("/presets/data")
+    def presets_data():
+        signature = presets_registry_version()
+        if request.args.get("signature") == signature:
+            return jsonify({"ok": True, "changed": False, "signature": signature})
+        presets = discover_presets()
+        payload = {
+            "ok": True,
+            "changed": True,
+            "signature": signature,
+            "presets": [_preset_payload(p) for p in presets],
+            "exported_presets": discover_exported_presets(),
+        }
+        if request.args.get("include_keys") == "1":
+            runnable = [p for p in presets if not p.error]
+            payload["key_requirements"] = {
+                p.name: _api_key_requirements_for_preset(p.name)
+                for p in runnable
+            }
+        return jsonify(payload)
+
+    @app.route("/run-agent")
+    def run_agent():
+        presets = [p for p in discover_presets() if not p.error]
+        return render_template(
+            "dev_run_agent.html",
+            presets=presets,
+            preset_signature=presets_registry_version(),
+            problems=_discover_problem_files(),
+            key_requirements={
+                p.name: _api_key_requirements_for_preset(p.name)
+                for p in presets
+            },
+        )
+
+    @app.route("/run-agent/start", methods=["POST"])
+    def run_agent_start():
+        payload = request.get_json(silent=True) or {}
+        preset_name = str(payload.get("preset") or "").strip()
+        preset = find_preset(preset_name)
+        if preset is None:
+            return jsonify({"ok": False, "errors": ["Choose an agent to run."]}), 400
+
+        try:
+            max_parallel = max(1, int(payload.get("max_parallel") or 1))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "errors": ["Max parallel runs must be a number."]}), 400
+
+        try:
+            problems = _selected_run_problems(payload)
+        except ValueError as e:
+            return jsonify({"ok": False, "errors": [str(e)]}), 400
+        if not problems:
+            return jsonify({"ok": False, "errors": ["Select or create at least one problem."]}), 400
+
+        env = _dashboard_subprocess_env()
+        for key, value in (payload.get("api_keys") or {}).items():
+            clean_key = str(key or "").strip()
+            clean_value = str(value or "").strip()
+            if clean_key and clean_value:
+                env[clean_key] = clean_value
+
+        missing = [
+            req["env"]
+            for req in _api_key_requirements_for_preset(preset_name, env=env)
+            if not req["present"]
+        ]
+        if missing:
+            return jsonify({"ok": False, "errors": [f"Missing API keys: {', '.join(missing)}"]}), 400
+
+        display_name = _run_display_name(preset.label, problems)
+        outputs_root = REPO_ROOT / "outputs"
+        run_id = _next_run_id(_slug(display_name).lower(), outputs_root)
+        batch_dir = outputs_root / run_id
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        problems_file = batch_dir / "problems.json"
+        problems_file.write_text(
+            json.dumps({"problems": problems}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (batch_dir / "run-metadata.json").write_text(
+            json.dumps(
+                {
+                    "status": "starting",
+                    "display_name": display_name,
+                    "started_by": "dashboard",
+                    "preset": preset_name,
+                    "started_at": datetime.now().isoformat(timespec="seconds"),
+                    "manifest": {
+                        "started_at": datetime.now().isoformat(timespec="seconds"),
+                        "preset": preset_name,
+                        "max_parallel": max_parallel,
+                        "problems": {
+                            problem["id"]: {
+                                "status": "queued",
+                                "problem_id": problem["id"],
+                                "display_name": problem.get("display_name") or _human_label(problem["id"]),
+                                "run_id": f"{run_id}-{problem['id']}",
+                            }
+                            for problem in problems
+                        },
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        log_path = batch_dir / "dashboard-subprocess.log"
+        cmd = [
+            sys.executable,
+            "scripts/run_workflow_batch.py",
+            "--workflow",
+            preset_name,
+            "--problems-file",
+            str(problems_file),
+            "--output",
+            str(outputs_root),
+            "--run-id",
+            run_id,
+            "--run-name",
+            display_name,
+            "--max-parallel",
+            str(max_parallel),
+        ]
+        with log_path.open("a", encoding="utf-8") as log:
+            subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "run_id": run_id,
+                "display_name": display_name,
+                "url": url_for("run_detail", run_id=run_id),
+            }
+        )
+
+    @app.route("/run-agent/problem", methods=["POST"])
+    def run_agent_problem():
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return jsonify({"ok": False, "errors": ["Problem statement is required."]}), 400
+        problem = _save_problem_text(str(payload.get("id") or ""), text)
+        return jsonify({"ok": True, "problem": problem})
+
+    @app.route("/agents/new")
+    def new_agent():
+        label = _random_agent_label()
+        name = _next_preset_name(_slug(label).lower())
+        save_preset_yaml(name, _starter_agent_yaml(name, label))
+        return redirect(url_for("preset_editor", name=name))
+
+    @app.route("/preset/<name>/editor")
+    def preset_editor(name: str):
+        preset = find_preset(name)
+        if preset is None:
+            abort(404)
+        report = preset_dag_report(name)
+        return render_template(
+            "dev_preset_editor.html",
+            preset=preset,
+            report=report.to_dict(),
+            model_options=discover_model_options(),
+            preset_registry_version=presets_registry_version(),
+            agent_palette_items=discover_agent_palette_items(),
+            exported_presets=discover_exported_presets(),
+            tool_definitions=[
+                tool_definition_to_dict(tool) for tool in discover_tool_definitions()
+            ],
+        )
+
+    @app.route("/preset/<name>/editor/data")
+    def preset_editor_data(name: str):
+        try:
+            file_version = preset_file_version(name)
+        except FileNotFoundError:
+            abort(404)
+        registry_version = presets_registry_version()
+        registry_changed = request.args.get("registry_version") != registry_version
+        if request.args.get("file_version") == file_version and not registry_changed:
+            return jsonify(
+                {
+                    "ok": True,
+                    "changed": False,
+                    "file_version": file_version,
+                    "registry_version": registry_version,
+                }
+            )
+        if request.args.get("file_version") == file_version and registry_changed:
+            return jsonify(
+                {
+                    "ok": True,
+                    "changed": False,
+                    "registry_changed": True,
+                    "file_version": file_version,
+                    "registry_version": registry_version,
+                    "exported_presets": discover_exported_presets(),
+                }
+            )
+        preset = find_preset(name)
+        if preset is None:
+            abort(404)
+        return jsonify(
+            {
+                "ok": True,
+                "changed": True,
+                "preset": {
+                    "name": preset.name,
+                    "label": preset.label,
+                    "raw_yaml": preset.raw_yaml,
+                    "file_version": file_version,
+                    "component_configs": preset.component_configs,
+                },
+                "report": preset_dag_report(name).to_dict(),
+                "model_options": discover_model_options(),
+                "registry_version": registry_version,
+                "exported_presets": discover_exported_presets(),
+                "tool_definitions": [
+                    tool_definition_to_dict(tool)
+                    for tool in discover_tool_definitions()
+                ],
+            }
+        )
+
+    @app.route("/tools/new", methods=["POST"])
+    def tool_create():
+        try:
+            tool = create_tool_definition()
+        except Exception as e:
+            return jsonify({"ok": False, "errors": [str(e)]}), 400
+        return jsonify({"ok": True, "tool": tool_definition_to_dict(tool)})
+
+    @app.route("/tools/<name>/save", methods=["POST"])
+    def tool_save(name: str):
+        payload = request.get_json(silent=True) or {}
+        try:
+            tool = save_tool_definition(
+                name,
+                str(payload.get("name") or name),
+                str(payload.get("yaml") or ""),
+                str(payload.get("python") or ""),
+            )
+        except Exception as e:
+            return jsonify({"ok": False, "errors": [str(e)]}), 400
+        return jsonify({"ok": True, "tool": tool_definition_to_dict(tool)})
+
+    @app.route("/preset/<name>/editor/validate", methods=["POST"])
+    def preset_editor_validate(name: str):
+        payload = request.get_json(silent=True) or {}
+        raw_yaml = str(payload.get("raw_yaml", ""))
+        return jsonify(validate_preset_yaml(raw_yaml))
+
+    @app.route("/preset/<name>/editor/mutate", methods=["POST"])
+    def preset_editor_mutate(name: str):
+        if find_preset(name) is None:
+            abort(404)
+        payload = request.get_json(silent=True) or {}
+        raw_yaml = str(payload.get("raw_yaml", ""))
+        operation = payload.get("operation") or {}
+        return jsonify(mutate_preset_yaml(raw_yaml, operation))
+
+    @app.route("/preset/<name>/editor/save", methods=["POST"])
+    def preset_editor_save(name: str):
+        payload = request.get_json(silent=True) or {}
+        raw_yaml = str(payload.get("raw_yaml", ""))
+        base_file_version = str(payload.get("base_file_version") or "")
+        preset = find_preset(name)
+        if preset is None:
+            abort(404)
+        if (
+            base_file_version
+            and preset.file_version != base_file_version
+            and preset.raw_yaml != raw_yaml
+        ):
+            return jsonify(
+                {
+                    "ok": False,
+                    "conflict": True,
+                    "errors": ["YAML changed on disk; reloaded the latest version."],
+                    "preset": {
+                        "name": preset.name,
+                        "label": preset.label,
+                        "raw_yaml": preset.raw_yaml,
+                        "file_version": preset.file_version,
+                        "component_configs": preset.component_configs,
+                    },
+                    "report": preset_dag_report(name).to_dict(),
+                    "model_options": discover_model_options(),
+                    "exported_presets": discover_exported_presets(),
+                    "tool_definitions": [
+                        tool_definition_to_dict(tool)
+                        for tool in discover_tool_definitions()
+                    ],
+                }
+            ), 409
+        try:
+            save_preset_yaml(name, raw_yaml)
+        except Exception as e:
+            return jsonify({"ok": False, "errors": [str(e)]}), 400
+        preset = find_preset(name)
+        file_version = preset.file_version if preset else preset_file_version(name)
+        return jsonify(
+            {
+                "ok": True,
+                "file_version": file_version,
+                "preset": {
+                    "name": name,
+                    "label": preset.label if preset else name.replace("_", " ").title(),
+                    "raw_yaml": raw_yaml,
+                    "file_version": file_version,
+                    "component_configs": preset.component_configs if preset else {},
+                },
+                "report": validate_preset_yaml(raw_yaml),
+            }
+        )
+
+    @app.route("/preset/<name>/delete", methods=["POST"])
+    def preset_delete(name: str):
+        try:
+            delete_preset(name)
+        except Exception as e:
+            return jsonify({"ok": False, "errors": [str(e)]}), 400
+        return jsonify({"ok": True, "url": url_for("presets_index")})
+
+    @app.route("/preset/<name>/editor/run-sample", methods=["POST"])
+    def preset_editor_run_sample(name: str):
+        preset = find_preset(name)
+        if preset is None:
+            abort(404)
+        payload = request.get_json(silent=True) or {}
+        problem = str(
+            payload.get("problem")
+            or "Prove that the square root of 2 is irrational."
+        ).strip()
+        problem_id = _slug(str(payload.get("problem_id") or "editor_sample"))
+        display_name = _run_display_name(preset.label, [{"id": problem_id}])
+        outputs_root = REPO_ROOT / "outputs"
+        run_id = _next_run_id(_slug(display_name).lower(), outputs_root)
+        outputs_root.mkdir(parents=True, exist_ok=True)
+        run_dir = outputs_root / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run-metadata.json").write_text(
+            json.dumps(
+                {
+                    "status": "starting",
+                    "display_name": display_name,
+                    "started_by": "dashboard",
+                    "preset": name,
+                    "problem_id": problem_id,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        log_path = run_dir / "dashboard-subprocess.log"
+        env = _dashboard_subprocess_env()
+        cmd = [
+            sys.executable,
+            "scripts/run_workflow.py",
+            "--workflow",
+            name,
+            "--problem-text",
+            problem,
+            "--problem-id",
+            problem_id,
+            "--run-id",
+            run_id,
+            "--run-name",
+            display_name,
+            "--output",
+            str(outputs_root),
+        ]
+        with log_path.open("a", encoding="utf-8") as log:
+            subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "run_id": run_id,
+                "display_name": display_name,
+                "url": url_for("run_detail", run_id=run_id),
+                "log": str(log_path),
+            }
+        )
+
+    # --- UI-0: run viewer -----------------------------------------------------
+
+    @app.route("/runs")
+    def runs_index():
+        runs = discover_runs(app.config["RUNS_ROOTS"])
+        return render_template("dev_runs.html", runs=runs)
+
+    @app.route("/run/<run_id>")
+    def run_detail(run_id: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        tree = load_event_tree(run.path)
+        exec_graph = load_execution_graph(run.path, tree=tree)
+        workflow_input = workflow_input_from_tree(tree)
+        workflow_output = workflow_output_from_tree(tree)
+        return render_template(
+            "dev_run_detail.html",
+            run=run,
+            tree=tree,
+            exec_graph=exec_graph,
+            workflow_input=workflow_input,
+            workflow_output=workflow_output,
+        )
+
+    @app.route("/run/<run_id>/graph-fragment")
+    def run_graph_fragment(run_id: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        tree = load_event_tree(run.path)
+        exec_graph = load_execution_graph(run.path, tree=tree)
+        return render_template("dev_run_graph.html", run=run, tree=tree, exec_graph=exec_graph)
+
+    @app.route("/run/<run_id>/call/<call_ref>")
+    def call_detail(run_id: str, call_ref: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        tree = load_event_tree(run.path)
+        load_execution_graph(run.path, tree=tree)
+        node = tree.by_ref.get(call_ref)
+        if node is None:
+            abort(404)
+        detail = load_call_detail(run.path, node)
+        rendered = render_recorded_messages(detail.messages_json)
+        input_payload = detail.input_json if detail.input_json is not None else node.input
+        input_problem = _extract_problem_text(input_payload)
+        parent_ref = ""
+        if node.parent_call_id and node.parent_call_id in tree.by_id:
+            parent_ref = tree.by_id[node.parent_call_id].display_ref
+        return render_template(
+            "dev_call_detail.html",
+            run=run,
+            tree=tree,
+            node=node,
+            detail=detail,
+            rendered=rendered,
+            input_problem=input_problem,
+            input_fields=_input_without_rendered_problem(input_payload, input_problem),
+            parent_ref=parent_ref,
+        )
+
+    @app.route("/run/<run_id>/blob")
+    def run_blob(run_id: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        ref = request.args.get("ref", "")
+        try:
+            path = safe_blob_path(run.path, ref)
+        except ValueError as e:
+            abort(400, description=str(e))
+        return send_file(path, mimetype="text/plain")
+
+    return app
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="ProofStack local dashboard",
+    )
+    p.add_argument("--port", type=int, default=5002)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument(
+        "--runs-root",
+        action="append",
+        default=[],
+        type=Path,
+        help=(
+            "Directory holding run dirs (or a single run dir itself). "
+            "Repeatable. Defaults to ./outputs/."
+        ),
+    )
+    p.add_argument("--debug", action="store_true")
+    return p.parse_args()
+
+
+def _dashboard_subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.update(_read_dotenv(REPO_ROOT / ".env"))
+    src = str(REPO_ROOT / "src")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = src if not existing else f"{src}{os.pathsep}{existing}"
+    return env
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _discover_problem_files() -> list[dict[str, str]]:
+    if not PROBLEMS_ROOT.exists():
+        return []
+    problems: list[dict[str, str]] = []
+    for path in sorted(PROBLEMS_ROOT.glob("*.txt")):
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        preview = " ".join(text.split())
+        problems.append(
+            {
+                "id": path.stem,
+                "title": path.stem.replace("_", " "),
+                "preview": preview[:180],
+            }
+        )
+    return problems
+
+
+def _selected_run_problems(payload: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_id in payload.get("problems") or []:
+        file_id = str(raw_id or "").strip()
+        if not file_id or "/" in file_id or "\\" in file_id:
+            continue
+        problem_id = _slug(file_id)
+        if problem_id in seen:
+            continue
+        path = PROBLEMS_ROOT / f"{file_id}.txt"
+        if not path.exists() or path.parent != PROBLEMS_ROOT:
+            raise ValueError(f"Problem not found: {file_id}")
+        text = path.read_text(encoding="utf-8").strip()
+        if text:
+            out.append({"id": problem_id, "text": text, "display_name": _human_label(problem_id)})
+            seen.add(problem_id)
+    return out
+
+
+def _extract_problem_text(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ("problem", "problem_statement", "problem_text", "statement"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        for key in ("input", "inputs", "payload"):
+            nested = _extract_problem_text(value.get(key))
+            if nested:
+                return nested
+    if isinstance(value, list):
+        for item in value:
+            nested = _extract_problem_text(item)
+            if nested:
+                return nested
+    return ""
+
+
+def _input_without_rendered_problem(value: Any, rendered_problem: str) -> Any:
+    if value is None:
+        return None
+    problem_keys = {"problem", "problem_statement", "problem_text", "statement"}
+
+    def clean(item: Any) -> Any:
+        if item is None:
+            return None
+        if isinstance(item, dict):
+            out: dict[str, Any] = {}
+            for key, nested in item.items():
+                if (
+                    rendered_problem
+                    and str(key) in problem_keys
+                    and isinstance(nested, str)
+                    and nested.strip() == rendered_problem
+                ):
+                    continue
+                cleaned = clean(nested)
+                if cleaned is not None:
+                    out[key] = cleaned
+            return out or None
+        if isinstance(item, list):
+            cleaned_items = [clean(nested) for nested in item]
+            return [nested for nested in cleaned_items if nested is not None]
+        return item
+
+    return clean(value)
+
+
+def _save_problem_text(requested_id: str, text: str) -> dict[str, str]:
+    problem_id = _next_problem_id(_slug(requested_id or text[:40] or "problem"))
+    PROBLEMS_ROOT.mkdir(parents=True, exist_ok=True)
+    (PROBLEMS_ROOT / f"{problem_id}.txt").write_text(text.strip() + "\n", encoding="utf-8")
+    preview = " ".join(text.split())
+    return {
+        "id": problem_id,
+        "title": problem_id.replace("_", " "),
+        "preview": preview[:180],
+    }
+
+
+def _next_problem_id(base: str) -> str:
+    base = _slug(base)
+    if not (PROBLEMS_ROOT / f"{base}.txt").exists():
+        return base
+    idx = 2
+    while (PROBLEMS_ROOT / f"{base}_{idx}.txt").exists():
+        idx += 1
+    return f"{base}_{idx}"
+
+
+def _preset_payload(preset) -> dict[str, Any]:
+    return {
+        "name": preset.name,
+        "label": preset.label,
+        "description": preset.description,
+        "inputs": preset.inputs,
+        "budget": preset.budget,
+        "model_overrides": preset.model_overrides,
+        "error": preset.error,
+        "edit_url": url_for("preset_editor", name=preset.name),
+        "delete_url": url_for("preset_delete", name=preset.name),
+    }
+
+
+def _api_key_requirements_for_preset(name: str, env: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    preset = find_preset(name)
+    if preset is None:
+        return []
+    env = env or _dashboard_subprocess_env()
+    try:
+        raw = yaml.safe_load(preset.raw_yaml) or {}
+    except yaml.YAMLError:
+        return []
+    specs = _model_specs_from_value(raw)
+    by_env: dict[str, dict[str, Any]] = {}
+    for spec in specs:
+        for requirement in _api_key_requirements_for_model(spec, env):
+            item = by_env.setdefault(
+                requirement["env"],
+                {
+                    "env": requirement["env"],
+                    "provider": requirement["provider"],
+                    "label": requirement["label"],
+                    "models": [],
+                    "present": bool(env.get(requirement["env"])),
+                },
+            )
+            for model in requirement["models"]:
+                if model not in item["models"]:
+                    item["models"].append(model)
+    return sorted(by_env.values(), key=lambda item: item["env"])
+
+
+def _model_specs_from_value(value: Any) -> list[Any]:
+    specs: list[Any] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _is_model_spec_key(key):
+                if isinstance(item, list):
+                    specs.extend(item)
+                else:
+                    specs.append(item)
+            elif key == "model_overrides" and isinstance(item, dict):
+                specs.extend(item.values())
+            else:
+                specs.extend(_model_specs_from_value(item))
+    elif isinstance(value, list):
+        for item in value:
+            specs.extend(_model_specs_from_value(item))
+    return specs
+
+
+def _is_model_spec_key(key: Any) -> bool:
+    normalized = str(key)
+    return normalized in {"model", "model_config"} or normalized.endswith(
+        ("_model", "_models")
+    )
+
+
+def _api_key_requirements_for_model(spec: Any, env: dict[str, str]) -> list[dict[str, Any]]:
+    try:
+        cfg = load_solver_config(spec)
+    except Exception:
+        return []
+    if cfg.get("type") == "agent" and isinstance(cfg.get("model_config"), dict):
+        return _api_key_requirements_for_model(cfg["model_config"], env)
+    api = str(cfg.get("api") or "openai")
+    key_env = str(cfg.get("api_key_env") or PROVIDER_API_KEYS.get(api) or "")
+    if not key_env or api in {"custom", "vllm"}:
+        return []
+    model = str(cfg.get("model") or spec)
+    return [
+        {
+            "env": key_env,
+            "provider": api,
+            "label": api.replace("_", " ").title(),
+            "models": [model],
+            "present": bool(env.get(key_env)),
+        }
+    ]
+
+
+def _slug(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in value.strip())
+    safe = safe.strip("_")
+    return safe or "editor_sample"
+
+
+def _human_label(value: str) -> str:
+    text = re.sub(r"[_-]+", " ", str(value or "").strip()).strip()
+    return text.title() if text else "Problem"
+
+
+def _run_display_name(agent_label: str, problems: list[dict[str, Any]]) -> str:
+    label = str(agent_label or "Agent").strip() or "Agent"
+    if len(problems) == 1:
+        problem = problems[0]
+        problem_name = str(problem.get("display_name") or _human_label(str(problem.get("id") or "problem")))
+        return f"{label} · {problem_name}"
+    return f"{label} · {len(problems)} problems"
+
+
+def _next_preset_name(base: str) -> str:
+    existing = {p.name for p in discover_presets()}
+    if base not in existing:
+        return base
+    idx = 2
+    while f"{base}_{idx}" in existing:
+        idx += 1
+    return f"{base}_{idx}"
+
+
+def _next_run_id(base: str, outputs_root: Path) -> str:
+    safe = _slug(base).lower()
+    if not (outputs_root / safe).exists():
+        return safe
+    idx = 2
+    while (outputs_root / f"{safe}-{idx}").exists():
+        idx += 1
+    return f"{safe}-{idx}"
+
+
+def _random_agent_label() -> str:
+    adjectives = [
+        "Brisk",
+        "Cheeky",
+        "Clever",
+        "Cosmic",
+        "Dapper",
+        "Dizzy",
+        "Jaunty",
+        "Nimble",
+        "Plucky",
+        "Zesty",
+    ]
+    nouns = [
+        "Axiom",
+        "Lemma",
+        "Proof",
+        "Quibble",
+        "Riddle",
+        "Scheme",
+        "Spark",
+        "Theorem",
+        "Twist",
+        "Zigzag",
+    ]
+    return f"{random.choice(adjectives)} {random.choice(nouns)}"
+
+
+def _starter_agent_yaml(name: str, label: str | None = None) -> str:
+    label = label or name.replace("_", " ").title()
+    return f"""workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: >
+  Draft proof agent. Edit the prompt, graph, and settings in the visual editor.
+
+export:
+  visible_as_node: true
+  label: {label}
+  description: Draft proof agent.
+
+inputs:
+  problem: ""
+
+budget:
+  max_usd: 2.0
+  max_wallclock_s: 600
+
+components:
+  cfg_solver:
+    model: models/openai/gpt-54-mini
+    system_prompt: |
+      You are an expert research mathematician. Produce a clear, rigorous proof attempt.
+      Return only the proof inside <solution>...</solution>.
+    user_prompt: |
+      Problem:
+      {{problem}}
+
+      Write a complete proof inside <solution>...</solution>.
+    input_schema:
+      problem: string
+    output:
+      xml_tags: [solution]
+      default_field: solution
+
+dag:
+  ui:
+    workflow_output:
+      x: 520
+      y: 90
+  nodes:
+    - id: solver
+      kind: agent
+      agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+      name: cfg_solver
+      inputs:
+        problem: $input.problem
+      best_tex: $output.solution
+      ui:
+        x: 80
+        y: 90
+        label: Draft solver
+
+  outputs:
+    solution: $node.solver.solution
+"""
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    roots = tuple(args.runs_root) if args.runs_root else DEFAULT_RUNS_ROOTS
+    app = create_app(runs_roots=roots)
+    app.run(host=args.host, port=args.port, debug=args.debug)

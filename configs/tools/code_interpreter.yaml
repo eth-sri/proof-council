@@ -1,0 +1,6 @@
+name: code_interpreter
+description: Provider-managed Python code execution for models that support it, such as OpenAI Responses API models.
+tool:
+  type: code_interpreter
+  container:
+    type: auto

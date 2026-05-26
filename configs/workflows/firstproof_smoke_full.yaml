@@ -1,0 +1,43 @@
+workflow: proofstack.agents.ac.ACWorkflow
+description: >
+  Slower variant of firstproof_smoke_fast that *also* exercises the
+  Compute Worker (Codex CLI). Same Author/Critic/Council on
+  gpt-5.4-mini, but enable_compute: true with gpt-5.5 low reasoning
+  effort, subprocess sandbox, and Codex sandbox bypass because this
+  runs inside the already-isolated submission container. Codex CLI startup and the worker's
+  network access make this materially slower than the fast smoke
+  (~10 min per problem with compute triggered vs ~2 min without).
+  Use this when you specifically need to verify that the
+  <compute_agent> → codex CLI → workspace-zip → next-round Author
+  attachment plumbing still works.
+
+  Problem #3 in smoke/input.json is worded to nudge the Author into
+  emitting <compute_agent>; the rest may or may not, depending on
+  the model.
+
+inputs:
+  n_rounds: 2
+  full_critic_interval: 1
+  enable_council: true
+  enable_compute: true
+  compute_model: gpt-5.5
+  compute_reasoning_effort: low
+  compute_cost_config: models/openai/gpt-55-medium
+  compute_sandbox_backend: subprocess
+  compute_codex_sandbox: docker-bypass
+  enable_final_critic: false
+  council_models:
+    - models/openai/gpt-54-mini
+    - models/anthropic/sonnet_46
+    - models/gemini/gemini-31-pro
+  page_limit: 8
+
+budget:
+  max_usd: 15.0
+  max_wallclock_s: 3600
+
+components:
+  Author:
+    model: models/openai/gpt-54-mini
+  ACCritic:
+    model: models/openai/gpt-54-mini

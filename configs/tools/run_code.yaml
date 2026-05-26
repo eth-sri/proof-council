@@ -1,0 +1,22 @@
+name: run_code
+description: Run a short Python or C++ snippet in a restricted local subprocess.
+python_function: run_code
+tool:
+  type: function
+  function:
+    name: run_code
+    description: Run a short Python or C++ program and return stdout, stderr, exit code, and timeout status.
+    parameters:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Source code to run.
+        lang:
+          type: string
+          enum: [python, cpp]
+          description: Language of the snippet.
+        timeout_s:
+          type: integer
+          description: Timeout in seconds.
+      required: [code]

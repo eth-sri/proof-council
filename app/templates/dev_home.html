@@ -1,0 +1,14 @@
+{% extends "dev_base.html" %}
+{% set active_tab = 'home' %}
+{% block title %}ProofStack{% endblock %}
+{% block content %}
+    <section class="home-screen">
+        <h1>ProofStack</h1>
+        <div class="home-actions">
+            <a class="big-action" href="{{ url_for('new_agent') }}">Create New Agent</a>
+            <a class="big-action" href="{{ url_for('presets_index') }}">Edit Agent</a>
+            <a class="big-action" href="{{ url_for('run_agent') }}">Run Agent</a>
+            <a class="big-action" href="{{ url_for('runs_index') }}">View Runs</a>
+        </div>
+    </section>
+{% endblock %}

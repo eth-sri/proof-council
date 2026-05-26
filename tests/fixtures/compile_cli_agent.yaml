@@ -1,0 +1,32 @@
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+inputs:
+  tex_body: ""
+components:
+  cfg_compile_latex:
+    cmd: [sh, -c, "true"]
+    prompt: "Create main.tex and main.pdf from this body:\n\n{tex_body}"
+    sandbox:
+      backend: docker
+      docker_no_new_privileges: false
+    input_schema:
+      tex_body: string
+    output_schema:
+      workspace: string
+      tex_path: string
+      pdf_path: string
+    output_files:
+      tex_path:
+        path: main.tex
+        type: path
+      pdf_path:
+        path: main.pdf
+        type: path
+dag:
+  nodes:
+    - id: compile_latex
+      kind: agent
+      agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+      name: cfg_compile_latex
+  outputs:
+    tex_path: $node.compile_latex.tex_path
+    pdf_path: $node.compile_latex.pdf_path

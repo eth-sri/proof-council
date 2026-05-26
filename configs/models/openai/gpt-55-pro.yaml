@@ -1,0 +1,35 @@
+model: gpt-5.5-pro--xhigh
+api: openai
+max_tokens: 200000
+cache_read_cost: 30
+read_cost: 30
+write_cost: 180
+concurrent_requests: 16
+temperature: null
+top_p: null
+batch_processing: false
+background: true
+use_openai_responses_api: true
+# A Pro call in background mode polls until OpenAI returns the
+# response or the per-attempt timeout fires. GPT-5.5 Pro calls can
+# legitimately remain queued/in_progress for a long time; give each
+# background attempt a 3h10m polling window before retrying.
+timeout: 11400
+# If the first 3h10m background poll times out, retry at the next
+# lower reasoning effort instead of launching another xhigh attempt.
+background_timeout_downgrade_after: 1
+background_timeout_reasoning_efforts:
+  - high
+# Exhausted Pro retries should surface as workflow errors instead of
+# blank assistant turns.
+throw_error_on_failure: true
+# Hard wallclock cap for the inner retry loop (api_client polls
+# this from both the start-of-attempt guard AND the background
+# polling deadline, so a stuck call cannot poll past it). With a
+# 3h10m per-attempt timeout this lets the initial xhigh attempt
+# run to completion; if it times out, the downgraded retry gets
+# whatever budget remains (~42 min worst case) before the cap
+# fires.
+max_wallclock_per_call_s: 14000
+reasoning:
+  summary: "auto"

@@ -1,0 +1,6 @@
+{
+  "instance_type": "r7i.2xlarge",
+  "timeout_minutes": 1380,
+  "env_vars": true,
+  "rationale": "CPU/RAM-only First Proof dry run. No GPU required. Uses bounded local computation plus public-model API calls."
+}

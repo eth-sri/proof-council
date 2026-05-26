@@ -1,0 +1,54 @@
+{% macro render_graph_node(node, run_id) %}
+    <div class="graph-node status-{{ node.status }}"
+         data-agent="{{ (node.label ~ ' ' ~ node.node_id ~ ' ' ~ node.status)|lower }}"
+         data-status="{{ node.status }}">
+        <div class="graph-node-main">
+            <div class="graph-node-copy">
+                {% if node.call_ref %}
+                    <a class="agent-link graph-title"
+                       href="{{ url_for('call_detail', run_id=run_id, call_ref=node.call_ref) }}">
+                        {{ node.label }}
+                    </a>
+                {% else %}
+                    <span class="graph-title">{{ node.label }}</span>
+                {% endif %}
+            </div>
+            <div class="graph-meta">
+                {% if node.execution_index > 1 %}<span>#{{ node.execution_index }}</span>{% endif %}
+                <span class="graph-status-label">{{ node.status }}</span>
+                {% if node.duration_s is not none %}<span>{{ node.duration_s | display_duration }}</span>{% endif %}
+                {% if node.cost_usd and node.cost_usd > 0 %}<span>${{ '%.4f'|format(node.cost_usd) }}</span>{% endif %}
+            </div>
+        </div>
+        {% if node.reason %}<div class="graph-reason">{{ node.reason }}</div>{% endif %}
+        {% if node.children %}
+            <div class="graph-children">
+                {% for child in node.children %}
+                    {{ render_graph_node(child, run_id) }}
+                {% endfor %}
+            </div>
+        {% endif %}
+    </div>
+{% endmacro %}
+
+{% if not exec_graph.roots %}
+    <p class="dim">No workflow node events recorded.</p>
+{% else %}
+    <div class="graph-toolbar">
+        <input id="graph-search" type="search" placeholder="Filter nodes" oninput="filterExecutionGraph()">
+        <select id="graph-status" onchange="filterExecutionGraph()">
+            <option value="">All statuses</option>
+            <option value="ok">OK</option>
+            <option value="running">Running</option>
+            <option value="pending">Pending</option>
+            <option value="skipped">Skipped</option>
+            <option value="error">Error</option>
+        </select>
+        <span class="dim" data-live-status>Live updates enabled</span>
+    </div>
+    <div class="execution-graph">
+        {% for root in exec_graph.roots %}
+            {{ render_graph_node(root, run.run_id) }}
+        {% endfor %}
+    </div>
+{% endif %}

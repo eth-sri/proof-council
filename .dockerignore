@@ -1,0 +1,68 @@
+# Keep the docker build context small and prevent accidental leaks of
+# private state / credentials / large artifacts. The root Dockerfile
+# already uses explicit COPY for src/, configs/, scripts/, pyproject.toml,
+# README.md — so nothing else needs to enter the context.
+
+# VCS / editor state
+.git/
+.gitignore
+.gitattributes
+.claude/
+.codex/
+.idea/
+.vscode/
+
+# Local environment
+.env
+.env.*
+*.env
+secrets.env
+suspect_key.txt
+
+# Large artifacts / private inputs / outputs
+*.pdf
+*.zip
+brainstorming/
+private_problems/
+test_run_problems/
+problems/
+input.json
+outputs/
+solutions/
+agent_checkpoints/
+logs/
+
+# Smoke pack lives on a different branch, but be defensive
+smoke/output/
+smoke/output_container/
+
+# Lockfiles / build caches
+uv.lock
+*.egg-info/
+
+# Python bytecode
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Local Docker test outputs
+deploy/
+
+# README + spec docs that aren't part of the runtime image
+SETUP_ISSUES.md
+SPEC.md
+PWC_spec.md
+Spec_feedback.md
+First_Proof_Specifications_Round_2.pdf
+batch2_design-master.zip
+review_claude.md
+
+# Editor backup files
+*~
+*.swp
+*.swo
+
+# OS junk
+.DS_Store
+Thumbs.db

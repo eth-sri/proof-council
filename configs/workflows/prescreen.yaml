@@ -1,0 +1,120 @@
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: >
+  One-shot pre-screen for a submitted research problem. Runs
+  gpt-5.5-pro--xhigh with web_search + code_interpreter to (a) check that
+  the statement is well-defined, well-posed, and free of obvious issues,
+  (b) do a brief literature / sanity-check pass for known or easy answers,
+  and (c) emit a cleaned standalone LaTeX version plus a structured verdict
+  the filing script can merge into metadata.yaml.
+
+inputs:
+  problem: ''
+
+budget:
+  max_usd: 30.0
+  max_wallclock_s: 3600
+
+components:
+  cfg_prescreen:
+    model: models/openai/gpt-55-pro
+    tool_refs:
+      - web_search_preview
+      - code_interpreter
+    max_tool_calls: 16
+    system_prompt: |
+      You are a senior research mathematician acting as referee for a
+      pre-screen of a problem submitted to an AI-based math research
+      workflow. Your job is NOT to solve the problem in full. It is to:
+
+      1. Decide whether the statement is well-defined, well-posed, and free
+         of obvious typos or missing assumptions.
+      2. Do a brief literature scan (web_search) and a small computational
+         sanity check (code_interpreter) when useful, to see whether the
+         problem has a known answer or is much easier or much harder than
+         it appears.
+      3. Produce a cleaned standalone LaTeX version of the statement with
+         obvious issues fixed (or annotated where you cannot fix them
+         yourself).
+      4. Emit a short structured verdict so the result can be filed
+         automatically.
+
+      Be terse and precise. Do not invent results; cite sources for any
+      claim that depends on the literature. If you spot an issue, propose
+      the minimal fix rather than rewriting the whole problem.
+
+      Use ``$...$`` for inline math and ``$$...$$`` for display math in the
+      markdown report so it renders cleanly through pandoc.
+    user_prompt: |
+      Submitted problem (verbatim):
+
+      ----
+      {problem}
+      ----
+
+      Conduct the pre-screen described in the system prompt. Then return
+      your response in exactly the three blocks below, in this order, with
+      no text outside them:
+
+      <report>
+      ## Verdict
+
+      One paragraph: is the statement well-posed as written? If not, what
+      is the issue and what is the minimal fix?
+
+      ## Main issues found
+
+      Short list of typos, missing assumptions, or mathematical problems.
+
+      ## First research attack
+
+      A brief look at whether the result is known, easy to derive, or in
+      reach of standard techniques. Cite sources where relevant.
+
+      ## Bottom line
+
+      One or two sentences: does the problem look suitable for the
+      pressure-test run (challenging but plausibly solvable in 10-20
+      pages), or should it be revised or dropped?
+      </report>
+
+      <cleaned_latex>
+      A complete standalone LaTeX document containing only the corrected
+      problem statement, wrapped in a single ```latex ... ``` fenced code
+      block. Use the article documentclass and load amsmath, amssymb, and
+      mathtools. Do NOT include the prescreen analysis or any commentary
+      here; this block should be self-contained and compilable.
+      </cleaned_latex>
+
+      <verdict>
+      ```yaml
+      verdict: <one of: well-posed | typo-or-clarification | mathematical-issues | known-answer | easy>
+      summary: <one-sentence takeaway>
+      suitable_for_test: <true | false>
+      flags:
+        - <short tag, e.g. statement-incorrect>
+        - <short tag, e.g. resolved-in-corrected-version>
+      ```
+      </verdict>
+    input_schema:
+      problem: string
+    output:
+      xml_tags: [report, cleaned_latex, verdict]
+      default_field: report
+    output_schema:
+      report: string
+      cleaned_latex: string
+      verdict: string
+
+dag:
+  nodes:
+    - id: prescreen
+      kind: agent
+      agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+      name: cfg_prescreen
+      inputs:
+        problem: $input.problem
+
+  outputs:
+    report: $node.prescreen.report
+    cleaned_latex: $node.prescreen.cleaned_latex
+    verdict: $node.prescreen.verdict

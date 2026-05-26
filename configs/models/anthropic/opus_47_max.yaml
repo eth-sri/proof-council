@@ -1,0 +1,28 @@
+model: claude-opus-4-7
+api: anthropic
+max_tokens: 128000
+concurrent_requests: 32
+temperature: null
+top_p: null
+cache_write_cost: 6.25
+cache_read_cost: 0.5
+read_cost: 5
+write_cost: 25
+thinking:
+  type: adaptive
+  display: omitted
+output_config:
+  effort: max
+cache_control:
+  type: ephemeral
+batch_processing: false
+stream_anthropic_messages: true
+anthropic_salvage_empty_max_tokens: true
+# Use Anthropic streaming for long adaptive-thinking calls, with a
+# 30-minute total cap for the council seat.
+timeout: 1800
+max_wallclock_per_call_s: 1800
+max_retries: 1
+max_retries_inner: 1
+sleep_on_error: 10
+sleep_on_error_max: 60

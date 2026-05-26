@@ -1,0 +1,38 @@
+workflow: proofstack.agents.ac.ACWorkflow
+description: >
+  Cheap end-to-end smoke for the First Proof harness. Author and Critic
+  run on gpt-5.4-mini--low; the Advisory Council fans out across three
+  mini/sonnet/gemini models so the council code path is exercised but
+  costs stay tiny. The Compute Worker is disabled (the Codex CLI path
+  has its own slow startup; see firstproof_smoke_full for a smoke that
+  exercises it). 2 rounds, page_limit 8, $5 / 30 min ceiling per
+  problem — enough headroom that 8 fake problems run in well under 30
+  min total at trivial cost.
+
+  Intended use: launched against smoke/input.json (eight fake
+  "problems" worded to exercise different code paths). The point is to
+  confirm the entrypoint, AC loop, Council fanout, page-limit gate,
+  fallback_tex, and token_usage.jsonl writers all behave on a freshly
+  built container before the real run.
+
+inputs:
+  n_rounds: 2
+  full_critic_interval: 1
+  enable_council: true
+  enable_compute: false
+  enable_final_critic: false
+  council_models:
+    - models/openai/gpt-54-mini
+    - models/anthropic/sonnet_46
+    - models/gemini/gemini-31-pro
+  page_limit: 8
+
+budget:
+  max_usd: 5.0
+  max_wallclock_s: 1800
+
+components:
+  Author:
+    model: models/openai/gpt-54-mini
+  ACCritic:
+    model: models/openai/gpt-54-mini

@@ -1,0 +1,13 @@
+model: moonshotai/kimi-k2-thinking
+api: openrouter
+max_tokens: 256000
+temperature: 1.0 
+concurrent_requests: 8
+read_cost: 0.60
+write_cost: 2.50
+context_limit: 256000
+extra_body:
+  provider:
+    allow_fallbacks: False
+    order:
+    - moonshotai

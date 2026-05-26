@@ -1,0 +1,46 @@
+\textbf{Problem.} Given $e \geq 0$ and $g \geq 2$, denote by $M_e(g)$
+the number of isomorphism classes of stable graphs of genus $g$ with
+$n = 0$ legs and precisely $e$ edges. For fixed $e$, analyze the
+structure of the function
+\[
+M_e(-) : \{\, g \in \mathbb{Z} : g \geq 2 \,\} \longrightarrow
+\mathbb{Z}_{\geq 0}, \qquad g \longmapsto M_e(g),
+\]
+and prove a structure result. Give a complete, self-contained
+description of $M_e(-)$ for $e = 0, 1, 2, 3$.
+
+\bigskip
+
+\noindent\textbf{Sample solution sketch (for human validation only;
+the agent must produce its own argument).} The function $M_e(g)$ is
+eventually (for $g$ sufficiently large, depending on $e$) a
+quasi-polynomial in $g$. For example, for $e = 3$ one has $M_3(2) = 2$
+and, for $g \geq 3$,
+\[
+M_3(g) = \begin{cases}
+\dfrac{1}{9} g^3 + \dfrac{7}{8} g^2 + \dfrac{5}{12} g - 2
+   & \text{if } g \equiv 0 \pmod 6, \\[6pt]
+\dfrac{1}{9} g^3 + \dfrac{7}{8} g^2 + \dfrac{1}{6} g - \dfrac{155}{72}
+   & \text{if } g \equiv 1 \pmod 6, \\[6pt]
+\dfrac{1}{9} g^3 + \dfrac{7}{8} g^2 + \dfrac{5}{12} g - \dfrac{20}{9}
+   & \text{if } g \equiv 2 \pmod 6, \\[6pt]
+\dfrac{1}{9} g^3 + \dfrac{7}{8} g^2 + \dfrac{1}{6} g - \dfrac{19}{8}
+   & \text{if } g \equiv 3 \pmod 6, \\[6pt]
+\dfrac{1}{9} g^3 + \dfrac{7}{8} g^2 + \dfrac{5}{12} g - \dfrac{16}{9}
+   & \text{if } g \equiv 4 \pmod 6, \\[6pt]
+\dfrac{1}{9} g^3 + \dfrac{7}{8} g^2 + \dfrac{1}{6} g - \dfrac{187}{72}
+   & \text{if } g \equiv 5 \pmod 6.
+\end{cases}
+\]
+
+\bigskip
+
+\noindent\textbf{Constraints.}
+\begin{itemize}
+  \item Final answer must be a self-contained mathematical document.
+  \item Maximum length: 15 pages of standard \texttt{article} class
+        output.
+  \item Treat the sample solution sketch above as a target shape, not
+        as a reference: the proof must be derived independently and
+        rigorously.
+\end{itemize}

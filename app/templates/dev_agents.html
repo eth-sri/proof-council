@@ -1,0 +1,33 @@
+{% extends "dev_base.html" %}
+{% set active_tab = 'catalog' %}
+{% block title %}Agent Catalog — ProofStack{% endblock %}
+{% block content %}
+    <h1>Agent catalog</h1>
+
+    {% set by_mode = {} %}
+    {% for a in agents %}
+        {% set _ = by_mode.setdefault(a.execution_mode, []).append(a) %}
+    {% endfor %}
+
+    {% for mode, group in by_mode.items() %}
+        <h2>{{ mode }} <span class="dim">({{ group|length }})</span></h2>
+        {% for a in group %}
+            <div class="card">
+                <h3>
+                    <a class="agent-link" href="{{ url_for('agent_detail', qualname=a.qualname) }}">{{ a.qualname }}</a>
+                    <span class="pill {{ a.kind }}">{{ a.kind }}</span>
+                    <span class="pill {{ a.execution_mode }}">{{ a.execution_mode }}</span>
+                </h3>
+                <p class="dim"><code>{{ a.module }}</code></p>
+                {% if a.description %}
+                    <p>{{ a.description }}</p>
+                {% endif %}
+                {% if a.class_attrs.get("MODEL") %}
+                    <div class="grid">
+                        <div class="key">Default model:</div><div class="val">{{ a.class_attrs["MODEL"] }}</div>
+                    </div>
+                {% endif %}
+            </div>
+        {% endfor %}
+    {% endfor %}
+{% endblock %}

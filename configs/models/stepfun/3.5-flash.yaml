@@ -1,0 +1,11 @@
+model: step-3.5-flash
+api: stepfun
+max_tokens: 250000
+read_cost: 0.1
+write_cost: 0.3
+batch_processing: false
+use_openai_responses_api: false
+temperature: 1
+concurrent_requests: 32
+top_p: 1
+stream_openai_chat_completions: false

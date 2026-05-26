@@ -1,0 +1,12 @@
+name: list_persisted_files
+description: List files persisted for this workflow run.
+python_function: list_persisted_files
+tool:
+  type: function
+  function:
+    name: list_persisted_files
+    description: List the file ids currently persisted for this workflow run.
+    parameters:
+      type: object
+      properties: {}
+      required: []

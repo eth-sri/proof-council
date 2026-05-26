@@ -1,0 +1,15 @@
+name: read_persisted_file
+description: Read a text file persisted for this workflow run.
+python_function: read_persisted_file
+tool:
+  type: function
+  function:
+    name: read_persisted_file
+    description: Read a text file by file_id. File ids are stable within this workflow run.
+    parameters:
+      type: object
+      properties:
+        file_id:
+          type: string
+          description: Stable id of the file to read within this workflow run.
+      required: [file_id]

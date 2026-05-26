@@ -1,0 +1,142 @@
+{% extends "dev_base.html" %}
+{% import "dev_macros.html" as ui %}
+{% set active_tab = 'runs' %}
+{% block title %}{{ node.display_name }} — {{ run.display_name }} — ProofStack{% endblock %}
+
+{% macro render_payload(payload) %}
+    {% if payload is mapping and payload.get("$ref") %}
+        <p><a href="{{ url_for('run_blob', run_id=run.run_id, ref=payload['$ref']) }}">view blob ({{ payload['$ref'] }})</a></p>
+    {% else %}
+        {{ ui.render_fields(payload) }}
+    {% endif %}
+{% endmacro %}
+
+{% block content %}
+    <h1>
+        {{ node.display_name }}
+        <span class="pill status-{{ node.status }}">{{ node.status }}</span>
+        {% if node.cache_hit %}<span class="pill">cache hit</span>{% endif %}
+    </h1>
+    {% if parent_ref %}
+        <p class="dim"><a class="agent-link" href="{{ url_for('call_detail', run_id=run.run_id, call_ref=parent_ref) }}">Parent call</a></p>
+    {% endif %}
+
+    <div class="card">
+        <div class="grid">
+            {% if node.start_ts %}<div class="key">Started:</div><div class="val">{{ node.start_ts | display_time }}</div>{% endif %}
+            {% if node.end_ts %}<div class="key">Ended:</div><div class="val">{{ node.end_ts | display_time }}</div>{% endif %}
+            {% if node.duration_s is not none %}<div class="key">Duration:</div><div class="val">{{ node.duration_s | display_duration }}</div>{% endif %}
+            <div class="key">Cost:</div><div class="val">${{ '%.4f'|format(node.cost_usd) }}</div>
+            {% if node.cost_usd_subtree is defined %}<div class="key">Cost with children:</div><div class="val">${{ '%.4f'|format(node.cost_usd_subtree) }}</div>{% endif %}
+        </div>
+    </div>
+
+    {% if node.error %}
+        <h2>Error</h2>
+        <div class="card">{{ ui.render_fields(node.error) }}</div>
+    {% endif %}
+
+    {% if rendered %}
+        <h2>Recorded messages</h2>
+        {% if rendered.error %}
+            <p class="dim" style="color:#991b1b">{{ rendered.error }}</p>
+        {% endif %}
+        {% if rendered.system %}
+            <details class="message-block message-system">
+                <summary>system / developer</summary>
+                <div class="rendered-text">{{ rendered.system }}</div>
+            </details>
+        {% endif %}
+        {% if rendered.user %}
+            <details class="message-block message-user">
+                <summary>user</summary>
+                <div class="rendered-text">{{ rendered.user }}</div>
+            </details>
+        {% endif %}
+    {% endif %}
+
+    <details>
+        <summary>Input</summary>
+        {% if input_problem %}
+            <section class="input-problem">
+                <div class="rendered-text latex-text">{{ input_problem }}</div>
+            </section>
+        {% endif %}
+        {% if input_fields is not none %}
+            {{ ui.render_fields(input_fields) }}
+        {% elif not input_problem %}
+            <p class="dim">No input recorded.</p>
+        {% endif %}
+    </details>
+
+    <h2>Output</h2>
+    {% if detail.output_json is not none %}
+        {% if detail.output_json is mapping %}
+            {% set output = namespace(rendered=false) %}
+            {% for key, value in detail.output_json.items() %}
+                {% if value is string and value and key not in ['raw_text'] %}
+                    {{ ui.render_text_output(key, value, true) }}
+                    {% set output.rendered = true %}
+                {% endif %}
+            {% endfor %}
+            {% if not output.rendered %}
+                {{ ui.render_fields(detail.output_json) }}
+            {% endif %}
+        {% elif detail.output_json is string and detail.output_json %}
+            {{ ui.render_text_output('output', detail.output_json, true) }}
+        {% endif %}
+    {% elif node.output is not none %}
+        {{ render_payload(node.output) }}
+    {% else %}
+        <p class="dim">No output recorded.</p>
+    {% endif %}
+
+    {% if node.model_calls %}
+        <h2>Model calls ({{ node.model_calls|length }})</h2>
+        <table class="runs">
+            <thead>
+                <tr><th>Time</th><th>Model</th><th>Input tokens</th><th>Output tokens</th><th>Cost</th><th>Duration</th></tr>
+            </thead>
+            <tbody>
+                {% for mc in node.model_calls %}
+                    <tr>
+                        <td><span class="dim">{{ mc.ts | display_time }}</span></td>
+                        <td><code>{{ mc.model }}</code></td>
+                        <td>{{ mc.in_tokens or '—' }}</td>
+                        <td>{{ mc.out_tokens or '—' }}</td>
+                        <td>{% if mc.cost_usd %}${{ '%.4f'|format(mc.cost_usd) }}{% else %}—{% endif %}</td>
+                        <td>{% if mc.duration_s %}{{ mc.duration_s | display_duration }}{% else %}—{% endif %}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+
+    {% if node.tool_calls %}
+        <h2>Tool calls ({{ node.tool_calls|length }})</h2>
+        {{ ui.render_fields(node.tool_calls) }}
+    {% endif %}
+
+    {% if node.children %}
+        <h2>Children ({{ node.children|length }})</h2>
+        <ul class="tree">
+            {% for child in node.children %}
+                <li>
+                    <div class="node-row">
+                        <a class="agent-link node-name"
+                           href="{{ url_for('call_detail', run_id=run.run_id, call_ref=child.display_ref) }}">
+                            {{ child.display_name }}
+                        </a>
+                        <span class="pill status-{{ child.status }}">{{ child.status }}</span>
+                        <span class="node-stats">
+                            {% if child.duration_s is not none %}{{ child.duration_s | display_duration }}{% endif %}
+                            {% if child.cost_usd_subtree and child.cost_usd_subtree > 0 %}
+                                · ${{ '%.4f'|format(child.cost_usd_subtree) }}
+                            {% endif %}
+                        </span>
+                    </div>
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+{% endblock %}

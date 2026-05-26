@@ -1,0 +1,32 @@
+workflow: proofstack.agents.ac.ACWorkflow
+description: >
+  Mini-model variant of the AC + Compute Worker wiring smoke. Same
+  problem (stable_graphs_compute_smoke), 3 rounds, no Council. Author
+  and Critic run on gpt-5.4-mini (known-good for smoke runs) so the
+  Responses API + background loop finishes fast. Compute worker stays
+  on gpt-5.5 low effort via codex CLI (different API surface from the
+  Responses API; subprocess backend + Codex sandbox bypass inside the
+  already-isolated container). The whole point is to actually
+  exercise the new <compute_agent> path end-to-end.
+
+inputs:
+  n_rounds: 3
+  full_critic_interval: 1
+  enable_council: false
+  enable_compute: true
+  compute_model: gpt-5.5
+  compute_reasoning_effort: low
+  compute_cost_config: models/openai/gpt-55-high
+  compute_sandbox_backend: subprocess
+  compute_codex_sandbox: docker-bypass
+  enable_final_critic: false
+
+budget:
+  max_usd: 5.0
+  max_wallclock_s: 2400
+
+components:
+  Author:
+    model: models/openai/gpt-54-mini
+  ACCritic:
+    model: models/openai/gpt-54-mini

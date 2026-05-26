@@ -1,0 +1,4 @@
+name: web_search_preview
+description: Built-in provider web search tool.
+tool:
+  type: web_search_preview

@@ -1,0 +1,79 @@
+{% macro render_fields(value) %}
+    {% if value is mapping %}
+        {% if value %}
+            <table class="field-table">
+                <tbody>
+                {% for key, item in value.items() %}
+                    <tr>
+                        <th>{{ key }}</th>
+                        <td>{{ render_fields(item) }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <span class="dim">none</span>
+        {% endif %}
+    {% elif value is sequence and value is not string %}
+        {% if value %}
+            <ol class="field-list field-list-sequence">
+                {% for item in value %}
+                    <li>{{ render_fields(item) }}</li>
+                {% endfor %}
+            </ol>
+        {% else %}
+            <span class="dim">none</span>
+        {% endif %}
+    {% else %}
+        <span class="field-scalar">{{ value | display_scalar }}</span>
+    {% endif %}
+{% endmacro %}
+
+{% macro render_text_output(label, text, open=false) %}
+    <details class="message-block message-output" {% if open %}open{% endif %}>
+        <summary>{{ label }}</summary>
+        <div class="rendered-text">{{ text }}</div>
+    </details>
+{% endmacro %}
+
+{% macro render_output(value, empty_text='No output captured.') %}
+    {% set display_output = value if value is mapping else {'output': value} %}
+    {% set output = namespace(rendered=false) %}
+    {% for key, item in display_output.items() %}
+        {% if key != 'raw_text' and item is not none and item != '' %}
+            {% if item is string %}
+                {{ render_text_output(key | replace('_', ' '), item, true) }}
+            {% else %}
+                <details class="message-block message-output" open>
+                    <summary>{{ key | replace('_', ' ') }}</summary>
+                    {{ render_fields(item) }}
+                </details>
+            {% endif %}
+            {% set output.rendered = true %}
+        {% endif %}
+    {% endfor %}
+    {% if not output.rendered %}
+        <p class="dim">{{ empty_text }}</p>
+    {% endif %}
+{% endmacro %}
+
+{% macro render_input(value, empty_text='No input captured.') %}
+    {% set display_input = value if value is mapping else {'input': value} %}
+    {% set input = namespace(rendered=false) %}
+    {% for key, item in display_input.items() %}
+        {% if item is not none and item != '' %}
+            <details class="message-block message-input" open>
+                <summary>{{ key | replace('_', ' ') }}</summary>
+                {% if item is string %}
+                    <div class="rendered-text latex-text">{{ item }}</div>
+                {% else %}
+                    {{ render_fields(item) }}
+                {% endif %}
+            </details>
+            {% set input.rendered = true %}
+        {% endif %}
+    {% endfor %}
+    {% if not input.rendered %}
+        <p class="dim">{{ empty_text }}</p>
+    {% endif %}
+{% endmacro %}

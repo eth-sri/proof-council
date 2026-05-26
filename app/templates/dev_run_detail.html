@@ -1,0 +1,63 @@
+{% extends "dev_base.html" %}
+{% import "dev_macros.html" as ui %}
+{% set active_tab = 'runs' %}
+{% block title %}{{ run.display_name }} — ProofStack{% endblock %}
+
+{% block content %}
+    <h1>{{ run.display_name }}</h1>
+
+    <div class="card">
+        <div class="grid">
+            {% if run.started_at %}<div class="key">Started:</div><div class="val">{{ run.started_at | display_time }}</div>{% endif %}
+            {% if run.wallclock_s is not none %}<div class="key">Wallclock:</div><div class="val">{{ run.wallclock_s | display_duration }}</div>{% endif %}
+            {% if run.cost_usd is not none %}<div class="key">Cost:</div><div class="val">${{ '%.4f'|format(run.cost_usd) }}</div>{% endif %}
+        </div>
+    </div>
+
+    {% if run.problems %}
+        <h2>Problem Runs</h2>
+        <table class="runs">
+            <thead><tr><th>Problem</th><th>Status</th><th>Details</th><th>Started</th></tr></thead>
+            <tbody>
+                {% for problem_id, problem in run.problems.items() %}
+                    <tr>
+                        <td>{{ problem.display_name or problem.title or problem.problem_id or problem_id }}</td>
+                        <td><span class="pill" data-problem-status="{{ problem.status or 'queued' }}">{{ problem.status or 'queued' }}</span></td>
+                        <td>
+                            {% if problem.run_id %}
+                                <a class="agent-link" href="{{ url_for('run_detail', run_id=problem.run_id) }}">Open</a>
+                            {% else %}—{% endif %}
+                        </td>
+                        <td><span class="dim">{{ problem.started_at | display_time }}</span></td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <script>
+            if ([...document.querySelectorAll('[data-problem-status]')].some((el) => ['queued', 'running'].includes(el.dataset.problemStatus))) {
+                setTimeout(() => window.location.reload(), 3000);
+            }
+        </script>
+    {% endif %}
+
+    {% if run.has_events %}
+        <h2>Execution graph</h2>
+        <div id="execution-graph-panel">
+            {% include "dev_run_graph.html" %}
+        </div>
+        <script>
+            startRunGraphPolling("{{ url_for('run_graph_fragment', run_id=run.run_id) }}");
+        </script>
+    {% endif %}
+
+    {% if workflow_input is not none %}
+        <h2>Workflow input</h2>
+        {{ ui.render_input(workflow_input, 'No workflow input captured.') }}
+    {% endif %}
+
+    {% if workflow_output is not none %}
+        <h2>Workflow output</h2>
+        {{ ui.render_output(workflow_output, 'No workflow output captured.') }}
+    {% endif %}
+
+{% endblock %}

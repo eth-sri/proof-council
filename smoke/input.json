@@ -1,0 +1,37 @@
+{
+  "_note": "Fake First-Proof-style problem list for the firstproof_smoke_fast / firstproof_smoke_full workflows. Each entry is a syntactically valid input.json item; the LaTeX bodies are designed to exercise different code paths in scripts/firstproof_entrypoint.py and the Author/Critic loop. See smoke/README.md for which path each problem targets.",
+  "problems": [
+    {
+      "id": "smoke-001-trivial-arithmetic",
+      "latex": "\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n\\begin{document}\n\\textbf{Problem 1 (smoke -- trivial).} Prove that $1 + 1 = 2$ in the natural numbers $\\mathbb{N}$, working from the Peano axioms. A two-paragraph proof is sufficient. The goal here is to exercise the shortest possible Author/Critic loop end-to-end; the mathematical content is intentionally minimal.\n\\end{document}"
+    },
+    {
+      "id": "smoke-002-sqrt2-classic",
+      "latex": "\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n\\begin{document}\n\\textbf{Problem 2 (smoke -- classic short proof).} Prove that $\\sqrt{2}$ is irrational using the standard descent argument on coprime integers $p, q$. Briefly comment on which steps generalise to $\\sqrt{n}$ for non-square $n$. Keep the proof under one page.\n\\end{document}"
+    },
+    {
+      "id": "smoke-003-compute-trigger",
+      "latex": "\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n\\begin{document}\n\\textbf{Problem 3 (smoke -- computation-heavy).} Determine the smallest positive integer $n$ such that $F_n > 10^{12}$, where $F_n$ is the $n$-th Fibonacci number ($F_1 = F_2 = 1$). Verify your answer by direct numerical computation (genuinely compute Fibonacci numbers rather than rely on closed-form approximation). Then provide a short rigorous argument bounding $F_n$ in terms of $\\varphi^n$ that confirms the result. The verification step should make use of a computational tool.\n\\end{document}"
+    },
+    {
+      "id": "smoke-004-council-trigger",
+      "latex": "\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n\\begin{document}\n\\textbf{Problem 4 (smoke -- strategic decision).} The fundamental theorem of arithmetic (every $n \\geq 2$ factors uniquely into primes) admits several distinct proof strategies. Survey at least three: (a) Euclid's lemma via the Euclidean algorithm; (b) well-ordering on the set of integers that fail unique factorisation; (c) induction on $n$ using the smallest prime divisor. For each, state the proof in a single short paragraph. Before committing to a single recommended exposition, consult external advisors (council) on which presentation is most appropriate for an undergraduate audience and incorporate the response into your final write-up.\n\\end{document}"
+    },
+    {
+      "id": "smoke-005-references-test",
+      "latex": "\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n\\begin{document}\n\\textbf{Problem 5 (smoke -- citation handling).} State and prove the Cantor--Bernstein--Schroeder theorem: if there exist injections $A \\hookrightarrow B$ and $B \\hookrightarrow A$, then $|A| = |B|$. Provide at least two genuine bibliographic references (with author, title, year, and either DOI or arXiv identifier) for the historical context and for an accessible modern exposition. The references should appear in a real \\texttt{references.bib} entry and be cited via \\texttt{$\\backslash$cite} in the body of \\texttt{answer.tex}.\n\\end{document}"
+    },
+    {
+      "id": "smoke-006-empty-input",
+      "latex": ""
+    },
+    {
+      "id": "smoke-007-malformed-latex",
+      "latex": "Problem 7 (smoke -- malformed wrapper). The input here is deliberately NOT a complete LaTeX document: there is no \\documentclass, no \\begin{document}, and no closing \\end{document}. The task itself is well-defined though: prove that the harmonic series $\\sum_{n=1}^{\\infty} \\frac{1}{n}$ diverges, using the classical grouping-by-powers-of-two argument due to Oresme. The entrypoint should still produce a compilable output by wrapping the response in the standard 12pt article preamble."
+    },
+    {
+      "id": "smoke-008-rh-cannot-solve",
+      "latex": "\\documentclass{article}\n\\usepackage{amsmath,amssymb}\n\\begin{document}\n\\textbf{Problem 8 (smoke -- unsolved problem).} Prove or disprove the Riemann hypothesis: every non-trivial zero of the Riemann zeta function $\\zeta(s)$ has real part equal to $1/2$. This problem is unsolved at the time of writing. The expected behaviour is that the workflow honestly reports the open status (likely in a ``Remaining open issues'' section), summarises the state of the art, and does NOT declare $\\langle\\text{ready}\\rangle$true$\\langle/\\text{ready}\\rangle$. The output should still be a single well-formed LaTeX document.\n\\end{document}"
+    }
+  ]
+}

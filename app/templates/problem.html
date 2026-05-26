@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+
+{% block sidebar %}
+    {% for problem, data in sidebar.problems.items() %}
+        <a href="{{ url_for('problem_view', problem_key=problem) }}" class="sidebar-item {{ data.class }}">{{ data.name }} {{ data.ticks }}</a>
+    {% endfor %}
+{% endblock %}
+
+{% block content %}
+    <h3 style="text-align: left;">Output Folder: {{ folder_name }}</h3>
+    <h3 style="text-align: left;">Problem: {{ problem_name }}</h3>
+
+    <div class="box problem-box">
+        <div class="marked">{{ problem_statement }}</div>
+    </div>
+
+    {% if instances %}
+        <div class="run-tab" role="tablist">
+            {% for instance in instances %}
+                <button
+                    type="button"
+                    class="run-tab-button {% if loop.first %}active{% endif %}"
+                    data-target="run-tab-{{ instance.run }}"
+                >
+                    Run {{ instance.run }}
+                </button>
+            {% endfor %}
+        </div>
+
+        {% for instance in instances %}
+            <div id="run-tab-{{ instance.run }}" class="run-tabcontent" style="display: {{ 'block' if loop.first else 'none' }};">
+                <p class="strong">[Run {{ instance.run }}] Final Response:</p>
+                <div class="box solution-box"><div class="marked">{{ instance.final_response | trim }}</div></div>
+
+                <details class="strong">
+                    <summary>[Run {{ instance.run }}] Metadata:</summary>
+                    <div class="box metadata-box">
+                        <p>File: {{ instance.file_name }}</p>
+                        {% if instance.created_at %}<p>Created: {{ instance.created_at }}</p>{% endif %}
+                        {% if instance.config_ref %}<p>Config: {{ instance.config_ref }}</p>{% endif %}
+                        {% if instance.metadata.cost %}
+                            <p>Cost: ${{ instance.metadata.cost.cost }}</p>
+                            <p>Input Tokens: {{ instance.metadata.cost.input_tokens }}</p>
+                            <p>Output Tokens: {{ instance.metadata.cost.output_tokens }}</p>
+                            {% if instance.metadata.cost.time %}
+                                <p>Time taken: {{ instance.metadata.cost.time }}s</p>
+                            {% endif %}
+                        {% endif %}
+                        <p>Tool Calls:</p>
+                        {% if instance.metadata.tool_calls %}
+                            <ul>
+                            {% for tool, count in instance.metadata.tool_calls.items() %}
+                                <li>{{ tool }}: {{ count }}</li>
+                            {% endfor %}
+                            </ul>
+                        {% else %}
+                            <p>No tool calls in this run.</p>
+                        {% endif %}
+                    </div>
+                </details>
+
+                {% if instance.history and instance.history|length > 0 %}
+                    <details class="response-box-details strong" id="{{ instance.conversation_id }}>>history">
+                        <summary>[Run {{ instance.run }}] History:</summary>
+                    </details>
+                {% endif %}
+
+                <details class="response-box-details strong" id="{{ instance.conversation_id }}" open>
+                    <summary>[Run {{ instance.run }}] Conversation:</summary>
+                </details>
+            </div>
+        {% endfor %}
+    {% endif %}
+
+    <style>
+        .run-tab {
+            background-color: #f8f9fa;
+            border-radius: 6px 6px 0 0;
+            margin-top: 1.5rem;
+        }
+
+        .run-tab-button {
+            background-color: inherit;
+            outline: none;
+            cursor: pointer;
+            padding: 14px 17px;
+            transition: background-color 0.3s ease, color 0.3s ease;
+            font-size: 0.95rem;
+            color: #495057;
+            border-top: 1px solid transparent;
+            border-left: 1px solid transparent;
+            border-right: 1px solid #dee2e6;
+            border-bottom: 4px solid transparent;
+        }
+
+        .run-tab-button:last-child {
+            border-right: none;
+        }
+
+        .run-tab-button:hover {
+            background-color: #e9ecef;
+            color: #0056b3;
+        }
+
+        .run-tab-button.active {
+            background-color: #ffffff;
+            color: #007bff;
+            font-weight: 600;
+        }
+
+        .run-tabcontent {
+            padding: 20px 15px;
+            border: 1px solid #dee2e6;
+            background-color: #ffffff;
+            border-top: none;
+            border-radius: 0 0 6px 6px;
+            line-height: 1.6;
+        }
+    </style>
+{% endblock %}

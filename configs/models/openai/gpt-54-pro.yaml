@@ -1,0 +1,17 @@
+model: gpt-5.4-pro--xhigh
+api: openai
+max_tokens: 128000
+cache_read_cost: 30
+read_cost: 30
+write_cost: 180
+concurrent_requests: 16
+temperature: null
+top_p: null
+batch_processing: false
+background: true
+use_openai_responses_api: true
+# Per-attempt timeout. Pro background calls can legitimately run
+# 25-50 min; 70 min gives a buffer before retry. Mirrors gpt-55-pro.
+timeout: 4200
+reasoning:
+  summary: "auto"

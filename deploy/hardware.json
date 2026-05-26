@@ -1,0 +1,6 @@
+{
+  "instance_type": "t3.medium",
+  "timeout_minutes": 1380,
+  "env_vars": true,
+  "rationale": "Compute is dominated by remote LLM API calls. CPU and RAM are used for orchestration, JSONL event logging, budget tracking, pdflatex compiles, and short-lived Codex/Claude-Code subprocess sandboxes used by configurable CLI nodes. t3.medium gives us 2 vCPU and 4 GiB RAM, which is enough for the current workflow runner image. The 23-hour timeout leaves margin for clean shutdown and final metadata writes."
+}

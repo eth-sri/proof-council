@@ -1,0 +1,33 @@
+workflow: proofstack.agents.ac.ACWorkflow
+description: >
+  Wiring smoke test for the new Author/Critic + Compute Worker
+  integration. 3 rounds, no Council. Author and Critic both run on
+  gpt-5.5 medium. Compute worker runs codex CLI with gpt-5.5 low
+  reasoning effort and the subprocess sandbox backend
+  (``proofstack-pwc-sandbox`` docker image is not built on this host;
+  Codex's own sandbox is bypassed because these smokes run inside an
+  already-isolated container).
+  Final-Critic is left off so the smoke exercises the in-loop path
+  only.
+
+inputs:
+  n_rounds: 3
+  full_critic_interval: 1
+  enable_council: false
+  enable_compute: true
+  compute_model: gpt-5.5
+  compute_reasoning_effort: low
+  compute_cost_config: models/openai/gpt-55-medium
+  compute_sandbox_backend: subprocess
+  compute_codex_sandbox: docker-bypass
+  enable_final_critic: false
+
+budget:
+  max_usd: 15.0
+  max_wallclock_s: 3600
+
+components:
+  Author:
+    model: models/openai/gpt-55-medium
+  ACCritic:
+    model: models/openai/gpt-55-medium
