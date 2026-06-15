@@ -87,10 +87,10 @@ RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION} @anthropic-ai/claude-co
 
 WORKDIR /app
 
-# Copy the package source AND README before installing.
-# pyproject.toml references README.md, and hatchling builds from src/ -
-# the install would fail if either were missing.
-COPY README.md pyproject.toml ./
+# Copy package metadata before installing.
+# pyproject.toml references README.md and LICENSE, and hatchling builds
+# from src/ - the install would fail if any referenced file were missing.
+COPY README.md pyproject.toml LICENSE ./
 # hardware.json carries timeout_minutes; the entrypoint reads it to
 # install an internal soft deadline ~5 min before the harness's outer
 # `timeout` SIGKILL so partial aggregates get flushed cleanly.
