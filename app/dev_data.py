@@ -847,6 +847,31 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
     return tasks
 
 
+def find_runs_awaiting_human(roots: Iterable[Path]) -> list[dict[str, Any]]:
+    """Every run currently blocked on human input, across all run roots.
+
+    Used by the global "waiting on you" nav indicator. A run can have more
+    than one pending ask (loops), so each entry carries a count. Only
+    non-terminal runs are scanned (a finished/errored run cannot be waiting),
+    which keeps this cheap enough to call on every page render. Newest first.
+    """
+    out: list[dict[str, Any]] = []
+    for run in discover_runs(roots, include_batch_children=True):
+        if (run.status or "running") in {"finished", "error"}:
+            continue
+        tasks = load_pending_human_tasks(run.path)
+        if not tasks:
+            continue
+        out.append(
+            {
+                "run_id": run.run_id,
+                "display_name": run.display_name or run.run_id,
+                "count": len(tasks),
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Event tree (UI-0)
 # ---------------------------------------------------------------------------

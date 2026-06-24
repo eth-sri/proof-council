@@ -47,6 +47,7 @@ from app.dev_data import (
     find_agent,
     find_preset,
     find_run,
+    find_runs_awaiting_human,
     load_call_detail,
     load_event_tree,
     load_monitor_summaries,
@@ -127,6 +128,17 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         static_folder=str(Path(__file__).parent / "static"),
     )
     app.config["RUNS_ROOTS"] = list(runs_roots)
+
+    @app.context_processor
+    def inject_human_waiting_runs():
+        # Powers the global "waiting on you" nav indicator on every page.
+        # Only runs blocked on human input are returned (cheap: non-terminal
+        # runs only). Failures here must never break page rendering.
+        try:
+            waiting = find_runs_awaiting_human(app.config["RUNS_ROOTS"])
+        except Exception:
+            waiting = []
+        return {"human_waiting_runs": waiting}
 
     @app.template_filter("display_scalar")
     def display_scalar(value):

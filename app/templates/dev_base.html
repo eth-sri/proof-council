@@ -455,7 +455,7 @@
         .schema-field .fname { font-weight: 600; color: #374151; font-family: ui-monospace, monospace; }
         .schema-field .ftype { color: #7c3aed; font-size: 0.85em; margin-left: 6px; font-family: ui-monospace, monospace; }
         .schema-field .fdesc { color: #6b7280; font-size: 0.88em; margin-top: 2px; }
-        nav.tabs { margin-top: 6px; }
+        nav.tabs { margin-top: 6px; display: flex; align-items: center; flex-wrap: wrap; }
         nav.tabs a {
             display: inline-block;
             padding: 2px 12px;
@@ -466,6 +466,51 @@
         }
         nav.tabs a.active { background: #3b82f6; color: #fff; }
         nav.tabs a:hover { background: rgba(255,255,255,0.18); }
+        .nav-waiting { margin-left: auto; position: relative; }
+        .nav-waiting-btn {
+            background: #f59e0b !important;
+            color: #1f2937 !important;
+            font-weight: 600;
+            margin-right: 0 !important;
+            animation: nav-waiting-pulse 2s ease-in-out infinite;
+        }
+        .nav-waiting-btn:hover { background: #fbbf24 !important; }
+        @keyframes nav-waiting-pulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.5); }
+            50% { box-shadow: 0 0 0 5px rgba(245,158,11,0); }
+        }
+        .nav-waiting-menu {
+            display: none;
+            position: absolute;
+            right: 0;
+            top: 100%;
+            margin-top: 4px;
+            background: #111827;
+            border: 1px solid #374151;
+            border-radius: 8px;
+            padding: 6px;
+            min-width: 240px;
+            max-width: 360px;
+            z-index: 50;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+        }
+        .nav-waiting:hover .nav-waiting-menu { display: block; }
+        .nav-waiting-menu a {
+            display: block;
+            margin: 2px 0;
+            padding: 6px 10px;
+            border-radius: 6px;
+            background: transparent;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .nav-waiting-menu a:hover { background: rgba(245,158,11,0.18); }
+        .nav-waiting-menu .nav-waiting-count {
+            color: #f59e0b;
+            font-weight: 600;
+            margin-left: 6px;
+        }
         @media (max-width: 720px) {
             .home-actions {
                 grid-template-columns: 1fr;
@@ -2850,6 +2895,16 @@
             <a href="{{ url_for('presets_index') }}"  class="{{ 'active' if active == 'edit' else '' }}">Edit Agent</a>
             <a href="{{ url_for('run_agent') }}"      class="{{ 'active' if active == 'run_agent' else '' }}">Run Agent</a>
             <a href="{{ url_for('runs_index') }}"     class="{{ 'active' if active == 'runs' else '' }}">View Runs</a>
+            {% if human_waiting_runs %}
+            <div class="nav-waiting">
+                <a class="nav-waiting-btn" href="{{ url_for('run_detail', run_id=human_waiting_runs[0].run_id) }}">⏳ Waiting on you ({{ human_waiting_runs|sum(attribute='count') }})</a>
+                <div class="nav-waiting-menu">
+                    {% for w in human_waiting_runs %}
+                    <a href="{{ url_for('run_detail', run_id=w.run_id) }}">{{ w.display_name }}<span class="nav-waiting-count">{{ w.count }}</span></a>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
         </nav>
     </header>
     <main>
