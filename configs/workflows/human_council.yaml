@@ -1,0 +1,235 @@
+# Human-in-the-loop council.
+# Same council as `claude_only_min` (Claude + Codex solvers -> Claude synthesizer)
+# but with a THIRD solver: you. The human node hands you the problem, blocks until
+# you submit a proof in the web dashboard, and your proof becomes candidate C.
+# Because the synthesizer MERGES rather than picks, a single key idea you
+# contribute can survive into the final proof even if the rest is thin.
+#
+# All three solvers run in parallel; the run waits for whichever is slowest
+# (usually you). Subscription auth, no API keys, no Docker — see claude_only_min
+# for the detailed notes on the Claude HOME override and Codex copy_codex_auth.
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: Claude + Codex + Human solvers, merged by a Claude synthesizer (subscription, no API key, no Docker).
+
+budget:
+  max_usd: 0.0
+  max_wallclock_s: 3600   # generous: a human is in the loop
+
+inputs:
+  problem: ''
+  claude_model: opus      # opus (serious) | sonnet | haiku (cheap test)
+  codex_model: gpt-5.5    # gpt-5.5 (top) | gpt-5.4 | gpt-5.4-mini (cheap)
+  codex_effort: high      # high (serious) | medium | low | minimal (cheap test)
+
+components:
+  claude_worker:
+    cmd:
+      - claude
+      - -p
+      - --model
+      - "{claude_model}"
+      - --permission-mode
+      - acceptEdits
+      - --allowedTools
+      - Bash(finish:*)
+    sandbox:
+      backend: subprocess
+      timeout_s: 1500
+    env:
+      HOME: /Users/davidholmes
+    prompt: |
+      You are a research mathematician. Solve the problem below with a complete,
+      rigorous proof.
+
+      Problem:
+      {problem}
+
+      Instructions:
+      1. Write your full solution as a self-contained LaTeX document to a file
+         named  answer.tex  in the current directory.
+      2. When you are finished, run this exact shell command to signal completion:
+           finish '{"status":"done","summary":"proof written to answer.tex"}'
+      Work autonomously; do not ask questions.
+    input_schema:
+      problem: string
+      workspace: string
+    output_schema:
+      workspace: string
+      answer_tex: string
+      status: string
+    output_files:
+      answer_tex: answer.tex
+    done_outputs:
+      status: status
+
+  codex_worker:
+    cmd:
+      - codex
+      - exec
+      - --ignore-user-config
+      - --skip-git-repo-check
+      - --ephemeral
+      - --json
+      - -m
+      - "{codex_model}"
+      - -c
+      - model_reasoning_effort="{codex_effort}"
+    codex_sandbox: auto
+    copy_codex_auth: true
+    sandbox:
+      backend: subprocess
+      timeout_s: 1500
+    prompt: |
+      You are a research mathematician. Solve the problem below with a complete,
+      rigorous proof.
+
+      Problem:
+      {problem}
+
+      Instructions:
+      1. Write your full solution as a self-contained LaTeX document to a file
+         named  answer.tex  in the current directory.
+      2. When you are finished, run this exact shell command to signal completion:
+           finish '{"status":"done","summary":"proof written to answer.tex"}'
+      Work autonomously; do not ask questions.
+    input_schema:
+      problem: string
+      workspace: string
+    output_schema:
+      workspace: string
+      answer_tex: string
+      status: string
+    output_files:
+      answer_tex: answer.tex
+    done_outputs:
+      status: status
+
+  human_worker:
+    # You, as a solver. The dashboard shows a "Waiting for your input" box with
+    # this prompt; your submission becomes candidate C. Submitting an empty or
+    # partial proof is fine — the synthesizer merges whatever you contribute.
+    prompt: |
+      You are one of three solvers on this problem. Write whatever proof, partial
+      argument, or single key idea you can — even one good lemma is valuable; the
+      synthesizer will merge it with the AI proofs.
+
+      Problem:
+      {problem}
+    input_schema:
+      problem: string
+    output_schema:
+      answer_tex: string
+      status: string
+
+  claude_synthesizer:
+    # Reads all THREE candidates (A = Claude, B = Codex, C = you) and writes one
+    # consolidated best proof, salvaging the strongest idea from each.
+    cmd:
+      - claude
+      - -p
+      - --model
+      - "{claude_model}"
+      - --permission-mode
+      - acceptEdits
+      - --allowedTools
+      - Bash(finish:*)
+    sandbox:
+      backend: subprocess
+      timeout_s: 1500
+    env:
+      HOME: /Users/davidholmes
+    prompt: |
+      You are the editor of a mathematics journal assembling the best possible
+      proof from several independently produced candidates. You are given a
+      problem and three candidate proofs (A, B, and C). Candidate C comes from a
+      human collaborator and may be short, partial, or just a single key idea —
+      some candidates may be empty, incomplete, or wrong, and that is fine.
+
+      Your job is NOT to pick one and discard the rest. It is to produce a single
+      consolidated proof that takes the strongest, most rigorous idea from each
+      candidate where it helps. If a candidate (especially the human's C)
+      contributes only one key insight inside an otherwise thin argument, salvage
+      that insight.
+
+      Problem:
+      {problem}
+
+      Candidate proof A (Claude, LaTeX source):
+      {proof_a}
+
+      Candidate proof B (Codex, LaTeX source):
+      {proof_b}
+
+      Candidate proof C (human, LaTeX or notes):
+      {proof_c}
+
+      Instructions:
+      1. Write the consolidated best proof as a complete, self-contained, rigorous
+         LaTeX document to a file named  best.tex  in the current directory. Only
+         include steps you have actually checked; do not paste a step you cannot
+         verify just because a candidate asserted it. The result must stand on its
+         own as a correct proof, not a diff against the candidates.
+      2. Write a short file  notes.md  recording: a one-line assessment of each
+         candidate, and which specific ideas you took from where (explicitly call
+         out any key idea you salvaged from the human candidate C).
+      3. When you are finished, run this exact shell command to signal completion:
+           finish '{"status":"done","summary":"best proof written to best.tex"}'
+      Work autonomously; do not ask questions.
+    input_schema:
+      problem: string
+      proof_a: string
+      proof_b: string
+      proof_c: string
+      workspace: string
+    output_schema:
+      workspace: string
+      best_tex: string
+      notes: string
+      status: string
+    output_files:
+      best_tex: best.tex
+      notes: notes.md
+    done_outputs:
+      status: status
+
+dag:
+  nodes:
+    - id: solve
+      kind: agent
+      agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+      name: claude_worker
+      inputs:
+        problem: $input.problem
+        claude_model: $input.claude_model
+    - id: solve_codex
+      kind: agent
+      agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+      name: codex_worker
+      inputs:
+        problem: $input.problem
+        codex_model: $input.codex_model
+        codex_effort: $input.codex_effort
+    - id: solve_human
+      kind: agent
+      agent: proofstack.agents.human_agent.HumanAgent
+      name: human_worker
+      inputs:
+        problem: $input.problem
+    - id: synthesize
+      kind: agent
+      needs: [solve, solve_codex, solve_human]
+      agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+      name: claude_synthesizer
+      inputs:
+        problem: $input.problem
+        claude_model: $input.claude_model
+        proof_a: $node.solve.answer_tex
+        proof_b: $node.solve_codex.answer_tex
+        proof_c: $node.solve_human.answer_tex
+  outputs:
+    best_tex: $node.synthesize.best_tex
+    synthesis_notes: $node.synthesize.notes
+    answer_tex: $node.solve.answer_tex
+    answer_tex_codex: $node.solve_codex.answer_tex
+    answer_tex_human: $node.solve_human.answer_tex
+    status: $node.synthesize.status

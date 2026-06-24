@@ -1,0 +1,37 @@
+# Smoke test for the human-in-the-loop node (Phase 1).
+# One HumanAgent node: it hands the problem to a human, blocks until a response
+# is submitted, and returns it as answer.tex — interchangeable with a model node.
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: Single human-solver node (proves the human-in-the-loop mechanism).
+
+budget:
+  max_usd: 0.0
+  max_wallclock_s: 3600   # give a human up to an hour to respond
+
+inputs:
+  problem: ''
+
+components:
+  human_solver:
+    prompt: |
+      Please solve this problem and submit your proof as `answer_tex`.
+
+      Problem:
+      {problem}
+    input_schema:
+      problem: string
+    output_schema:
+      answer_tex: string
+      status: string
+
+dag:
+  nodes:
+    - id: ask
+      kind: agent
+      agent: proofstack.agents.human_agent.HumanAgent
+      name: human_solver
+      inputs:
+        problem: $input.problem
+  outputs:
+    answer_tex: $node.ask.answer_tex
+    status: $node.ask.status

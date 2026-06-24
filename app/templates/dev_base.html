@@ -1966,6 +1966,12 @@
             background: #f3f4f6;
             color: #374151;
         }
+        .wiring-choice {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 0;
+        }
         [hidden],
         .inspector-grid label[hidden] {
             display: none !important;
@@ -2446,6 +2452,29 @@
             align-items: center;
             gap: 6px;
             width: fit-content;
+        }
+        .field-bound-hint {
+            font-size: 0.82em;
+            font-weight: 500;
+            line-height: 1.35;
+        }
+        .human-task-card {
+            border: 1px solid var(--accent, #2563eb);
+        }
+        .human-task-prompt {
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .human-task-field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin: 12px 0;
+        }
+        .human-task-field textarea {
+            width: 100%;
+            font-family: var(--mono, monospace);
+            box-sizing: border-box;
         }
         .field-help {
             position: relative;

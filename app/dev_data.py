@@ -771,6 +771,82 @@ def find_run(roots: Iterable[Path], run_id: str) -> RunInfo | None:
     return None
 
 
+def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
+    """Human-in-the-loop tasks awaiting a response in this run.
+
+    A task is pending when a ``human.waiting`` event has no matching
+    ``human.submitted``/``human.timeout`` and its response file hasn't been
+    written yet. Each task carries the rendered prompt, the node's inputs,
+    the expected output fields, and the response filename to write back to.
+    """
+    events_path = run_path / "events.jsonl"
+    if not events_path.exists():
+        return []
+    waiting: dict[str, dict[str, Any]] = {}
+    resolved: set[str] = set()
+    try:
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = e.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                response_path = str(payload.get("response_path") or "")
+                if not response_path:
+                    continue
+                kind = e.get("kind")
+                if kind == "human.waiting":
+                    waiting[response_path] = {**payload, "agent": e.get("agent")}
+                elif kind in ("human.submitted", "human.timeout"):
+                    resolved.add(response_path)
+    except OSError:
+        return []
+
+    inbox = run_path / "human_inbox"
+    tasks: list[dict[str, Any]] = []
+    for response_path, payload in waiting.items():
+        if response_path in resolved:
+            continue
+        filename = Path(response_path).name
+        if (inbox / filename).exists():
+            continue  # response already dropped; run will resume
+        # Read display fields from the on-disk task.json, NOT the event payload:
+        # a large prompt (e.g. one embedding an AI proof) gets offloaded to a blob
+        # in events.jsonl and shows up as {"$ref": ...}, whereas HumanAgent writes
+        # the full prompt straight to task.json.
+        full: dict[str, Any] = {}
+        task_path = payload.get("task_path")
+        if task_path and Path(task_path).exists():
+            try:
+                loaded = json.loads(Path(task_path).read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    full = loaded
+            except (json.JSONDecodeError, OSError):
+                full = {}
+        prompt = full.get("prompt")
+        if not isinstance(prompt, str):
+            prompt = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
+        output_fields = full.get("output_fields") or payload.get("output_fields")
+        if not isinstance(output_fields, dict) or not output_fields:
+            output_fields = {"response": "string"}
+        tasks.append(
+            {
+                "agent": full.get("agent") or payload.get("agent"),
+                "prompt": prompt,
+                "output_fields": output_fields,
+                "inputs": full.get("inputs") or {},
+                "response_filename": filename,
+            }
+        )
+    return tasks
+
+
 # ---------------------------------------------------------------------------
 # Event tree (UI-0)
 # ---------------------------------------------------------------------------

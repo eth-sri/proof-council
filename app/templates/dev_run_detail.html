@@ -14,6 +14,69 @@
         </div>
     </div>
 
+    {% if human_tasks %}
+        {% for task in human_tasks %}
+            <div class="card human-task-card">
+                <h2>⏳ Waiting for your input{% if task.agent %} — <span class="dim">{{ task.agent }}</span>{% endif %}</h2>
+                {% if task.prompt %}<pre class="human-task-prompt">{{ task.prompt }}</pre>{% endif %}
+                <form method="post" action="{{ url_for('run_human_submit', run_id=run.run_id) }}">
+                    <input type="hidden" name="response_filename" value="{{ task.response_filename }}">
+                    {% for field, ftype in task.output_fields.items() %}
+                        {% if field != 'status' %}
+                            <label class="human-task-field">
+                                <span class="key">{{ field }}</span>
+                                <textarea name="f_{{ field }}" rows="12" spellcheck="false" placeholder="Type your {{ field }} here…"></textarea>
+                            </label>
+                        {% endif %}
+                    {% endfor %}
+                    <button type="submit" class="btn-primary">Submit</button>
+                </form>
+            </div>
+        {% endfor %}
+    {% endif %}
+
+    {# Poll for human-task changes so a NEW ask (e.g. the 2nd time a loop reaches
+       a human node) appears on its own — and so the page refreshes to the final
+       result when the run ends. Never reloads while you're entering an answer. #}
+    <script>
+        (function () {
+            const rendered = {{ human_tasks | map(attribute='response_filename') | list | tojson }};
+            const renderedFinished = {{ 'true' if run_finished else 'false' }};
+            const pollUrl = "{{ url_for('run_human_pending', run_id=run.run_id) }}";
+            function userIsEntering() {
+                const active = document.activeElement;
+                if (active && active.tagName === 'TEXTAREA' && active.closest('.human-task-card')) {
+                    return true;
+                }
+                return [...document.querySelectorAll('.human-task-card textarea')]
+                    .some((t) => t.value.trim() !== '');
+            }
+            function sameSet(a, b) {
+                if (a.length !== b.length) return false;
+                const s = new Set(a);
+                return b.every((x) => s.has(x));
+            }
+            async function poll() {
+                try {
+                    const r = await fetch(pollUrl, { cache: 'no-store' });
+                    if (r.ok) {
+                        const data = await r.json();
+                        const pending = data.pending || [];
+                        if (!userIsEntering()) {
+                            // A task appeared or was answered -> show the new state.
+                            if (!sameSet(pending, rendered)) { window.location.reload(); return; }
+                            // Run just finished -> show the final result.
+                            if (data.finished && !renderedFinished) { window.location.reload(); return; }
+                            if (data.finished) { return; }  // settled; stop polling
+                        }
+                    }
+                } catch (e) { /* transient; keep polling */ }
+                setTimeout(poll, 5000);
+            }
+            if (!renderedFinished || rendered.length) { setTimeout(poll, 5000); }
+        })();
+    </script>
+
     {% if run.problems %}
         <h2>Problem Runs</h2>
         <table class="runs">

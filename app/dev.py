@@ -50,6 +50,7 @@ from app.dev_data import (
     load_call_detail,
     load_event_tree,
     load_monitor_summaries,
+    load_pending_human_tasks,
     load_execution_graph,
     mutate_preset_yaml,
     presets_registry_version,
@@ -68,6 +69,9 @@ from app.dev_data import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUNS_ROOTS = (REPO_ROOT / "outputs",)
+# Normalized run statuses (see dev_data._normalize_run_status) that mean the run
+# is over, so the human-task poller can stop.
+_TERMINAL_RUN_STATUSES = {"finished", "error"}
 PROBLEMS_ROOT = REPO_ROOT / "problems"
 LOCAL_TIMEZONE = ZoneInfo(os.environ.get("PROOFSTACK_TIMEZONE") or "Europe/Zurich")
 PROVIDER_API_KEYS = {
@@ -641,6 +645,46 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             monitor_summaries=monitor_summaries,
             show_monitor=show_monitor,
             show_execution_graph=show_execution_graph,
+            human_tasks=load_pending_human_tasks(run.path),
+            run_finished=(run.status or "running") in _TERMINAL_RUN_STATUSES,
+        )
+
+    @app.route("/run/<run_id>/human", methods=["POST"])
+    def run_human_submit(run_id: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        # Only allow writing a *.response.json directly inside this run's inbox.
+        if "/" in filename or "\\" in filename or not filename.endswith(".response.json"):
+            abort(400, description="invalid response filename")
+        inbox = (run.path / "human_inbox").resolve()
+        target = (inbox / filename).resolve()
+        if target.parent != inbox:
+            abort(400, description="response path escapes inbox")
+        values: dict[str, Any] = {}
+        for key, value in request.form.items():
+            if key.startswith("f_"):
+                values[key[2:]] = value
+        values.setdefault("status", "done")
+        inbox.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/human-pending")
+    def run_human_pending(run_id: str):
+        # Cheap poll target so the run page can notice a NEW human ask appear
+        # (e.g. the second time a loop reaches a human node) and reload itself.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        tasks = load_pending_human_tasks(run.path)
+        finished = (run.status or "running") in _TERMINAL_RUN_STATUSES
+        return jsonify(
+            {
+                "pending": sorted(str(t["response_filename"]) for t in tasks),
+                "finished": finished,
+            }
         )
 
     @app.route("/run/<run_id>/graph-fragment")

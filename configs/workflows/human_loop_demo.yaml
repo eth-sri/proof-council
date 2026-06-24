@@ -1,0 +1,187 @@
+# Multi-ask human demo. Purpose: feel the UX when the human is asked for input
+# MORE THAN ONCE in a single run.
+#
+# Flow:  you (idea) -> Claude (attempts it) -> you (refine, seeing the attempt)
+#        -> Claude (finalizes, merging everything)
+# So you get TWO "Waiting for your input" cards in one run; the second one shows
+# the AI's attempt, so its content differs from the first.
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: Two-round human-in-the-loop demo (idea -> AI attempt -> human refine -> AI finalize).
+
+budget:
+  max_usd: 0.0
+  max_wallclock_s: 3600
+
+inputs:
+  problem: ''
+  claude_model: opus      # haiku for cheap testing
+
+components:
+  human_hint:
+    prompt: |
+      ROUND 1 of 2. Give a starting idea, strategy, or partial argument for this
+      problem — whatever you've got. The AI will attempt a proof using it, then
+      come back to you to refine.
+
+      Problem:
+      {problem}
+    input_schema:
+      problem: string
+    output_schema:
+      hint: string
+      status: string
+
+  claude_attempt:
+    cmd:
+      - claude
+      - -p
+      - --model
+      - "{claude_model}"
+      - --permission-mode
+      - acceptEdits
+      - --allowedTools
+      - Bash(finish:*)
+    sandbox:
+      backend: subprocess
+      timeout_s: 1500
+    env:
+      HOME: /Users/davidholmes
+    prompt: |
+      You are a research mathematician. Attempt a complete, rigorous proof of the
+      problem, making use of the human collaborator's idea where it helps.
+
+      Problem:
+      {problem}
+
+      Human's idea:
+      {hint}
+
+      Instructions:
+      1. Write your attempt as a self-contained LaTeX document to a file named
+         answer.tex  in the current directory.
+      2. Then run:  finish '{"status":"done","summary":"attempt written"}'
+      Work autonomously; do not ask questions.
+    input_schema:
+      problem: string
+      hint: string
+      workspace: string
+    output_schema:
+      workspace: string
+      answer_tex: string
+      status: string
+    output_files:
+      answer_tex: answer.tex
+    done_outputs:
+      status: status
+
+  human_refine:
+    prompt: |
+      ROUND 2 of 2. Here is the AI's attempt using your idea. Refine it: point out
+      a gap, add a missing step, suggest a cleaner approach, or just say it looks
+      good. Even a one-line correction is valuable.
+
+      Problem:
+      {problem}
+
+      The AI's current attempt (LaTeX):
+      {proof}
+    input_schema:
+      problem: string
+      proof: string
+    output_schema:
+      feedback: string
+      status: string
+
+  claude_finalize:
+    cmd:
+      - claude
+      - -p
+      - --model
+      - "{claude_model}"
+      - --permission-mode
+      - acceptEdits
+      - --allowedTools
+      - Bash(finish:*)
+    sandbox:
+      backend: subprocess
+      timeout_s: 1500
+    env:
+      HOME: /Users/davidholmes
+    prompt: |
+      You are finalizing a proof. Produce the best possible consolidated proof,
+      incorporating the human's original idea and their refinement feedback. Only
+      include steps you have actually checked.
+
+      Problem:
+      {problem}
+
+      Current attempt (LaTeX):
+      {proof}
+
+      Human's original idea:
+      {hint}
+
+      Human's refinement feedback:
+      {feedback}
+
+      Instructions:
+      1. Write the final proof as a self-contained LaTeX document to  best.tex .
+      2. Then run:  finish '{"status":"done","summary":"final proof written"}'
+      Work autonomously; do not ask questions.
+    input_schema:
+      problem: string
+      proof: string
+      hint: string
+      feedback: string
+      workspace: string
+    output_schema:
+      workspace: string
+      best_tex: string
+      status: string
+    output_files:
+      best_tex: best.tex
+    done_outputs:
+      status: status
+
+dag:
+  nodes:
+    - id: hint
+      kind: agent
+      agent: proofstack.agents.human_agent.HumanAgent
+      name: human_hint
+      inputs:
+        problem: $input.problem
+    - id: attempt
+      kind: agent
+      needs: [hint]
+      agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+      name: claude_attempt
+      inputs:
+        problem: $input.problem
+        claude_model: $input.claude_model
+        hint: $node.hint.hint
+    - id: refine
+      kind: agent
+      needs: [attempt]
+      agent: proofstack.agents.human_agent.HumanAgent
+      name: human_refine
+      inputs:
+        problem: $input.problem
+        proof: $node.attempt.answer_tex
+    - id: finalize
+      kind: agent
+      needs: [attempt, refine, hint]
+      agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+      name: claude_finalize
+      inputs:
+        problem: $input.problem
+        claude_model: $input.claude_model
+        proof: $node.attempt.answer_tex
+        hint: $node.hint.hint
+        feedback: $node.refine.feedback
+  outputs:
+    best_tex: $node.finalize.best_tex
+    attempt_tex: $node.attempt.answer_tex
+    hint: $node.hint.hint
+    feedback: $node.refine.feedback
+    status: $node.finalize.status

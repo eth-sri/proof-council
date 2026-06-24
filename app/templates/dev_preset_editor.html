@@ -156,6 +156,14 @@
             tools: "Reusable model tools made available to this node.",
             maxToolCalls: "Optional cap on tool calls for this node."
         };
+        // Friendly dropdown choices for known model knobs in the Workflow Inputs
+        // tab. Editable: a "Custom…" option always lets you type a value the
+        // list doesn't have yet (model names change over time).
+        const workflowInputChoices = {
+            claude_model: ['opus', 'sonnet', 'haiku'],
+            codex_model: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+            codex_effort: ['high', 'medium', 'low', 'minimal'],
+        };
         let currentReport = {{ report | tojson }};
         let selectedNodeId = null;
         let selectedVisualNodeId = null;
@@ -4218,9 +4226,12 @@
                     <input class="wiring-field" type="hidden" value="${escapeAttr(field)}">
                 `
                 : `<input class="wiring-field" value="${escapeAttr(field)}" placeholder="name" ${readonlyField}>`;
+            const choices = workflowInputChoices[field];
             const valueControl = sourcePicker
                 ? customWiringValueControl(value)
-                : `<input class="wiring-value" value="${escapeAttr(editorValue(value))}" placeholder="default value">`;
+                : (choices
+                    ? choiceWiringValueControl(editorValue(value), choices)
+                    : `<input class="wiring-value" value="${escapeAttr(editorValue(value))}" placeholder="default value">`);
             return `
                 <div class="wiring-row ${sourcePicker ? '' : 'two-column'}" data-wiring-row${skipEmpty}>
                     ${fieldControl}
@@ -4243,6 +4254,40 @@
             return !String(value || '').startsWith('$')
                 && !String(value || '').startsWith('{')
                 && !String(value || '').startsWith('[');
+        }
+
+        // Editable dropdown for a known model knob: a <select> of valid values
+        // plus a "Custom…" escape hatch that reveals a free-text box. The
+        // hidden .wiring-value input always holds the chosen value so the
+        // existing collectMappingEntries() reader is unchanged.
+        function choiceWiringValueControl(value, choices) {
+            const current = String(value ?? '');
+            const isKnown = choices.includes(current);
+            const optionsHtml = choices.map((opt) => `
+                <option value="${escapeAttr(opt)}" ${opt === current ? 'selected' : ''}>${escapeHtml(opt)}</option>
+            `).join('');
+            return `
+                <div class="wiring-choice">
+                    <select class="wiring-choice-select" onchange="applyWiringChoice(this)">
+                        ${optionsHtml}
+                        <option value="__custom" ${isKnown ? '' : 'selected'}>Custom…</option>
+                    </select>
+                    <input class="wiring-value wiring-choice-custom" value="${escapeAttr(current)}" placeholder="custom value" ${isKnown ? 'hidden' : ''}>
+                </div>
+            `;
+        }
+
+        function applyWiringChoice(select) {
+            const wrap = select.closest('.wiring-choice');
+            const custom = wrap?.querySelector('.wiring-choice-custom');
+            if (!custom) return;
+            if (select.value === '__custom') {
+                custom.hidden = false;
+                custom.focus();
+            } else {
+                custom.hidden = true;
+                custom.value = select.value;
+            }
         }
 
         function addWiringRow(prefix, sourcePicker) {
@@ -4760,6 +4805,16 @@
             return cfg.model || cliModelFromCmd(cfg.cmd) || '';
         }
 
+        // If a CLI field holds a {placeholder} that names a declared workflow
+        // input, explain that it's bound on purpose (not broken) and where to
+        // set the actual value.
+        function boundInputHint(value) {
+            const match = String(value || '').match(/^\{([A-Za-z_][\w]*)\}$/);
+            if (!match) return '';
+            if (!workflowInputNames().includes(match[1])) return '';
+            return `<span class="field-bound-hint dim">Bound to workflow input “${escapeHtml(match[1])}” — choose its value in the Workflow Inputs tab.</span>`;
+        }
+
         function cliReasoningEffortValue(cfg) {
             return cfg.model_reasoning_effort || cliReasoningEffortFromCmd(cfg.cmd) || '';
         }
@@ -4899,7 +4954,7 @@
                 ${showParameters ? parameterEditorForPromptSpec(`${prefix}-parameters`, spec, parentNode) : ''}
                 ${includePromptControls && cliPrompt ? `
                     <div class="inspector-grid inspector-grid-wide">
-                        <label>${fieldLabel('CLI model', fieldHelp.cliModel)} <input id="${escapeAttr(prefix)}-cli-model" value="${escapeAttr(cliModelValue(cfg))}" placeholder="gpt-5.5" spellcheck="false"></label>
+                        <label>${fieldLabel('CLI model', fieldHelp.cliModel)} <input id="${escapeAttr(prefix)}-cli-model" value="${escapeAttr(cliModelValue(cfg))}" placeholder="gpt-5.5" spellcheck="false">${boundInputHint(cliModelValue(cfg))}</label>
                         <label>${fieldLabel('Reasoning effort', fieldHelp.cliReasoningEffort)} ${cliReasoningEffortSelect(prefix, cliReasoningEffortValue(cfg))}</label>
                         <label>${fieldLabel('Prompt', fieldHelp.userPrompt)} <textarea id="${escapeAttr(prefix)}-cli-prompt" rows="12">${escapeHtml(cfg.prompt || '')}</textarea></label>
                     </div>
