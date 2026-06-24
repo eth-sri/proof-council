@@ -23,6 +23,7 @@ inputs:
 
 components:
   claude_worker:
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     cmd:
       - claude
       - -p
@@ -63,6 +64,7 @@ components:
       status: status
 
   codex_worker:
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     cmd:
       - codex
       - exec
@@ -124,6 +126,7 @@ components:
   claude_synthesizer:
     # Reads all THREE candidates (A = Claude, B = Codex, C = you) and writes one
     # consolidated best proof, salvaging the strongest idea from each.
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     cmd:
       - claude
       - -p

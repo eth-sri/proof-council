@@ -32,6 +32,7 @@ components:
       status: string
 
   claude_attempt:
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     cmd:
       - claude
       - -p
@@ -93,6 +94,7 @@ components:
       status: string
 
   claude_finalize:
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     cmd:
       - claude
       - -p
