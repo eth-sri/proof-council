@@ -306,6 +306,43 @@ def _safe_id(value: str) -> str:
     return cleaned or "problem"
 
 
+def _write_resume_spec(
+    run_dir: Path,
+    args: argparse.Namespace,
+    problem_text: str,
+    problem_id: str,
+    run_id: str,
+    output_root: Path,
+) -> None:
+    """Write resume.json: the argv (sans python exe, sans --resume-from) that
+    relaunches this exact run. The dashboard appends --resume-from <run_id>."""
+    argv: list[str] = [
+        "scripts/run_workflow.py",
+        "--workflow", args.workflow,
+        "--problem-text", problem_text,
+        "--problem-id", problem_id,
+        "--run-id", run_id,
+        "--output", str(output_root),
+    ]
+    if args.run_name:
+        argv += ["--run-name", args.run_name]
+    for kv in args.input or []:
+        argv += ["--input", kv]
+    for kv in args.model or []:
+        argv += ["--model", kv]
+    for kv in args.component or []:
+        argv += ["--component", kv]
+    if args.monitor:
+        argv += ["--monitor", "--monitor-model", args.monitor_model]
+    try:
+        (run_dir / "resume.json").write_text(
+            json.dumps({"run_id": run_id, "argv": argv}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def _append_additional_instructions(problem: str, extra: str) -> str:
     extra = extra.strip()
     if not extra:
@@ -415,6 +452,10 @@ async def amain() -> int:
             },
         },
     )
+
+    # Persist exactly how to relaunch this run, so the dashboard's "Resume"
+    # button can replay it with --resume-from (in-place resume from the cache).
+    _write_resume_spec(ctx.root_workdir, args, problem_text, problem_id, run_id, output_root)
 
     built_inputs = preset.build_inputs(
         problem=problem_text,

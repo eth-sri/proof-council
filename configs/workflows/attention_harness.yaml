@@ -34,6 +34,7 @@ components:
     cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     sandbox: {backend: subprocess, timeout_s: 1500}
     env: {HOME: /Users/davidholmes}
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
       You are the PREMISE specialist in a proof-writing council. In a few bullet
       points, name the key definitions and classical results most relevant to the
@@ -60,6 +61,7 @@ components:
     cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     sandbox: {backend: subprocess, timeout_s: 1500}
     env: {HOME: /Users/davidholmes}
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
       You are the ANALOGY specialist. In a few bullet points, suggest analogous
       problems, standard proof templates, or strategies that have worked on
@@ -86,6 +88,7 @@ components:
     cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     sandbox: {backend: subprocess, timeout_s: 1500}
     env: {HOME: /Users/davidholmes}
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
       You are the LEMMA specialist. In a few bullet points, list the intermediate
       claims or sub-lemmas a correct proof would likely need, and flag which look
@@ -133,6 +136,7 @@ components:
     cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     sandbox: {backend: subprocess, timeout_s: 1500}
     env: {HOME: /Users/davidholmes}
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
       You are the council editor. Four specialists each wrote a brief about this
       problem. Merge them into ONE short, focused brief for the author. Do NOT
@@ -166,6 +170,7 @@ components:
     cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     sandbox: {backend: subprocess, timeout_s: 1500}
     env: {HOME: /Users/davidholmes}
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
       You are the author. Using the focused brief below, write or extend a
       complete, rigorous proof. If there is a current attempt, improve it
@@ -196,6 +201,7 @@ components:
     cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     sandbox: {backend: subprocess, timeout_s: 1500}
     env: {HOME: /Users/davidholmes}
+    cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
       You are a strict referee. Check the proof rigorously for gaps, unjustified
       steps, false claims, and missing cases.

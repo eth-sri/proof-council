@@ -34,11 +34,16 @@ class HumanAgent(Agent):
     description: ClassVar[str] = "Hand a task to a human and wait for their response."
     execution_mode: ClassVar[str] = "human_assisted"
     # A human's answer is not reproducible and is not captured by config, so
-    # never replay it from the resume cache.
-    cache_enabled: ClassVar[bool] = False
+    # A human's answer is expensive and irreplaceable, so cache it: on resume the
+    # prior answer is replayed instead of re-asked. (Opt out per component with
+    # cache_enabled: false if you ever want to force a fresh ask on resume.)
+    cache_enabled: ClassVar[bool] = True
 
     POLL_INTERVAL_S: ClassVar[float] = 2.0
     HEARTBEAT_INTERVAL_S: ClassVar[float] = 30.0
+    # How long to wait for a human before giving up. Independent of (and far
+    # larger than) the run's compute wallclock budget — a person may take days.
+    DEFAULT_HUMAN_TIMEOUT_S: ClassVar[float] = 7 * 24 * 3600.0
 
     PALETTE: ClassVar[dict[str, str]] = {
         "id": "human",
@@ -117,7 +122,11 @@ class HumanAgent(Agent):
         return self.Outputs.model_validate(data)
 
     async def _wait_for_response(self, response_path: Path) -> dict[str, Any] | None:
-        last_heartbeat = time.monotonic()
+        timeout_s = float(
+            self.component_config.get("human_timeout_s") or self.DEFAULT_HUMAN_TIMEOUT_S
+        )
+        start = time.monotonic()
+        last_heartbeat = start
         while True:
             if response_path.exists():
                 try:
@@ -126,17 +135,20 @@ class HumanAgent(Agent):
                     await asyncio.sleep(self.POLL_INTERVAL_S)
                     continue
                 return raw if isinstance(raw, dict) else {"value": raw}
-            remaining = self.tracker.remaining_wallclock_s()
-            if remaining is not None and remaining <= 0:
+            elapsed = time.monotonic() - start
+            if timeout_s > 0 and elapsed >= timeout_s:
                 return None
             now = time.monotonic()
             if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_S:
                 last_heartbeat = now
                 await self.events.emit(
                     "human.heartbeat",
-                    {"remaining_s": remaining, "response_path": str(response_path)},
+                    {"waited_s": elapsed, "response_path": str(response_path)},
                 )
             await asyncio.sleep(self.POLL_INTERVAL_S)
+            # Human thinking time is not compute time: credit it back so it never
+            # eats the run's wallclock budget.
+            self.tracker.add_paused(self.POLL_INTERVAL_S)
 
     def _output_fields(self) -> dict[str, str]:
         schema = self.component_config.get("output_schema")

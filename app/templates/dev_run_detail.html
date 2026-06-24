@@ -14,6 +14,16 @@
         </div>
     </div>
 
+    {% if can_resume and not run_finished and not human_tasks %}
+        <div class="card">
+            <form method="post" action="{{ url_for('run_resume', run_id=run.run_id) }}"
+                  onsubmit="return confirm('Resume this run? Only do this if it has stopped or crashed — resuming a run that is still going will launch a duplicate.');">
+                <button type="submit" class="btn-primary">▶ Resume run</button>
+                <span class="dim">Replays finished nodes (including your answers) from disk and continues where it stopped.</span>
+            </form>
+        </div>
+    {% endif %}
+
     {% if human_tasks %}
         {% for task in human_tasks %}
             <div class="card human-task-card">

@@ -647,6 +647,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             show_execution_graph=show_execution_graph,
             human_tasks=load_pending_human_tasks(run.path),
             run_finished=(run.status or "running") in _TERMINAL_RUN_STATUSES,
+            can_resume=(run.path / "resume.json").exists(),
         )
 
     @app.route("/run/<run_id>/human", methods=["POST"])
@@ -669,6 +670,38 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         values.setdefault("status", "done")
         inbox.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/resume", methods=["POST"])
+    def run_resume(run_id: str):
+        # Relaunch a stopped/crashed run in place: same run_id, --resume-from
+        # itself, so completed nodes (incl. answered human prompts) replay from
+        # the resume_cache and the run continues from the first unfinished node.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        spec_path = run.path / "resume.json"
+        if not spec_path.exists():
+            abort(400, description="no resume spec recorded for this run")
+        try:
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            argv = spec.get("argv") or []
+        except (json.JSONDecodeError, OSError):
+            abort(400, description="invalid resume spec")
+        if not argv:
+            abort(400, description="empty resume spec")
+        cmd = [sys.executable, *[str(a) for a in argv], "--resume-from", run_id]
+        env = _dashboard_subprocess_env()
+        log_path = run.path / "dashboard-resume.log"
+        with log_path.open("a", encoding="utf-8") as log:
+            subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/human-pending")

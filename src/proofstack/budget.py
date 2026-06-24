@@ -74,10 +74,14 @@ class _Counters:
     usd: float = 0.0
     tokens: int = 0
     tool_calls: int = 0
+    paused_s: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
     def wallclock_s(self) -> float:
-        return time.monotonic() - self.started_at
+        # Time spent waiting on a human (paused_s) does not count as compute
+        # wallclock, so a node that waits hours/days for input never trips the
+        # run's wallclock budget.
+        return max(0.0, time.monotonic() - self.started_at - self.paused_s)
 
 
 @dataclass
@@ -104,6 +108,16 @@ class BudgetTracker:
         self.counters.tool_calls += n
         if self.parent is not None:
             self.parent.add_tool_call(n)
+
+    def add_paused(self, seconds: float) -> None:
+        """Exclude ``seconds`` from wallclock at this scope and all parents.
+
+        Used by human-in-the-loop nodes so time spent waiting for a person is
+        not charged against the run's compute wallclock budget.
+        """
+        self.counters.paused_s += seconds
+        if self.parent is not None:
+            self.parent.add_paused(seconds)
 
     def chain(self) -> Iterable["BudgetTracker"]:
         node: BudgetTracker | None = self
