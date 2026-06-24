@@ -24,6 +24,20 @@
         </div>
     {% endif %}
 
+    {% if pruned_kb is not none %}
+        <div class="card"><span class="dim">🧹 Reclaimed {{ pruned_kb }} KB by removing finished-node sandboxes and CLI logs.</span></div>
+    {% endif %}
+    {% set pb = prunable_bytes or 0 %}
+    {% if pb > 0 %}
+        <div class="card">
+            <form method="post" action="{{ url_for('run_prune', run_id=run.run_id) }}"
+                  onsubmit="return confirm('Delete finished nodes’ throwaway sandboxes and raw CLI logs to reclaim disk?\n\nProof outputs, run history, and everything shown in the dashboard are kept, and the run can still be resumed.');">
+                <button type="submit">🧹 Prune artifacts ({% if pb >= 1048576 %}{{ (pb / 1048576) | round(1) }} MB{% else %}{{ (pb / 1024) | round(0) | int }} KB{% endif %})</button>
+                <span class="dim">Frees disk on long runs by deleting finished nodes' sandbox files and CLI logs (redundant with cached output). Keeps proof text, run history, and resume.</span>
+            </form>
+        </div>
+    {% endif %}
+
     {% if human_tasks %}
         {% for task in human_tasks %}
             <div class="card human-task-card">

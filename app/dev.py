@@ -45,6 +45,7 @@ from app.dev_data import (
     discover_runs,
     discover_tool_definitions,
     find_agent,
+    estimate_prunable_bytes,
     find_preset,
     find_run,
     find_runs_awaiting_human,
@@ -57,6 +58,7 @@ from app.dev_data import (
     presets_registry_version,
     preset_file_version,
     preset_dag_report,
+    prune_run_artifacts,
     render_recorded_messages,
     safe_blob_path,
     save_preset_yaml,
@@ -660,6 +662,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             human_tasks=load_pending_human_tasks(run.path),
             run_finished=(run.status or "running") in _TERMINAL_RUN_STATUSES,
             can_resume=(run.path / "resume.json").exists(),
+            prunable_bytes=estimate_prunable_bytes(run.path),
+            pruned_kb=request.args.get("pruned_kb", type=int),
         )
 
     @app.route("/run/<run_id>/human", methods=["POST"])
@@ -715,6 +719,19 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 start_new_session=True,
             )
         return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/prune", methods=["POST"])
+    def run_prune(run_id: str):
+        # Reclaim disk: delete finished nodes' throwaway sandboxes + CLI logs.
+        # Safe — the dashboard reads input/output/messages.json (kept) and
+        # resume replays from resume_cache/ (kept). Proof text lives in
+        # output.json, so nothing visible or replayable is lost.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        result = prune_run_artifacts(run.path)
+        pruned_kb = result["bytes_freed"] // 1024
+        return redirect(url_for("run_detail", run_id=run_id, pruned_kb=pruned_kb))
 
     @app.route("/run/<run_id>/human-pending")
     def run_human_pending(run_id: str):

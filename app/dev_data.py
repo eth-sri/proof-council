@@ -13,6 +13,7 @@ import importlib
 import json
 import pkgutil
 import re
+import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -870,6 +871,84 @@ def find_runs_awaiting_human(roots: Iterable[Path]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def _path_size(path: Path) -> int:
+    """Total bytes under ``path`` (a file or a directory tree)."""
+    try:
+        if path.is_file() or path.is_symlink():
+            return path.lstat().st_size
+        total = 0
+        for child in path.rglob("*"):
+            try:
+                if child.is_file() or child.is_symlink():
+                    total += child.lstat().st_size
+            except OSError:
+                continue
+        return total
+    except OSError:
+        return 0
+
+
+# Per-node artifacts safe to delete once a node has finished: the throwaway
+# sandbox workspace and the raw CLI logs. The dashboard never reads these
+# (it uses input.json/output.json/messages.json), and resume replays from
+# resume_cache/, so removing them loses nothing visible or replayable.
+_PRUNABLE_NODE_ARTIFACTS = ("sandbox", "cli_stdout.log", "cli_stderr.log")
+
+
+def estimate_prunable_bytes(run_path: Path) -> int:
+    """Bytes reclaimable by prune_run_artifacts without actually deleting."""
+    agents_dir = run_path / "agents"
+    if not agents_dir.exists():
+        return 0
+    total = 0
+    for node_dir in agents_dir.iterdir():
+        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+            continue
+        for name in _PRUNABLE_NODE_ARTIFACTS:
+            target = node_dir / name
+            if target.exists():
+                total += _path_size(target)
+    return total
+
+
+def prune_run_artifacts(run_path: Path) -> dict[str, int]:
+    """Reclaim disk by deleting redundant artifacts of FINISHED nodes.
+
+    For every agent call dir that has an ``output.json`` (i.e. the node
+    completed and its output was captured), remove the throwaway ``sandbox/``
+    tree and the raw ``cli_stdout.log`` / ``cli_stderr.log``. A node still
+    running has no ``output.json`` yet, so it is left untouched. The proof text
+    and everything the UI shows live in output.json + the resume cache, so this
+    is non-destructive to anything visible or replayable. Returns the number of
+    nodes pruned and bytes freed.
+    """
+    agents_dir = run_path / "agents"
+    pruned_nodes = 0
+    bytes_freed = 0
+    if not agents_dir.exists():
+        return {"pruned_nodes": 0, "bytes_freed": 0}
+    for node_dir in agents_dir.iterdir():
+        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+            continue
+        node_freed = 0
+        for name in _PRUNABLE_NODE_ARTIFACTS:
+            target = node_dir / name
+            if not target.exists():
+                continue
+            node_freed += _path_size(target)
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                try:
+                    target.unlink()
+                except OSError:
+                    node_freed -= _path_size(target)
+        if node_freed > 0:
+            pruned_nodes += 1
+            bytes_freed += node_freed
+    return {"pruned_nodes": pruned_nodes, "bytes_freed": bytes_freed}
 
 
 # ---------------------------------------------------------------------------
