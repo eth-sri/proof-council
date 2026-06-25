@@ -10,7 +10,9 @@ description: Two-round human-in-the-loop demo (idea -> AI attempt -> human refin
 
 # Subscription guardrails — see claude_only_min.yaml for the full rationale.
 budget:
-  max_usd: 0.0            # always 0 on a subscription; not a real gate here
+  max_usd: 2.0            # small cap on PAID calls (API node / --monitor / metered
+                          # codex). Subscription CLI adds $0, so a pure-subscription
+                          # run stays at $0; this only bites if you add paid calls.
   max_tokens: 8000000     # metered full token throughput incl. cache (see
                           # claude_only_min.yaml); ~2 Claude calls/run. Tighten
                           # via metered_tokens in model.call events.

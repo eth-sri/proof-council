@@ -28,7 +28,10 @@ description: Attention-harness loop (3 AI hint specialists + human hint -> synth
 # trip it but a misconfigured/looping run still stops. Until token accounting
 # lands, lowering max_rounds is the most direct way to cap spend on a hard problem.
 budget:
-  max_usd: 0.0             # always 0 on a subscription; not a real gate here
+  max_usd: 5.0             # small cap on PAID calls (API node / --monitor / metered
+                           # codex); higher than the single-shot presets because this
+                           # LOOPS. Subscription CLI adds $0, so a pure-subscription run
+                           # stays at $0; this only bites if you add paid calls.
   max_tokens: 40000000     # metered full throughput incl. cache, across ALL rounds
                            # (see claude_only_min.yaml). Much higher than the
                            # single-shot presets because this LOOPS 6 calls/round:

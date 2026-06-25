@@ -25,9 +25,13 @@
 workflow: proofstack.agents.dag_workflow.DAGWorkflow
 description: Claude + Codex dual-solver with a Claude synthesizer that merges the best of each (subscription, no API key, no Docker).
 
-# Subscription guardrails. max_usd is always 0 on a subscription (no API spend),
-# so it can't gate anything here — the real limit is Anthropic's rolling token
-# window. The protective caps:
+# Subscription guardrails. A pure-subscription run spends $0 (the Claude CLI adds
+# no USD), so the real limit is Anthropic's rolling TOKEN window, capped by
+# max_tokens. max_usd is a small backstop on any PAID calls you mix in later (an
+# API node, --monitor, or a metered codex node) — paid + subscription are two
+# separate dials by design ($ for the API side, tokens for the subscription side).
+# The protective caps:
+#   max_usd         -> small ceiling on PAID (API/monitor/metered-codex) spend
 #   max_tokens      -> metered token ceiling per run (see note below)
 #   max_tool_calls  -> hard cap on total CLI spawns (solve/codex/synth/...) per run
 #   max_wallclock_s -> coarse compute-time backstop (excludes human-wait time)
@@ -47,7 +51,9 @@ description: Claude + Codex dual-solver with a Claude synthesizer that merges th
 # `metered_tokens` is recorded in each model.call event, so your real runs
 # self-calibrate this ceiling.
 budget:
-  max_usd: 0.0            # always 0 on a subscription; not a real gate here
+  max_usd: 2.0            # small cap on PAID calls (API node / --monitor / metered
+                          # codex). Subscription CLI adds $0, so a pure-subscription
+                          # run stays at $0; this only bites if you add paid calls.
   max_tokens: 8000000     # backstop: ~2 Claude calls/run; trivial ≈ 275k, a hard
                           # opus run a few M. Tighten using metered_tokens in events.
   max_tool_calls: 12      # at most 12 agentic CLI calls per run
@@ -182,8 +188,10 @@ components:
     done_outputs:
       status: status
     # No `usage:` block on purpose: it would compute a USD cost from token rates
-    # and trip the max_usd: 0.0 budget gate. This is a subscription run, so we
-    # don't meter it.
+    # and consume max_usd (which is now a small real cap, not 0) — but this is a
+    # subscription codex run with no real API spend, so we don't meter it. Add a
+    # `usage: {type: codex_jsonl, ...}` block only if you route codex through the
+    # PAID API and want that cost counted against max_usd.
 
   claude_synthesizer:
     # The council editor. Instead of judging and discarding all but one proof, it

@@ -12,11 +12,15 @@ workflow: proofstack.agents.dag_workflow.DAGWorkflow
 description: Claude + Codex + Human solvers, merged by a Claude synthesizer (subscription, no API key, no Docker).
 
 # Subscription guardrails — see claude_only_min.yaml for the full rationale.
-# max_usd is always 0 on a subscription; the real protection is the call cap plus
-# per-node soft/hard timeouts. Wallclock stays generous because a human is in the
-# loop (human-wait time is exempt from the compute budget anyway).
+# A pure-subscription run spends $0; max_usd is a small backstop on any PAID calls
+# you mix in (API node / --monitor / metered codex), max_tokens bounds the
+# subscription token window, and per-node soft/hard timeouts bound each call.
+# Wallclock stays generous because a human is in the loop (human-wait time is
+# exempt from the compute budget anyway).
 budget:
-  max_usd: 0.0            # always 0 on a subscription; not a real gate here
+  max_usd: 2.0            # small cap on PAID calls (API node / --monitor / metered
+                          # codex). Subscription CLI adds $0, so a pure-subscription
+                          # run stays at $0; this only bites if you add paid calls.
   max_tokens: 8000000     # metered full token throughput incl. cache (see
                           # claude_only_min.yaml); ~2 Claude calls/run. Tighten
                           # via metered_tokens in model.call events.
