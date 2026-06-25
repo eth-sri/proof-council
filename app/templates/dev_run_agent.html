@@ -230,6 +230,39 @@
             renderLatexElements(row);
         }
 
+        // Known options for model-ish inputs, mirroring the preset editor. A
+        // "Custom…" entry keeps free-text available (model names change).
+        const workflowInputChoices = {
+            claude_model: ['opus', 'sonnet', 'haiku'],
+            codex_model: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+            codex_effort: ['high', 'medium', 'low', 'minimal'],
+        };
+
+        function inputFieldControl(key, value) {
+            const current = String(value ?? '');
+            const choices = workflowInputChoices[key];
+            if (!choices) {
+                return `<input type="text" data-input-key="${escapeAttr(key)}" value="${escapeAttr(current)}">`;
+            }
+            const opts = choices.slice();
+            if (current && !opts.includes(current)) opts.unshift(current);  // preserve a custom default
+            const options = opts.map((o) =>
+                `<option value="${escapeAttr(o)}" ${o === current ? 'selected' : ''}>${escapeHtml(o)}</option>`
+            ).join('');
+            return `
+                <select data-input-key="${escapeAttr(key)}" data-input-choice="1" onchange="onChoiceChange(this)">
+                    ${options}
+                    <option value="__custom__">Custom…</option>
+                </select>
+                <input type="text" data-input-custom="${escapeAttr(key)}" placeholder="custom value" style="display:none">
+            `;
+        }
+
+        function onChoiceChange(select) {
+            const custom = document.querySelector(`[data-input-custom="${select.dataset.inputKey}"]`);
+            if (custom) custom.style.display = (select.value === '__custom__') ? '' : 'none';
+        }
+
         function renderWorkflowInputs() {
             const container = document.getElementById('run-agent-inputs');
             if (!container) return;
@@ -242,7 +275,7 @@
             container.innerHTML = keys.map((key) => `
                 <label class="run-agent-field compact">
                     ${escapeHtml(key)}
-                    <input type="text" data-input-key="${escapeAttr(key)}" value="${escapeAttr(String(inputs[key] ?? ''))}">
+                    ${inputFieldControl(key, inputs[key])}
                 </label>
             `).join('');
         }
@@ -250,7 +283,13 @@
         function collectWorkflowInputs() {
             const inputs = {};
             document.querySelectorAll('[data-input-key]').forEach((el) => {
-                const v = String(el.value || '').trim();
+                let v;
+                if (el.dataset.inputChoice && el.value === '__custom__') {
+                    const custom = document.querySelector(`[data-input-custom="${el.dataset.inputKey}"]`);
+                    v = String(custom?.value || '').trim();
+                } else {
+                    v = String(el.value || '').trim();
+                }
                 if (v !== '') inputs[el.dataset.inputKey] = v;
             });
             return inputs;
