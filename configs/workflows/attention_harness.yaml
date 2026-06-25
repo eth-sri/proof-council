@@ -20,9 +20,21 @@
 workflow: proofstack.agents.dag_workflow.DAGWorkflow
 description: Attention-harness loop (3 AI hint specialists + human hint -> synthesize -> author -> critic), subscription only.
 
+# Subscription guardrails — see claude_only_min.yaml for the full rationale.
+# This preset LOOPS: each round runs 6 AI CLI calls (premise/analogy/lemma/
+# synthesize/author/critic). The repeat is bounded by max_rounds, but the real
+# cost dial is max_rounds itself (6 calls per round). max_tool_calls is a runaway
+# backstop set just above the default 4 rounds (24 calls) so normal runs don't
+# trip it but a misconfigured/looping run still stops. Until token accounting
+# lands, lowering max_rounds is the most direct way to cap spend on a hard problem.
 budget:
-  max_usd: 0.0
-  max_wallclock_s: 10800   # generous: human in the loop, multiple rounds
+  max_usd: 0.0             # always 0 on a subscription; not a real gate here
+  max_tokens: 4000000      # the real ceiling: input+output tokens across ALL rounds.
+                           # Higher than the single-shot presets because this loops;
+                           # this is the knob that actually stops a loop from eating
+                           # the token window. Calibrate to your plan's comfort.
+  max_tool_calls: 30       # backstop: ~5 rounds of 6 AI calls; stops a runaway loop
+  max_wallclock_s: 7200    # 2h compute backstop (human-wait time is exempt)
 
 inputs:
   problem: ''
@@ -31,8 +43,9 @@ inputs:
 
 components:
   claude_premise:
-    cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
-    sandbox: {backend: subprocess, timeout_s: 1500}
+    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    soft_timeout_s: 780
+    sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
     cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
@@ -56,10 +69,12 @@ components:
     output_schema: {workspace: string, hint: string, status: string}
     output_files: {hint: hint.txt}
     done_outputs: {status: status}
+    usage: {type: claude_json}
 
   claude_analogy:
-    cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
-    sandbox: {backend: subprocess, timeout_s: 1500}
+    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    soft_timeout_s: 780
+    sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
     cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
@@ -83,10 +98,12 @@ components:
     output_schema: {workspace: string, hint: string, status: string}
     output_files: {hint: hint.txt}
     done_outputs: {status: status}
+    usage: {type: claude_json}
 
   claude_lemma:
-    cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
-    sandbox: {backend: subprocess, timeout_s: 1500}
+    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    soft_timeout_s: 780
+    sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
     cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
@@ -110,6 +127,7 @@ components:
     output_schema: {workspace: string, hint: string, status: string}
     output_files: {hint: hint.txt}
     done_outputs: {status: status}
+    usage: {type: claude_json}
 
   human_hint:
     # You are the fourth hint specialist. You see the current attempt and the
@@ -133,8 +151,9 @@ components:
     output_schema: {hint: string, status: string}
 
   claude_synthesize:
-    cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
-    sandbox: {backend: subprocess, timeout_s: 1500}
+    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    soft_timeout_s: 780
+    sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
     cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
@@ -165,10 +184,12 @@ components:
     output_schema: {workspace: string, brief: string, status: string}
     output_files: {brief: brief.txt}
     done_outputs: {status: status}
+    usage: {type: claude_json}
 
   claude_author:
-    cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
-    sandbox: {backend: subprocess, timeout_s: 1500}
+    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    soft_timeout_s: 780
+    sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
     cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
@@ -196,10 +217,12 @@ components:
     output_schema: {workspace: string, answer_tex: string, status: string}
     output_files: {answer_tex: answer.tex}
     done_outputs: {status: status}
+    usage: {type: claude_json}
 
   claude_critic:
-    cmd: [claude, -p, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
-    sandbox: {backend: subprocess, timeout_s: 1500}
+    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    soft_timeout_s: 780
+    sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
     cache_enabled: true   # replay this node from disk on resume (durable runs)
     prompt: |
@@ -227,6 +250,7 @@ components:
       verdict: verdict.txt
       feedback: feedback.md
     done_outputs: {status: status}
+    usage: {type: claude_json}
 
 dag:
   nodes:

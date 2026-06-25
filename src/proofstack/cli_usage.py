@@ -50,6 +50,68 @@ def parse_codex_jsonl(text: str) -> CodexUsage:
     return usage
 
 
+@dataclass
+class ClaudeUsage:
+    input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    output_tokens: int = 0
+    num_turns: int = 0
+    total_cost_usd: float = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    @property
+    def found(self) -> bool:
+        return self.num_turns > 0 or self.input_tokens > 0 or self.output_tokens > 0
+
+
+def _find_claude_result_object(text: str) -> dict | None:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    found: dict | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] != "{":
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "result":
+            found = ev
+        elif found is None and isinstance(ev.get("usage"), dict):
+            found = ev
+    return found
+
+
+def parse_claude_json(text: str) -> ClaudeUsage:
+    obj = _find_claude_result_object(text)
+    if obj is None:
+        return ClaudeUsage()
+    usage = obj.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    return ClaudeUsage(
+        input_tokens=int(usage.get("input_tokens") or 0),
+        cache_creation_input_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+        cache_read_input_tokens=int(usage.get("cache_read_input_tokens") or 0),
+        output_tokens=int(usage.get("output_tokens") or 0),
+        num_turns=int(obj.get("num_turns") or 0),
+        total_cost_usd=float(obj.get("total_cost_usd") or 0.0),
+    )
+
+
 def cost_for_codex_usage(
     usage: CodexUsage,
     *,
@@ -80,8 +142,10 @@ def load_cost_rates(config_ref: str) -> dict[str, float]:
 
 
 __all__ = [
+    "ClaudeUsage",
     "CodexUsage",
     "cost_for_codex_usage",
     "load_cost_rates",
+    "parse_claude_json",
     "parse_codex_jsonl",
 ]

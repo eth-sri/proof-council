@@ -18,7 +18,12 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from proofstack.cli_usage import cost_for_codex_usage, load_cost_rates, parse_codex_jsonl
+from proofstack.cli_usage import (
+    cost_for_codex_usage,
+    load_cost_rates,
+    parse_claude_json,
+    parse_codex_jsonl,
+)
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
@@ -126,7 +131,13 @@ class ConfigurableCLIAgent(CLIAgent):
         done: CLIDoneRecord,
     ) -> None:
         usage_cfg = self.component_config.get("usage") or {}
-        if not isinstance(usage_cfg, dict) or usage_cfg.get("type") != "codex_jsonl":
+        if not isinstance(usage_cfg, dict):
+            return
+        kind = usage_cfg.get("type")
+        if kind == "claude_json":
+            await self._record_claude_usage(stdout_text)
+            return
+        if kind != "codex_jsonl":
             return
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
@@ -160,6 +171,31 @@ class ConfigurableCLIAgent(CLIAgent):
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
+            },
+        )
+
+    async def _record_claude_usage(self, stdout_text: str) -> None:
+        usage = parse_claude_json(stdout_text)
+        if not usage.found:
+            return
+        # Charge tokens (gated by max_tokens) but NOT usd: a subscription run has
+        # no API spend, and add_usd would trip the max_usd: 0.0 gate. Tokens are
+        # the real subscription limit (Anthropic's rolling token window).
+        self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
+        await self.events.emit(
+            "model.call",
+            {
+                "model": str(
+                    self.component_config.get("model")
+                    or _model_from_cmd(self.CLI_CMD)
+                    or "claude"
+                ),
+                "in_tokens": usage.input_tokens,
+                "cached_in_tokens": usage.cache_read_input_tokens,
+                "out_tokens": usage.output_tokens,
+                "cost_usd": usage.total_cost_usd,
+                "n_turns": usage.num_turns,
+                "via": "claude_exec_json",
             },
         )
 

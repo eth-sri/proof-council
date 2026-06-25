@@ -8,9 +8,12 @@
 workflow: proofstack.agents.dag_workflow.DAGWorkflow
 description: Two-round human-in-the-loop demo (idea -> AI attempt -> human refine -> AI finalize).
 
+# Subscription guardrails — see claude_only_min.yaml for the full rationale.
 budget:
-  max_usd: 0.0
-  max_wallclock_s: 3600
+  max_usd: 0.0            # always 0 on a subscription; not a real gate here
+  max_tokens: 1500000     # the real subscription ceiling (input+output tokens/run)
+  max_tool_calls: 12      # hard cap on total CLI spawns per run
+  max_wallclock_s: 3600   # generous compute backstop (human-wait time is exempt)
 
 inputs:
   problem: ''
@@ -36,15 +39,18 @@ components:
     cmd:
       - claude
       - -p
+      - --output-format
+      - json
       - --model
       - "{claude_model}"
       - --permission-mode
       - acceptEdits
       - --allowedTools
       - Bash(finish:*)
+    soft_timeout_s: 780
     sandbox:
       backend: subprocess
-      timeout_s: 1500
+      timeout_s: 900
     env:
       HOME: /Users/davidholmes
     prompt: |
@@ -74,6 +80,8 @@ components:
       answer_tex: answer.tex
     done_outputs:
       status: status
+    usage:
+      type: claude_json
 
   human_refine:
     prompt: |
@@ -98,15 +106,18 @@ components:
     cmd:
       - claude
       - -p
+      - --output-format
+      - json
       - --model
       - "{claude_model}"
       - --permission-mode
       - acceptEdits
       - --allowedTools
       - Bash(finish:*)
+    soft_timeout_s: 780
     sandbox:
       backend: subprocess
-      timeout_s: 1500
+      timeout_s: 900
     env:
       HOME: /Users/davidholmes
     prompt: |
@@ -144,6 +155,8 @@ components:
       best_tex: best.tex
     done_outputs:
       status: status
+    usage:
+      type: claude_json
 
 dag:
   nodes:
