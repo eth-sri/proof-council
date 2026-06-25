@@ -15,9 +15,11 @@ import json
 import os
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +34,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, url_for
 from mathagents.config_loader import load_solver_config
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, normalize_monitor_model_spec
 
@@ -66,12 +68,14 @@ from app.dev_data import (
     preset_dag_report,
     prune_run_artifacts,
     render_recorded_messages,
+    resolve_output_refs,
     safe_blob_path,
     save_preset_yaml,
     save_tool_definition,
     tool_definition_to_dict,
     validate_preset_yaml,
     workflow_input_from_tree,
+    workflow_output_field_text,
     workflow_output_from_tree,
 )
 
@@ -672,8 +676,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(404)
         tree = load_event_tree(run.path)
         exec_graph = load_execution_graph(run.path, tree=tree)
-        workflow_input = workflow_input_from_tree(tree)
-        workflow_output = workflow_output_from_tree(tree)
+        workflow_input = resolve_output_refs(run.path, workflow_input_from_tree(tree))
+        workflow_output = resolve_output_refs(run.path, workflow_output_from_tree(tree))
         monitor_summaries = load_monitor_summaries(run.path, graph=exec_graph)
         show_monitor = bool(run.monitor_enabled or monitor_summaries)
         show_execution_graph = bool(run.has_events or (run.status == "running" and not run.problems))
@@ -862,7 +866,76 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description=str(e))
         return send_file(path, mimetype="text/plain")
 
+    @app.route("/run/<run_id>/output/<field>/download")
+    def run_output_download(run_id: str, field: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", field):
+            abort(400, description="invalid field")
+        text = workflow_output_field_text(run.path, load_event_tree(run.path), field)
+        if text is None:
+            abort(404)
+        return Response(
+            text,
+            mimetype="text/x-tex",
+            headers={"Content-Disposition": f'attachment; filename="{field}.tex"'},
+        )
+
+    @app.route("/run/<run_id>/output/<field>/pdf")
+    def run_output_pdf(run_id: str, field: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", field):
+            abort(400, description="invalid field")
+        text = workflow_output_field_text(run.path, load_event_tree(run.path), field)
+        if text is None:
+            abort(404)
+        pdf, log = _compile_latex_pdf(text, field)
+        if pdf is None:
+            return Response("LaTeX compile failed:\n\n" + log, status=422, mimetype="text/plain")
+        return Response(
+            pdf,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{field}.pdf"'},
+        )
+
     return app
+
+
+# pdflatex/latexmk are installed under /Library/TeX/texbin on macOS, which a GUI-
+# launched dashboard may not have on PATH; add it so the compiler is found.
+_TEX_BIN = "/Library/TeX/texbin"
+
+
+def _compile_latex_pdf(tex_source: str, name: str) -> tuple[bytes | None, str]:
+    """Compile a LaTeX document to PDF in a throwaway dir. Returns (pdf_bytes,
+    log); pdf_bytes is None on failure with the tail of the compiler log."""
+    search_path = os.environ.get("PATH", "") + os.pathsep + _TEX_BIN
+    latexmk = shutil.which("latexmk", path=search_path)
+    pdflatex = shutil.which("pdflatex", path=search_path)
+    if latexmk:
+        cmd = [latexmk, "-pdf", "-interaction=nonstopmode", "-halt-on-error", f"{name}.tex"]
+    elif pdflatex:
+        cmd = [pdflatex, "-interaction=nonstopmode", "-halt-on-error", f"{name}.tex"]
+    else:
+        return None, "No LaTeX compiler (latexmk or pdflatex) found."
+    env = dict(os.environ)
+    env["PATH"] = search_path
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / f"{name}.tex").write_text(tex_source, encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                cmd, cwd=tmp, capture_output=True, text=True, timeout=120, env=env
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return None, f"compile error: {type(e).__name__}: {e}"
+        pdf_path = tmp_path / f"{name}.pdf"
+        if pdf_path.exists():
+            return pdf_path.read_bytes(), proc.stdout[-2000:]
+        return None, (proc.stdout + "\n" + proc.stderr)[-4000:]
 
 
 def _parse_args() -> argparse.Namespace:

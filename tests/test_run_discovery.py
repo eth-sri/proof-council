@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 import app.dev as dev  # noqa: E402
 from app.dev import create_app  # noqa: E402
-from app.dev_data import discover_runs, find_run  # noqa: E402
+from app.dev_data import discover_runs, find_run, resolve_output_refs  # noqa: E402
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -35,6 +35,24 @@ def _batch_module():
 
 
 class RunDiscoveryTests(unittest.TestCase):
+    def test_resolve_output_refs_inflates_blobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            blobs = run / "events_blobs"
+            blobs.mkdir()
+            (blobs / "p.txt").write_text("PROOF BODY", encoding="utf-8")
+            out = resolve_output_refs(
+                run,
+                {
+                    "best_tex": {"$ref": "events_blobs/p.txt"},
+                    "verdict": "ready",
+                    "missing": {"$ref": "events_blobs/nope.txt"},
+                },
+            )
+        self.assertEqual(out["best_tex"], "PROOF BODY")  # inflated
+        self.assertEqual(out["verdict"], "ready")  # plain value untouched
+        self.assertEqual(out["missing"], {"$ref": "events_blobs/nope.txt"})  # unreadable left as-is
+
     def test_run_agent_problem_picker_discovers_non_txt_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

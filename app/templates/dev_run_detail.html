@@ -184,7 +184,7 @@
 
     {% if workflow_output is not none %}
         <h2>Workflow output</h2>
-        {{ ui.render_output(workflow_output, 'No workflow output captured.') }}
+        {{ ui.render_output(workflow_output, run.run_id, 'No workflow output captured.') }}
     {% endif %}
 
 {% endblock %}

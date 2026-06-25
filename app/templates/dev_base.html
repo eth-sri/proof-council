@@ -2727,6 +2727,25 @@
             .sample-runner { grid-template-columns: 1fr; }
             .inspector-grid { grid-template-columns: 1fr; }
         }
+        .output-toolbar {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin: 4px 0 8px;
+        }
+        .output-toolbar .copy-output-btn,
+        .output-toolbar .btn-link {
+            font-size: 12px;
+            padding: 2px 8px;
+            border: 1px solid var(--border, #ccc);
+            border-radius: 6px;
+            background: var(--card-bg, #fff);
+            color: inherit;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .output-toolbar .copy-output-btn:hover,
+        .output-toolbar .btn-link:hover { background: var(--hover-bg, #f0f0f0); }
     </style>
     <script>
         window.MathJax = {
@@ -2740,6 +2759,21 @@
     </script>
     <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
     <script>
+        // Copy an output field's text to the clipboard.
+        document.addEventListener('click', async (e) => {
+            const btn = e.target.closest('.copy-output-btn');
+            if (!btn) return;
+            const text = btn.closest('details')?.querySelector('.rendered-text')?.textContent ?? '';
+            try {
+                await navigator.clipboard.writeText(text);
+                const prev = btn.textContent;
+                btn.textContent = 'Copied!';
+                setTimeout(() => { btn.textContent = prev; }, 1200);
+            } catch (err) {
+                btn.textContent = 'Copy failed';
+            }
+        });
+
         function filterExecutionGraph() {
             const query = (document.getElementById('graph-search')?.value || '').trim().toLowerCase();
             const status = document.getElementById('graph-status')?.value || '';

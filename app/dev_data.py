@@ -1439,6 +1439,36 @@ def workflow_input_from_tree(tree: RunEventTree) -> Any:
     return _clean_display_output(node.input)
 
 
+def resolve_output_refs(run_path: Path, value: Any) -> Any:
+    """Inflate ``{"$ref": "events_blobs/..."}`` pointers to the blob's text.
+
+    Large event payloads (e.g. a full proof) are offloaded to events_blobs/ and
+    left as a $ref; the display would otherwise show the pointer. Reads the blob
+    in place; leaves a ref unresolved (as-is) if it can't be read.
+    """
+    if isinstance(value, dict):
+        if set(value) == {"$ref"} and isinstance(value.get("$ref"), str):
+            try:
+                return safe_blob_path(run_path, value["$ref"]).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except (ValueError, OSError):
+                return value
+        return {k: resolve_output_refs(run_path, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_output_refs(run_path, v) for v in value]
+    return value
+
+
+def workflow_output_field_text(run_path: Path, tree: RunEventTree, field: str) -> str | None:
+    """The resolved string value of one top-level workflow-output field, or None
+    if absent / not a string. Used by the download + PDF routes."""
+    out = resolve_output_refs(run_path, workflow_output_from_tree(tree))
+    if isinstance(out, dict) and isinstance(out.get(field), str):
+        return out[field]
+    return None
+
+
 def _clean_display_output(value: Any) -> Any:
     return _clean_display_output_value(value)
 
