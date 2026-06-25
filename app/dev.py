@@ -915,7 +915,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         pdf, log = _compile_latex_pdf(
             _MONOSPACE_TEMPLATE.replace("__NAME__", name),
             name,
-            extra_files={f"{name}.txt": text},
+            extra_files={f"{name}.txt": _ascii_fallback(text)},
         )
         if pdf is None:
             return Response("PDF render failed:\n\n" + log, status=422, mimetype="text/plain")
@@ -944,6 +944,29 @@ _MONOSPACE_TEMPLATE = r"""\documentclass[11pt]{article}
 \end{document}
 """
 
+# Map common math/typographic Unicode to ASCII so a pdflatex monospace render
+# never chokes on a glyph the default fonts lack. Anything unmapped becomes "?".
+_UNICODE_TO_ASCII = {
+    "—": "--", "–": "-", "−": "-", "…": "...",
+    "“": '"', "”": '"', "‘": "'", "’": "'",
+    "≥": ">=", "≤": "<=", "≠": "!=", "≈": "~=", "≡": "==",
+    "∈": " in ", "∉": " notin ", "⊆": " subseteq ", "⊂": " subset ",
+    "∪": " union ", "∩": " intersect ", "∅": "{}",
+    "×": "x", "·": "*", "÷": "/", "→": "->", "⇒": "=>", "↦": "|->",
+    "∀": "forall ", "∃": "exists ", "∞": "infinity", "√": "sqrt",
+    "∑": "sum", "∏": "prod", "∫": "int", "⊕": "(+)", "⊗": "(x)",
+    "ℝ": "R", "ℤ": "Z", "ℕ": "N", "ℚ": "Q", "ℂ": "C",
+    "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta",
+    "ε": "epsilon", "θ": "theta", "λ": "lambda", "μ": "mu",
+    "π": "pi", "ρ": "rho", "σ": "sigma", "φ": "phi", "ω": "omega",
+}
+
+
+def _ascii_fallback(text: str) -> str:
+    for char, repl in _UNICODE_TO_ASCII.items():
+        text = text.replace(char, repl)
+    return text.encode("ascii", "replace").decode("ascii")
+
 
 def _compile_latex_pdf(
     tex_source: str, name: str, *, extra_files: dict[str, str] | None = None
@@ -969,7 +992,17 @@ def _compile_latex_pdf(
             (tmp_path / fname).write_text(content, encoding="utf-8")
         try:
             proc = subprocess.run(
-                cmd, cwd=tmp, capture_output=True, text=True, timeout=120, env=env
+                cmd,
+                cwd=tmp,
+                capture_output=True,
+                # Decode the compiler log tolerantly: pdflatex wraps lines at ~79
+                # chars and can split a multi-byte UTF-8 char (e.g. an em dash),
+                # which strict decoding would crash on.
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                env=env,
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return None, f"compile error: {type(e).__name__}: {e}"

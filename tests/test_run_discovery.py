@@ -35,6 +35,17 @@ def _batch_module():
 
 
 class RunDiscoveryTests(unittest.TestCase):
+    def test_ascii_fallback_makes_text_compilable(self) -> None:
+        from app.dev import _ascii_fallback
+
+        out = _ascii_fallback("note — the bound deg(H') ≥ deg(H) for x ∈ S, λ > 0 ✗")
+        self.assertTrue(out.isascii())  # pdflatex-safe
+        self.assertIn("--", out)  # em dash
+        self.assertIn(">=", out)  # >=
+        self.assertIn(" in ", out)  # in
+        self.assertIn("lambda", out)
+        self.assertIn("?", out)  # unmapped glyph degrades gracefully
+
     def test_resolve_output_refs_inflates_blobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run = Path(tmp)
