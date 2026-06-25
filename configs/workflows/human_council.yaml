@@ -17,7 +17,9 @@ description: Claude + Codex + Human solvers, merged by a Claude synthesizer (sub
 # loop (human-wait time is exempt from the compute budget anyway).
 budget:
   max_usd: 0.0            # always 0 on a subscription; not a real gate here
-  max_tokens: 1500000     # the real subscription ceiling (input+output tokens/run)
+  max_tokens: 8000000     # metered full token throughput incl. cache (see
+                          # claude_only_min.yaml); ~2 Claude calls/run. Tighten
+                          # via metered_tokens in model.call events.
   max_tool_calls: 12      # hard cap on total CLI spawns per run
   max_wallclock_s: 3600   # generous compute backstop (human-wait time is exempt)
 

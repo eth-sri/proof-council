@@ -29,10 +29,12 @@ description: Attention-harness loop (3 AI hint specialists + human hint -> synth
 # lands, lowering max_rounds is the most direct way to cap spend on a hard problem.
 budget:
   max_usd: 0.0             # always 0 on a subscription; not a real gate here
-  max_tokens: 4000000      # the real ceiling: input+output tokens across ALL rounds.
-                           # Higher than the single-shot presets because this loops;
-                           # this is the knob that actually stops a loop from eating
-                           # the token window. Calibrate to your plan's comfort.
+  max_tokens: 40000000     # metered full throughput incl. cache, across ALL rounds
+                           # (see claude_only_min.yaml). Much higher than the
+                           # single-shot presets because this LOOPS 6 calls/round:
+                           # trivial ≈ 3.2M at 4 rounds, a hard opus run far more.
+                           # The real cost dial is max_rounds; this is the catch-all
+                           # backstop. Tighten via metered_tokens in model.call events.
   max_tool_calls: 30       # backstop: ~5 rounds of 6 AI calls; stops a runaway loop
   max_wallclock_s: 7200    # 2h compute backstop (human-wait time is exempt)
 

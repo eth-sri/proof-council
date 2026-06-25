@@ -64,6 +64,20 @@ class ClaudeUsage:
         return self.input_tokens + self.output_tokens
 
     @property
+    def metered_tokens(self) -> int:
+        # Tokens the call actually processed, against the subscription's rolling
+        # window. Cache reads dominate in an agentic loop (the cached system
+        # prompt + conversation is re-fed every turn), so they MUST be counted
+        # or the backstop is blind to exactly the runaway it exists to catch.
+        # Counted full-weight on purpose: a backstop should not undercount.
+        return (
+            self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+            + self.output_tokens
+        )
+
+    @property
     def found(self) -> bool:
         return self.num_turns > 0 or self.input_tokens > 0 or self.output_tokens > 0
 

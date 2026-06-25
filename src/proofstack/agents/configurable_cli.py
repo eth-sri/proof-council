@@ -180,8 +180,11 @@ class ConfigurableCLIAgent(CLIAgent):
             return
         # Charge tokens (gated by max_tokens) but NOT usd: a subscription run has
         # no API spend, and add_usd would trip the max_usd: 0.0 gate. Tokens are
-        # the real subscription limit (Anthropic's rolling token window).
-        self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
+        # the real subscription limit (Anthropic's rolling token window). We meter
+        # the full throughput (input + cache create + cache read + output): cache
+        # reads dominate an agentic loop and counting only input+output undercounts
+        # ~40x. All categories are recorded below so the weighting stays visible.
+        self.tracker.add_tokens(usage.metered_tokens)
         await self.events.emit(
             "model.call",
             {
@@ -191,8 +194,10 @@ class ConfigurableCLIAgent(CLIAgent):
                     or "claude"
                 ),
                 "in_tokens": usage.input_tokens,
+                "cache_creation_in_tokens": usage.cache_creation_input_tokens,
                 "cached_in_tokens": usage.cache_read_input_tokens,
                 "out_tokens": usage.output_tokens,
+                "metered_tokens": usage.metered_tokens,
                 "cost_usd": usage.total_cost_usd,
                 "n_turns": usage.num_turns,
                 "via": "claude_exec_json",

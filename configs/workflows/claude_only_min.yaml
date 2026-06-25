@@ -27,19 +27,26 @@ description: Claude + Codex dual-solver with a Claude synthesizer that merges th
 
 # Subscription guardrails. max_usd is always 0 on a subscription (no API spend),
 # so it can't gate anything here — the real limit is Anthropic's rolling token
-# window. Until per-node token accounting lands, these are the protective caps:
+# window. The protective caps:
+#   max_tokens      -> metered token ceiling per run (see note below)
 #   max_tool_calls  -> hard cap on total CLI spawns (solve/codex/synth/...) per run
 #   max_wallclock_s -> coarse compute-time backstop (excludes human-wait time)
 # Each call is additionally bounded per-node by soft_timeout_s (graceful "wrap up"
 # nudge) and sandbox.timeout_s (hard kill). See the components below.
-# NOTE: these bound a *runaway*; a legitimately hard problem can still consume a
-# big slice of the token window. A real token ceiling needs the token-accounting
-# fix (parse `claude -p` stream-json usage -> add_tokens -> max_tokens).
+#
+# TOKEN METERING: each `claude -p --output-format json` call reports its usage;
+# we charge the FULL throughput (input + cache-create + cache-read + output) to
+# max_tokens. Cache reads dominate — in an agentic loop the cached system prompt +
+# conversation is re-fed every turn — so counting only input+output undercounts
+# ~40x and would miss exactly the runaway this guards against. Real baseline
+# (measured): a trivial haiku call ≈ 135k metered tokens (input 44, output ~3k,
+# the rest cache). A hard opus run with many turns is far larger; the per-call
+# `metered_tokens` is recorded in each model.call event, so your real runs
+# self-calibrate this ceiling.
 budget:
   max_usd: 0.0            # always 0 on a subscription; not a real gate here
-  max_tokens: 1500000     # THE real subscription ceiling (input+output tokens/run).
-                          # Calibrate to your plan's comfort; tokens are now metered
-                          # from `claude -p --output-format json` (see usage: blocks).
+  max_tokens: 8000000     # backstop: ~2 Claude calls/run; trivial ≈ 275k, a hard
+                          # opus run a few M. Tighten using metered_tokens in events.
   max_tool_calls: 12      # at most 12 agentic CLI calls per run
   max_wallclock_s: 5400   # 90 min compute backstop (human-wait time is exempt)
 
@@ -115,7 +122,7 @@ components:
     done_outputs:
       status: status
     usage:
-      type: claude_json   # meter input+output tokens against the run's max_tokens
+      type: claude_json   # meter full token throughput (incl. cache) vs max_tokens
 
   codex_worker:
     # The "diversity" solver: a SECOND, independent attempt at the same problem

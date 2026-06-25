@@ -56,13 +56,43 @@ class ParseClaudeJsonTests(unittest.TestCase):
             self.assertFalse(usage.found, text)
             self.assertEqual(usage.total_tokens, 0)
 
-    def test_parsed_tokens_trip_max_tokens_budget(self) -> None:
+    def test_metered_tokens_includes_cache(self) -> None:
+        usage = parse_claude_json(
+            json.dumps(
+                {
+                    "type": "result",
+                    "num_turns": 6,
+                    "usage": {
+                        "input_tokens": 44,
+                        "cache_creation_input_tokens": 11332,
+                        "cache_read_input_tokens": 118080,
+                        "output_tokens": 3039,
+                    },
+                }
+            )
+        )
+        # The backstop must count cache reads, which dominate an agentic loop;
+        # input+output alone would undercount this real call ~43x.
+        self.assertEqual(usage.total_tokens, 3083)
+        self.assertEqual(usage.metered_tokens, 132495)
+
+    def test_metered_tokens_trip_max_tokens_budget(self) -> None:
         text = json.dumps(
-            {"type": "result", "num_turns": 1, "usage": {"input_tokens": 600, "output_tokens": 600}}
+            {
+                "type": "result",
+                "num_turns": 1,
+                "usage": {
+                    "input_tokens": 44,
+                    "cache_read_input_tokens": 5000,
+                    "output_tokens": 600,
+                },
+            }
         )
         usage = parse_claude_json(text)
+        # input+output (644) stays under the cap; the full metered total (5644)
+        # trips it. The backstop only works because cache reads are counted.
         tracker = BudgetTracker(scope="run", spec=BudgetSpec(max_tokens=1000))
-        tracker.add_tokens(usage.input_tokens + usage.output_tokens)
+        tracker.add_tokens(usage.metered_tokens)
         with self.assertRaises(BudgetExhausted):
             tracker.check()
 
