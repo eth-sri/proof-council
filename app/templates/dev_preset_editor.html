@@ -140,7 +140,7 @@
         let toolDefinitions = {{ tool_definitions | tojson }};
         const fieldHelp = {
             model: "Model config used for this component's API call.",
-            cliModel: "Raw model name passed to the CLI, for example gpt-5.5.",
+            cliModel: "Model for this node. 'Default' inherits the workflow model; pick a specific model to override just this node.",
             cliReasoningEffort: "Reasoning effort passed to Codex as model_reasoning_effort.",
             systemPrompt: "High-level instructions that set the component's role and behavior.",
             userPrompt: "The message template sent to the model for each run. Placeholders such as {problem} are filled from graph inputs.",
@@ -4860,6 +4860,49 @@
             return '';
         }
 
+        // Per-node model picker for CLI nodes. "Default" clears the override so
+        // the node uses its command's model (a {claude_model} binding for Claude,
+        // or the literal model for Codex); picking a specific model overrides just
+        // this node, with a "Custom…" escape hatch for names not in the list.
+        function cliModelControl(prefix, cfg) {
+            const override = String(cfg.model || '').trim();
+            const bound = cliModelFromCmd(cfg.cmd);
+            const boundIsBinding = /^\{[A-Za-z_][\w]*\}$/.test(bound);
+            const isCodex = cliCommandParts(cfg.cmd).includes('codex');
+            const known = isCodex ? ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['opus', 'sonnet', 'haiku'];
+            const isCustom = override !== '' && !known.includes(override);
+            const defaultLabel = boundIsBinding
+                ? `Workflow default (${bound})`
+                : (bound ? `Default (${bound})` : 'Default');
+            const opts = [`<option value="" ${override === '' ? 'selected' : ''}>${escapeHtml(defaultLabel)}</option>`];
+            known.forEach((m) => {
+                opts.push(`<option value="${escapeAttr(m)}" ${m === override ? 'selected' : ''}>${escapeHtml(m)}</option>`);
+            });
+            opts.push(`<option value="__custom__" ${isCustom ? 'selected' : ''}>Custom…</option>`);
+            return `
+                <select id="${escapeAttr(prefix)}-cli-model-select" onchange="onCliModelChange('${escapeAttr(prefix)}')">${opts.join('')}</select>
+                <input id="${escapeAttr(prefix)}-cli-model-custom" placeholder="custom model" spellcheck="false"
+                       value="${isCustom ? escapeAttr(override) : ''}" style="${isCustom ? '' : 'display:none'}">
+            `;
+        }
+
+        function onCliModelChange(prefix) {
+            const select = document.getElementById(`${prefix}-cli-model-select`);
+            const custom = document.getElementById(`${prefix}-cli-model-custom`);
+            if (select && custom) custom.style.display = (select.value === '__custom__') ? '' : 'none';
+        }
+
+        function cliModelFieldValue(prefix) {
+            const select = document.getElementById(`${prefix}-cli-model-select`);
+            if (!select) {
+                return document.getElementById(`${prefix}-cli-model`)?.value || '';
+            }
+            if (select.value === '__custom__') {
+                return String(document.getElementById(`${prefix}-cli-model-custom`)?.value || '').trim();
+            }
+            return select.value;
+        }
+
         function cliReasoningEffortFromCmd(cmd) {
             const parts = cliCommandParts(cmd);
             for (let i = 0; i < parts.length; i += 1) {
@@ -4970,7 +5013,7 @@
                 ${showParameters ? parameterEditorForPromptSpec(`${prefix}-parameters`, spec, parentNode) : ''}
                 ${includePromptControls && cliPrompt ? `
                     <div class="inspector-grid inspector-grid-wide">
-                        <label>${fieldLabel('CLI model', fieldHelp.cliModel)} <input id="${escapeAttr(prefix)}-cli-model" value="${escapeAttr(cliModelValue(cfg))}" placeholder="gpt-5.5" spellcheck="false">${boundInputHint(cliModelValue(cfg))}</label>
+                        <label>${fieldLabel('CLI model', fieldHelp.cliModel)} ${cliModelControl(prefix, cfg)}</label>
                         <label>${fieldLabel('Reasoning effort', fieldHelp.cliReasoningEffort)} ${cliReasoningEffortSelect(prefix, cliReasoningEffortValue(cfg))}</label>
                         <label>${fieldLabel('Prompt', fieldHelp.userPrompt)} <textarea id="${escapeAttr(prefix)}-cli-prompt" rows="12">${escapeHtml(cfg.prompt || '')}</textarea></label>
                     </div>
@@ -5680,7 +5723,7 @@
             if (!cliPrompt && !model) return;
             const fields = cliPrompt ? {
                 prompt: cliPrompt.value,
-                model: document.getElementById(`${prefix}-cli-model`)?.value || '',
+                model: cliModelFieldValue(prefix),
                 model_reasoning_effort: document.getElementById(`${prefix}-cli-reasoning-effort`)?.value || '',
             } : {
                 model: model.value,

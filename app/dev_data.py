@@ -4036,10 +4036,19 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         _rename_component_output_refs(raw, name, fields["__rename_output_refs"])
         handled_fields.add("__rename_output_refs")
 
-    for key in ("model", "system_prompt", "user_prompt", "prompt"):
+    for key in ("system_prompt", "user_prompt", "prompt"):
         if key in fields:
             cfg[key] = str(fields[key] or "")
             handled_fields.add(key)
+    if "model" in fields:
+        # Empty means "no per-node override" — drop the key rather than writing an
+        # inert model: '' (matches the reasoning-effort handling below).
+        model = str(fields["model"] or "").strip()
+        if model:
+            cfg["model"] = model
+        else:
+            cfg.pop("model", None)
+        handled_fields.add("model")
     if "model_reasoning_effort" in fields:
         effort = str(fields["model_reasoning_effort"] or "").strip()
         if effort:
