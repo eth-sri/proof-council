@@ -159,6 +159,10 @@ async def amain() -> int:
                     cwd=REPO_ROOT,
                     stdout=log,
                     stderr=asyncio.subprocess.STDOUT,
+                    # Own session/process group per child run, so the dashboard's
+                    # Stop button can terminate one run's group (the worker + its
+                    # sandbox CLIs) without killing sibling problems or the batch.
+                    start_new_session=True,
                 )
                 code = await proc.wait()
             await update_problem(

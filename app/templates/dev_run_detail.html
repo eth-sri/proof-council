@@ -14,7 +14,23 @@
         </div>
     </div>
 
-    {% if can_resume and not run_finished and not human_tasks %}
+    {% if run_running and run_alive %}
+        <div class="card">
+            <form method="post" action="{{ url_for('run_stop', run_id=run.run_id) }}"
+                  onsubmit="return confirm('Stop this run? It will be terminated cleanly and you can Resume it later from where it stopped.');">
+                <button type="submit">⏹ Stop run</button>
+                <span class="dim">Terminates the run (and its model calls) now to stop spending tokens. Finished nodes are kept, so you can Resume it later from where it stopped.</span>
+            </form>
+        </div>
+    {% endif %}
+
+    {% if run.status == 'stopped' %}
+        <div class="card"><span class="dim">⏹ This run was stopped. Resume it below to continue from where it left off.</span></div>
+    {% elif run_running and not run_alive %}
+        <div class="card"><span class="dim">⚠ This run is marked “running” but its process is no longer alive (it likely crashed or the machine slept). Resume it below to continue.</span></div>
+    {% endif %}
+
+    {% if can_resume and not run_finished and not run_alive and not human_tasks %}
         <div class="card">
             <form method="post" action="{{ url_for('run_resume', run_id=run.run_id) }}"
                   onsubmit="return confirm('Resume this run? Only do this if it has stopped or crashed — resuming a run that is still going will launch a duplicate.');">

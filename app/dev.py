@@ -15,8 +15,10 @@ import json
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,7 @@ from mathagents.config_loader import load_solver_config
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, normalize_monitor_model_spec
 
 from app.dev_data import (
+    clear_stopped_marker,
     create_tool_definition,
     delete_preset,
     discover_agent_palette_items,
@@ -49,6 +52,9 @@ from app.dev_data import (
     find_preset,
     find_run,
     find_runs_awaiting_human,
+    run_process_alive,
+    stop_run_process,
+    write_stopped_marker,
     load_call_detail,
     load_event_tree,
     load_monitor_summaries,
@@ -661,6 +667,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             show_execution_graph=show_execution_graph,
             human_tasks=load_pending_human_tasks(run.path),
             run_finished=(run.status or "running") in _TERMINAL_RUN_STATUSES,
+            run_running=(run.status or "running") == "running",
+            run_alive=run_process_alive(run.path),
             can_resume=(run.path / "resume.json").exists(),
             prunable_bytes=estimate_prunable_bytes(run.path),
             pruned_kb=request.args.get("pruned_kb", type=int),
@@ -707,6 +715,9 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         if not argv:
             abort(400, description="empty resume spec")
         cmd = [sys.executable, *[str(a) for a in argv], "--resume-from", run_id]
+        # Drop any "stopped" marker so the relaunched run reads as running again,
+        # not as the stopped run it was a moment ago.
+        clear_stopped_marker(run.path)
         env = _dashboard_subprocess_env()
         log_path = run.path / "dashboard-resume.log"
         with log_path.open("a", encoding="utf-8") as log:
@@ -718,6 +729,20 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/stop", methods=["POST"])
+    def run_stop(run_id: str):
+        # Stop a live run: terminate its process group (worker + sandbox CLIs)
+        # and mark it "stopped" (non-terminal) so the Resume button shows. We do
+        # NOT freeze it (SIGSTOP) — a clean kill + durable resume is more robust
+        # than a frozen process the OS might reap. Resume replays finished nodes
+        # from the cache and continues from where it stopped.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        result = stop_run_process(run.path)
+        write_stopped_marker(run.path, signalled=result["signalled"])
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/prune", methods=["POST"])

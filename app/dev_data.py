@@ -11,9 +11,12 @@ import copy
 import hashlib
 import importlib
 import json
+import os
 import pkgutil
 import re
 import shutil
+import signal
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -538,8 +541,27 @@ def _read_run_info(path: Path) -> RunInfo:
     # from the event log. Cheap O(n) scan, ~kB-sized files.
     if info.has_events:
         _enrich_from_events(info)
+    _apply_stopped_marker(info)
     _finalize_run_info(info)
     return info
+
+
+def _apply_stopped_marker(info: RunInfo) -> None:
+    # A run the user stopped has no terminal run.end, so it would otherwise read
+    # as "running" forever. The marker flips it to non-terminal "stopped" (Resume
+    # shows) — but only over running/unknown, so a resumed run that later finishes
+    # (terminal status from metadata/run.end) keeps its real outcome.
+    if info.status not in (None, "running"):
+        return
+    marker = info.path / "run-control.json"
+    if not marker.exists():
+        return
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict) and str(data.get("status") or "").strip() == "stopped":
+        info.status = "stopped"
 
 
 def _batch_child_run_ids(infos: Iterable[RunInfo]) -> set[str]:
@@ -949,6 +971,99 @@ def prune_run_artifacts(run_path: Path) -> dict[str, int]:
             pruned_nodes += 1
             bytes_freed += node_freed
     return {"pruned_nodes": pruned_nodes, "bytes_freed": bytes_freed}
+
+
+def read_run_pid(run_path: Path) -> int | None:
+    """The worker PID recorded by run_workflow.py, or None if absent/garbage."""
+    try:
+        return int((run_path / "run.pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
+    """Terminate a run's process group (the worker plus its sandbox CLIs).
+
+    The worker records its PID in ``run.pid`` and the dashboard launches it as a
+    process-group leader, so that PID is the run's PGID. We SIGTERM the group,
+    wait briefly for a clean exit, then SIGKILL anything still alive. ``signalled``
+    is False when there was no live process to stop (already crashed/finished) —
+    the caller still marks the run stopped so Resume appears.
+    """
+    pid = read_run_pid(run_path)
+    if pid is None or not _pid_alive(pid):
+        return {"signalled": False, "pid": pid}
+    # Only signal the GROUP if this PID is genuinely its own group leader, else
+    # killpg would hit an unrelated group; otherwise signal just the process.
+    try:
+        use_group = os.getpgid(pid) == pid
+    except ProcessLookupError:
+        return {"signalled": False, "pid": pid}
+
+    def send(sig: int) -> None:
+        if use_group:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
+
+    try:
+        send(signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return {"signalled": False, "pid": pid}
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline and _pid_alive(pid):
+        time.sleep(0.1)
+    if _pid_alive(pid):
+        try:
+            send(signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        (run_path / "run.pid").unlink()
+    except OSError:
+        pass
+    return {"signalled": True, "pid": pid}
+
+
+def run_process_alive(run_path: Path) -> bool:
+    """True if the run's recorded worker PID is still a live process. Used to
+    tell a genuinely-running run from a phantom (status "running" but dead)."""
+    pid = read_run_pid(run_path)
+    return pid is not None and _pid_alive(pid)
+
+
+def write_stopped_marker(run_path: Path, *, signalled: bool) -> None:
+    """Mark a run deliberately stopped (non-terminal) so Resume surfaces it."""
+    payload = {
+        "status": "stopped",
+        "stopped_at": datetime.now().isoformat(timespec="seconds"),
+        "signalled": bool(signalled),
+    }
+    try:
+        (run_path / "run-control.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def clear_stopped_marker(run_path: Path) -> None:
+    """Drop the stopped marker — called on resume so the relaunched run is not
+    mislabelled stopped while it runs again."""
+    try:
+        (run_path / "run-control.json").unlink()
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------

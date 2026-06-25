@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -343,6 +344,24 @@ def _write_resume_spec(
         pass
 
 
+def _write_run_pid(run_dir: Path) -> None:
+    """Record this process's PID so the dashboard's Stop button can terminate
+    the run's process group. The dashboard launches this script as a process-
+    group leader (start_new_session / batch start_new_session), so this PID is
+    the run's PGID; the Stop route verifies that before signalling the group."""
+    try:
+        (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_run_pid(run_dir: Path) -> None:
+    try:
+        (run_dir / "run.pid").unlink()
+    except OSError:
+        pass
+
+
 def _append_additional_instructions(problem: str, extra: str) -> str:
     extra = extra.strip()
     if not extra:
@@ -456,6 +475,7 @@ async def amain() -> int:
     # Persist exactly how to relaunch this run, so the dashboard's "Resume"
     # button can replay it with --resume-from (in-place resume from the cache).
     _write_resume_spec(ctx.root_workdir, args, problem_text, problem_id, run_id, output_root)
+    _write_run_pid(ctx.root_workdir)
 
     built_inputs = preset.build_inputs(
         problem=problem_text,
@@ -508,6 +528,7 @@ async def amain() -> int:
             )
         )
         print(f"workflow failed: {type(e).__name__}: {e}", file=sys.stderr)
+        _clear_run_pid(ctx.root_workdir)
         return 1
 
     out_json = out.model_dump(mode="json") if hasattr(out, "model_dump") else out
@@ -522,6 +543,7 @@ async def amain() -> int:
         )
     )
 
+    _clear_run_pid(ctx.root_workdir)
     print(f"run_id: {run_id}")
     print(f"output: {ctx.root_workdir}")
     print("outputs:")
