@@ -214,6 +214,12 @@ class ConfigurableCLIAgent(CLIAgent):
             reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
             if reasoning_effort:
                 cmd = _with_codex_reasoning_effort(cmd, reasoning_effort)
+        else:
+            # Per-node model override for non-codex CLIs (e.g. claude): a node can
+            # use a stronger model than the global {claude_model} default.
+            model = str(self.component_config.get("model") or "").strip()
+            if model:
+                cmd = _with_claude_model(cmd, model)
         if self.component_config.get("prompt") and _is_codex_exec_cmd(cmd) and _codex_prompt_arg_index(cmd) is None:
             cmd = [*cmd, "-"]
         codex_sandbox = str(self.component_config.get("codex_sandbox") or "").strip()
@@ -366,6 +372,20 @@ def _with_codex_sandbox_flag(cmd: list[str], mode: str, backend: str) -> list[st
 def _with_codex_model(cmd: list[str], model: str) -> list[str]:
     cmd = _without_codex_model(cmd)
     return _insert_codex_exec_options(cmd, ["-m", model])
+
+
+def _with_claude_model(cmd: list[str], model: str) -> list[str]:
+    """Override the model of a non-codex (e.g. claude) command in place. Rewrites
+    the existing ``--model``/``-m`` value, or appends one if absent."""
+    out = list(cmd)
+    for i, part in enumerate(out):
+        if part in ("--model", "-m") and i + 1 < len(out):
+            out[i + 1] = model
+            return out
+        if part.startswith("--model="):
+            out[i] = f"--model={model}"
+            return out
+    return [*out, "--model", model]
 
 
 def _without_codex_model(cmd: list[str]) -> list[str]:
