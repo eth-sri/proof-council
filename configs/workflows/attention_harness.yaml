@@ -1,350 +1,421 @@
-# Attention-harness with a human hint specialist (after Bérczi, "attention
-# mechanisms in agentic harnesses", proof-council slides p.21).
-#
-# Each ROUND:
-#   four "hint" specialists look at the problem (+ the current attempt and the
-#   critic's last feedback) and each writes a short brief:
-#     - Premise  (AI)      key definitions / classical results
-#     - Analogy  (AI)      analogous proof templates / strategies
-#     - Lemma    (AI)      intermediate sub-claims a proof would need
-#     - Human    (YOU)     your idea, insight, or the obstruction you see
-#   -> SYNTHESIZE merges all four briefs into ONE focused brief (it does NOT pick
-#      one; it integrates the best of each, including yours)
-#   -> AUTHOR writes/extends the proof using that brief
-#   -> CRITIC checks it and writes a verdict (ready | continue) + feedback
-#   the feedback becomes the "objection memory" fed into the next round.
-#
-# The loop repeats until the critic says "ready" or max rounds is hit. The human
-# node is INSIDE the loop, so on a hard problem you get asked once per round —
-# that is intended. Subscription auth, no API keys, no Docker.
 workflow: proofstack.agents.dag_workflow.DAGWorkflow
-description: Attention-harness loop (3 AI hint specialists + human hint -> synthesize -> author -> critic), subscription only.
-
-# Subscription guardrails — see claude_only_min.yaml for the full rationale.
-# This preset LOOPS: each round runs 6 AI CLI calls (premise/analogy/lemma/
-# synthesize/author/critic). The repeat is bounded by max_rounds, but the real
-# cost dial is max_rounds itself (6 calls per round). max_tool_calls is a runaway
-# backstop set just above the default 4 rounds (24 calls) so normal runs don't
-# trip it but a misconfigured/looping run still stops. Until token accounting
-# lands, lowering max_rounds is the most direct way to cap spend on a hard problem.
+description: Attention-harness loop (3 Claude hint specialists + human hint -> synthesize -> author -> critic),
+  subscription only.
 budget:
-  max_usd: 5.0             # small cap on PAID calls (API node / --monitor / metered
-                           # codex); higher than the single-shot presets because this
-                           # LOOPS. Subscription CLI adds $0, so a pure-subscription run
-                           # stays at $0; this only bites if you add paid calls.
-  max_tokens: 40000000     # metered full throughput incl. cache, across ALL rounds
-                           # (see claude_only_min.yaml). Much higher than the
-                           # single-shot presets because this LOOPS 6 calls/round:
-                           # trivial ≈ 3.2M at 4 rounds, a hard opus run far more.
-                           # The real cost dial is max_rounds; this is the catch-all
-                           # backstop. Tighten via metered_tokens in model.call events.
-  max_tool_calls: 30       # backstop: ~5 rounds of 6 AI calls; stops a runaway loop
-  max_wallclock_s: 7200    # 2h compute backstop (human-wait time is exempt)
-
+  max_usd: 5.0
+  max_tokens: 40000000
+  max_tool_calls: 30
+  max_wallclock_s: 7200
 inputs:
+  claude_model: sonnet
+  max_rounds: 10
   problem: ''
-  claude_model: opus       # haiku for cheap testing
-  max_rounds: 4            # how many times the human may be asked
-
 components:
   claude_premise:
-    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
     soft_timeout_s: 780
-    sandbox: {backend: subprocess, timeout_s: 900}
-    env: {HOME: /Users/davidholmes}
-    cache_enabled: true   # replay this node from disk on resume (durable runs)
-    prompt: |
-      You are the PREMISE specialist in a proof-writing council. In a few bullet
-      points, name the key definitions and classical results most relevant to the
-      problem. Be brief and concrete; this is a hint for the author, not a proof.
-
-      Problem:
-      {problem}
-
-      Current proof attempt (may be empty on round 1):
-      {proof}
-
-      Critic's feedback from last round (may be empty):
-      {memory}
-
-      Write your brief to a file named  hint.txt , then run:
-        finish '{"status":"done","summary":"premise brief"}'
-      Work autonomously; do not ask questions.
-    input_schema: {problem: string, proof: string, memory: string, workspace: string}
-    output_schema: {workspace: string, hint: string, status: string}
-    output_files: {hint: hint.txt}
-    done_outputs: {status: status}
-    usage: {type: claude_json}
-
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the PREMISE specialist in a proof-writing council. In a few bullet\npoints, name\
+      \ the key definitions and classical results most relevant to the\nproblem. Be brief and concrete;\
+      \ this is a hint for the author, not a proof.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may\
+      \ be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\
+      \nWrite your brief to a file named  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\"\
+      :\"premise brief\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      hint: string
+      status: string
+    output_files:
+      hint: hint.txt
+    done_outputs:
+      status: status
   claude_analogy:
-    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
     soft_timeout_s: 780
-    sandbox: {backend: subprocess, timeout_s: 900}
-    env: {HOME: /Users/davidholmes}
-    cache_enabled: true   # replay this node from disk on resume (durable runs)
-    prompt: |
-      You are the ANALOGY specialist. In a few bullet points, suggest analogous
-      problems, standard proof templates, or strategies that have worked on
-      similar problems. Be brief; this is a hint for the author.
-
-      Problem:
-      {problem}
-
-      Current proof attempt (may be empty on round 1):
-      {proof}
-
-      Critic's feedback from last round (may be empty):
-      {memory}
-
-      Write your brief to a file named  hint.txt , then run:
-        finish '{"status":"done","summary":"analogy brief"}'
-      Work autonomously; do not ask questions.
-    input_schema: {problem: string, proof: string, memory: string, workspace: string}
-    output_schema: {workspace: string, hint: string, status: string}
-    output_files: {hint: hint.txt}
-    done_outputs: {status: status}
-    usage: {type: claude_json}
-
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the ANALOGY specialist. In a few bullet points, suggest analogous\nproblems, standard\
+      \ proof templates, or strategies that have worked on\nsimilar problems. Be brief; this is a hint\
+      \ for the author.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
+      \nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named\
+      \  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"analogy brief\"}'\nWork autonomously;\
+      \ do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      hint: string
+      status: string
+    output_files:
+      hint: hint.txt
+    done_outputs:
+      status: status
   claude_lemma:
-    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
     soft_timeout_s: 780
-    sandbox: {backend: subprocess, timeout_s: 900}
-    env: {HOME: /Users/davidholmes}
-    cache_enabled: true   # replay this node from disk on resume (durable runs)
-    prompt: |
-      You are the LEMMA specialist. In a few bullet points, list the intermediate
-      claims or sub-lemmas a correct proof would likely need, and flag which look
-      hardest. Be brief; this is a hint for the author.
-
-      Problem:
-      {problem}
-
-      Current proof attempt (may be empty on round 1):
-      {proof}
-
-      Critic's feedback from last round (may be empty):
-      {memory}
-
-      Write your brief to a file named  hint.txt , then run:
-        finish '{"status":"done","summary":"lemma brief"}'
-      Work autonomously; do not ask questions.
-    input_schema: {problem: string, proof: string, memory: string, workspace: string}
-    output_schema: {workspace: string, hint: string, status: string}
-    output_files: {hint: hint.txt}
-    done_outputs: {status: status}
-    usage: {type: claude_json}
-
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the LEMMA specialist. In a few bullet points, list the intermediate\nclaims or sub-lemmas\
+      \ a correct proof would likely need, and flag which look\nhardest. Be brief; this is a hint for\
+      \ the author.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
+      \nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named\
+      \  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"lemma brief\"}'\nWork autonomously;\
+      \ do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      hint: string
+      status: string
+    output_files:
+      hint: hint.txt
+    done_outputs:
+      status: status
   human_hint:
-    # You are the fourth hint specialist. You see the current attempt and the
-    # critic's feedback, and contribute whatever you've got — an idea, a key
-    # lemma, or the obstruction you think is blocking progress.
-    prompt: |
-      You are the HUMAN specialist on this proof council. Contribute whatever you
+    prompt: 'You are the HUMAN specialist on this proof council. Contribute whatever you
+
       have for THIS round: a key idea, a lemma, a strategy, or the obstruction you
+
       think is blocking progress. Even one line is valuable — the synthesizer will
-      merge it with the AI specialists' briefs.
+
+      merge it with the AI specialists'' briefs.
+
 
       Problem:
+
       {problem}
 
+
       Current proof attempt (may be empty on round 1):
+
       {proof}
 
-      Critic's feedback from last round (may be empty):
-      {memory}
-    input_schema: {problem: string, proof: string, memory: string}
-    output_schema: {hint: string, status: string}
 
+      Critic''s feedback from last round (may be empty):
+
+      {memory}
+
+      '
+    input_schema:
+      problem: string
+      proof: string
+      memory: string
+    output_schema:
+      hint: string
+      status: string
   claude_synthesize:
-    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
     soft_timeout_s: 780
-    sandbox: {backend: subprocess, timeout_s: 900}
-    env: {HOME: /Users/davidholmes}
-    cache_enabled: true   # replay this node from disk on resume (durable runs)
-    prompt: |
-      You are the council editor. Four specialists each wrote a brief about this
-      problem. Merge them into ONE short, focused brief for the author. Do NOT
-      just pick one — integrate the strongest, most useful ideas from each,
-      including the human's. Keep it actionable and concise.
-
-      Problem:
-      {problem}
-
-      Premise specialist:
-      {premise}
-
-      Analogy specialist:
-      {analogy}
-
-      Lemma specialist:
-      {lemma}
-
-      Human specialist:
-      {human}
-
-      Write the merged brief to a file named  brief.txt , then run:
-        finish '{"status":"done","summary":"merged brief"}'
-      Work autonomously; do not ask questions.
-    input_schema: {problem: string, premise: string, analogy: string, lemma: string, human: string, workspace: string}
-    output_schema: {workspace: string, brief: string, status: string}
-    output_files: {brief: brief.txt}
-    done_outputs: {status: status}
-    usage: {type: claude_json}
-
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the council editor. Four specialists each wrote a brief about this\nproblem. Merge\
+      \ them into ONE short, focused brief for the author. Do NOT\njust pick one — integrate the strongest,\
+      \ most useful ideas from each,\nincluding the human's. Keep it actionable and concise.\n\nProblem:\n\
+      {problem}\n\nPremise specialist:\n{premise}\n\nAnalogy specialist:\n{analogy}\n\nLemma specialist:\n\
+      {lemma}\n\nHuman specialist:\n{human}\n\nWrite the merged brief to a file named  brief.txt , then\
+      \ run:\n  finish '{\"status\":\"done\",\"summary\":\"merged brief\"}'\nWork autonomously; do not\
+      \ ask questions.\n"
+    input_schema:
+      problem: string
+      premise: string
+      analogy: string
+      lemma: string
+      human: string
+      workspace: string
+    output_schema:
+      workspace: string
+      brief: string
+      status: string
+    output_files:
+      brief: brief.txt
+    done_outputs:
+      status: status
   claude_author:
-    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
     soft_timeout_s: 780
-    sandbox: {backend: subprocess, timeout_s: 900}
-    env: {HOME: /Users/davidholmes}
-    cache_enabled: true   # replay this node from disk on resume (durable runs)
-    prompt: |
-      You are the author. Using the focused brief below, write or extend a
-      complete, rigorous proof. If there is a current attempt, improve it
-      according to the brief and the critic's feedback rather than starting over.
-
-      Problem:
-      {problem}
-
-      Focused brief (synthesized from the specialists):
-      {brief}
-
-      Current proof attempt (may be empty on round 1):
-      {proof}
-
-      Critic's feedback from last round (may be empty):
-      {memory}
-
-      Write your full solution as a self-contained LaTeX document to a file named
-        answer.tex , then run:
-        finish '{"status":"done","summary":"author draft"}'
-      Work autonomously; do not ask questions.
-    input_schema: {problem: string, brief: string, proof: string, memory: string, workspace: string}
-    output_schema: {workspace: string, answer_tex: string, status: string}
-    output_files: {answer_tex: answer.tex}
-    done_outputs: {status: status}
-    usage: {type: claude_json}
-
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the author/documenter for a mathematical research workflow. Your job\nis to turn\
+      \ the focused brief below into the clearest possible LaTeX progress\ndocument. If the ingredients\
+      \ are enough for a complete proof, write a\ncomplete rigorous proof. If they are not enough, do\
+      \ not pretend they are:\nwrite a clean partial proof, clearly separate established steps from\nconjectural\
+      \ or unfinished steps, and state exactly what remains to be proved.\n\nProblem:\n{problem}\n\nFocused\
+      \ brief (synthesized from the specialists):\n{brief}\n\nCurrent proof attempt (may be empty on round\
+      \ 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite a self-contained\
+      \ LaTeX document to a file named answer.tex. It should\ninclude:\n1. a concise status paragraph\
+      \ saying whether this is a complete proof or a\n   progress report;\n2. the cleanest rigorous argument\
+      \ currently justified by the brief and prior\n   attempt;\n3. a clearly marked section listing\
+      \ the remaining gaps, missing lemmas, or\n   checks still needed.\nThen run:\n  finish '{\"status\"\
+      :\"done\",\"summary\":\"author progress draft\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      brief: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      answer_tex: string
+      status: string
+    output_files:
+      answer_tex: answer.tex
+    done_outputs:
+      status: status
   claude_critic:
-    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
     soft_timeout_s: 780
-    sandbox: {backend: subprocess, timeout_s: 900}
-    env: {HOME: /Users/davidholmes}
-    cache_enabled: true   # replay this node from disk on resume (durable runs)
-    prompt: |
-      You are a strict referee. Check the proof rigorously for gaps, unjustified
-      steps, false claims, and missing cases.
-
-      Problem:
-      {problem}
-
-      Proof to check:
-      {proof}
-
-      Then do BOTH of these:
-      1. Write specific, actionable feedback (what to fix next) to a file named
-         feedback.md .
-      2. Write a file named  verdict.txt  containing EXACTLY one word, no
-         punctuation: "ready" if this is a complete and correct proof, otherwise
-         "continue".
-      Finally run:
-        finish '{"status":"done","summary":"critique"}'
-      Work autonomously; do not ask questions.
-    input_schema: {problem: string, proof: string, workspace: string}
-    output_schema: {workspace: string, verdict: string, feedback: string, status: string}
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are a strict referee. Check the proof rigorously for gaps, unjustified\nsteps, false\
+      \ claims, and missing cases.\n\nProblem:\n{problem}\n\nProof to check:\n{proof}\n\nThen do BOTH\
+      \ of these:\n1. Write specific, actionable feedback (what to fix next) to a file named\n   feedback.md\
+      \ .\n2. Write a file named  verdict.txt  containing EXACTLY one word, no\n   punctuation: \"ready\"\
+      \ if this is a complete and correct proof, otherwise\n   \"continue\".\nFinally run:\n  finish '{\"\
+      status\":\"done\",\"summary\":\"critique\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      workspace: string
+    output_schema:
+      workspace: string
+      verdict: string
+      feedback: string
+      status: string
     output_files:
       verdict: verdict.txt
       feedback: feedback.md
-    done_outputs: {status: status}
-    usage: {type: claude_json}
-
+    done_outputs:
+      status: status
 dag:
   nodes:
-    - id: rounds
-      kind: repeat
-      max_iterations: $input.max_rounds
-      initial_state:
-        proof: ''
-        memory: ''
-        verdict: pending
-      condition:
-        python: iteration == 0 or inputs.get("verdict", "").strip() != "ready"
-      body:
-        nodes:
-          - id: premise
-            kind: agent
-            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
-            name: claude_premise
-            inputs:
-              problem: $input.problem
-              claude_model: $input.claude_model
-              proof: $state.proof
-              memory: $state.memory
-          - id: analogy
-            kind: agent
-            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
-            name: claude_analogy
-            inputs:
-              problem: $input.problem
-              claude_model: $input.claude_model
-              proof: $state.proof
-              memory: $state.memory
-          - id: lemma
-            kind: agent
-            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
-            name: claude_lemma
-            inputs:
-              problem: $input.problem
-              claude_model: $input.claude_model
-              proof: $state.proof
-              memory: $state.memory
-          - id: human
-            kind: agent
-            agent: proofstack.agents.human_agent.HumanAgent
-            name: human_hint
-            inputs:
-              problem: $input.problem
-              proof: $state.proof
-              memory: $state.memory
-          - id: synthesize
-            kind: agent
-            needs: [premise, analogy, lemma, human]
-            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
-            name: claude_synthesize
-            inputs:
-              problem: $input.problem
-              claude_model: $input.claude_model
-              premise: $node.premise.hint
-              analogy: $node.analogy.hint
-              lemma: $node.lemma.hint
-              human: $node.human.hint
-          - id: author
-            kind: agent
-            needs: [synthesize]
-            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
-            name: claude_author
-            inputs:
-              problem: $input.problem
-              claude_model: $input.claude_model
-              brief: $node.synthesize.brief
-              proof: $state.proof
-              memory: $state.memory
-          - id: critic
-            kind: agent
-            needs: [author]
-            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
-            name: claude_critic
-            inputs:
-              problem: $input.problem
-              claude_model: $input.claude_model
-              proof: $node.author.answer_tex
-        state_updates:
+  - id: rounds
+    kind: repeat
+    max_iterations: $input.max_rounds
+    initial_state:
+      proof: ''
+      memory: ''
+      verdict: pending
+    condition:
+      python: iteration == 0 or inputs.get("verdict", "").strip() != "ready"
+    body:
+      nodes:
+      - id: premise
+        kind: agent
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_premise
+        inputs:
+          problem: $input.problem
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 328
+          y: -336
+      - id: analogy
+        kind: agent
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_analogy
+        inputs:
+          problem: $input.problem
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 350
+          y: -138
+      - id: lemma
+        kind: agent
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_lemma
+        inputs:
+          problem: $input.problem
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 363
+          y: 59
+      - id: human
+        kind: agent
+        agent: proofstack.agents.human_agent.HumanAgent
+        name: human_hint
+        inputs:
+          problem: $input.problem
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 355
+          y: 289
+      - id: synthesize
+        kind: agent
+        needs:
+        - premise
+        - analogy
+        - lemma
+        - human
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_synthesize
+        inputs:
+          problem: $input.problem
+          premise: $node.premise.hint
+          analogy: $node.analogy.hint
+          lemma: $node.lemma.hint
+          human: $node.human.hint
+        ui:
+          x: 1268
+          y: -48
+      - id: author
+        kind: agent
+        needs:
+        - synthesize
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_author
+        inputs:
+          problem: $input.problem
+          brief: $node.synthesize.brief
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 1758
+          y: 132
+      - id: critic
+        kind: agent
+        needs:
+        - author
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_critic
+        inputs:
+          problem: $input.problem
           proof: $node.author.answer_tex
-          memory: $node.critic.feedback
-          verdict: $node.critic.verdict
-      outputs:
-        best_tex: $state.proof
-        verdict: $state.verdict
-        last_feedback: $state.memory
+        ui:
+          x: 2250
+          y: 314
+      state_updates:
+        proof: $node.author.answer_tex
+        memory: $node.critic.feedback
+        verdict: $node.critic.verdict
+    outputs:
+      best_tex: $state.proof
+      verdict: $state.verdict
+      last_feedback: $state.memory
+    ui:
+      repeat_input:
+        x: -72
+        y: 83
+      repeat_output:
+        x: 2808
+        y: 53
   outputs:
     best_tex: $node.rounds.best_tex
     verdict: $node.rounds.verdict
