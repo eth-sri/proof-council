@@ -123,6 +123,32 @@ class StopRunProcessTests(unittest.TestCase):
                 self.assertIn("Resume run", page)
                 self.assertNotIn("Stop run", page)
 
+    def test_phantom_run_flagged_only_when_pid_present_and_dead(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def make_run(name: str) -> Path:
+                d = root / name
+                d.mkdir()
+                (d / "events.jsonl").write_text(
+                    '{"kind": "run.start", "payload": {}}\n', encoding="utf-8"
+                )
+                return d
+
+            dead = make_run("dead")
+            (dead / "run.pid").write_text("2147480000", encoding="utf-8")
+            self.assertTrue(_read_run_info(dead).process_dead)
+
+            no_pid = make_run("no-pid")  # e.g. batch parent / legacy run
+            self.assertFalse(_read_run_info(no_pid).process_dead)
+
+            alive = make_run("alive")  # e.g. a run still working / waiting on a human
+            proc = _spawn_group_leader()
+            self.addCleanup(proc.wait)
+            self.addCleanup(lambda: self._reap(proc.pid))
+            (alive / "run.pid").write_text(str(proc.pid), encoding="utf-8")
+            self.assertFalse(_read_run_info(alive).process_dead)
+
     def _wait_dead(self, pid: int, timeout: float = 3.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

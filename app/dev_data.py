@@ -442,6 +442,7 @@ class RunInfo:
     n_problems: int | None = None
     has_events: bool = False
     monitor_enabled: bool = False
+    process_dead: bool = False   # status "running" but the recorded PID is dead
     problems: dict[str, Any] = field(default_factory=dict)
 
 
@@ -542,8 +543,21 @@ def _read_run_info(path: Path) -> RunInfo:
     if info.has_events:
         _enrich_from_events(info)
     _apply_stopped_marker(info)
+    _apply_process_liveness(info)
     _finalize_run_info(info)
     return info
+
+
+def _apply_process_liveness(info: RunInfo) -> None:
+    # Flag a phantom: a run that still reads "running" but whose recorded worker
+    # PID is dead (crashed / laptop slept). Only when a PID is actually present —
+    # a run with no run.pid (batch parent, legacy run, or one waiting on a human
+    # whose worker is alive) must NOT be mislabelled.
+    if info.status != "running":
+        return
+    pid = read_run_pid(info.path)
+    if pid is not None and not _pid_alive(pid):
+        info.process_dead = True
 
 
 def _apply_stopped_marker(info: RunInfo) -> None:
@@ -595,6 +609,10 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
                 problem["started_at"] = child.started_at
             if child.status:
                 problem["status"] = child.status
+            # A batch parent has no run.pid of its own; inherit a child's phantom
+            # state so a dead single-problem run still surfaces on the list.
+            if child.process_dead:
+                info.process_dead = True
         if saw_cost:
             info.cost_usd = total_cost
 

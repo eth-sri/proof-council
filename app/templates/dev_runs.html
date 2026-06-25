@@ -27,7 +27,10 @@
                             <a class="agent-link" href="{{ url_for('run_detail', run_id=r.run_id) }}">{{ r.display_name }}</a>
                             {% if not r.has_events and r.n_problems and r.n_problems > 1 %}<span class="pill">batch</span>{% endif %}
                         </td>
-                        <td><span class="pill status-{{ r.status or 'running' }}">{{ r.status or 'running' }}</span></td>
+                        <td>
+                            <span class="pill status-{{ r.status or 'running' }}">{{ r.status or 'running' }}</span>
+                            {% if r.process_dead %}<span class="pill status-error" title="Marked running but the process is no longer alive — open the run to resume it.">stalled?</span>{% endif %}
+                        </td>
                         <td><span class="dim">{{ r.started_at | display_time }}</span></td>
                         <td>{% if r.cost_usd is not none %}${{ '%.4f'|format(r.cost_usd) }}{% else %}—{% endif %}</td>
                         <td>{% if r.wallclock_s is not none %}{{ r.wallclock_s | display_duration }}{% else %}—{% endif %}</td>
