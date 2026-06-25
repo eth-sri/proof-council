@@ -82,38 +82,7 @@ class ClaudeUsage:
         return self.num_turns > 0 or self.input_tokens > 0 or self.output_tokens > 0
 
 
-def _find_claude_result_object(text: str) -> dict | None:
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-    found: dict | None = None
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line[0] != "{":
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(ev, dict):
-            continue
-        if ev.get("type") == "result":
-            found = ev
-        elif found is None and isinstance(ev.get("usage"), dict):
-            found = ev
-    return found
-
-
-def parse_claude_json(text: str) -> ClaudeUsage:
-    obj = _find_claude_result_object(text)
-    if obj is None:
-        return ClaudeUsage()
+def _usage_from_result_object(obj: dict) -> ClaudeUsage:
     usage = obj.get("usage")
     usage = usage if isinstance(usage, dict) else {}
     return ClaudeUsage(
@@ -124,6 +93,63 @@ def parse_claude_json(text: str) -> ClaudeUsage:
         num_turns=int(obj.get("num_turns") or 0),
         total_cost_usd=float(obj.get("total_cost_usd") or 0.0),
     )
+
+
+def parse_claude_json(text: str) -> ClaudeUsage:
+    """Parse token usage from a ``claude -p`` run.
+
+    Handles both output formats:
+
+    - ``--output-format json`` / the final ``result`` event of stream-json: a
+      single object whose ``usage`` is the accurate CUMULATIVE total across all
+      turns (verified: its input/cache/output equal the sum of the per-turn
+      usages). When present it is authoritative — we use it directly.
+    - ``--output-format stream-json`` KILLED mid-run (no ``result`` event): we
+      reconstruct a partial total from the per-turn ``assistant`` usages. The
+      stream emits several ``assistant`` snapshots per turn (sharing a message
+      id) as the message streams, so we keep the LAST usage per message id and
+      sum across distinct turns — never double-counting a streamed turn. This is
+      the whole point of streaming: a node killed at its timeout — the most
+      expensive case — is still metered, instead of recording zero.
+    """
+    result_obj: dict | None = None
+    per_turn: dict[str, dict] = {}
+    anon_turns = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] != "{":
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        etype = ev.get("type")
+        if etype == "result":
+            result_obj = ev
+        elif etype == "assistant":
+            message = ev.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if isinstance(usage, dict):
+                mid = message.get("id")
+                if not mid:
+                    mid = f"_anon_{anon_turns}"
+                    anon_turns += 1
+                per_turn[str(mid)] = usage  # last streamed snapshot wins
+        elif result_obj is None and isinstance(ev.get("usage"), dict):
+            result_obj = ev  # bare single result object
+    if result_obj is not None:
+        return _usage_from_result_object(result_obj)
+    if per_turn:
+        agg = ClaudeUsage(num_turns=len(per_turn))
+        for usage in per_turn.values():
+            agg.input_tokens += int(usage.get("input_tokens") or 0)
+            agg.cache_creation_input_tokens += int(usage.get("cache_creation_input_tokens") or 0)
+            agg.cache_read_input_tokens += int(usage.get("cache_read_input_tokens") or 0)
+            agg.output_tokens += int(usage.get("output_tokens") or 0)
+        return agg
+    return ClaudeUsage()
 
 
 def cost_for_codex_usage(

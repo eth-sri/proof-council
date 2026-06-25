@@ -34,13 +34,16 @@ description: Claude + Codex dual-solver with a Claude synthesizer that merges th
 # Each call is additionally bounded per-node by soft_timeout_s (graceful "wrap up"
 # nudge) and sandbox.timeout_s (hard kill). See the components below.
 #
-# TOKEN METERING: each `claude -p --output-format json` call reports its usage;
-# we charge the FULL throughput (input + cache-create + cache-read + output) to
-# max_tokens. Cache reads dominate — in an agentic loop the cached system prompt +
-# conversation is re-fed every turn — so counting only input+output undercounts
+# TOKEN METERING: the claude nodes run `--output-format stream-json`, which emits
+# usage per turn as it goes; we SUM the per-turn usage and charge the FULL
+# throughput (input + cache-create + cache-read + output) to max_tokens. Streaming
+# (not the end-only `json`) is deliberate: a node KILLED by its timeout — the most
+# expensive case — is still metered for the work it did before the kill, instead of
+# recording zero. Cache reads dominate — in an agentic loop the cached system prompt
+# + conversation is re-fed every turn — so counting only input+output undercounts
 # ~40x and would miss exactly the runaway this guards against. Real baseline
 # (measured): a trivial haiku call ≈ 135k metered tokens (input 44, output ~3k,
-# the rest cache). A hard opus run with many turns is far larger; the per-call
+# the rest cache). A hard run with many turns is far larger; the per-call
 # `metered_tokens` is recorded in each model.call event, so your real runs
 # self-calibrate this ceiling.
 budget:
@@ -76,7 +79,8 @@ components:
       - claude
       - -p                               # headless: read prompt from stdin, print, exit
       - --output-format
-      - json                             # emit a usage JSON so tokens can be metered
+      - stream-json                      # per-turn usage; a timed-out node is still metered
+      - --verbose                        # required with stream-json in -p mode
       - --model
       - "{claude_model}"                 # per-run knob (see top-level inputs)
       # Least-privilege instead of --dangerously-skip-permissions:
@@ -192,7 +196,8 @@ components:
       - claude
       - -p
       - --output-format
-      - json
+      - stream-json
+      - --verbose
       - --model
       - "{claude_model}"                 # per-run knob (see top-level inputs)
       - --permission-mode

@@ -42,7 +42,8 @@ components:
       - claude
       - -p
       - --output-format
-      - json
+      - stream-json
+      - --verbose
       - --model
       - "{claude_model}"
       - --permission-mode
@@ -109,7 +110,8 @@ components:
       - claude
       - -p
       - --output-format
-      - json
+      - stream-json
+      - --verbose
       - --model
       - "{claude_model}"
       - --permission-mode

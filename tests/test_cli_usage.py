@@ -50,6 +50,55 @@ class ParseClaudeJsonTests(unittest.TestCase):
         self.assertEqual(usage.output_tokens, 50)
         self.assertEqual(usage.num_turns, 3)
 
+    def _assistant(self, mid: str, **usage) -> str:
+        return json.dumps({"type": "assistant", "message": {"id": mid, "usage": usage}})
+
+    def test_stream_json_completed_uses_result_total(self) -> None:
+        # The real stream emits several assistant snapshots per turn (same id)
+        # plus a final result with the CUMULATIVE total. The result is
+        # authoritative — duplicate snapshots must not inflate the count.
+        lines = [
+            json.dumps({"type": "system", "subtype": "init"}),
+            self._assistant("msg_a", input_tokens=10, cache_read_input_tokens=5000, output_tokens=0),
+            self._assistant("msg_a", input_tokens=10, cache_read_input_tokens=5000, output_tokens=200),
+            self._assistant("msg_b", input_tokens=12, cache_read_input_tokens=5200, output_tokens=300),
+            json.dumps(
+                {
+                    "type": "result",
+                    "num_turns": 2,
+                    "total_cost_usd": 0.03,
+                    "usage": {
+                        "input_tokens": 22,
+                        "cache_read_input_tokens": 10200,
+                        "output_tokens": 500,
+                    },
+                }
+            ),
+        ]
+        usage = parse_claude_json("\n".join(lines))
+        self.assertEqual(usage.input_tokens, 22)
+        self.assertEqual(usage.cache_read_input_tokens, 10200)
+        self.assertEqual(usage.output_tokens, 500)
+        self.assertEqual(usage.num_turns, 2)
+        self.assertAlmostEqual(usage.total_cost_usd, 0.03)
+        self.assertEqual(usage.metered_tokens, 22 + 10200 + 500)
+
+    def test_stream_json_killed_dedupes_and_sums_turns(self) -> None:
+        # No final `result` (killed by a timeout). Reconstruct from per-turn
+        # usage, deduping the repeated streaming snapshots by message id so a
+        # turn is counted once — and still metered (not zero).
+        lines = [
+            json.dumps({"type": "system", "subtype": "init"}),
+            self._assistant("msg_a", input_tokens=10, cache_creation_input_tokens=8000, cache_read_input_tokens=50000, output_tokens=900),
+            self._assistant("msg_a", input_tokens=10, cache_creation_input_tokens=8000, cache_read_input_tokens=50000, output_tokens=1500),
+            self._assistant("msg_b", input_tokens=12, cache_read_input_tokens=60000, output_tokens=1800),
+        ]
+        usage = parse_claude_json("\n".join(lines))
+        self.assertTrue(usage.found)
+        self.assertEqual(usage.num_turns, 2)  # two distinct message ids
+        self.assertEqual(usage.output_tokens, 3300)  # 1500 (last msg_a) + 1800
+        self.assertEqual(usage.metered_tokens, 22 + 8000 + 110000 + 3300)
+
     def test_empty_or_garbage_is_not_found(self) -> None:
         for text in ("", "   ", "not json at all", "plain stdout\nno usage here"):
             usage = parse_claude_json(text)

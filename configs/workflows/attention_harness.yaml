@@ -45,7 +45,7 @@ inputs:
 
 components:
   claude_premise:
-    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     soft_timeout_s: 780
     sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
@@ -74,7 +74,7 @@ components:
     usage: {type: claude_json}
 
   claude_analogy:
-    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     soft_timeout_s: 780
     sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
@@ -103,7 +103,7 @@ components:
     usage: {type: claude_json}
 
   claude_lemma:
-    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     soft_timeout_s: 780
     sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
@@ -153,7 +153,7 @@ components:
     output_schema: {hint: string, status: string}
 
   claude_synthesize:
-    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     soft_timeout_s: 780
     sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
@@ -189,7 +189,7 @@ components:
     usage: {type: claude_json}
 
   claude_author:
-    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     soft_timeout_s: 780
     sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
@@ -222,7 +222,7 @@ components:
     usage: {type: claude_json}
 
   claude_critic:
-    cmd: [claude, -p, --output-format, json, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
+    cmd: [claude, -p, --output-format, stream-json, --verbose, --model, "{claude_model}", --permission-mode, acceptEdits, --allowedTools, "Bash(finish:*)"]
     soft_timeout_s: 780
     sandbox: {backend: subprocess, timeout_s: 900}
     env: {HOME: /Users/davidholmes}
