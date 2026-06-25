@@ -60,7 +60,14 @@
         {% for task in human_tasks %}
             <div class="card human-task-card">
                 <h2>⏳ Waiting for your input{% if task.agent %} — <span class="dim">{{ task.agent }}</span>{% endif %}</h2>
-                {% if task.prompt %}<pre class="human-task-prompt">{{ task.prompt }}</pre>{% endif %}
+                {% if task.prompt %}
+                    <div class="output-toolbar">
+                        <button type="button" class="copy-prompt-btn">Copy</button>
+                        <button type="button" class="prompt-txt-btn">Download .txt</button>
+                        <button type="button" class="prompt-pdf-btn">Download PDF</button>
+                    </div>
+                    <pre class="human-task-prompt">{{ task.prompt }}</pre>
+                {% endif %}
                 <form method="post" action="{{ url_for('run_human_submit', run_id=run.run_id) }}">
                     <input type="hidden" name="response_filename" value="{{ task.response_filename }}">
                     {% for field, ftype in task.output_fields.items() %}

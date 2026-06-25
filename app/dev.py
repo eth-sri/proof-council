@@ -901,6 +901,30 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             headers={"Content-Disposition": f'inline; filename="{field}.pdf"'},
         )
 
+    @app.route("/compile/text-pdf", methods=["POST"])
+    def compile_text_pdf():
+        # Render arbitrary text (e.g. a human-task prompt) as a readable monospace
+        # PDF. Local dashboard only; the content is the system's own.
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get("text") or "")
+        if not text.strip():
+            abort(400, description="empty text")
+        name = str(payload.get("filename") or "document")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+            name = "document"
+        pdf, log = _compile_latex_pdf(
+            _MONOSPACE_TEMPLATE.replace("__NAME__", name),
+            name,
+            extra_files={f"{name}.txt": text},
+        )
+        if pdf is None:
+            return Response("PDF render failed:\n\n" + log, status=422, mimetype="text/plain")
+        return Response(
+            pdf,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{name}.pdf"'},
+        )
+
     return app
 
 
@@ -908,10 +932,25 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
 # launched dashboard may not have on PATH; add it so the compiler is found.
 _TEX_BIN = "/Library/TeX/texbin"
 
+# Robust "just readable" wrapper for arbitrary text: listings reads the text from
+# a sidecar file (\lstinputlisting), so any content compiles with no escaping and
+# long lines wrap. Monospace, not typeset — fine for reading a prompt.
+_MONOSPACE_TEMPLATE = r"""\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{listings}
+\lstset{breaklines=true,basicstyle=\small\ttfamily,columns=fullflexible}
+\begin{document}
+\lstinputlisting{__NAME__.txt}
+\end{document}
+"""
 
-def _compile_latex_pdf(tex_source: str, name: str) -> tuple[bytes | None, str]:
+
+def _compile_latex_pdf(
+    tex_source: str, name: str, *, extra_files: dict[str, str] | None = None
+) -> tuple[bytes | None, str]:
     """Compile a LaTeX document to PDF in a throwaway dir. Returns (pdf_bytes,
-    log); pdf_bytes is None on failure with the tail of the compiler log."""
+    log); pdf_bytes is None on failure with the tail of the compiler log.
+    extra_files are written alongside name.tex (e.g. a sidecar text file)."""
     search_path = os.environ.get("PATH", "") + os.pathsep + _TEX_BIN
     latexmk = shutil.which("latexmk", path=search_path)
     pdflatex = shutil.which("pdflatex", path=search_path)
@@ -926,6 +965,8 @@ def _compile_latex_pdf(tex_source: str, name: str) -> tuple[bytes | None, str]:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         (tmp_path / f"{name}.tex").write_text(tex_source, encoding="utf-8")
+        for fname, content in (extra_files or {}).items():
+            (tmp_path / fname).write_text(content, encoding="utf-8")
         try:
             proc = subprocess.run(
                 cmd, cwd=tmp, capture_output=True, text=True, timeout=120, env=env
