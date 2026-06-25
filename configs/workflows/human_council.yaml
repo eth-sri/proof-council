@@ -8,6 +8,10 @@
 # All three solvers run in parallel; the run waits for whichever is slowest
 # (usually you). Subscription auth, no API keys, no Docker — see claude_only_min
 # for the detailed notes on the Claude HOME override and Codex copy_codex_auth.
+#
+# Needs both the `claude` AND `codex` CLIs logged in. If you only have `claude`,
+# use an all-Claude human-in-the-loop preset instead: `attention_harness.yaml`
+# has a human node and every AI node is Claude-only (no Codex required).
 workflow: proofstack.agents.dag_workflow.DAGWorkflow
 description: Claude + Codex + Human solvers, merged by a Claude synthesizer (subscription, no API key, no Docker).
 

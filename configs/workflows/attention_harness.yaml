@@ -1,14 +1,14 @@
 workflow: proofstack.agents.dag_workflow.DAGWorkflow
-description: Attention-harness loop (3 Claude hint specialists + human hint -> synthesize -> author -> critic),
-  subscription only.
+description: Attention-harness loop (3 Claude hint specialists + human hint -> synthesize -> author ->
+  critic), subscription only.
 budget:
   max_usd: 5.0
   max_tokens: 40000000
-  max_tool_calls: 30
+  max_tool_calls: 48
   max_wallclock_s: 7200
 inputs:
-  claude_model: sonnet
-  max_rounds: 10
+  claude_model: opus
+  max_rounds: 6
   problem: ''
 components:
   claude_premise:
@@ -35,10 +35,11 @@ components:
       type: claude_json
     prompt: "You are the PREMISE specialist in a proof-writing council. In a few bullet\npoints, name\
       \ the key definitions and classical results most relevant to the\nproblem. Be brief and concrete;\
-      \ this is a hint for the author, not a proof. Flag any you are unsure are actually relevant.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may\
-      \ be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\
-      \nWrite your brief to a file named  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\"\
-      :\"premise brief\"}'\nWork autonomously; do not ask questions.\n"
+      \ this is a hint for the author, not a proof. Flag any you are unsure are actually relevant.\n\n\
+      Problem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback\
+      \ from last round (may be empty):\n{memory}\n\nWrite your brief to a file named  hint.txt , then\
+      \ run:\n  finish '{\"status\":\"done\",\"summary\":\"premise brief\"}'\nWork autonomously; do not\
+      \ ask questions.\n"
     input_schema:
       problem: string
       proof: string
@@ -76,10 +77,10 @@ components:
       type: claude_json
     prompt: "You are the ANALOGY specialist. In a few bullet points, suggest analogous\nproblems, standard\
       \ proof templates, or strategies that have worked on\nsimilar problems. Be brief; this is a hint\
-      \ for the author. Flag how promising vs. speculative each suggestion is.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
-      \nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named\
-      \  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"analogy brief\"}'\nWork autonomously;\
-      \ do not ask questions.\n"
+      \ for the author. Flag how promising vs. speculative each suggestion is.\n\nProblem:\n{problem}\n\
+      \nCurrent proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback from last round\
+      \ (may be empty):\n{memory}\n\nWrite your brief to a file named  hint.txt , then run:\n  finish\
+      \ '{\"status\":\"done\",\"summary\":\"analogy brief\"}'\nWork autonomously; do not ask questions.\n"
     input_schema:
       problem: string
       proof: string
@@ -116,11 +117,11 @@ components:
     usage:
       type: claude_json
     prompt: "You are the LEMMA specialist. In a few bullet points, list the intermediate\nclaims or sub-lemmas\
-      \ a correct proof would likely need, and flag which look\nhardest, and how confident you are each is needed and true. Be brief; this is a hint for\
-      \ the author.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
-      \nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named\
-      \  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"lemma brief\"}'\nWork autonomously;\
-      \ do not ask questions.\n"
+      \ a correct proof would likely need, and flag which look\nhardest, and how confident you are each\
+      \ is needed and true. Be brief; this is a hint for the author.\n\nProblem:\n{problem}\n\nCurrent\
+      \ proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be\
+      \ empty):\n{memory}\n\nWrite your brief to a file named  hint.txt , then run:\n  finish '{\"status\"\
+      :\"done\",\"summary\":\"lemma brief\"}'\nWork autonomously; do not ask questions.\n"
     input_schema:
       problem: string
       proof: string
@@ -139,7 +140,8 @@ components:
 
       have for THIS round: a key idea, a lemma, a strategy, or the obstruction you
 
-      think is blocking progress. Even one line is valuable, and feel free to flag how sure you are (a hunch vs. something solid) — the synthesizer will
+      think is blocking progress. Even one line is valuable, and feel free to flag how sure you are (a
+      hunch vs. something solid) — the synthesizer will
 
       merge it with the AI specialists'' briefs.
 
@@ -190,11 +192,11 @@ components:
       type: claude_json
     prompt: "You are the council editor. Four specialists each wrote a brief about this\nproblem. Merge\
       \ them into ONE short, focused brief for the author. Do NOT\njust pick one — integrate the strongest,\
-      \ most useful ideas from each,\nincluding the human's. Keep it actionable and concise. Note which ideas look solid vs. speculative.\n\nProblem:\n\
-      {problem}\n\nPremise specialist:\n{premise}\n\nAnalogy specialist:\n{analogy}\n\nLemma specialist:\n\
-      {lemma}\n\nHuman specialist:\n{human}\n\nWrite the merged brief to a file named  brief.txt , then\
-      \ run:\n  finish '{\"status\":\"done\",\"summary\":\"merged brief\"}'\nWork autonomously; do not\
-      \ ask questions.\n"
+      \ most useful ideas from each,\nincluding the human's. Keep it actionable and concise. Note which\
+      \ ideas look solid vs. speculative.\n\nProblem:\n{problem}\n\nPremise specialist:\n{premise}\n\n\
+      Analogy specialist:\n{analogy}\n\nLemma specialist:\n{lemma}\n\nHuman specialist:\n{human}\n\nWrite\
+      \ the merged brief to a file named  brief.txt , then run:\n  finish '{\"status\":\"done\",\"summary\"\
+      :\"merged brief\"}'\nWork autonomously; do not ask questions.\n"
     input_schema:
       problem: string
       premise: string
@@ -235,15 +237,16 @@ components:
     prompt: "You are the author/documenter for a mathematical research workflow. Your job\nis to turn\
       \ the focused brief below into the clearest possible LaTeX progress\ndocument. If the ingredients\
       \ are enough for a complete proof, write a\ncomplete rigorous proof. If they are not enough, do\
-      \ not pretend they are:\nwrite a clean partial proof, clearly separate established steps from\nconjectural\
-      \ or unfinished steps, and state exactly what remains to be proved.\n\nProblem:\n{problem}\n\nFocused\
-      \ brief (synthesized from the specialists):\n{brief}\n\nCurrent proof attempt (may be empty on round\
-      \ 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite a self-contained\
-      \ LaTeX document to a file named answer.tex. It should\ninclude:\n1. a concise status paragraph\
-      \ saying whether this is a complete proof or a\n   progress report;\n2. the cleanest rigorous argument\
-      \ currently justified by the brief and prior\n   attempt;\n3. a clearly marked section listing\
-      \ the remaining gaps, missing lemmas, or\n   checks still needed.\nThen run:\n  finish '{\"status\"\
-      :\"done\",\"summary\":\"author progress draft\"}'\nWork autonomously; do not ask questions.\n"
+      \ not pretend they are:\nwrite a clean partial proof, clearly separate established steps from\n\
+      conjectural or unfinished steps, and state exactly what remains to be proved.\n\nProblem:\n{problem}\n\
+      \nFocused brief (synthesized from the specialists):\n{brief}\n\nCurrent proof attempt (may be empty\
+      \ on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite\
+      \ a self-contained LaTeX document to a file named answer.tex. It should\ninclude:\n1. a concise\
+      \ status paragraph saying whether this is a complete proof or a\n   progress report;\n2. the cleanest\
+      \ rigorous argument currently justified by the brief and prior\n   attempt;\n3. a clearly marked\
+      \ section listing the remaining gaps, missing lemmas, or\n   checks still needed.\nThen run:\n \
+      \ finish '{\"status\":\"done\",\"summary\":\"author progress draft\"}'\nWork autonomously; do not\
+      \ ask questions.\n"
     input_schema:
       problem: string
       brief: string
