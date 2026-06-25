@@ -123,6 +123,33 @@ class StopRunProcessTests(unittest.TestCase):
                 self.assertIn("Resume run", page)
                 self.assertNotIn("Stop run", page)
 
+    def test_detail_page_phantom_notice_only_for_dead_pid(self) -> None:
+        # The "no longer alive" notice must fire only when a PID is present and
+        # dead — never for a running run that simply has no run.pid (old run or
+        # batch parent), which would otherwise promise a Resume button that the
+        # run has no resume.json to back.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def make_run(name: str) -> Path:
+                d = root / name
+                d.mkdir()
+                (d / "events.jsonl").write_text(
+                    '{"kind": "run.start", "payload": {}}\n', encoding="utf-8"
+                )
+                return d
+
+            dead = make_run("dead")
+            (dead / "run.pid").write_text("2147480000", encoding="utf-8")
+            no_pid = make_run("nopid")
+
+            app = create_app(runs_roots=(root,))
+            with app.test_client() as client:
+                dead_page = client.get("/run/dead").get_data(as_text=True)
+                self.assertIn("no longer alive", dead_page)
+                nopid_page = client.get("/run/nopid").get_data(as_text=True)
+                self.assertNotIn("no longer alive", nopid_page)
+
     def test_phantom_run_flagged_only_when_pid_present_and_dead(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
