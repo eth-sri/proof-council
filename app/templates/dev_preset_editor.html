@@ -3941,11 +3941,27 @@
             });
         }
 
+        // The wallclock budget is stored in SECONDS but shown/edited in MINUTES
+        // (seconds is awkward to reason about). Convert on the way in and out.
+        function wallclockSecondsToMinutes(seconds) {
+            if (seconds === '' || seconds === null || seconds === undefined) return '';
+            const n = Number(seconds);
+            if (!isFinite(n)) return String(seconds);
+            const minutes = n / 60;
+            return String(Number.isInteger(minutes) ? minutes : Math.round(minutes * 100) / 100);
+        }
+        function wallclockMinutesToSeconds(minutes) {
+            if (minutes === '' || minutes === null || minutes === undefined) return minutes;
+            const n = Number(minutes);
+            if (!isFinite(n)) return minutes;
+            return String(Math.round(n * 60));
+        }
+
         function workflowBudgetEditorHtml(prefix) {
             const rawBudget = currentReport.workflow_budget || {};
             const budget = {
                 max_usd: rawBudget.max_usd ?? '',
-                max_wallclock_s: rawBudget.max_wallclock_s ?? '',
+                max_wallclock_s: wallclockSecondsToMinutes(rawBudget.max_wallclock_s),
             };
             return mappingEditor(prefix, budget, {
                 sourcePicker: false,
@@ -4545,8 +4561,8 @@
             const labels = {
                 problem: 'Problem statement',
                 problem_id: 'Problem id',
-                max_usd: 'Cost budget',
-                max_wallclock_s: 'Time budget',
+                max_usd: 'Cost budget ($)',
+                max_wallclock_s: 'Time budget (minutes)',
                 n: 'Number of approaches',
                 n_approaches: 'Number of approaches',
                 skip_literature_search: 'Skip literature search',
@@ -5978,9 +5994,13 @@
         }
 
         async function applyWorkflowBudget(prefix) {
+            const budget = collectMappingEntries(prefix);
+            if (budget && 'max_wallclock_s' in budget) {
+                budget.max_wallclock_s = wallclockMinutesToSeconds(budget.max_wallclock_s);
+            }
             await mutateEditor({
                 op: 'update_workflow_budget',
-                budget: collectMappingEntries(prefix),
+                budget,
             }, {status: 'Workflow budget updated', renderReport: false});
         }
 
