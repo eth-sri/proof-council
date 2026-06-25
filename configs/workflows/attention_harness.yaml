@@ -35,7 +35,7 @@ components:
       type: claude_json
     prompt: "You are the PREMISE specialist in a proof-writing council. In a few bullet\npoints, name\
       \ the key definitions and classical results most relevant to the\nproblem. Be brief and concrete;\
-      \ this is a hint for the author, not a proof.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may\
+      \ this is a hint for the author, not a proof. Flag any you are unsure are actually relevant.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may\
       \ be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\
       \nWrite your brief to a file named  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\"\
       :\"premise brief\"}'\nWork autonomously; do not ask questions.\n"
@@ -76,7 +76,7 @@ components:
       type: claude_json
     prompt: "You are the ANALOGY specialist. In a few bullet points, suggest analogous\nproblems, standard\
       \ proof templates, or strategies that have worked on\nsimilar problems. Be brief; this is a hint\
-      \ for the author.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
+      \ for the author. Flag how promising vs. speculative each suggestion is.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
       \nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named\
       \  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"analogy brief\"}'\nWork autonomously;\
       \ do not ask questions.\n"
@@ -116,7 +116,7 @@ components:
     usage:
       type: claude_json
     prompt: "You are the LEMMA specialist. In a few bullet points, list the intermediate\nclaims or sub-lemmas\
-      \ a correct proof would likely need, and flag which look\nhardest. Be brief; this is a hint for\
+      \ a correct proof would likely need, and flag which look\nhardest, and how confident you are each is needed and true. Be brief; this is a hint for\
       \ the author.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
       \nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named\
       \  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"lemma brief\"}'\nWork autonomously;\
@@ -139,7 +139,7 @@ components:
 
       have for THIS round: a key idea, a lemma, a strategy, or the obstruction you
 
-      think is blocking progress. Even one line is valuable — the synthesizer will
+      think is blocking progress. Even one line is valuable, and feel free to flag how sure you are (a hunch vs. something solid) — the synthesizer will
 
       merge it with the AI specialists'' briefs.
 
@@ -190,7 +190,7 @@ components:
       type: claude_json
     prompt: "You are the council editor. Four specialists each wrote a brief about this\nproblem. Merge\
       \ them into ONE short, focused brief for the author. Do NOT\njust pick one — integrate the strongest,\
-      \ most useful ideas from each,\nincluding the human's. Keep it actionable and concise.\n\nProblem:\n\
+      \ most useful ideas from each,\nincluding the human's. Keep it actionable and concise. Note which ideas look solid vs. speculative.\n\nProblem:\n\
       {problem}\n\nPremise specialist:\n{premise}\n\nAnalogy specialist:\n{analogy}\n\nLemma specialist:\n\
       {lemma}\n\nHuman specialist:\n{human}\n\nWrite the merged brief to a file named  brief.txt , then\
       \ run:\n  finish '{\"status\":\"done\",\"summary\":\"merged brief\"}'\nWork autonomously; do not\
