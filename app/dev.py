@@ -191,6 +191,20 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             return f"{hours} h"
         return f"{total_minutes} min"
 
+    @app.template_filter("display_tokens")
+    def display_tokens(value):
+        if value is None:
+            return "—"
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return "—"
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"{n / 1_000:.0f}k"
+        return str(n)
+
     @app.route("/")
     def index():
         return render_template("dev_home.html")
@@ -771,6 +785,9 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             {
                 "pending": sorted(str(t["response_filename"]) for t in tasks),
                 "finished": finished,
+                # The worker's live state, so the page can swap the Stop/Resume
+                # button when a resume's process comes up (or a stop's goes down).
+                "alive": run_process_alive(run.path),
             }
         )
 

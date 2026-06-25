@@ -15,7 +15,8 @@
                     <th>Run</th>
                     <th>Status</th>
                     <th>Started</th>
-                    <th>Cost</th>
+                    <th>USD</th>
+                    <th>Tokens</th>
                     <th>Wallclock</th>
                     <th>Problems</th>
                 </tr>
@@ -33,6 +34,7 @@
                         </td>
                         <td><span class="dim">{{ r.started_at | display_time }}</span></td>
                         <td>{% if r.cost_usd is not none %}${{ '%.4f'|format(r.cost_usd) }}{% else %}—{% endif %}</td>
+                        <td><span class="dim">{{ r.tokens | display_tokens }}</span></td>
                         <td>{% if r.wallclock_s is not none %}{{ r.wallclock_s | display_duration }}{% else %}—{% endif %}</td>
                         <td>
                             {% if r.problem_summary %}

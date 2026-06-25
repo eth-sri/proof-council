@@ -438,6 +438,7 @@ class RunInfo:
     preset: str | None = None
     problem_summary: str | None = None
     cost_usd: float | None = None
+    tokens: int | None = None    # total tokens processed (the subscription dial)
     wallclock_s: float | None = None
     n_problems: int | None = None
     has_events: bool = False
@@ -562,10 +563,11 @@ def _apply_process_liveness(info: RunInfo) -> None:
 
 def _apply_stopped_marker(info: RunInfo) -> None:
     # A run the user stopped has no terminal run.end, so it would otherwise read
-    # as "running" forever. The marker flips it to non-terminal "stopped" (Resume
-    # shows) — but only over running/unknown, so a resumed run that later finishes
-    # (terminal status from metadata/run.end) keeps its real outcome.
-    if info.status not in (None, "running"):
+    # as "running" forever — or "error" if the kill raced the worker into an error
+    # run.end. The marker flips it to non-terminal "stopped" (Resume shows). We
+    # override running/unknown/error but NOT "finished": if it genuinely completed
+    # before the stop took effect, that real outcome wins.
+    if info.status == "finished":
         return
     marker = info.path / "run-control.json"
     if not marker.exists():
@@ -594,7 +596,9 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
         if not info.problems:
             continue
         total_cost = 0.0
+        total_tokens = 0
         saw_cost = False
+        saw_tokens = False
         for problem in info.problems.values():
             if not isinstance(problem, dict):
                 continue
@@ -605,6 +609,9 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
             if child.cost_usd is not None:
                 total_cost += float(child.cost_usd)
                 saw_cost = True
+            if child.tokens is not None:
+                total_tokens += int(child.tokens)
+                saw_tokens = True
             if not problem.get("started_at") and child.started_at:
                 problem["started_at"] = child.started_at
             if child.status:
@@ -615,20 +622,23 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
                 info.process_dead = True
         if saw_cost:
             info.cost_usd = total_cost
+        if saw_tokens:
+            info.tokens = total_tokens
         # Recompute the parent status from the children's REAL statuses (just
         # refreshed above). The batch manifest is a stale snapshot: if the batch
-        # process died after a child finished but before it recorded the result,
-        # the parent is stuck "running" while the child reads "finished". The
-        # children are ground truth — but never override a terminal status the
-        # batch itself recorded (a clean run wrote "finished"/"error").
-        if info.status not in ("finished", "error"):
-            derived = _status_from_problem_statuses(
-                [p.get("status") for p in info.problems.values() if isinstance(p, dict)]
-            )
-            if derived:
-                info.status = derived
-                if derived in ("finished", "error"):
-                    info.process_dead = False  # resolved, not a phantom
+        # process died after a child finished/was stopped but before it recorded
+        # the result, the parent is stuck "running" or mislabelled "error" (a
+        # stopped child exits non-zero, which the batch records as a failure).
+        # Children are ground truth. We override a stale terminal status only when
+        # the children show the run is actually still going ("running") or was
+        # deliberately stopped ("stopped") — never to fabricate a finish.
+        derived = _status_from_problem_statuses(
+            [p.get("status") for p in info.problems.values() if isinstance(p, dict)]
+        )
+        if derived and (info.status not in ("finished", "error") or derived in ("running", "stopped")):
+            info.status = derived
+            if derived in ("finished", "error"):
+                info.process_dead = False  # resolved, not a phantom
 
 
 def _enrich_from_dashboard_subprocess_log(info: RunInfo, *, finished_at: Any) -> None:
@@ -670,6 +680,8 @@ def _dashboard_subprocess_failure_message(path: Path) -> str:
 
 def _enrich_from_events(info: RunInfo) -> None:
     cost = 0.0
+    tokens = 0
+    saw_tokens = False
     first_ts: str | None = None
     last_ts: str | None = None
     saw_workflow_failure = False
@@ -709,12 +721,20 @@ def _enrich_from_events(info: RunInfo) -> None:
                 if e.get("kind") == "model.call":
                     p = e.get("payload") or {}
                     cost += float(p.get("cost_usd") or 0.0)
+                    if "metered_tokens" in p or "in_tokens" in p or "out_tokens" in p:
+                        saw_tokens = True
+                        if p.get("metered_tokens") is not None:
+                            tokens += int(p.get("metered_tokens") or 0)
+                        else:
+                            tokens += int(p.get("in_tokens") or 0) + int(p.get("out_tokens") or 0)
     except OSError:
         return
     if info.started_at is None and first_ts is not None:
         info.started_at = first_ts
     if info.cost_usd is None and cost:
         info.cost_usd = cost
+    if info.tokens is None and saw_tokens:
+        info.tokens = tokens
     if info.wallclock_s is None and first_ts and last_ts:
         info.wallclock_s = _duration(first_ts, last_ts)
     if saw_workflow_failure:
@@ -770,8 +790,10 @@ def _normalize_run_status(value: Any) -> str | None:
     raw = str(value or "").strip().lower()
     if raw in {"ok", "finished", "success", "succeeded", "complete", "completed", "done"}:
         return "finished"
-    if raw in {"error", "failed", "failure", "cancelled", "canceled"}:
+    if raw in {"error", "failed", "failure"}:
         return "error"
+    if raw in {"stopped", "paused", "cancelled", "canceled"}:
+        return "stopped"
     if raw in {"running", "starting", "started", "queued", "pending"}:
         return "running"
     return None
@@ -781,10 +803,14 @@ def _status_from_problem_statuses(statuses: list[Any]) -> str | None:
     normalized = [_normalize_run_status(status) for status in statuses if status]
     if not normalized:
         return None
-    if "error" in normalized:
-        return "error"
+    # A still-running child keeps the batch running; a deliberately stopped child
+    # makes it "stopped" (resumable) and wins over a stop-induced "error".
     if "running" in normalized:
         return "running"
+    if "stopped" in normalized:
+        return "stopped"
+    if "error" in normalized:
+        return "error"
     if all(status == "finished" for status in normalized):
         return "finished"
     return None

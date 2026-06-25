@@ -83,6 +83,20 @@ class StopRunProcessTests(unittest.TestCase):
             info = _read_run_info(run_dir)
             self.assertEqual(info.status, "finished")
 
+    def test_stopped_marker_overrides_error_from_the_kill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            # The kill raced the worker into an error run.end; the stop marker
+            # still wins, so the user sees "stopped" (resumable), not "error".
+            (run_dir / "events.jsonl").write_text(
+                '{"kind": "run.start", "payload": {}}\n'
+                '{"kind": "run.end", "payload": {"status": "error"}}\n',
+                encoding="utf-8",
+            )
+            write_stopped_marker(run_dir, signalled=True)
+            info = _read_run_info(run_dir)
+            self.assertEqual(info.status, "stopped")
+
     def test_stop_route_kills_group_and_shows_resume(self) -> None:
         # Faithful end-to-end of the Stop button: a real process group (spawned
         # the way the dashboard launches a worker) is terminated by the HTTP

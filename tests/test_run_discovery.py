@@ -511,6 +511,78 @@ class RunDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(runs[0].status, "running")
 
+    def test_batch_parent_shows_stopped_over_error_when_child_was_stopped(self) -> None:
+        # A stopped child exits non-zero, so the batch records the problem (and
+        # itself) as "error". But the child has a stopped marker — the user
+        # paused it — so the parent must read "stopped" (resumable), not "error".
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch_dir = root / "batch-run"
+            batch_dir.mkdir()
+            _write_json(
+                batch_dir / "run-metadata.json",
+                {
+                    "status": "error",
+                    "manifest": {
+                        "started_at": "2026-06-25T06:30:00.000Z",
+                        "problems": {
+                            "g": {"status": "error", "problem_id": "g", "run_id": "batch-run-g"},
+                        },
+                    },
+                },
+            )
+            child = root / "batch-run-g"
+            child.mkdir()
+            _write_event(child / "events.jsonl", ts="2026-06-25T06:30:00.000Z", kind="run.start", payload={})
+            _write_json(child / "run-control.json", {"status": "stopped", "signalled": True})
+
+            runs = discover_runs([root])
+            child_info = find_run([root], "batch-run-g")
+
+        self.assertEqual(child_info.status, "stopped")
+        self.assertEqual(runs[0].status, "stopped")
+
+    def test_discover_runs_sums_and_aggregates_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch_dir = root / "batch-run"
+            batch_dir.mkdir()
+            _write_json(
+                batch_dir / "run-metadata.json",
+                {
+                    "manifest": {
+                        "started_at": "2026-06-25T09:00:00.000Z",
+                        "finished_at": "2026-06-25T09:02:00.000Z",
+                        "problems": {
+                            "a": {"status": "ok", "problem_id": "a", "run_id": "batch-run-a"},
+                            "b": {"status": "ok", "problem_id": "b", "run_id": "batch-run-b"},
+                        },
+                    },
+                },
+            )
+            # Child a: two claude model.calls reporting metered_tokens.
+            a = root / "batch-run-a"
+            a.mkdir()
+            _write_event(a / "events.jsonl", ts="2026-06-25T09:00:00.000Z", kind="run.start", payload={})
+            _write_event(a / "events.jsonl", ts="2026-06-25T09:01:00.000Z", kind="model.call", payload={"metered_tokens": 1500, "out_tokens": 5})
+            _write_event(a / "events.jsonl", ts="2026-06-25T09:01:30.000Z", kind="model.call", payload={"metered_tokens": 500})
+            _write_event(a / "events.jsonl", ts="2026-06-25T09:02:00.000Z", kind="run.end", payload={"status": "ok"})
+            # Child b: an API-style model.call with only in/out tokens (no metered).
+            b = root / "batch-run-b"
+            b.mkdir()
+            _write_event(b / "events.jsonl", ts="2026-06-25T09:00:00.000Z", kind="run.start", payload={})
+            _write_event(b / "events.jsonl", ts="2026-06-25T09:01:00.000Z", kind="model.call", payload={"in_tokens": 500, "out_tokens": 250})
+            _write_event(b / "events.jsonl", ts="2026-06-25T09:02:00.000Z", kind="run.end", payload={"status": "ok"})
+
+            find_run([root], "batch-run-a")
+            child_a = find_run([root], "batch-run-a")
+            child_b = find_run([root], "batch-run-b")
+            runs = discover_runs([root])
+
+        self.assertEqual(child_a.tokens, 2000)
+        self.assertEqual(child_b.tokens, 750)
+        self.assertEqual(runs[0].tokens, 2750)
+
     def test_runs_page_renders_batch_row_without_child_rows_or_utc_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

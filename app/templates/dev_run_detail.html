@@ -10,7 +10,8 @@
         <div class="grid">
             {% if run.started_at %}<div class="key">Started:</div><div class="val">{{ run.started_at | display_time }}</div>{% endif %}
             {% if run.wallclock_s is not none %}<div class="key">Wallclock:</div><div class="val">{{ run.wallclock_s | display_duration }}</div>{% endif %}
-            {% if run.cost_usd is not none %}<div class="key">Cost:</div><div class="val">${{ '%.4f'|format(run.cost_usd) }}</div>{% endif %}
+            {% if run.cost_usd is not none %}<div class="key">USD:</div><div class="val">${{ '%.4f'|format(run.cost_usd) }}</div>{% endif %}
+            {% if run.tokens is not none %}<div class="key">Tokens:</div><div class="val">{{ run.tokens | display_tokens }}</div>{% endif %}
         </div>
     </div>
 
@@ -83,6 +84,7 @@
         (function () {
             const rendered = {{ human_tasks | map(attribute='response_filename') | list | tojson }};
             const renderedFinished = {{ 'true' if run_finished else 'false' }};
+            const renderedAlive = {{ 'true' if run_alive else 'false' }};
             const pollUrl = "{{ url_for('run_human_pending', run_id=run.run_id) }}";
             function userIsEntering() {
                 const active = document.activeElement;
@@ -106,6 +108,9 @@
                         if (!userIsEntering()) {
                             // A task appeared or was answered -> show the new state.
                             if (!sameSet(pending, rendered)) { window.location.reload(); return; }
+                            // Worker came up (resume) or went down (stop/crash) ->
+                            // swap the Stop/Resume button.
+                            if (data.alive !== renderedAlive) { window.location.reload(); return; }
                             // Run just finished -> show the final result.
                             if (data.finished && !renderedFinished) { window.location.reload(); return; }
                             if (data.finished) { return; }  // settled; stop polling
