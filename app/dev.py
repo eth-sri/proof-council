@@ -259,6 +259,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         return render_template(
             "dev_run_agent.html",
             presets=presets,
+            preset_inputs={p.name: p.inputs for p in presets},
             preset_signature=presets_registry_version(),
             problems=_discover_problem_files(),
             monitor_model_options=_monitor_model_options(),
@@ -371,6 +372,13 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         ]
         if monitor_enabled:
             cmd.extend(["--monitor", "--monitor-model", monitor_model])
+        # Per-run workflow input overrides (e.g. claude_model=haiku). Only
+        # non-empty values are forwarded; blanks fall back to the preset default.
+        for key, value in (payload.get("inputs") or {}).items():
+            clean_key = str(key or "").strip()
+            clean_value = str("" if value is None else value).strip()
+            if clean_key and clean_value:
+                cmd.extend(["--input", f"{clean_key}={clean_value}"])
         with log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(
                 cmd,

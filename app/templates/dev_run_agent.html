@@ -47,6 +47,12 @@
         </div>
 
         <section class="card run-agent-panel">
+            <h2>Workflow inputs</h2>
+            <p class="dim">Per-run settings for the selected agent (e.g. models). Leave a field as-is to keep its default. For cheap runs try claude_model = haiku, codex_model = gpt-5.4-mini.</p>
+            <div id="run-agent-inputs" class="run-agent-inputs"></div>
+        </section>
+
+        <section class="card run-agent-panel">
             <h2>Problems</h2>
             <div id="problem-picker" class="problem-picker">
                 {% if problems %}
@@ -88,6 +94,7 @@
         let presetSignature = {{ preset_signature | tojson }};
         let keyRequirements = {{ key_requirements | tojson }};
         const monitorKeyRequirements = {{ monitor_key_requirements | tojson }};
+        const presetInputs = {{ preset_inputs | tojson }};
 
         function escapeHtml(value) {
             return String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
@@ -223,6 +230,32 @@
             renderLatexElements(row);
         }
 
+        function renderWorkflowInputs() {
+            const container = document.getElementById('run-agent-inputs');
+            if (!container) return;
+            const inputs = presetInputs[selectedPresetName()] || {};
+            const keys = Object.keys(inputs).filter((k) => k !== 'problem' && k !== 'problem_id');
+            if (!keys.length) {
+                container.innerHTML = '<p class="dim">This agent has no per-run inputs.</p>';
+                return;
+            }
+            container.innerHTML = keys.map((key) => `
+                <label class="run-agent-field compact">
+                    ${escapeHtml(key)}
+                    <input type="text" data-input-key="${escapeAttr(key)}" value="${escapeAttr(String(inputs[key] ?? ''))}">
+                </label>
+            `).join('');
+        }
+
+        function collectWorkflowInputs() {
+            const inputs = {};
+            document.querySelectorAll('[data-input-key]').forEach((el) => {
+                const v = String(el.value || '').trim();
+                if (v !== '') inputs[el.dataset.inputKey] = v;
+            });
+            return inputs;
+        }
+
         async function startAgentRun() {
             const status = document.getElementById('run-agent-status');
             if (String(document.getElementById('new-problem-text')?.value || '').trim()) {
@@ -240,6 +273,7 @@
                 api_keys: apiKeys,
                 monitor: document.getElementById('run-agent-monitor-enabled')?.checked || false,
                 monitor_model: document.getElementById('run-agent-monitor-model')?.value || 'openai/gpt-54-mini',
+                inputs: collectWorkflowInputs(),
             };
             if (status) status.textContent = 'Starting...';
             const response = await fetch('{{ url_for("run_agent_start") }}', {
@@ -256,9 +290,11 @@
         }
 
         document.getElementById('run-agent-preset')?.addEventListener('change', renderApiKeys);
+        document.getElementById('run-agent-preset')?.addEventListener('change', renderWorkflowInputs);
         document.getElementById('run-agent-monitor-enabled')?.addEventListener('change', renderApiKeys);
         document.getElementById('run-agent-monitor-model')?.addEventListener('change', renderApiKeys);
         renderApiKeys();
+        renderWorkflowInputs();
         window.setInterval(pollPresetRegistry, 1000);
     </script>
 {% endblock %}
