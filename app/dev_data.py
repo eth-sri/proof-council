@@ -615,6 +615,20 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
                 info.process_dead = True
         if saw_cost:
             info.cost_usd = total_cost
+        # Recompute the parent status from the children's REAL statuses (just
+        # refreshed above). The batch manifest is a stale snapshot: if the batch
+        # process died after a child finished but before it recorded the result,
+        # the parent is stuck "running" while the child reads "finished". The
+        # children are ground truth — but never override a terminal status the
+        # batch itself recorded (a clean run wrote "finished"/"error").
+        if info.status not in ("finished", "error"):
+            derived = _status_from_problem_statuses(
+                [p.get("status") for p in info.problems.values() if isinstance(p, dict)]
+            )
+            if derived:
+                info.status = derived
+                if derived in ("finished", "error"):
+                    info.process_dead = False  # resolved, not a phantom
 
 
 def _enrich_from_dashboard_subprocess_log(info: RunInfo, *, finished_at: Any) -> None:

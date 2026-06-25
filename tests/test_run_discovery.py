@@ -439,6 +439,78 @@ class RunDiscoveryTests(unittest.TestCase):
         self.assertIsNotNone(child)
         self.assertEqual(child.run_id, "batch-run-hard")
 
+    def test_batch_parent_status_follows_finished_child_when_manifest_stale(self) -> None:
+        # The batch process died after the child finished but before recording
+        # the result, so the manifest is stuck "running". The child wrote
+        # run.end: ok — its real status must win, so the parent reads "finished"
+        # (consistent with what the child/detail page shows), not "running".
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch_dir = root / "batch-run"
+            batch_dir.mkdir()
+            _write_json(
+                batch_dir / "run-metadata.json",
+                {
+                    "status": "running",
+                    "manifest": {
+                        "started_at": "2026-06-24T15:27:00.000Z",
+                        "problems": {
+                            "example": {
+                                "status": "running",
+                                "problem_id": "example",
+                                "display_name": "Example",
+                                "run_id": "batch-run-example",
+                            },
+                        },
+                    },
+                },
+            )
+            child_dir = root / "batch-run-example"
+            child_dir.mkdir()
+            events_path = child_dir / "events.jsonl"
+            _write_event(events_path, ts="2026-06-24T15:27:00.000Z", kind="run.start", payload={})
+            _write_event(events_path, ts="2026-06-24T15:28:00.000Z", kind="run.end", payload={"status": "ok"})
+
+            runs = discover_runs([root])
+            parent = find_run([root], "batch-run")
+
+        self.assertEqual([run.run_id for run in runs], ["batch-run"])
+        self.assertEqual(runs[0].status, "finished")
+        self.assertEqual(parent.status, "finished")
+        self.assertFalse(parent.process_dead)
+
+    def test_batch_parent_stays_running_while_a_child_still_runs(self) -> None:
+        # A genuinely in-progress batch (one child finished, one still running)
+        # must remain "running" — the recompute must not declare it finished early.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch_dir = root / "batch-run"
+            batch_dir.mkdir()
+            _write_json(
+                batch_dir / "run-metadata.json",
+                {
+                    "status": "running",
+                    "manifest": {
+                        "started_at": "2026-06-24T15:27:00.000Z",
+                        "problems": {
+                            "a": {"status": "running", "problem_id": "a", "run_id": "batch-run-a"},
+                            "b": {"status": "running", "problem_id": "b", "run_id": "batch-run-b"},
+                        },
+                    },
+                },
+            )
+            done = root / "batch-run-a"
+            done.mkdir()
+            _write_event(done / "events.jsonl", ts="2026-06-24T15:27:00.000Z", kind="run.start", payload={})
+            _write_event(done / "events.jsonl", ts="2026-06-24T15:28:00.000Z", kind="run.end", payload={"status": "ok"})
+            going = root / "batch-run-b"
+            going.mkdir()
+            _write_event(going / "events.jsonl", ts="2026-06-24T15:27:00.000Z", kind="run.start", payload={})
+
+            runs = discover_runs([root])
+
+        self.assertEqual(runs[0].status, "running")
+
     def test_runs_page_renders_batch_row_without_child_rows_or_utc_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
