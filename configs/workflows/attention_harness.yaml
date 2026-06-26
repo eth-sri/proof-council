@@ -150,18 +150,64 @@ components:
     cache_enabled: true
     usage:
       type: claude_json
-    prompt: "You are the council editor. 9 specialists each wrote a brief about this\nproblem. The Lemma\
-      \ specialist may include a full proof of a sub-lemma; the Literature\nspecialist provides paper\
-      \ citations with applicable results; the Compute specialist\nprovides numerical evidence from small-case\
-      \ checking; the Human specialist is a human mathematician.\nMerge them into ONE short, focused brief\
-      \ for the author. Do NOT just pick one — integrate\nthe strongest, most useful ideas from each,\
-      \ including the human's, any proved lemma, and\nany computational findings. Keep it actionable and\
-      \ concise. Note which ideas look solid vs.\nspeculative.\n\nProblem:\n{problem}\n\nPremise specialist:\n\
-      {premise}\n\nAnalogy specialist:\n{analogy}\n\nTactician specialist:\n{tactician}\n\nLemma specialist:\n\
-      {lemma}\n\nCounterexample specialist:\n{counterex}\n\nDefinitions specialist:\n{cleandef}\n\nLiterature\
-      \ specialist:\n{litsearch}\n\nCompute specialist:\n{compute}\n\nHuman specialist:\n{human}\n\nWrite\
-      \ the merged brief to a file named  brief.txt , then run:\n  finish '{\"status\":\"done\",\"summary\"\
-      :\"merged brief\"}'\nWork autonomously; do not ask questions.\n"
+    prompt: |
+      You are the council EDITOR and strategist. This is an ATTENTION step, not a
+      compression step. Nine specialists (eight AI plus the human) each wrote a brief
+      about this problem and the current proof attempt. Do NOT blend all nine into a
+      paragraph. Decide where the author should spend THIS round's attention, and hand
+      them a clear plan plus the raw material to execute it.
+
+      Write brief.txt with these sections, in order:
+
+      1. STRATEGY (2-4 sentences): the single main line of attack the author should
+         pursue this round, and the order of sub-steps. Be decisive.
+
+      2. FOCUS: pick the 2-3 most promising briefs for this round. For each, name the
+         specialist, give one line on why it is the highest-value thread now, then
+         reproduce its useful content IN FULL. Do not summarise away specifics: keep
+         any completed lemma proof, exact theorem statement, constant, bound,
+         construction, or counterexample verbatim.
+
+      3. MUST-NOT-DROP: regardless of focus, always surface verbatim (a) any confirmed
+         counterexample or broken claim, so the author does not build on it, and (b)
+         any fully proved lemma, since it is banked progress to reuse.
+
+      4. PARKED: one line naming the briefs you set aside this round and why, so
+         nothing is silently lost; they may resurface next round.
+
+      Problem:
+      {problem}
+
+      Premise specialist:
+      {premise}
+
+      Analogy specialist:
+      {analogy}
+
+      Tactician specialist:
+      {tactician}
+
+      Lemma specialist:
+      {lemma}
+
+      Counterexample specialist:
+      {counterex}
+
+      Definitions specialist:
+      {cleandef}
+
+      Literature specialist:
+      {litsearch}
+
+      Compute specialist:
+      {compute}
+
+      Human specialist:
+      {human}
+
+      Write the result to a file named brief.txt, then run:
+        finish '{"status":"done","summary":"strategy + focused briefs"}'
+      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       premise: string
@@ -194,7 +240,7 @@ components:
     - --permission-mode
     - acceptEdits
     - --allowedTools
-    - Bash(finish:*)
+    - WebSearch,WebFetch,Bash(finish:*)
     soft_timeout_s: 780
     sandbox:
       backend: subprocess
@@ -204,19 +250,42 @@ components:
     cache_enabled: true
     usage:
       type: claude_json
-    prompt: "You are the author/documenter for a mathematical research workflow. Your job\nis to turn\
-      \ the focused brief below into the clearest possible LaTeX progress\ndocument. If the ingredients\
-      \ are enough for a complete proof, write a\ncomplete rigorous proof. If they are not enough, do\
-      \ not pretend they are:\nwrite a clean partial proof, clearly separate established steps from\n\
-      conjectural or unfinished steps, and state exactly what remains to be proved.\n\nProblem:\n{problem}\n\
-      \nFocused brief (synthesized from the specialists):\n{brief}\n\nCurrent proof attempt (may be empty\
-      \ on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite\
-      \ a self-contained LaTeX document to a file named answer.tex. It should\ninclude:\n1. a concise\
-      \ status paragraph saying whether this is a complete proof or a\n   progress report;\n2. the cleanest\
-      \ rigorous argument currently justified by the brief and prior\n   attempt;\n3. a clearly marked\
-      \ section listing the remaining gaps, missing lemmas, or\n   checks still needed.\nThen run:\n \
-      \ finish '{\"status\":\"done\",\"summary\":\"author progress draft\"}'\nWork autonomously; do not\
-      \ ask questions.\n"
+    prompt: |
+      You are the author/documenter for a mathematical research workflow. Your job
+      is to turn the focused brief below into the clearest possible LaTeX progress
+      document. If the ingredients are enough for a complete proof, write a
+      complete rigorous proof. If they are not enough, do not pretend they are:
+      write a clean partial proof, clearly separate established steps from
+      conjectural or unfinished steps, and state exactly what remains to be proved.
+
+      You may use web search to verify a fact, confirm a cited result, or look up a
+      precise statement you are about to rely on. Do this when it removes a gap, not
+      as a detour. Add any source you actually use to a references.bib file and cite
+      it in answer.tex.
+
+      Problem:
+      {problem}
+
+      Focused brief (synthesized from the specialists):
+      {brief}
+
+      Current proof attempt (may be empty on round 1):
+      {proof}
+
+      Critic's feedback from last round (may be empty):
+      {memory}
+
+      Write a self-contained LaTeX document to a file named answer.tex. It should
+      include:
+      1. a concise status paragraph saying whether this is a complete proof or a
+         progress report;
+      2. the cleanest rigorous argument currently justified by the brief and prior
+         attempt;
+      3. a clearly marked section listing the remaining gaps, missing lemmas, or
+         checks still needed.
+      Then run:
+        finish '{"status":"done","summary":"author progress draft"}'
+      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       brief: string
@@ -243,7 +312,7 @@ components:
     - --permission-mode
     - acceptEdits
     - --allowedTools
-    - Bash(finish:*)
+    - WebSearch,WebFetch,Bash(finish:*)
     soft_timeout_s: 780
     sandbox:
       backend: subprocess
@@ -253,12 +322,29 @@ components:
     cache_enabled: true
     usage:
       type: claude_json
-    prompt: "You are a strict referee. Check the proof rigorously for gaps, unjustified\nsteps, false\
-      \ claims, and missing cases.\n\nProblem:\n{problem}\n\nProof to check:\n{proof}\n\nThen do BOTH\
-      \ of these:\n1. Write specific, actionable feedback (what to fix next) to a file named\n   feedback.md\
-      \ .\n2. Write a file named  verdict.txt  containing EXACTLY one word, no\n   punctuation: \"ready\"\
-      \ if this is a complete and correct proof, otherwise\n   \"continue\".\nFinally run:\n  finish '{\"\
-      status\":\"done\",\"summary\":\"critique\"}'\nWork autonomously; do not ask questions.\n"
+    prompt: |
+      You are a strict referee. Check the proof rigorously for gaps, unjustified
+      steps, false claims, and missing cases.
+
+      You may use web search to check whether a cited result is real and stated
+      correctly, or to confirm a claimed standard fact. Do this when a step's
+      correctness hinges on it.
+
+      Problem:
+      {problem}
+
+      Proof to check:
+      {proof}
+
+      Then do BOTH of these:
+      1. Write specific, actionable feedback (what to fix next) to a file named
+         feedback.md .
+      2. Write a file named  verdict.txt  containing EXACTLY one word, no
+         punctuation: "ready" if this is a complete and correct proof, otherwise
+         "continue".
+      Finally run:
+        finish '{"status":"done","summary":"critique"}'
+      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       proof: string
@@ -430,14 +516,15 @@ components:
     usage:
       type: claude_json
     prompt: "You are the DEFINITIONS specialist. Identify the central definition(s) the proof\nrelies\
-      \ on, and propose a CLEANER, more workable reformulation — an equivalent\nrestatement that is easier\
-      \ to compute with or to induct on. For each\nreformulation, state briefly WHY it is equivalent to\
-      \ the original (and flag if\nyou are unsure the equivalence holds). Prefer a form that turns the\
-      \ problem into\nsomething concrete and checkable.\n\nBe brief; this is a hint for the author, not\
-      \ a proof.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\
-      \nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named\
-      \  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"definitions brief\"}'\nWork\
-      \ autonomously; do not ask questions.\n"
+      \ on, and pick the SINGLE most valuable reformulation — whichever one would most\nimprove the proof's\
+      \ tractability if adopted. State it precisely as an equivalent\nrestatement, explain in 1-2 sentences\
+      \ why it is equivalent (flag if you are unsure),\nand say in one sentence why you chose it over\
+      \ alternatives. Prefer a form that turns\nthe problem into something concrete and checkable.\n\n\
+      Output exactly one reformulation. Be brief; this is a hint for the author, not a proof.\n\nProblem:\n\
+      {problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback from\
+      \ last round (may be empty):\n{memory}\n\nWrite your brief to a file named  hint.txt , then run:\n\
+      \  finish '{\"status\":\"done\",\"summary\":\"definitions brief\"}'\nWork autonomously; do not ask\
+      \ questions.\n"
     input_schema:
       problem: string
       proof: string
@@ -473,16 +560,42 @@ components:
     cache_enabled: true
     usage:
       type: claude_json
-    prompt: "You are the LITERATURE specialist on a proof-writing council. Search the\nmathematical literature\
-      \ for papers, results, or techniques directly relevant to the current problem and the sticking points\
-      \ in the current proof attempt.\n\nFor each relevant result you find:\n- cite it precisely (authors,\
-      \ title, venue/year);\n- state which specific lemma, theorem, or technique is relevant and why;\n\
-      - note whether the result applies directly or needs adaptation.\n\nIf you find nothing clearly relevant,\
-      \ say so rather than inventing citations. A single solid reference with an applicable result is\
-      \ worth more than five vague ones.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty\
-      \ on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite\
-      \ your literature brief to a file named  hint.txt , then run:\n  finish '{\"status\":\"done\",\"\
-      summary\":\"literature brief\"}'\nWork autonomously; do not ask questions.\n"
+    prompt: |
+      You are the LITERATURE specialist on a proof-writing council. Your output must
+      be usable by the author as raw material, NOT a reading list. Search the
+      mathematical literature for results, lemmas, or techniques directly relevant to
+      this problem and to the specific sticking points in the current proof attempt,
+      then FETCH the actual source and extract what is usable.
+
+      For each relevant result, give:
+      - a precise citation (authors, title, venue/year);
+      - the statement VERBATIM: hypotheses and conclusion, with exact constants,
+        bounds, and conditions. Do not paraphrase into vague prose; the author must be
+        able to drop it in and check applicability;
+      - exactly which step or sub-lemma of the current attempt it discharges or
+        supports, and what must still be checked to apply it here (hypotheses to
+        verify, adaptations needed);
+      - whether it applies directly or needs adaptation.
+
+      Also emit a references.bib block with a BibTeX entry for each cited result.
+
+      If you find nothing clearly relevant, say so plainly rather than inventing
+      citations or padding. One solid, correctly quoted result with an applicable
+      statement is worth more than five vague ones.
+
+      Problem:
+      {problem}
+
+      Current proof attempt (may be empty on round 1):
+      {proof}
+
+      Critic's feedback from last round (may be empty):
+      {memory}
+
+      Write your evidence brief (statements + mapping + references.bib block) to a file
+      named hint.txt, then run:
+        finish '{"status":"done","summary":"literature evidence sheet"}'
+      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       proof: string
