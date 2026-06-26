@@ -1,0 +1,338 @@
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: Attention-harness experiment variant 'combo' (prompt-only change from baseline).
+budget:
+  max_usd: 5.0
+  max_tokens: 40000000
+  max_tool_calls: 48
+  max_wallclock_s: 7200
+inputs:
+  claude_model: opus
+  max_rounds: 6
+  problem: ''
+components:
+  claude_premise:
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
+    soft_timeout_s: 780
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the PREMISE specialist in a proof-writing council. This is a\nCOUNTING problem (count isomorphism classes of combinatorial structures). In a\nfew bullet points, name the key definitions and classical results most relevant.\nBe brief and concrete; this is a hint for the author, not a proof.\n\nMake sure to consider, and say whether each is actually relevant:\n- The precise definition of a stable graph of genus g (vertices carry genus\n  weights g_v >= 0, the genus formula g = sum(g_v) + first Betti number =\n  sum(g_v) + (#edges - #vertices + 1), and the stability condition\n  2 g_v - 2 + (valence at v) > 0 for every vertex).\n- Counting isomorphism classes = counting orbits, so Burnside / orbit-counting\n  and the structure of graph automorphism groups are likely central.\n- That with e fixed and g large, the count is a value of a combinatorial\n  counting function in g; quasi-polynomiality of such counts (Ehrhart-style /\n  lattice-point / partition-with-bounded-parts behavior) is the expected shape.\n\nFlag any item you are unsure is actually relevant.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"premise brief\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      hint: string
+      status: string
+    output_files:
+      hint: hint.txt
+    done_outputs:
+      status: status
+  claude_analogy:
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
+    soft_timeout_s: 780
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the ANALOGY specialist. In a few bullet points, suggest analogous\nproblems, standard proof templates, or strategies that have worked on similar\nproblems. Be brief; this is a hint for the author. Flag how promising vs.\nspeculative each suggestion is.\n\nThis is a fixed-e, varying-g enumeration. Strongly consider:\n- Reducing to a finite list of \"topological types\" (the underlying graph shape\n  with e edges, ignoring genus weights) and then, for each shape, counting the\n  ways to distribute the leftover genus across vertices subject to stability.\n- The genus-distribution step as counting integer points / partitions into a\n  bounded number of parts -> these counts are quasi-polynomial in g with period\n  dividing lcm of the relevant denominators, which explains the periodicity.\n- Doing e=0,1,2,3 by hand FIRST as the source of truth, then matching the\n  general formula to those data points.\n\nFlag how promising vs. speculative each suggestion is.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"analogy brief\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      hint: string
+      status: string
+    output_files:
+      hint: hint.txt
+    done_outputs:
+      status: status
+  claude_lemma:
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
+    soft_timeout_s: 780
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the LEMMA specialist. In a few bullet points, list the intermediate\nclaims or sub-lemmas a correct proof would likely need, and flag which look\nhardest and how confident you are each is needed and true. Be brief.\n\nREQUIREMENT: explicitly demand small-case verification. The author must\nenumerate M_e(g) by hand for the small cases (e = 0, 1, 2, 3, and several\ngenera each, including computing M_3(2)) and CHECK any proposed general formula\nreproduces those numbers before claiming it. List, as sub-lemmas:\n- finiteness of underlying topological types for fixed e;\n- for each type, the genus-weight distribution count as a function of g\n  (quasi-polynomial, with its period);\n- correct handling of automorphisms / overcounting when summing over types;\n- the boundary between \"small g\" exceptional values and the eventual\n  quasi-polynomial regime.\n\nFlag which sub-lemmas are hardest and your confidence in each.\n\nProblem:\n{problem}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite your brief to a file named  hint.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"lemma brief\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      hint: string
+      status: string
+    output_files:
+      hint: hint.txt
+    done_outputs:
+      status: status
+  claude_synthesize:
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
+    soft_timeout_s: 780
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the council editor. Three specialists each wrote a brief about this\nproblem. Merge them into ONE short, focused brief for the author. Do NOT just\npick one - integrate the strongest, most useful ideas from each. Keep it\nactionable and concise. Note which ideas look solid vs. speculative.\n\nYour brief MUST open with an explicit, ordered \"DO THIS FIRST\" action list (3-5\nnumbered steps) telling the author the exact sequence to follow - e.g. which\nsmall cases to enumerate by hand before any general claim, then which general\nstructure to aim for, then what to cross-check. Put the highest-leverage,\nmost-certain step first.\n\nProblem:\n{problem}\n\nPremise specialist:\n{premise}\n\nAnalogy specialist:\n{analogy}\n\nLemma specialist:\n{lemma}\n\nWrite the merged brief to a file named  brief.txt , then run:\n  finish '{\"status\":\"done\",\"summary\":\"merged brief\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      premise: string
+      analogy: string
+      lemma: string
+      workspace: string
+    output_schema:
+      workspace: string
+      brief: string
+      status: string
+    output_files:
+      brief: brief.txt
+    done_outputs:
+      status: status
+  claude_author:
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
+    soft_timeout_s: 780
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are the author/documenter for a mathematical research workflow. Your job\nis to turn the focused brief below into the clearest possible LaTeX progress\ndocument.\n\nMANDATORY METHOD: before stating ANY general structural claim, you must first\nwork out the small cases explicitly. Enumerate the isomorphism classes of\nstable graphs of genus g with 0 legs and e edges by hand for e = 0, 1, 2, 3,\nderiving closed-form expressions for M_0(g), M_1(g), M_2(g), M_3(g), and\nexplicitly computing M_3(2). Only after these worked enumerations may you state\nand justify the general structure result (eventual quasi-polynomiality in g for\nfixed e). Every general formula you assert must be cross-checked against your\nown enumerated small-case values; show that check.\n\nIf the ingredients are enough for a complete proof, write a complete rigorous\nproof. If they are not enough, do not pretend they are: write a clean partial\nproof, clearly separate established steps from conjectural or unfinished steps,\nand state exactly what remains to be proved.\n\nProblem:\n{problem}\n\nFocused brief (synthesized from the specialists):\n{brief}\n\nCurrent proof attempt (may be empty on round 1):\n{proof}\n\nCritic's feedback from last round (may be empty):\n{memory}\n\nWrite a self-contained LaTeX document to a file named answer.tex. It should\ninclude:\n1. a concise status paragraph saying whether this is a complete proof or a\n   progress report;\n2. the explicit small-case enumerations (e = 0,1,2,3) with M_3(2) computed;\n3. the cleanest rigorous general argument currently justified, cross-checked\n   against the small cases;\n4. a clearly marked section listing the remaining gaps, missing lemmas, or\n   checks still needed.\nThen run:\n  finish '{\"status\":\"done\",\"summary\":\"author progress draft\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      brief: string
+      proof: string
+      memory: string
+      workspace: string
+    output_schema:
+      workspace: string
+      answer_tex: string
+      status: string
+    output_files:
+      answer_tex: answer.tex
+    done_outputs:
+      status: status
+  claude_critic:
+    cmd:
+    - claude
+    - -p
+    - --output-format
+    - stream-json
+    - --verbose
+    - --model
+    - '{claude_model}'
+    - --permission-mode
+    - acceptEdits
+    - --allowedTools
+    - Bash(finish:*)
+    soft_timeout_s: 780
+    sandbox:
+      backend: subprocess
+      timeout_s: 900
+    env:
+      HOME: /Users/davidholmes
+    cache_enabled: true
+    usage:
+      type: claude_json
+    prompt: "You are a strict referee. Check the proof rigorously for gaps, unjustified\nsteps, false claims, and missing cases.\n\nCRITICAL GATING RULE: before you may write the verdict \"ready\", you must\nverify the proof against concrete small cases by independent computation. In\nparticular:\n- Independently confirm M_3(2) = 2 and that the proof's claimed genus-3\n  formula reproduces it.\n- Spot-check at least two more values (e.g. M_3(g) for a small g >= 3, and an\n  e in {0,1,2}) against the proof's general formula.\n- Confirm the proof actually states the eventual quasi-polynomial structure\n  result AND gives complete descriptions for e = 0, 1, 2, 3.\nIf ANY of these checks fails, is missing, or the proof is internally\ncontradictory, the verdict MUST be \"continue\".\n\nProblem:\n{problem}\n\nProof to check:\n{proof}\n\nThen do BOTH of these:\n1. Write specific, actionable feedback (what to fix next), including the\n   results of your small-case checks, to a file named  feedback.md .\n2. Write a file named  verdict.txt  containing EXACTLY one word, no\n   punctuation: \"ready\" if and only if every check above passed and the proof\n   is complete and correct, otherwise \"continue\".\nFinally run:\n  finish '{\"status\":\"done\",\"summary\":\"critique\"}'\nWork autonomously; do not ask questions.\n"
+    input_schema:
+      problem: string
+      proof: string
+      workspace: string
+    output_schema:
+      workspace: string
+      verdict: string
+      feedback: string
+      status: string
+    output_files:
+      verdict: verdict.txt
+      feedback: feedback.md
+    done_outputs:
+      status: status
+dag:
+  nodes:
+  - id: rounds
+    kind: repeat
+    max_iterations: $input.max_rounds
+    initial_state:
+      proof: ''
+      memory: ''
+      verdict: pending
+    condition:
+      python: iteration == 0 or inputs.get("verdict", "").strip() != "ready"
+    body:
+      nodes:
+      - id: premise
+        kind: agent
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_premise
+        inputs:
+          problem: $input.problem
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 328
+          y: -336
+      - id: analogy
+        kind: agent
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_analogy
+        inputs:
+          problem: $input.problem
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 350
+          y: -138
+      - id: lemma
+        kind: agent
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_lemma
+        inputs:
+          problem: $input.problem
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 363
+          y: 59
+      - id: synthesize
+        kind: agent
+        needs:
+        - premise
+        - analogy
+        - lemma
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_synthesize
+        inputs:
+          problem: $input.problem
+          premise: $node.premise.hint
+          analogy: $node.analogy.hint
+          lemma: $node.lemma.hint
+        ui:
+          x: 1268
+          y: -48
+      - id: author
+        kind: agent
+        needs:
+        - synthesize
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_author
+        inputs:
+          problem: $input.problem
+          brief: $node.synthesize.brief
+          proof: $state.proof
+          memory: $state.memory
+        ui:
+          x: 1758
+          y: 132
+      - id: critic
+        kind: agent
+        needs:
+        - author
+        agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+        name: claude_critic
+        inputs:
+          problem: $input.problem
+          proof: $node.author.answer_tex
+        ui:
+          x: 2250
+          y: 314
+      state_updates:
+        proof: $node.author.answer_tex
+        memory: $node.critic.feedback
+        verdict: $node.critic.verdict
+    outputs:
+      best_tex: $state.proof
+      verdict: $state.verdict
+      last_feedback: $state.memory
+    ui:
+      repeat_input:
+        x: -72
+        y: 83
+      repeat_output:
+        x: 2808
+        y: 53
+  outputs:
+    best_tex: $node.rounds.best_tex
+    verdict: $node.rounds.verdict
+    last_feedback: $node.rounds.last_feedback
