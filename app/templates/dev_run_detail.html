@@ -32,7 +32,7 @@
         {% if can_resume %}Resume it below to continue.{% else %}Open the problem run below to resume it.{% endif %}</span></div>
     {% endif %}
 
-    {% if can_resume and not run_finished and not run_alive and not human_tasks %}
+    {% if can_resume and not run_finished and not run_alive and (not human_tasks or run.status == 'stopped') %}
         <div class="card">
             <form method="post" action="{{ url_for('run_resume', run_id=run.run_id) }}"
                   onsubmit="return confirm('Resume this run? Only do this if it has stopped or crashed — resuming a run that is still going will launch a duplicate.');">

@@ -938,7 +938,7 @@ def find_runs_awaiting_human(roots: Iterable[Path]) -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     for run in discover_runs(roots, include_batch_children=True):
-        if (run.status or "running") in {"finished", "error"}:
+        if (run.status or "running") in {"finished", "error", "stopped"}:
             continue
         tasks = load_pending_human_tasks(run.path)
         if not tasks:
