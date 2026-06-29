@@ -2538,7 +2538,7 @@ def presets_registry_version(root: Path | None = None) -> str:
     if not root.exists():
         return "empty"
     parts: list[str] = []
-    for path in sorted(root.glob("*.yaml")):
+    for path in sorted(root.rglob("*.yaml")):
         try:
             stat = path.stat()
         except OSError:
