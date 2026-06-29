@@ -1202,6 +1202,7 @@ class ExecutionGraphNode:
     call_ref: str | None = None
     cost_usd: float = 0.0
     reason: str = ""
+    cache_hit: bool = False
     execution_index: int = 1
     parent_node_id: str = ""
     children: list["ExecutionGraphNode"] = field(default_factory=list)
@@ -1570,7 +1571,11 @@ def load_execution_graph(
         if kind == "run.end":
             run_status = str(payload.get("status") or "")
         if not str(kind or "").startswith("dag.node_"):
-            if kind == "agent.start":
+            if kind in {"agent.start", "agent.cache_hit"}:
+                # Cache hits skip agent.start/agent.end but still need their
+                # call_id linked to the active DAG node, so a replayed node can
+                # be cross-referenced back to its (cached) call and rendered as
+                # "cached" rather than as a fresh run.
                 parent_id = evt.get("parent_call_id")
                 if parent_id:
                     attached = _attach_call_to_active_node(
@@ -1680,6 +1685,7 @@ def load_execution_graph(
                 continue
             node.call_ref = call.display_ref or node.call_id
             call.display_label = node.label
+            node.cache_hit = call.cache_hit
             node.cost_usd = float(getattr(call, "cost_usd_subtree", call.cost_usd) or 0.0)
             if node.duration_s is None:
                 node.duration_s = call.duration_s
