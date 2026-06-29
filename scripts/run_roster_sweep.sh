@@ -5,7 +5,7 @@
 # independent judge. Run ids are roster-* to stay separate from the prompt
 # sweep's exp-* runs.
 # Usage: scripts/run_roster_sweep.sh
-set -u
+set -euo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 

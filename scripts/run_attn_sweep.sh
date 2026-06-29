@@ -5,12 +5,13 @@
 #
 # Baseline (exp-baseline) is launched separately; this driver runs the rest.
 # Usage: scripts/run_attn_sweep.sh
-set -u
+set -euo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 
 PROBLEM="problems/stable_graphs_M_e.tex"
 VARIANTS=(specialists critic author synth combo)
+RUN_IDS=()
 
 for name in "${VARIANTS[@]}"; do
   echo "=== running variant: ${name} ==="
@@ -21,9 +22,10 @@ for name in "${VARIANTS[@]}"; do
     --input max_rounds=4 \
     --run-id "exp-${name}" \
     --run-name "exp ${name}"
+  RUN_IDS+=("exp-${name}")
   echo "=== finished variant: ${name} ==="
 done
 
 echo "=== all variants done; judging ==="
-uv run python scripts/judge_attn.py
+uv run python scripts/judge_attn.py "${RUN_IDS[@]}"
 echo "=== sweep complete ==="

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 import unittest
@@ -275,6 +276,31 @@ class ConfigurableCLITests(unittest.TestCase):
 
             self.assertEqual(codex_home, Path(out.workspace) / ".codex-home")
             self.assertFalse(codex_home.exists())
+
+    def test_env_template_can_use_parent_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["sh", "-c", "printf '%s' \"$HOME\" > home.txt"],
+                        "env": {"HOME": "{env:PROOFSTACK_TEST_HOME}"},
+                        "sandbox": {"backend": "subprocess"},
+                        "output_schema": {
+                            "workspace": "string",
+                            "home": "string",
+                        },
+                        "output_files": {"home": "home.txt"},
+                    }
+                },
+            )
+
+            with mock.patch.dict(os.environ, {"PROOFSTACK_TEST_HOME": "/portable/home"}):
+                out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
+
+            self.assertEqual(out.home, "/portable/home")
 
 
 if __name__ == "__main__":

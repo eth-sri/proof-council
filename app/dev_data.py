@@ -895,8 +895,20 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
         if response_path in resolved:
             continue
         filename = Path(response_path).name
-        if (inbox / filename).exists():
-            continue  # response already dropped; run will resume
+        response_error = ""
+        response_file = inbox / filename
+        if response_file.exists():
+            try:
+                json.loads(response_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                response_error = (
+                    f"Invalid response JSON in {filename}: {e.msg} "
+                    f"(line {e.lineno}, column {e.colno})."
+                )
+            except OSError as e:
+                response_error = f"Could not read response file {filename}: {e}"
+            else:
+                continue  # response already dropped; run will resume
         # Read display fields from the on-disk task.json, NOT the event payload:
         # a large prompt (e.g. one embedding an AI proof) gets offloaded to a blob
         # in events.jsonl and shows up as {"$ref": ...}, whereas HumanAgent writes
@@ -923,6 +935,7 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                 "output_fields": output_fields,
                 "inputs": full.get("inputs") or {},
                 "response_filename": filename,
+                "response_error": response_error,
             }
         )
     return tasks

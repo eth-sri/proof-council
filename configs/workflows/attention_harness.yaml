@@ -30,7 +30,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -72,7 +72,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -146,7 +146,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -246,7 +246,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -318,7 +318,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -377,7 +377,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -420,7 +420,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -465,7 +465,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -511,7 +511,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -556,7 +556,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json
@@ -627,7 +627,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     cache_enabled: true
     usage:
       type: claude_json

@@ -68,6 +68,9 @@
                     </div>
                     <pre class="human-task-prompt">{{ task.prompt }}</pre>
                 {% endif %}
+                {% if task.response_error %}
+                    <p class="input-warning">{{ task.response_error }} Submit again to replace it.</p>
+                {% endif %}
                 <form method="post" action="{{ url_for('run_human_submit', run_id=run.run_id) }}">
                     <input type="hidden" name="response_filename" value="{{ task.response_filename }}">
                     {% for field, ftype in task.output_fields.items() %}

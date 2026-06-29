@@ -14,7 +14,12 @@ sys.path.insert(0, str(ROOT))
 
 import app.dev as dev  # noqa: E402
 from app.dev import create_app  # noqa: E402
-from app.dev_data import discover_runs, find_run, resolve_output_refs  # noqa: E402
+from app.dev_data import (  # noqa: E402
+    discover_runs,
+    find_run,
+    load_pending_human_tasks,
+    resolve_output_refs,
+)
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -63,6 +68,42 @@ class RunDiscoveryTests(unittest.TestCase):
         self.assertEqual(out["best_tex"], "PROOF BODY")  # inflated
         self.assertEqual(out["verdict"], "ready")  # plain value untouched
         self.assertEqual(out["missing"], {"$ref": "events_blobs/nope.txt"})  # unreadable left as-is
+
+    def test_invalid_human_response_stays_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            inbox = run / "human_inbox"
+            inbox.mkdir()
+            task_path = inbox / "ask.task.json"
+            response_path = inbox / "ask.response.json"
+            _write_json(
+                task_path,
+                {
+                    "agent": "human_solver",
+                    "prompt": "Please solve P.",
+                    "output_fields": {"answer_tex": "string", "status": "string"},
+                    "inputs": {"problem": "P"},
+                },
+            )
+            response_path.write_text("{not json", encoding="utf-8")
+            _write_event(
+                run / "events.jsonl",
+                kind="human.waiting",
+                agent="human_solver",
+                payload={
+                    "task_path": str(task_path),
+                    "response_path": str(response_path),
+                    "output_fields": {"answer_tex": "string", "status": "string"},
+                },
+            )
+
+            tasks = load_pending_human_tasks(run)
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]["response_filename"], "ask.response.json")
+            self.assertIn("Invalid response JSON", tasks[0]["response_error"])
+
+            response_path.write_text(json.dumps({"answer_tex": "A"}), encoding="utf-8")
+            self.assertEqual(load_pending_human_tasks(run), [])
 
     def test_run_agent_problem_picker_discovers_non_txt_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

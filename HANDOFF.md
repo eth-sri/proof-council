@@ -102,10 +102,10 @@ self-contained combinatorics.
 
 **Compute** (`claude_compute`): uses `--allowedTools Bash(*)` (unrestricted
 bash in the subprocess sandbox). Can write and run Python (sympy, numpy, etc.)
-to check formulas and find counterexamples. `HOME=/Users/davidholmes` pin is
-still in place (needed for Claude subscription auth) — so this node has home
-access. On a trusted machine this is fine; for untrusted problems, consider a
-more restricted allowedTools or a separate sandboxed HOME.
+to check formulas and find counterexamples. Claude subscription auth uses
+`HOME={env:HOME}` so the node has access to the caller's home directory. On a
+trusted machine this is fine; for untrusted problems, consider a more restricted
+allowedTools setting or a separate logged-in HOME.
 
 ## Pending / next session
 
@@ -171,7 +171,7 @@ and this `HANDOFF.md` note only.
 - Model split: premise / analogy / lemma / synthesize / author use
   `gpt-5.4-mini`; critic uses `gpt-5.5`. The human hint node is unchanged.
 - Removed the `claude_model` workflow input and Claude-specific `usage:
-  {type: claude_json}` / `HOME` settings from those attention-harness nodes.
+  {type: claude_json}` settings from those attention-harness nodes.
   Validation passed with `scripts/validate_preset.sh
   configs/workflows/attention_harness.yaml`.
 - After David tried the run, he noticed the old author prompt was too strong:
@@ -258,7 +258,7 @@ The attention_harness is entirely CLI-based (no API keys needed).
 
 ## Claude subscription login in subprocess sandbox
 The subprocess sandbox pins `HOME` to the sandbox root, so Claude reports
-"Not logged in". Fix: `env: { HOME: /Users/davidholmes }` in the component
-overrides HOME back to the real home directory. Applied to all claude nodes.
+"Not logged in". Fix: `env: { HOME: "{env:HOME}" }` in the component overrides
+HOME back to the caller's real home directory. Applied to all Claude nodes.
 Safety: the subprocess sandbox's file-read tools are working-directory gated;
 `--allowedTools Bash(finish:*)` prevents arbitrary shell access.

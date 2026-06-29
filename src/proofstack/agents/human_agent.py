@@ -118,7 +118,8 @@ class HumanAgent(Agent):
 
         await self.events.emit("human.submitted", {"response_path": str(response_path)})
         data = {**self._defaults(output_fields), **done}
-        data.setdefault("status", "done")
+        if not data.get("status"):
+            data["status"] = "done"
         return self.Outputs.model_validate(data)
 
     async def _wait_for_response(self, response_path: Path) -> dict[str, Any] | None:

@@ -10,6 +10,7 @@ YAML instead of requiring one Python subclass per worker role.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -535,13 +536,16 @@ def _file_content(spec: Any, fields: dict[str, Any]) -> str:
 
 def _format_template(template: str, fields: dict[str, Any]) -> str:
     def repl(match: re.Match[str]) -> str:
-        key = match.group(1)
+        env_key = match.group(1)
+        if env_key:
+            return os.environ.get(env_key, "")
+        key = match.group(2)
         if key not in fields:
             return match.group(0)
         value = fields.get(key, "")
         return "" if value is None else str(value)
 
-    return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, template)
+    return re.sub(r"\{(?:env:([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))\}", repl, template)
 
 
 def _output_file_spec(spec: Any) -> tuple[str, str, Any]:

@@ -15,9 +15,10 @@ SandboxBackend = Literal["subprocess", "docker"]
 
 
 # Standard env vars we always pass through; provider keys are added per call.
-# HOME is intentionally NOT in the allowlist — it is always pinned to the
-# sandbox root in ``build_env`` so a model-driven coding CLI cannot read or
-# modify files under the orchestrator's real home directory.
+# HOME is intentionally NOT in the allowlist. ``build_env`` pins it to the
+# sandbox root by default so a model-driven coding CLI cannot read or modify
+# files under the orchestrator's real home directory unless a component
+# explicitly overrides HOME through env_extra.
 DEFAULT_ENV_ALLOWLIST: tuple[str, ...] = (
     "PATH",
     "USER",
@@ -95,9 +96,9 @@ class SandboxSpec:
         path_parts = [str(p) for p in extra_path] + ([env["PATH"]] if "PATH" in env else [])
         if path_parts:
             env["PATH"] = os.pathsep.join(path_parts)
-        # HOME and TMPDIR are pinned to the sandbox root unconditionally —
-        # the parent's HOME must NEVER leak through, even if extra_env or
-        # the allowlist would set it.
+        # HOME and TMPDIR are pinned to the sandbox root at the base layer.
+        # Call-site env_extra is merged later by sandbox backends and may
+        # intentionally override HOME for trusted subscription-CLI workflows.
         env["HOME"] = str(sandbox_root)
         env["TMPDIR"] = str(sandbox_root)
         return env

@@ -11,12 +11,11 @@
 #      `--permission-mode acceptEdits` (auto-approve file writes) plus
 #      `--allowedTools Bash(finish:*)` (the ONLY shell command it may run is
 #      `finish`). Everything else is auto-denied in headless mode.
-#   2. The subprocess sandbox does NOT inherit ~/.claude — it pins HOME to the
-#      sandbox root (src/proofstack/sandbox/base.py), which makes the CLI report
-#      "Not logged in". The subscription login is keyed to the REAL HOME (the
-#      OAuth token lives in the macOS Keychain, gated on the real home dir).
-#      So we override HOME back to David's home via the component `env:` block
-#      below; that is the only setting that authenticates.
+#   2. The subprocess sandbox does NOT inherit ~/.claude by default — it pins
+#      HOME to the sandbox root (src/proofstack/sandbox/base.py), which makes the
+#      CLI report "Not logged in". The subscription login is keyed to the caller's
+#      real HOME (the OAuth token lives in the macOS Keychain, gated on that home
+#      dir), so Claude nodes set HOME to `{env:HOME}` in their component `env:`.
 #   SAFETY NOTE: HOME points at the real home, so the worker can *read* files
 #   under ~ in principle. But it can only *write* via the Write tool and can run
 #   no shell command except `finish`, so it cannot delete files, exfiltrate over
@@ -104,9 +103,9 @@ components:
       timeout_s: 900                     # 15 min: hard kill ceiling for this call
     env:
       # The subprocess sandbox pins HOME to the sandbox root, which hides the
-      # subscription login. Point HOME back at the real home so the `claude`
-      # CLI finds the logged-in Max subscription (no API key needed).
-      HOME: /Users/davidholmes
+      # subscription login. Point HOME back at the caller's real home so the
+      # `claude` CLI finds the logged-in Max subscription (no API key needed).
+      HOME: "{env:HOME}"
     prompt: |
       You are a research mathematician. Solve the problem below with a complete,
       rigorous proof.
@@ -217,7 +216,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     prompt: |
       You are the editor of a mathematics journal assembling the best possible
       proof from several independently produced candidates. You are given a

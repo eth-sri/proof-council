@@ -57,7 +57,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     prompt: |
       You are a research mathematician. Attempt a complete, rigorous proof of the
       problem, making use of the human collaborator's idea where it helps.
@@ -125,7 +125,7 @@ components:
       backend: subprocess
       timeout_s: 900
     env:
-      HOME: /Users/davidholmes
+      HOME: "{env:HOME}"
     prompt: |
       You are finalizing a proof. Produce the best possible consolidated proof,
       incorporating the human's original idea and their refinement feedback. Only

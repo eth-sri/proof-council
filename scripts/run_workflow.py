@@ -333,6 +333,10 @@ def _write_resume_spec(
         argv += ["--model", kv]
     for kv in args.component or []:
         argv += ["--component", kv]
+    if args.additional_instructions:
+        argv += ["--additional-instructions", args.additional_instructions]
+    if args.budget_usd is not None:
+        argv += ["--budget-usd", str(args.budget_usd)]
     if args.monitor:
         argv += ["--monitor", "--monitor-model", args.monitor_model]
     try:
