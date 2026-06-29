@@ -1562,12 +1562,15 @@ def load_execution_graph(
     execution_counts: dict[tuple[str, str], int] = {}
     repeat_child_offsets: dict[tuple[str, str], int] = {}
     run_status = None
+    run_start_ts: list[str] = []
 
     for evt in events:
         kind = evt.get("kind")
         payload = evt.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
+        if kind == "run.start" and evt.get("ts"):
+            run_start_ts.append(str(evt.get("ts")))
         if kind == "run.end":
             run_status = str(payload.get("status") or "")
         if not str(kind or "").startswith("dag.node_"):
@@ -1675,6 +1678,22 @@ def load_execution_graph(
             if node.status == "running":
                 node.status = "error"
                 node.reason = node.reason or "Run ended before this node finished."
+
+    # A resume appends a fresh run.start; a stop leaves no clean terminal
+    # event, so nodes interrupted by the stop stay "running" forever. Any agent
+    # node still "running" that started before the latest run.start belongs to
+    # the superseded attempt (it was re-run on resume), so mark it interrupted.
+    if len(run_start_ts) >= 2:
+        latest_start = max(run_start_ts)
+        for node in by_id.values():
+            if (
+                node.kind == "agent"
+                and node.status == "running"
+                and node.start_ts
+                and node.start_ts < latest_start
+            ):
+                node.status = "skipped"
+                node.reason = node.reason or "Interrupted by stop; re-run on resume."
 
     if tree is not None:
         for node in by_id.values():
