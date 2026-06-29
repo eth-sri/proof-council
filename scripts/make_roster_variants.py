@@ -18,9 +18,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-# These roster variants are personal scaffolding, not shipped examples;
-# they live under the gitignored configs/workflows/local/ tree.
-WF = ROOT / "configs" / "workflows" / "local"
+WF = ROOT / "configs" / "workflows"
 BASE = WF / "attention_harness_auto.yaml"
 
 base = yaml.safe_load(BASE.read_text())

@@ -149,16 +149,11 @@ class WorkflowPreset:
 
 
 def list_presets(root: Path | None = None) -> list[Path]:
-    """Return preset YAML paths under ``root`` (recursively). Sorted by name.
-
-    Searching subdirectories lets a deployment keep curated examples at the top
-    level and park personal/experimental presets in an (optionally gitignored)
-    subdir like ``local/`` without losing dashboard/CLI access to them.
-    """
+    """Return preset YAML paths under ``root``. Sorted by name."""
     root = root or DEFAULT_PRESET_ROOT
     if not root.exists():
         return []
-    return sorted(root.rglob("*.yaml"), key=lambda p: p.stem)
+    return sorted(p for p in root.glob("*.yaml"))
 
 
 def load_preset(name_or_path: str, *, root: Path | None = None) -> WorkflowPreset:
@@ -175,11 +170,6 @@ def _resolve_preset_path(name_or_path: str, root: Path) -> Path:
     short = root / f"{name_or_path}.yaml"
     if short.exists():
         return short.resolve()
-    # Fall back to a recursive search so presets parked in a subdir (e.g.
-    # ``local/``) still resolve by their bare name.
-    nested = sorted(root.rglob(f"{name_or_path}.yaml"), key=lambda p: len(p.parts))
-    if nested:
-        return nested[0].resolve()
     raise PresetError(
         f"preset not found: looked for {candidate!s} and {short!s}"
     )

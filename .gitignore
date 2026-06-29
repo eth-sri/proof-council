@@ -8,10 +8,6 @@ outputs/
 smoke-input/
 smoke-output/
 private_problems/
-# Personal/experimental workflow presets. The runtime discovers presets
-# recursively, so these stay runnable from the dashboard/CLI without shipping
-# in the curated example set a downloader gets.
-configs/workflows/local/
 uv.lock
 brainstorming
 .claude
