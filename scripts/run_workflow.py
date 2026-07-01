@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -306,6 +307,65 @@ def _safe_id(value: str) -> str:
     return cleaned or "problem"
 
 
+def _write_resume_spec(
+    run_dir: Path,
+    args: argparse.Namespace,
+    problem_text: str,
+    problem_id: str,
+    run_id: str,
+    output_root: Path,
+) -> None:
+    """Write resume.json: the argv (sans python exe, sans --resume-from) that
+    relaunches this exact run. The dashboard appends --resume-from <run_id>."""
+    argv: list[str] = [
+        "scripts/run_workflow.py",
+        "--workflow", args.workflow,
+        "--problem-text", problem_text,
+        "--problem-id", problem_id,
+        "--run-id", run_id,
+        "--output", str(output_root),
+    ]
+    if args.run_name:
+        argv += ["--run-name", args.run_name]
+    for kv in args.input or []:
+        argv += ["--input", kv]
+    for kv in args.model or []:
+        argv += ["--model", kv]
+    for kv in args.component or []:
+        argv += ["--component", kv]
+    if args.additional_instructions:
+        argv += ["--additional-instructions", args.additional_instructions]
+    if args.budget_usd is not None:
+        argv += ["--budget-usd", str(args.budget_usd)]
+    if args.monitor:
+        argv += ["--monitor", "--monitor-model", args.monitor_model]
+    try:
+        (run_dir / "resume.json").write_text(
+            json.dumps({"run_id": run_id, "argv": argv}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _write_run_pid(run_dir: Path) -> None:
+    """Record this process's PID so the dashboard's Stop button can terminate
+    the run's process group. The dashboard launches this script as a process-
+    group leader (start_new_session / batch start_new_session), so this PID is
+    the run's PGID; the Stop route verifies that before signalling the group."""
+    try:
+        (run_dir / "run.pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _clear_run_pid(run_dir: Path) -> None:
+    try:
+        (run_dir / "run.pid").unlink()
+    except OSError:
+        pass
+
+
 def _append_additional_instructions(problem: str, extra: str) -> str:
     extra = extra.strip()
     if not extra:
@@ -416,6 +476,11 @@ async def amain() -> int:
         },
     )
 
+    # Persist exactly how to relaunch this run, so the dashboard's "Resume"
+    # button can replay it with --resume-from (in-place resume from the cache).
+    _write_resume_spec(ctx.root_workdir, args, problem_text, problem_id, run_id, output_root)
+    _write_run_pid(ctx.root_workdir)
+
     built_inputs = preset.build_inputs(
         problem=problem_text,
         problem_id=problem_id,
@@ -467,6 +532,7 @@ async def amain() -> int:
             )
         )
         print(f"workflow failed: {type(e).__name__}: {e}", file=sys.stderr)
+        _clear_run_pid(ctx.root_workdir)
         return 1
 
     out_json = out.model_dump(mode="json") if hasattr(out, "model_dump") else out
@@ -481,6 +547,7 @@ async def amain() -> int:
         )
     )
 
+    _clear_run_pid(ctx.root_workdir)
     print(f"run_id: {run_id}")
     print(f"output: {ctx.root_workdir}")
     print("outputs:")

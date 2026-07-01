@@ -117,9 +117,12 @@ class Agent(ABC):
         parent_call_id = _PARENT_CALL_ID.get()
         agent_path_for_monitor = ".".join(_AGENT_PATH.get() + (self.name,))
 
-        if type(self).cache_enabled:
+        if self.cache_enabled:
             cached = self.ctx.resume_cache.get(cache_key)
             if cached is not None:
+                # Re-persist into the current run's cache so a chain of resumes
+                # (resuming a run that was itself resumed) stays self-contained.
+                self.ctx.resume_cache.put(cache_key, cached)
                 await self.events.emit(
                     "agent.cache_hit",
                     {"key": cache_key},
@@ -205,7 +208,7 @@ class Agent(ABC):
                         pass
 
         out_json = self._dump_output(out)
-        if type(self).cache_enabled:
+        if self.cache_enabled:
             self.ctx.resume_cache.put(cache_key, out_json)
         await self._persist_output(out, workdir)
         await self.events.emit(

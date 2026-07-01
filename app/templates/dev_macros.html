@@ -36,13 +36,25 @@
     </details>
 {% endmacro %}
 
-{% macro render_output(value, empty_text='No output captured.') %}
+{% macro render_output(value, run_id='', empty_text='No output captured.') %}
     {% set display_output = value if value is mapping else {'output': value} %}
     {% set output = namespace(rendered=false) %}
     {% for key, item in display_output.items() %}
         {% if key != 'raw_text' and item is not none and item != '' %}
             {% if item is string %}
-                {{ render_text_output(key | replace('_', ' '), item, true) }}
+                <details class="message-block message-output" open>
+                    <summary>{{ key | replace('_', ' ') }}</summary>
+                    {% if run_id %}
+                        <div class="output-toolbar">
+                            <button type="button" class="copy-output-btn">Copy</button>
+                            <a class="btn-link" href="{{ url_for('run_output_download', run_id=run_id, field=key) }}" download>Download .tex</a>
+                            {% if 'documentclass' in item %}
+                                <a class="btn-link" href="{{ url_for('run_output_pdf', run_id=run_id, field=key) }}" target="_blank" rel="noopener">PDF</a>
+                            {% endif %}
+                        </div>
+                    {% endif %}
+                    <div class="rendered-text">{{ item }}</div>
+                </details>
             {% else %}
                 <details class="message-block message-output" open>
                     <summary>{{ key | replace('_', ' ') }}</summary>

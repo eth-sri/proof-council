@@ -15,8 +15,12 @@ import json
 import os
 import random
 import re
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -30,11 +34,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
+from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, url_for
 from mathagents.config_loader import load_solver_config
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, normalize_monitor_model_spec
 
 from app.dev_data import (
+    clear_stopped_marker,
     create_tool_definition,
     delete_preset,
     discover_agent_palette_items,
@@ -45,29 +50,41 @@ from app.dev_data import (
     discover_runs,
     discover_tool_definitions,
     find_agent,
+    estimate_prunable_bytes,
     find_preset,
     find_run,
+    find_runs_awaiting_human,
+    run_process_alive,
+    stop_run_process,
+    write_stopped_marker,
     load_call_detail,
     load_event_tree,
     load_monitor_summaries,
+    load_pending_human_tasks,
     load_execution_graph,
     mutate_preset_yaml,
     presets_registry_version,
     preset_file_version,
     preset_dag_report,
+    prune_run_artifacts,
     render_recorded_messages,
+    resolve_output_refs,
     safe_blob_path,
     save_preset_yaml,
     save_tool_definition,
     tool_definition_to_dict,
     validate_preset_yaml,
     workflow_input_from_tree,
+    workflow_output_field_text,
     workflow_output_from_tree,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUNS_ROOTS = (REPO_ROOT / "outputs",)
+# Normalized run statuses (see dev_data._normalize_run_status) that mean the run
+# is over, so the human-task poller can stop.
+_TERMINAL_RUN_STATUSES = {"finished", "error"}
 PROBLEMS_ROOT = REPO_ROOT / "problems"
 LOCAL_TIMEZONE = ZoneInfo(os.environ.get("PROOFSTACK_TIMEZONE") or "Europe/Zurich")
 PROVIDER_API_KEYS = {
@@ -124,6 +141,17 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
     )
     app.config["RUNS_ROOTS"] = list(runs_roots)
 
+    @app.context_processor
+    def inject_human_waiting_runs():
+        # Powers the global "waiting on you" nav indicator on every page.
+        # Only runs blocked on human input are returned (cheap: non-terminal
+        # runs only). Failures here must never break page rendering.
+        try:
+            waiting = find_runs_awaiting_human(app.config["RUNS_ROOTS"])
+        except Exception:
+            waiting = []
+        return {"human_waiting_runs": waiting}
+
     @app.template_filter("display_scalar")
     def display_scalar(value):
         if value is True:
@@ -166,6 +194,20 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         if hours:
             return f"{hours} h"
         return f"{total_minutes} min"
+
+    @app.template_filter("display_tokens")
+    def display_tokens(value):
+        if value is None:
+            return "—"
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return "—"
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.1f}M"
+        if n >= 1_000:
+            return f"{n / 1_000:.0f}k"
+        return str(n)
 
     @app.route("/")
     def index():
@@ -221,6 +263,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         return render_template(
             "dev_run_agent.html",
             presets=presets,
+            preset_inputs={p.name: p.inputs for p in presets},
             preset_signature=presets_registry_version(),
             problems=_discover_problem_files(),
             monitor_model_options=_monitor_model_options(),
@@ -333,6 +376,13 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         ]
         if monitor_enabled:
             cmd.extend(["--monitor", "--monitor-model", monitor_model])
+        # Per-run workflow input overrides (e.g. claude_model=haiku). Only
+        # non-empty values are forwarded; blanks fall back to the preset default.
+        for key, value in (payload.get("inputs") or {}).items():
+            clean_key = str(key or "").strip()
+            clean_value = str("" if value is None else value).strip()
+            if clean_key and clean_value:
+                cmd.extend(["--input", f"{clean_key}={clean_value}"])
         with log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(
                 cmd,
@@ -626,8 +676,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(404)
         tree = load_event_tree(run.path)
         exec_graph = load_execution_graph(run.path, tree=tree)
-        workflow_input = workflow_input_from_tree(tree)
-        workflow_output = workflow_output_from_tree(tree)
+        workflow_input = resolve_output_refs(run.path, workflow_input_from_tree(tree))
+        workflow_output = resolve_output_refs(run.path, workflow_output_from_tree(tree))
         monitor_summaries = load_monitor_summaries(run.path, graph=exec_graph)
         show_monitor = bool(run.monitor_enabled or monitor_summaries)
         show_execution_graph = bool(run.has_events or (run.status == "running" and not run.problems))
@@ -641,6 +691,116 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             monitor_summaries=monitor_summaries,
             show_monitor=show_monitor,
             show_execution_graph=show_execution_graph,
+            human_tasks=load_pending_human_tasks(run.path),
+            run_finished=(run.status or "running") in _TERMINAL_RUN_STATUSES,
+            run_running=(run.status or "running") == "running",
+            run_alive=run_process_alive(run.path),
+            can_resume=(run.path / "resume.json").exists(),
+            prunable_bytes=estimate_prunable_bytes(run.path),
+            pruned_kb=request.args.get("pruned_kb", type=int),
+        )
+
+    @app.route("/run/<run_id>/human", methods=["POST"])
+    def run_human_submit(run_id: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        # Only allow writing a *.response.json directly inside this run's inbox.
+        if "/" in filename or "\\" in filename or not filename.endswith(".response.json"):
+            abort(400, description="invalid response filename")
+        inbox = (run.path / "human_inbox").resolve()
+        target = (inbox / filename).resolve()
+        if target.parent != inbox:
+            abort(400, description="response path escapes inbox")
+        values: dict[str, Any] = {}
+        for key, value in request.form.items():
+            if key.startswith("f_"):
+                values[key[2:]] = value
+        values.setdefault("status", "done")
+        inbox.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/resume", methods=["POST"])
+    def run_resume(run_id: str):
+        # Relaunch a stopped/crashed run in place: same run_id, --resume-from
+        # itself, so completed nodes (incl. answered human prompts) replay from
+        # the resume_cache and the run continues from the first unfinished node.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        spec_path = run.path / "resume.json"
+        if not spec_path.exists():
+            abort(400, description="no resume spec recorded for this run")
+        try:
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            argv = spec.get("argv") or []
+        except (json.JSONDecodeError, OSError):
+            abort(400, description="invalid resume spec")
+        if not argv:
+            abort(400, description="empty resume spec")
+        cmd = [sys.executable, *[str(a) for a in argv], "--resume-from", run_id]
+        # Drop any "stopped" marker so the relaunched run reads as running again,
+        # not as the stopped run it was a moment ago.
+        clear_stopped_marker(run.path)
+        env = _dashboard_subprocess_env()
+        log_path = run.path / "dashboard-resume.log"
+        with log_path.open("a", encoding="utf-8") as log:
+            subprocess.Popen(
+                cmd,
+                cwd=REPO_ROOT,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/stop", methods=["POST"])
+    def run_stop(run_id: str):
+        # Stop a live run: terminate its process group (worker + sandbox CLIs)
+        # and mark it "stopped" (non-terminal) so the Resume button shows. We do
+        # NOT freeze it (SIGSTOP) — a clean kill + durable resume is more robust
+        # than a frozen process the OS might reap. Resume replays finished nodes
+        # from the cache and continues from where it stopped.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        result = stop_run_process(run.path)
+        write_stopped_marker(run.path, signalled=result["signalled"])
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/prune", methods=["POST"])
+    def run_prune(run_id: str):
+        # Reclaim disk: delete finished nodes' throwaway sandboxes + CLI logs.
+        # Safe — the dashboard reads input/output/messages.json (kept) and
+        # resume replays from resume_cache/ (kept). Proof text lives in
+        # output.json, so nothing visible or replayable is lost.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        result = prune_run_artifacts(run.path)
+        pruned_kb = result["bytes_freed"] // 1024
+        return redirect(url_for("run_detail", run_id=run_id, pruned_kb=pruned_kb))
+
+    @app.route("/run/<run_id>/human-pending")
+    def run_human_pending(run_id: str):
+        # Cheap poll target so the run page can notice a NEW human ask appear
+        # (e.g. the second time a loop reaches a human node) and reload itself.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        tasks = load_pending_human_tasks(run.path)
+        finished = (run.status or "running") in _TERMINAL_RUN_STATUSES
+        return jsonify(
+            {
+                "pending": sorted(str(t["response_filename"]) for t in tasks),
+                "finished": finished,
+                # The worker's live state, so the page can swap the Stop/Resume
+                # button when a resume's process comes up (or a stop's goes down).
+                "alive": run_process_alive(run.path),
+            }
         )
 
     @app.route("/run/<run_id>/graph-fragment")
@@ -706,7 +866,150 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description=str(e))
         return send_file(path, mimetype="text/plain")
 
+    @app.route("/run/<run_id>/output/<field>/download")
+    def run_output_download(run_id: str, field: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", field):
+            abort(400, description="invalid field")
+        text = workflow_output_field_text(run.path, load_event_tree(run.path), field)
+        if text is None:
+            abort(404)
+        return Response(
+            text,
+            mimetype="text/x-tex",
+            headers={"Content-Disposition": f'attachment; filename="{field}.tex"'},
+        )
+
+    @app.route("/run/<run_id>/output/<field>/pdf")
+    def run_output_pdf(run_id: str, field: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        if not re.fullmatch(r"[A-Za-z0-9_]+", field):
+            abort(400, description="invalid field")
+        text = workflow_output_field_text(run.path, load_event_tree(run.path), field)
+        if text is None:
+            abort(404)
+        pdf, log = _compile_latex_pdf(text, field)
+        if pdf is None:
+            return Response("LaTeX compile failed:\n\n" + log, status=422, mimetype="text/plain")
+        return Response(
+            pdf,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{field}.pdf"'},
+        )
+
+    @app.route("/compile/text-pdf", methods=["POST"])
+    def compile_text_pdf():
+        # Render arbitrary text (e.g. a human-task prompt) as a readable monospace
+        # PDF. Local dashboard only; the content is the system's own.
+        payload = request.get_json(silent=True) or {}
+        text = str(payload.get("text") or "")
+        if not text.strip():
+            abort(400, description="empty text")
+        name = str(payload.get("filename") or "document")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+            name = "document"
+        pdf, log = _compile_latex_pdf(
+            _MONOSPACE_TEMPLATE.replace("__NAME__", name),
+            name,
+            extra_files={f"{name}.txt": _ascii_fallback(text)},
+        )
+        if pdf is None:
+            return Response("PDF render failed:\n\n" + log, status=422, mimetype="text/plain")
+        return Response(
+            pdf,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f'inline; filename="{name}.pdf"'},
+        )
+
     return app
+
+
+# pdflatex/latexmk are installed under /Library/TeX/texbin on macOS, which a GUI-
+# launched dashboard may not have on PATH; add it so the compiler is found.
+_TEX_BIN = "/Library/TeX/texbin"
+
+# Robust "just readable" wrapper for arbitrary text: listings reads the text from
+# a sidecar file (\lstinputlisting), so any content compiles with no escaping and
+# long lines wrap. Monospace, not typeset — fine for reading a prompt.
+_MONOSPACE_TEMPLATE = r"""\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{listings}
+\lstset{breaklines=true,basicstyle=\small\ttfamily,columns=fullflexible}
+\begin{document}
+\lstinputlisting{__NAME__.txt}
+\end{document}
+"""
+
+# Map common math/typographic Unicode to ASCII so a pdflatex monospace render
+# never chokes on a glyph the default fonts lack. Anything unmapped becomes "?".
+_UNICODE_TO_ASCII = {
+    "—": "--", "–": "-", "−": "-", "…": "...",
+    "“": '"', "”": '"', "‘": "'", "’": "'",
+    "≥": ">=", "≤": "<=", "≠": "!=", "≈": "~=", "≡": "==",
+    "∈": " in ", "∉": " notin ", "⊆": " subseteq ", "⊂": " subset ",
+    "∪": " union ", "∩": " intersect ", "∅": "{}",
+    "×": "x", "·": "*", "÷": "/", "→": "->", "⇒": "=>", "↦": "|->",
+    "∀": "forall ", "∃": "exists ", "∞": "infinity", "√": "sqrt",
+    "∑": "sum", "∏": "prod", "∫": "int", "⊕": "(+)", "⊗": "(x)",
+    "ℝ": "R", "ℤ": "Z", "ℕ": "N", "ℚ": "Q", "ℂ": "C",
+    "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta",
+    "ε": "epsilon", "θ": "theta", "λ": "lambda", "μ": "mu",
+    "π": "pi", "ρ": "rho", "σ": "sigma", "φ": "phi", "ω": "omega",
+}
+
+
+def _ascii_fallback(text: str) -> str:
+    for char, repl in _UNICODE_TO_ASCII.items():
+        text = text.replace(char, repl)
+    return text.encode("ascii", "replace").decode("ascii")
+
+
+def _compile_latex_pdf(
+    tex_source: str, name: str, *, extra_files: dict[str, str] | None = None
+) -> tuple[bytes | None, str]:
+    """Compile a LaTeX document to PDF in a throwaway dir. Returns (pdf_bytes,
+    log); pdf_bytes is None on failure with the tail of the compiler log.
+    extra_files are written alongside name.tex (e.g. a sidecar text file)."""
+    search_path = os.environ.get("PATH", "") + os.pathsep + _TEX_BIN
+    latexmk = shutil.which("latexmk", path=search_path)
+    pdflatex = shutil.which("pdflatex", path=search_path)
+    if latexmk:
+        cmd = [latexmk, "-pdf", "-interaction=nonstopmode", "-halt-on-error", f"{name}.tex"]
+    elif pdflatex:
+        cmd = [pdflatex, "-interaction=nonstopmode", "-halt-on-error", f"{name}.tex"]
+    else:
+        return None, "No LaTeX compiler (latexmk or pdflatex) found."
+    env = dict(os.environ)
+    env["PATH"] = search_path
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / f"{name}.tex").write_text(tex_source, encoding="utf-8")
+        for fname, content in (extra_files or {}).items():
+            (tmp_path / fname).write_text(content, encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=tmp,
+                capture_output=True,
+                # Decode the compiler log tolerantly: pdflatex wraps lines at ~79
+                # chars and can split a multi-byte UTF-8 char (e.g. an em dash),
+                # which strict decoding would crash on.
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                env=env,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return None, f"compile error: {type(e).__name__}: {e}"
+        pdf_path = tmp_path / f"{name}.pdf"
+        if pdf_path.exists():
+            return pdf_path.read_bytes(), proc.stdout[-2000:]
+        return None, (proc.stdout + "\n" + proc.stderr)[-4000:]
 
 
 def _parse_args() -> argparse.Namespace:

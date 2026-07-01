@@ -10,6 +10,7 @@ YAML instead of requiring one Python subclass per worker role.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -18,7 +19,12 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from proofstack.cli_usage import cost_for_codex_usage, load_cost_rates, parse_codex_jsonl
+from proofstack.cli_usage import (
+    cost_for_codex_usage,
+    load_cost_rates,
+    parse_claude_json,
+    parse_codex_jsonl,
+)
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
@@ -126,7 +132,13 @@ class ConfigurableCLIAgent(CLIAgent):
         done: CLIDoneRecord,
     ) -> None:
         usage_cfg = self.component_config.get("usage") or {}
-        if not isinstance(usage_cfg, dict) or usage_cfg.get("type") != "codex_jsonl":
+        if not isinstance(usage_cfg, dict):
+            return
+        kind = usage_cfg.get("type")
+        if kind == "claude_json":
+            await self._record_claude_usage(stdout_text)
+            return
+        if kind != "codex_jsonl":
             return
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
@@ -163,6 +175,36 @@ class ConfigurableCLIAgent(CLIAgent):
             },
         )
 
+    async def _record_claude_usage(self, stdout_text: str) -> None:
+        usage = parse_claude_json(stdout_text)
+        if not usage.found:
+            return
+        # Charge tokens (gated by max_tokens) but NOT usd: a subscription run has
+        # no API spend, and add_usd would trip the max_usd: 0.0 gate. Tokens are
+        # the real subscription limit (Anthropic's rolling token window). We meter
+        # the full throughput (input + cache create + cache read + output): cache
+        # reads dominate an agentic loop and counting only input+output undercounts
+        # ~40x. All categories are recorded below so the weighting stays visible.
+        self.tracker.add_tokens(usage.metered_tokens)
+        await self.events.emit(
+            "model.call",
+            {
+                "model": str(
+                    self.component_config.get("model")
+                    or _model_from_cmd(self.CLI_CMD)
+                    or "claude"
+                ),
+                "in_tokens": usage.input_tokens,
+                "cache_creation_in_tokens": usage.cache_creation_input_tokens,
+                "cached_in_tokens": usage.cache_read_input_tokens,
+                "out_tokens": usage.output_tokens,
+                "metered_tokens": usage.metered_tokens,
+                "cost_usd": usage.total_cost_usd,
+                "n_turns": usage.num_turns,
+                "via": "claude_exec_json",
+            },
+        )
+
     def _command_for(self, inp: BaseModel) -> list[str]:
         fields = self._fields(inp)
         cmd = _coerce_cmd(self._raw_cmd, fields)
@@ -173,6 +215,12 @@ class ConfigurableCLIAgent(CLIAgent):
             reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
             if reasoning_effort:
                 cmd = _with_codex_reasoning_effort(cmd, reasoning_effort)
+        else:
+            # Per-node model override for non-codex CLIs (e.g. claude): a node can
+            # use a stronger model than the global {claude_model} default.
+            model = str(self.component_config.get("model") or "").strip()
+            if model:
+                cmd = _with_claude_model(cmd, model)
         if self.component_config.get("prompt") and _is_codex_exec_cmd(cmd) and _codex_prompt_arg_index(cmd) is None:
             cmd = [*cmd, "-"]
         codex_sandbox = str(self.component_config.get("codex_sandbox") or "").strip()
@@ -327,6 +375,20 @@ def _with_codex_model(cmd: list[str], model: str) -> list[str]:
     return _insert_codex_exec_options(cmd, ["-m", model])
 
 
+def _with_claude_model(cmd: list[str], model: str) -> list[str]:
+    """Override the model of a non-codex (e.g. claude) command in place. Rewrites
+    the existing ``--model``/``-m`` value, or appends one if absent."""
+    out = list(cmd)
+    for i, part in enumerate(out):
+        if part in ("--model", "-m") and i + 1 < len(out):
+            out[i + 1] = model
+            return out
+        if part.startswith("--model="):
+            out[i] = f"--model={model}"
+            return out
+    return [*out, "--model", model]
+
+
 def _without_codex_model(cmd: list[str]) -> list[str]:
     out: list[str] = []
     i = 0
@@ -474,13 +536,16 @@ def _file_content(spec: Any, fields: dict[str, Any]) -> str:
 
 def _format_template(template: str, fields: dict[str, Any]) -> str:
     def repl(match: re.Match[str]) -> str:
-        key = match.group(1)
+        env_key = match.group(1)
+        if env_key:
+            return os.environ.get(env_key, "")
+        key = match.group(2)
         if key not in fields:
             return match.group(0)
         value = fields.get(key, "")
         return "" if value is None else str(value)
 
-    return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, template)
+    return re.sub(r"\{(?:env:([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))\}", repl, template)
 
 
 def _output_file_spec(spec: Any) -> tuple[str, str, Any]:

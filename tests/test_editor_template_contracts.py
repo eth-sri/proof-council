@@ -85,7 +85,7 @@ class EditorTemplateContractTests(unittest.TestCase):
         body = template[start:end]
 
         self.assertIn("CLI model", body)
-        self.assertIn("cliModelValue(cfg)", body)
+        self.assertIn("cliModelControl(prefix, cfg)", body)
         self.assertIn("Reasoning effort", body)
         self.assertIn("cliReasoningEffortSelect(prefix, cliReasoningEffortValue(cfg))", body)
         self.assertIn("model_reasoning_effort", template)

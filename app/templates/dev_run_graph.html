@@ -1,5 +1,5 @@
 {% macro render_graph_node(node, run_id) %}
-    <div class="graph-node status-{{ node.status }}"
+    <div class="graph-node status-{{ node.status }}{% if node.cache_hit %} graph-node-cached{% endif %}"
          data-agent="{{ (node.label ~ ' ' ~ node.node_id ~ ' ' ~ node.status)|lower }}"
          data-status="{{ node.status }}">
         <div class="graph-node-main">
@@ -15,6 +15,7 @@
             </div>
             <div class="graph-meta">
                 {% if node.execution_index > 1 %}<span>#{{ node.execution_index }}</span>{% endif %}
+                {% if node.cache_hit %}<span class="graph-cached-pill" title="Replayed from cache on resume — this node did not run again">cached</span>{% endif %}
                 <span class="graph-status-label">{{ node.status }}</span>
                 {% if node.duration_s is not none %}<span>{{ node.duration_s | display_duration }}</span>{% endif %}
                 {% if node.cost_usd and node.cost_usd > 0 %}<span>${{ '%.4f'|format(node.cost_usd) }}</span>{% endif %}

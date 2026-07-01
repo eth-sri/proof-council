@@ -21,6 +21,12 @@ def _argparser() -> argparse.ArgumentParser:
     p.add_argument("--run-id", required=True)
     p.add_argument("--run-name", help="Human-readable name shown in the dashboard.")
     p.add_argument("--max-parallel", type=int, default=1)
+    p.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help="Workflow input override forwarded to each run. Repeatable. KEY=VALUE.",
+    )
     p.add_argument("--monitor", action="store_true", help="Enable live LLM monitor summaries for each problem run.")
     p.add_argument("--monitor-model", default="models/openai/gpt-54-mini")
     return p
@@ -151,6 +157,8 @@ async def amain() -> int:
                 "--output",
                 str(outputs_root),
             ]
+            for override in args.input or []:
+                cmd.extend(["--input", override])
             if args.monitor:
                 cmd.extend(["--monitor", "--monitor-model", args.monitor_model])
             with log_path.open("a", encoding="utf-8") as log:
@@ -159,6 +167,10 @@ async def amain() -> int:
                     cwd=REPO_ROOT,
                     stdout=log,
                     stderr=asyncio.subprocess.STDOUT,
+                    # Own session/process group per child run, so the dashboard's
+                    # Stop button can terminate one run's group (the worker + its
+                    # sandbox CLIs) without killing sibling problems or the batch.
+                    start_new_session=True,
                 )
                 code = await proc.wait()
             await update_problem(

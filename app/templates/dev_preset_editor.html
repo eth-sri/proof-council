@@ -140,7 +140,7 @@
         let toolDefinitions = {{ tool_definitions | tojson }};
         const fieldHelp = {
             model: "Model config used for this component's API call.",
-            cliModel: "Raw model name passed to the CLI, for example gpt-5.5.",
+            cliModel: "Model for this node. 'Default' inherits the workflow model; pick a specific model to override just this node.",
             cliReasoningEffort: "Reasoning effort passed to Codex as model_reasoning_effort.",
             systemPrompt: "High-level instructions that set the component's role and behavior.",
             userPrompt: "The message template sent to the model for each run. Placeholders such as {problem} are filled from graph inputs.",
@@ -155,6 +155,14 @@
             fallbackOutput: "Value returned when this node is skipped. Use $input.solution for a workflow input, $state.solution for repeat memory, $node.solver.solution for another node's output, or plain text.",
             tools: "Reusable model tools made available to this node.",
             maxToolCalls: "Optional cap on tool calls for this node."
+        };
+        // Friendly dropdown choices for known model knobs in the Workflow Inputs
+        // tab. Editable: a "Custom…" option always lets you type a value the
+        // list doesn't have yet (model names change over time).
+        const workflowInputChoices = {
+            claude_model: ['opus', 'sonnet', 'haiku'],
+            codex_model: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+            codex_effort: ['high', 'medium', 'low', 'minimal'],
         };
         let currentReport = {{ report | tojson }};
         let selectedNodeId = null;
@@ -3933,11 +3941,27 @@
             });
         }
 
+        // The wallclock budget is stored in SECONDS but shown/edited in MINUTES
+        // (seconds is awkward to reason about). Convert on the way in and out.
+        function wallclockSecondsToMinutes(seconds) {
+            if (seconds === '' || seconds === null || seconds === undefined) return '';
+            const n = Number(seconds);
+            if (!isFinite(n)) return String(seconds);
+            const minutes = n / 60;
+            return String(Number.isInteger(minutes) ? minutes : Math.round(minutes * 100) / 100);
+        }
+        function wallclockMinutesToSeconds(minutes) {
+            if (minutes === '' || minutes === null || minutes === undefined) return minutes;
+            const n = Number(minutes);
+            if (!isFinite(n)) return minutes;
+            return String(Math.round(n * 60));
+        }
+
         function workflowBudgetEditorHtml(prefix) {
             const rawBudget = currentReport.workflow_budget || {};
             const budget = {
                 max_usd: rawBudget.max_usd ?? '',
-                max_wallclock_s: rawBudget.max_wallclock_s ?? '',
+                max_wallclock_s: wallclockSecondsToMinutes(rawBudget.max_wallclock_s),
             };
             return mappingEditor(prefix, budget, {
                 sourcePicker: false,
@@ -4218,9 +4242,12 @@
                     <input class="wiring-field" type="hidden" value="${escapeAttr(field)}">
                 `
                 : `<input class="wiring-field" value="${escapeAttr(field)}" placeholder="name" ${readonlyField}>`;
+            const choices = workflowInputChoices[field];
             const valueControl = sourcePicker
                 ? customWiringValueControl(value)
-                : `<input class="wiring-value" value="${escapeAttr(editorValue(value))}" placeholder="default value">`;
+                : (choices
+                    ? choiceWiringValueControl(editorValue(value), choices)
+                    : `<input class="wiring-value" value="${escapeAttr(editorValue(value))}" placeholder="default value">`);
             return `
                 <div class="wiring-row ${sourcePicker ? '' : 'two-column'}" data-wiring-row${skipEmpty}>
                     ${fieldControl}
@@ -4243,6 +4270,40 @@
             return !String(value || '').startsWith('$')
                 && !String(value || '').startsWith('{')
                 && !String(value || '').startsWith('[');
+        }
+
+        // Editable dropdown for a known model knob: a <select> of valid values
+        // plus a "Custom…" escape hatch that reveals a free-text box. The
+        // hidden .wiring-value input always holds the chosen value so the
+        // existing collectMappingEntries() reader is unchanged.
+        function choiceWiringValueControl(value, choices) {
+            const current = String(value ?? '');
+            const isKnown = choices.includes(current);
+            const optionsHtml = choices.map((opt) => `
+                <option value="${escapeAttr(opt)}" ${opt === current ? 'selected' : ''}>${escapeHtml(opt)}</option>
+            `).join('');
+            return `
+                <div class="wiring-choice">
+                    <select class="wiring-choice-select" onchange="applyWiringChoice(this)">
+                        ${optionsHtml}
+                        <option value="__custom" ${isKnown ? '' : 'selected'}>Custom…</option>
+                    </select>
+                    <input class="wiring-value wiring-choice-custom" value="${escapeAttr(current)}" placeholder="custom value" ${isKnown ? 'hidden' : ''}>
+                </div>
+            `;
+        }
+
+        function applyWiringChoice(select) {
+            const wrap = select.closest('.wiring-choice');
+            const custom = wrap?.querySelector('.wiring-choice-custom');
+            if (!custom) return;
+            if (select.value === '__custom') {
+                custom.hidden = false;
+                custom.focus();
+            } else {
+                custom.hidden = true;
+                custom.value = select.value;
+            }
         }
 
         function addWiringRow(prefix, sourcePicker) {
@@ -4500,8 +4561,8 @@
             const labels = {
                 problem: 'Problem statement',
                 problem_id: 'Problem id',
-                max_usd: 'Cost budget',
-                max_wallclock_s: 'Time budget',
+                max_usd: 'Cost budget ($)',
+                max_wallclock_s: 'Time budget (minutes)',
                 n: 'Number of approaches',
                 n_approaches: 'Number of approaches',
                 skip_literature_search: 'Skip literature search',
@@ -4760,6 +4821,16 @@
             return cfg.model || cliModelFromCmd(cfg.cmd) || '';
         }
 
+        // If a CLI field holds a {placeholder} that names a declared workflow
+        // input, explain that it's bound on purpose (not broken) and where to
+        // set the actual value.
+        function boundInputHint(value) {
+            const match = String(value || '').match(/^\{([A-Za-z_][\w]*)\}$/);
+            if (!match) return '';
+            if (!workflowInputNames().includes(match[1])) return '';
+            return `<span class="field-bound-hint dim">Bound to workflow input “${escapeHtml(match[1])}” — choose its value in the Workflow Inputs tab.</span>`;
+        }
+
         function cliReasoningEffortValue(cfg) {
             return cfg.model_reasoning_effort || cliReasoningEffortFromCmd(cfg.cmd) || '';
         }
@@ -4787,6 +4858,49 @@
                 if (part.startsWith('--model=')) return part.slice('--model='.length);
             }
             return '';
+        }
+
+        // Per-node model picker for CLI nodes. "Default" clears the override so
+        // the node uses its command's model (a {claude_model} binding for Claude,
+        // or the literal model for Codex); picking a specific model overrides just
+        // this node, with a "Custom…" escape hatch for names not in the list.
+        function cliModelControl(prefix, cfg) {
+            const override = String(cfg.model || '').trim();
+            const bound = cliModelFromCmd(cfg.cmd);
+            const boundIsBinding = /^\{[A-Za-z_][\w]*\}$/.test(bound);
+            const isCodex = cliCommandParts(cfg.cmd).includes('codex');
+            const known = isCodex ? ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['opus', 'sonnet', 'haiku'];
+            const isCustom = override !== '' && !known.includes(override);
+            const defaultLabel = boundIsBinding
+                ? `Workflow default (${bound})`
+                : (bound ? `Default (${bound})` : 'Default');
+            const opts = [`<option value="" ${override === '' ? 'selected' : ''}>${escapeHtml(defaultLabel)}</option>`];
+            known.forEach((m) => {
+                opts.push(`<option value="${escapeAttr(m)}" ${m === override ? 'selected' : ''}>${escapeHtml(m)}</option>`);
+            });
+            opts.push(`<option value="__custom__" ${isCustom ? 'selected' : ''}>Custom…</option>`);
+            return `
+                <select id="${escapeAttr(prefix)}-cli-model-select" onchange="onCliModelChange('${escapeAttr(prefix)}')">${opts.join('')}</select>
+                <input id="${escapeAttr(prefix)}-cli-model-custom" placeholder="custom model" spellcheck="false"
+                       value="${isCustom ? escapeAttr(override) : ''}" style="${isCustom ? '' : 'display:none'}">
+            `;
+        }
+
+        function onCliModelChange(prefix) {
+            const select = document.getElementById(`${prefix}-cli-model-select`);
+            const custom = document.getElementById(`${prefix}-cli-model-custom`);
+            if (select && custom) custom.style.display = (select.value === '__custom__') ? '' : 'none';
+        }
+
+        function cliModelFieldValue(prefix) {
+            const select = document.getElementById(`${prefix}-cli-model-select`);
+            if (!select) {
+                return document.getElementById(`${prefix}-cli-model`)?.value || '';
+            }
+            if (select.value === '__custom__') {
+                return String(document.getElementById(`${prefix}-cli-model-custom`)?.value || '').trim();
+            }
+            return select.value;
         }
 
         function cliReasoningEffortFromCmd(cmd) {
@@ -4899,7 +5013,7 @@
                 ${showParameters ? parameterEditorForPromptSpec(`${prefix}-parameters`, spec, parentNode) : ''}
                 ${includePromptControls && cliPrompt ? `
                     <div class="inspector-grid inspector-grid-wide">
-                        <label>${fieldLabel('CLI model', fieldHelp.cliModel)} <input id="${escapeAttr(prefix)}-cli-model" value="${escapeAttr(cliModelValue(cfg))}" placeholder="gpt-5.5" spellcheck="false"></label>
+                        <label>${fieldLabel('CLI model', fieldHelp.cliModel)} ${cliModelControl(prefix, cfg)}</label>
                         <label>${fieldLabel('Reasoning effort', fieldHelp.cliReasoningEffort)} ${cliReasoningEffortSelect(prefix, cliReasoningEffortValue(cfg))}</label>
                         <label>${fieldLabel('Prompt', fieldHelp.userPrompt)} <textarea id="${escapeAttr(prefix)}-cli-prompt" rows="12">${escapeHtml(cfg.prompt || '')}</textarea></label>
                     </div>
@@ -5609,7 +5723,7 @@
             if (!cliPrompt && !model) return;
             const fields = cliPrompt ? {
                 prompt: cliPrompt.value,
-                model: document.getElementById(`${prefix}-cli-model`)?.value || '',
+                model: cliModelFieldValue(prefix),
                 model_reasoning_effort: document.getElementById(`${prefix}-cli-reasoning-effort`)?.value || '',
             } : {
                 model: model.value,
@@ -5923,9 +6037,13 @@
         }
 
         async function applyWorkflowBudget(prefix) {
+            const budget = collectMappingEntries(prefix);
+            if (budget && 'max_wallclock_s' in budget) {
+                budget.max_wallclock_s = wallclockMinutesToSeconds(budget.max_wallclock_s);
+            }
             await mutateEditor({
                 op: 'update_workflow_budget',
-                budget: collectMappingEntries(prefix),
+                budget,
             }, {status: 'Workflow budget updated', renderReport: false});
         }
 

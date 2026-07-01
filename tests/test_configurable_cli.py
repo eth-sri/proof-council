@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 import unittest
@@ -194,6 +195,49 @@ class ConfigurableCLITests(unittest.TestCase):
             self.assertIn('model_reasoning_effort="xhigh"', cmd)
             self.assertNotIn('model_reasoning_effort="low"', cmd)
 
+    def test_claude_node_model_override_rewrites_cmd_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["claude", "-p", "--model", "{claude_model}", "--permission-mode", "acceptEdits"],
+                        "model": "opus",  # per-node override
+                        "prompt": "Problem: {problem}",
+                        "input_schema": {"problem": "string", "claude_model": "string"},
+                    }
+                },
+            )
+            agent = ConfigurableCLIAgent(ctx, name="cfg_cli")
+
+            cmd = agent._command_for(agent.Inputs(problem="P", claude_model="sonnet"))
+
+            self.assertIn("--model", cmd)
+            self.assertEqual(cmd[cmd.index("--model") + 1], "opus")
+            self.assertNotIn("sonnet", cmd)  # the override beats the workflow default
+
+    def test_claude_node_without_override_uses_workflow_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["claude", "-p", "--model", "{claude_model}"],
+                        "prompt": "Problem: {problem}",
+                        "input_schema": {"problem": "string", "claude_model": "string"},
+                    }
+                },
+            )
+            agent = ConfigurableCLIAgent(ctx, name="cfg_cli")
+
+            cmd = agent._command_for(agent.Inputs(problem="P", claude_model="haiku"))
+
+            self.assertEqual(cmd[cmd.index("--model") + 1], "haiku")
+
     def test_compile_codex_docker_sandbox_allows_node_exec(self) -> None:
         preset = load_preset(str(ROOT / "tests" / "fixtures" / "compile_cli_agent.yaml"))
         sandbox = preset.component_configs["cfg_compile_latex"]["sandbox"]
@@ -232,6 +276,31 @@ class ConfigurableCLITests(unittest.TestCase):
 
             self.assertEqual(codex_home, Path(out.workspace) / ".codex-home")
             self.assertFalse(codex_home.exists())
+
+    def test_env_template_can_use_parent_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["sh", "-c", "printf '%s' \"$HOME\" > home.txt"],
+                        "env": {"HOME": "{env:PROOFSTACK_TEST_HOME}"},
+                        "sandbox": {"backend": "subprocess"},
+                        "output_schema": {
+                            "workspace": "string",
+                            "home": "string",
+                        },
+                        "output_files": {"home": "home.txt"},
+                    }
+                },
+            )
+
+            with mock.patch.dict(os.environ, {"PROOFSTACK_TEST_HOME": "/portable/home"}):
+                out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
+
+            self.assertEqual(out.home, "/portable/home")
 
 
 if __name__ == "__main__":

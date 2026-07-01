@@ -11,8 +11,12 @@ import copy
 import hashlib
 import importlib
 import json
+import os
 import pkgutil
 import re
+import shutil
+import signal
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -434,10 +438,12 @@ class RunInfo:
     preset: str | None = None
     problem_summary: str | None = None
     cost_usd: float | None = None
+    tokens: int | None = None    # total tokens processed (the subscription dial)
     wallclock_s: float | None = None
     n_problems: int | None = None
     has_events: bool = False
     monitor_enabled: bool = False
+    process_dead: bool = False   # status "running" but the recorded PID is dead
     problems: dict[str, Any] = field(default_factory=dict)
 
 
@@ -537,8 +543,41 @@ def _read_run_info(path: Path) -> RunInfo:
     # from the event log. Cheap O(n) scan, ~kB-sized files.
     if info.has_events:
         _enrich_from_events(info)
+    _apply_stopped_marker(info)
+    _apply_process_liveness(info)
     _finalize_run_info(info)
     return info
+
+
+def _apply_process_liveness(info: RunInfo) -> None:
+    # Flag a phantom: a run that still reads "running" but whose recorded worker
+    # PID is dead (crashed / laptop slept). Only when a PID is actually present —
+    # a run with no run.pid (batch parent, legacy run, or one waiting on a human
+    # whose worker is alive) must NOT be mislabelled.
+    if info.status != "running":
+        return
+    pid = read_run_pid(info.path)
+    if pid is not None and not _pid_alive(pid):
+        info.process_dead = True
+
+
+def _apply_stopped_marker(info: RunInfo) -> None:
+    # A run the user stopped has no terminal run.end, so it would otherwise read
+    # as "running" forever — or "error" if the kill raced the worker into an error
+    # run.end. The marker flips it to non-terminal "stopped" (Resume shows). We
+    # override running/unknown/error but NOT "finished": if it genuinely completed
+    # before the stop took effect, that real outcome wins.
+    if info.status == "finished":
+        return
+    marker = info.path / "run-control.json"
+    if not marker.exists():
+        return
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict) and str(data.get("status") or "").strip() == "stopped":
+        info.status = "stopped"
 
 
 def _batch_child_run_ids(infos: Iterable[RunInfo]) -> set[str]:
@@ -557,7 +596,9 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
         if not info.problems:
             continue
         total_cost = 0.0
+        total_tokens = 0
         saw_cost = False
+        saw_tokens = False
         for problem in info.problems.values():
             if not isinstance(problem, dict):
                 continue
@@ -568,12 +609,36 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
             if child.cost_usd is not None:
                 total_cost += float(child.cost_usd)
                 saw_cost = True
+            if child.tokens is not None:
+                total_tokens += int(child.tokens)
+                saw_tokens = True
             if not problem.get("started_at") and child.started_at:
                 problem["started_at"] = child.started_at
             if child.status:
                 problem["status"] = child.status
+            # A batch parent has no run.pid of its own; inherit a child's phantom
+            # state so a dead single-problem run still surfaces on the list.
+            if child.process_dead:
+                info.process_dead = True
         if saw_cost:
             info.cost_usd = total_cost
+        if saw_tokens:
+            info.tokens = total_tokens
+        # Recompute the parent status from the children's REAL statuses (just
+        # refreshed above). The batch manifest is a stale snapshot: if the batch
+        # process died after a child finished/was stopped but before it recorded
+        # the result, the parent is stuck "running" or mislabelled "error" (a
+        # stopped child exits non-zero, which the batch records as a failure).
+        # Children are ground truth. We override a stale terminal status only when
+        # the children show the run is actually still going ("running") or was
+        # deliberately stopped ("stopped") — never to fabricate a finish.
+        derived = _status_from_problem_statuses(
+            [p.get("status") for p in info.problems.values() if isinstance(p, dict)]
+        )
+        if derived and (info.status not in ("finished", "error") or derived in ("running", "stopped")):
+            info.status = derived
+            if derived in ("finished", "error"):
+                info.process_dead = False  # resolved, not a phantom
 
 
 def _enrich_from_dashboard_subprocess_log(info: RunInfo, *, finished_at: Any) -> None:
@@ -615,6 +680,8 @@ def _dashboard_subprocess_failure_message(path: Path) -> str:
 
 def _enrich_from_events(info: RunInfo) -> None:
     cost = 0.0
+    tokens = 0
+    saw_tokens = False
     first_ts: str | None = None
     last_ts: str | None = None
     saw_workflow_failure = False
@@ -654,12 +721,20 @@ def _enrich_from_events(info: RunInfo) -> None:
                 if e.get("kind") == "model.call":
                     p = e.get("payload") or {}
                     cost += float(p.get("cost_usd") or 0.0)
+                    if "metered_tokens" in p or "in_tokens" in p or "out_tokens" in p:
+                        saw_tokens = True
+                        if p.get("metered_tokens") is not None:
+                            tokens += int(p.get("metered_tokens") or 0)
+                        else:
+                            tokens += int(p.get("in_tokens") or 0) + int(p.get("out_tokens") or 0)
     except OSError:
         return
     if info.started_at is None and first_ts is not None:
         info.started_at = first_ts
     if info.cost_usd is None and cost:
         info.cost_usd = cost
+    if info.tokens is None and saw_tokens:
+        info.tokens = tokens
     if info.wallclock_s is None and first_ts and last_ts:
         info.wallclock_s = _duration(first_ts, last_ts)
     if saw_workflow_failure:
@@ -715,8 +790,10 @@ def _normalize_run_status(value: Any) -> str | None:
     raw = str(value or "").strip().lower()
     if raw in {"ok", "finished", "success", "succeeded", "complete", "completed", "done"}:
         return "finished"
-    if raw in {"error", "failed", "failure", "cancelled", "canceled"}:
+    if raw in {"error", "failed", "failure"}:
         return "error"
+    if raw in {"stopped", "paused", "cancelled", "canceled"}:
+        return "stopped"
     if raw in {"running", "starting", "started", "queued", "pending"}:
         return "running"
     return None
@@ -726,10 +803,14 @@ def _status_from_problem_statuses(statuses: list[Any]) -> str | None:
     normalized = [_normalize_run_status(status) for status in statuses if status]
     if not normalized:
         return None
-    if "error" in normalized:
-        return "error"
+    # A still-running child keeps the batch running; a deliberately stopped child
+    # makes it "stopped" (resumable) and wins over a stop-induced "error".
     if "running" in normalized:
         return "running"
+    if "stopped" in normalized:
+        return "stopped"
+    if "error" in normalized:
+        return "error"
     if all(status == "finished" for status in normalized):
         return "finished"
     return None
@@ -769,6 +850,291 @@ def find_run(roots: Iterable[Path], run_id: str) -> RunInfo | None:
         if r.run_id == run_id:
             return r
     return None
+
+
+def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
+    """Human-in-the-loop tasks awaiting a response in this run.
+
+    A task is pending when a ``human.waiting`` event has no matching
+    ``human.submitted``/``human.timeout`` and its response file hasn't been
+    written yet. Each task carries the rendered prompt, the node's inputs,
+    the expected output fields, and the response filename to write back to.
+    """
+    events_path = run_path / "events.jsonl"
+    if not events_path.exists():
+        return []
+    waiting: dict[str, dict[str, Any]] = {}
+    resolved: set[str] = set()
+    try:
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = e.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                response_path = str(payload.get("response_path") or "")
+                if not response_path:
+                    continue
+                kind = e.get("kind")
+                if kind == "human.waiting":
+                    waiting[response_path] = {**payload, "agent": e.get("agent")}
+                elif kind in ("human.submitted", "human.timeout"):
+                    resolved.add(response_path)
+    except OSError:
+        return []
+
+    inbox = run_path / "human_inbox"
+    tasks: list[dict[str, Any]] = []
+    for response_path, payload in waiting.items():
+        if response_path in resolved:
+            continue
+        filename = Path(response_path).name
+        response_error = ""
+        response_file = inbox / filename
+        if response_file.exists():
+            try:
+                json.loads(response_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                response_error = (
+                    f"Invalid response JSON in {filename}: {e.msg} "
+                    f"(line {e.lineno}, column {e.colno})."
+                )
+            except OSError as e:
+                response_error = f"Could not read response file {filename}: {e}"
+            else:
+                continue  # response already dropped; run will resume
+        # Read display fields from the on-disk task.json, NOT the event payload:
+        # a large prompt (e.g. one embedding an AI proof) gets offloaded to a blob
+        # in events.jsonl and shows up as {"$ref": ...}, whereas HumanAgent writes
+        # the full prompt straight to task.json.
+        full: dict[str, Any] = {}
+        task_path = payload.get("task_path")
+        if task_path and Path(task_path).exists():
+            try:
+                loaded = json.loads(Path(task_path).read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    full = loaded
+            except (json.JSONDecodeError, OSError):
+                full = {}
+        prompt = full.get("prompt")
+        if not isinstance(prompt, str):
+            prompt = payload.get("prompt") if isinstance(payload.get("prompt"), str) else ""
+        output_fields = full.get("output_fields") or payload.get("output_fields")
+        if not isinstance(output_fields, dict) or not output_fields:
+            output_fields = {"response": "string"}
+        tasks.append(
+            {
+                "agent": full.get("agent") or payload.get("agent"),
+                "prompt": prompt,
+                "output_fields": output_fields,
+                "inputs": full.get("inputs") or {},
+                "response_filename": filename,
+                "response_error": response_error,
+            }
+        )
+    return tasks
+
+
+def find_runs_awaiting_human(roots: Iterable[Path]) -> list[dict[str, Any]]:
+    """Every run currently blocked on human input, across all run roots.
+
+    Used by the global "waiting on you" nav indicator. A run can have more
+    than one pending ask (loops), so each entry carries a count. Only
+    non-terminal runs are scanned (a finished/errored run cannot be waiting),
+    which keeps this cheap enough to call on every page render. Newest first.
+    """
+    out: list[dict[str, Any]] = []
+    for run in discover_runs(roots, include_batch_children=True):
+        if (run.status or "running") in {"finished", "error", "stopped"}:
+            continue
+        tasks = load_pending_human_tasks(run.path)
+        if not tasks:
+            continue
+        out.append(
+            {
+                "run_id": run.run_id,
+                "display_name": run.display_name or run.run_id,
+                "count": len(tasks),
+            }
+        )
+    return out
+
+
+def _path_size(path: Path) -> int:
+    """Total bytes under ``path`` (a file or a directory tree)."""
+    try:
+        if path.is_file() or path.is_symlink():
+            return path.lstat().st_size
+        total = 0
+        for child in path.rglob("*"):
+            try:
+                if child.is_file() or child.is_symlink():
+                    total += child.lstat().st_size
+            except OSError:
+                continue
+        return total
+    except OSError:
+        return 0
+
+
+# Per-node artifacts safe to delete once a node has finished: the throwaway
+# sandbox workspace and the raw CLI logs. The dashboard never reads these
+# (it uses input.json/output.json/messages.json), and resume replays from
+# resume_cache/, so removing them loses nothing visible or replayable.
+_PRUNABLE_NODE_ARTIFACTS = ("sandbox", "cli_stdout.log", "cli_stderr.log")
+
+
+def estimate_prunable_bytes(run_path: Path) -> int:
+    """Bytes reclaimable by prune_run_artifacts without actually deleting."""
+    agents_dir = run_path / "agents"
+    if not agents_dir.exists():
+        return 0
+    total = 0
+    for node_dir in agents_dir.iterdir():
+        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+            continue
+        for name in _PRUNABLE_NODE_ARTIFACTS:
+            target = node_dir / name
+            if target.exists():
+                total += _path_size(target)
+    return total
+
+
+def prune_run_artifacts(run_path: Path) -> dict[str, int]:
+    """Reclaim disk by deleting redundant artifacts of FINISHED nodes.
+
+    For every agent call dir that has an ``output.json`` (i.e. the node
+    completed and its output was captured), remove the throwaway ``sandbox/``
+    tree and the raw ``cli_stdout.log`` / ``cli_stderr.log``. A node still
+    running has no ``output.json`` yet, so it is left untouched. The proof text
+    and everything the UI shows live in output.json + the resume cache, so this
+    is non-destructive to anything visible or replayable. Returns the number of
+    nodes pruned and bytes freed.
+    """
+    agents_dir = run_path / "agents"
+    pruned_nodes = 0
+    bytes_freed = 0
+    if not agents_dir.exists():
+        return {"pruned_nodes": 0, "bytes_freed": 0}
+    for node_dir in agents_dir.iterdir():
+        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+            continue
+        node_freed = 0
+        for name in _PRUNABLE_NODE_ARTIFACTS:
+            target = node_dir / name
+            if not target.exists():
+                continue
+            node_freed += _path_size(target)
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                try:
+                    target.unlink()
+                except OSError:
+                    node_freed -= _path_size(target)
+        if node_freed > 0:
+            pruned_nodes += 1
+            bytes_freed += node_freed
+    return {"pruned_nodes": pruned_nodes, "bytes_freed": bytes_freed}
+
+
+def read_run_pid(run_path: Path) -> int | None:
+    """The worker PID recorded by run_workflow.py, or None if absent/garbage."""
+    try:
+        return int((run_path / "run.pid").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
+    """Terminate a run's process group (the worker plus its sandbox CLIs).
+
+    The worker records its PID in ``run.pid`` and the dashboard launches it as a
+    process-group leader, so that PID is the run's PGID. We SIGTERM the group,
+    wait briefly for a clean exit, then SIGKILL anything still alive. ``signalled``
+    is False when there was no live process to stop (already crashed/finished) —
+    the caller still marks the run stopped so Resume appears.
+    """
+    pid = read_run_pid(run_path)
+    if pid is None or not _pid_alive(pid):
+        return {"signalled": False, "pid": pid}
+    # Only signal the GROUP if this PID is genuinely its own group leader, else
+    # killpg would hit an unrelated group; otherwise signal just the process.
+    try:
+        use_group = os.getpgid(pid) == pid
+    except ProcessLookupError:
+        return {"signalled": False, "pid": pid}
+
+    def send(sig: int) -> None:
+        if use_group:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
+
+    try:
+        send(signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return {"signalled": False, "pid": pid}
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline and _pid_alive(pid):
+        time.sleep(0.1)
+    if _pid_alive(pid):
+        try:
+            send(signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        (run_path / "run.pid").unlink()
+    except OSError:
+        pass
+    return {"signalled": True, "pid": pid}
+
+
+def run_process_alive(run_path: Path) -> bool:
+    """True if the run's recorded worker PID is still a live process. Used to
+    tell a genuinely-running run from a phantom (status "running" but dead)."""
+    pid = read_run_pid(run_path)
+    return pid is not None and _pid_alive(pid)
+
+
+def write_stopped_marker(run_path: Path, *, signalled: bool) -> None:
+    """Mark a run deliberately stopped (non-terminal) so Resume surfaces it."""
+    payload = {
+        "status": "stopped",
+        "stopped_at": datetime.now().isoformat(timespec="seconds"),
+        "signalled": bool(signalled),
+    }
+    try:
+        (run_path / "run-control.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def clear_stopped_marker(run_path: Path) -> None:
+    """Drop the stopped marker — called on resume so the relaunched run is not
+    mislabelled stopped while it runs again."""
+    try:
+        (run_path / "run-control.json").unlink()
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +1202,7 @@ class ExecutionGraphNode:
     call_ref: str | None = None
     cost_usd: float = 0.0
     reason: str = ""
+    cache_hit: bool = False
     execution_index: int = 1
     parent_node_id: str = ""
     children: list["ExecutionGraphNode"] = field(default_factory=list)
@@ -1086,6 +1453,36 @@ def workflow_input_from_tree(tree: RunEventTree) -> Any:
     return _clean_display_output(node.input)
 
 
+def resolve_output_refs(run_path: Path, value: Any) -> Any:
+    """Inflate ``{"$ref": "events_blobs/..."}`` pointers to the blob's text.
+
+    Large event payloads (e.g. a full proof) are offloaded to events_blobs/ and
+    left as a $ref; the display would otherwise show the pointer. Reads the blob
+    in place; leaves a ref unresolved (as-is) if it can't be read.
+    """
+    if isinstance(value, dict):
+        if set(value) == {"$ref"} and isinstance(value.get("$ref"), str):
+            try:
+                return safe_blob_path(run_path, value["$ref"]).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except (ValueError, OSError):
+                return value
+        return {k: resolve_output_refs(run_path, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_output_refs(run_path, v) for v in value]
+    return value
+
+
+def workflow_output_field_text(run_path: Path, tree: RunEventTree, field: str) -> str | None:
+    """The resolved string value of one top-level workflow-output field, or None
+    if absent / not a string. Used by the download + PDF routes."""
+    out = resolve_output_refs(run_path, workflow_output_from_tree(tree))
+    if isinstance(out, dict) and isinstance(out.get(field), str):
+        return out[field]
+    return None
+
+
 def _clean_display_output(value: Any) -> Any:
     return _clean_display_output_value(value)
 
@@ -1165,16 +1562,23 @@ def load_execution_graph(
     execution_counts: dict[tuple[str, str], int] = {}
     repeat_child_offsets: dict[tuple[str, str], int] = {}
     run_status = None
+    run_start_ts: list[str] = []
 
     for evt in events:
         kind = evt.get("kind")
         payload = evt.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
+        if kind == "run.start" and evt.get("ts"):
+            run_start_ts.append(str(evt.get("ts")))
         if kind == "run.end":
             run_status = str(payload.get("status") or "")
         if not str(kind or "").startswith("dag.node_"):
-            if kind == "agent.start":
+            if kind in {"agent.start", "agent.cache_hit"}:
+                # Cache hits skip agent.start/agent.end but still need their
+                # call_id linked to the active DAG node, so a replayed node can
+                # be cross-referenced back to its (cached) call and rendered as
+                # "cached" rather than as a fresh run.
                 parent_id = evt.get("parent_call_id")
                 if parent_id:
                     attached = _attach_call_to_active_node(
@@ -1275,6 +1679,22 @@ def load_execution_graph(
                 node.status = "error"
                 node.reason = node.reason or "Run ended before this node finished."
 
+    # A resume appends a fresh run.start; a stop leaves no clean terminal
+    # event, so nodes interrupted by the stop stay "running" forever. Any agent
+    # node still "running" that started before the latest run.start belongs to
+    # the superseded attempt (it was re-run on resume), so mark it interrupted.
+    if len(run_start_ts) >= 2:
+        latest_start = max(run_start_ts)
+        for node in by_id.values():
+            if (
+                node.kind == "agent"
+                and node.status == "running"
+                and node.start_ts
+                and node.start_ts < latest_start
+            ):
+                node.status = "skipped"
+                node.reason = node.reason or "Interrupted by stop; re-run on resume."
+
     if tree is not None:
         for node in by_id.values():
             if not node.call_id:
@@ -1284,6 +1704,7 @@ def load_execution_graph(
                 continue
             node.call_ref = call.display_ref or node.call_id
             call.display_label = node.label
+            node.cache_hit = call.cache_hit
             node.cost_usd = float(getattr(call, "cost_usd_subtree", call.cost_usd) or 0.0)
             if node.duration_s is None:
                 node.duration_s = call.duration_s
@@ -3683,10 +4104,19 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         _rename_component_output_refs(raw, name, fields["__rename_output_refs"])
         handled_fields.add("__rename_output_refs")
 
-    for key in ("model", "system_prompt", "user_prompt", "prompt"):
+    for key in ("system_prompt", "user_prompt", "prompt"):
         if key in fields:
             cfg[key] = str(fields[key] or "")
             handled_fields.add(key)
+    if "model" in fields:
+        # Empty means "no per-node override" — drop the key rather than writing an
+        # inert model: '' (matches the reasoning-effort handling below).
+        model = str(fields["model"] or "").strip()
+        if model:
+            cfg["model"] = model
+        else:
+            cfg.pop("model", None)
+        handled_fields.add("model")
     if "model_reasoning_effort" in fields:
         effort = str(fields["model_reasoning_effort"] or "").strip()
         if effort:

@@ -330,6 +330,96 @@ class RunExecutionGraphTests(unittest.TestCase):
         self.assertEqual(graph.by_id["generator"].status, "error")
         self.assertEqual(graph.by_id["generator"].reason, "Run ended before this node finished.")
 
+    def test_execution_graph_marks_cache_replayed_node_as_cached(self) -> None:
+        # On resume a node is replayed from cache: dag.node_started/done still
+        # fire, but the agent emits agent.cache_hit instead of agent.start/end.
+        # The graph node should carry cache_hit so the UI can mark it "cached"
+        # rather than rendering it as a fresh run.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preset_root = root / "presets"
+            preset_root.mkdir()
+            (preset_root / "demo.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    workflow: proofstack.agents.dag_workflow.DAGWorkflow
+                    dag:
+                      nodes:
+                        - id: generator
+                          kind: agent
+                          name: cfg_generator
+                    """
+                ),
+                encoding="utf-8",
+            )
+            run_path = root / "run"
+            run_path.mkdir()
+            events_path = run_path / "events.jsonl"
+            _write_event(events_path, ts="2026-05-08T09:00:00.000Z", kind="run.start", payload={"preset": "demo"})
+            _write_event(events_path, ts="2026-05-08T09:00:01.000Z", kind="agent.start", call_id="workflow", parent_call_id=None, agent="DAGWorkflow", agent_path="DAGWorkflow", execution_mode="workflow", payload={})
+            _write_event(events_path, ts="2026-05-08T09:00:02.000Z", kind="dag.node_started", parent_call_id="workflow", payload={"node": "generator", "kind": "agent"})
+            _write_event(events_path, ts="2026-05-08T09:00:03.000Z", kind="agent.cache_hit", call_id="generator-call", parent_call_id="workflow", agent="cfg_generator", agent_path="DAGWorkflow.cfg_generator", execution_mode="agent", payload={"key": "abc123"})
+            _write_event(events_path, ts="2026-05-08T09:00:04.000Z", kind="dag.node_done", parent_call_id="workflow", payload={"node": "generator", "kind": "agent"})
+            _write_event(events_path, ts="2026-05-08T09:00:05.000Z", kind="run.end", payload={"status": "ok"})
+
+            tree = load_event_tree(run_path)
+            graph = load_execution_graph(run_path, tree=tree, preset_root=preset_root)
+
+        node = graph.by_id["generator"]
+        self.assertEqual(node.status, "ok")
+        self.assertTrue(node.cache_hit)
+
+    def test_resume_marks_interrupted_running_node_as_skipped(self) -> None:
+        # Stop leaves no clean terminal event; resume appends a second
+        # run.start. A node interrupted by the stop (started, never finished)
+        # must not stay "running" forever — it is superseded by the resume's
+        # re-run, so it should render as interrupted, while the re-run is ok.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preset_root = root / "presets"
+            preset_root.mkdir()
+            (preset_root / "demo.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    workflow: proofstack.agents.dag_workflow.DAGWorkflow
+                    dag:
+                      nodes:
+                        - id: solver
+                          kind: agent
+                          name: cfg_solver
+                    """
+                ),
+                encoding="utf-8",
+            )
+            run_path = root / "run"
+            run_path.mkdir()
+            events_path = run_path / "events.jsonl"
+            # Attempt 1: workflow w1 starts the solver, which never finishes.
+            _write_event(events_path, ts="2026-05-08T09:00:00.000Z", kind="run.start", payload={"preset": "demo"})
+            _write_event(events_path, ts="2026-05-08T09:00:01.000Z", kind="agent.start", call_id="w1", parent_call_id=None, agent="DAGWorkflow", agent_path="DAGWorkflow", execution_mode="workflow", payload={})
+            _write_event(events_path, ts="2026-05-08T09:00:02.000Z", kind="dag.node_started", parent_call_id="w1", payload={"node": "solver", "kind": "agent"})
+            _write_event(events_path, ts="2026-05-08T09:00:03.000Z", kind="agent.start", call_id="solver-1", parent_call_id="w1", agent="cfg_solver", agent_path="DAGWorkflow.cfg_solver", execution_mode="agent", payload={})
+            # Resume: workflow w2 re-runs the solver to completion.
+            _write_event(events_path, ts="2026-05-08T09:05:00.000Z", kind="run.start", payload={"preset": "demo"})
+            _write_event(events_path, ts="2026-05-08T09:05:01.000Z", kind="agent.start", call_id="w2", parent_call_id=None, agent="DAGWorkflow", agent_path="DAGWorkflow", execution_mode="workflow", payload={})
+            _write_event(events_path, ts="2026-05-08T09:05:02.000Z", kind="dag.node_started", parent_call_id="w2", payload={"node": "solver", "kind": "agent"})
+            _write_event(events_path, ts="2026-05-08T09:05:03.000Z", kind="agent.start", call_id="solver-2", parent_call_id="w2", agent="cfg_solver", agent_path="DAGWorkflow.cfg_solver", execution_mode="agent", payload={})
+            _write_event(events_path, ts="2026-05-08T09:05:04.000Z", kind="agent.end", call_id="solver-2", parent_call_id="w2", payload={"output": {"status": "done"}})
+            _write_event(events_path, ts="2026-05-08T09:05:05.000Z", kind="dag.node_done", parent_call_id="w2", payload={"node": "solver", "kind": "agent"})
+            _write_event(events_path, ts="2026-05-08T09:05:06.000Z", kind="run.end", payload={"status": "ok"})
+
+            tree = load_event_tree(run_path)
+            graph = load_execution_graph(run_path, tree=tree, preset_root=preset_root)
+
+        statuses = sorted(
+            node.status for node in graph.by_id.values() if node.raw_id == "solver"
+        )
+        # One interrupted (skipped) attempt, one completed (ok) re-run.
+        self.assertEqual(statuses, ["ok", "skipped"])
+        self.assertFalse(
+            any(n.status == "running" for n in graph.by_id.values() if n.raw_id == "solver")
+        )
+
     def test_execution_graph_uses_editor_labels_and_pending_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
