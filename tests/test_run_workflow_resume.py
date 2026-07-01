@@ -28,7 +28,7 @@ class RunWorkflowResumeTests(unittest.TestCase):
     def test_resume_spec_preserves_instruction_and_budget_overrides(self) -> None:
         module = _run_workflow_module()
         args = SimpleNamespace(
-            workflow="human_council",
+            workflow="human_loop_demo",
             run_name="Human Council",
             input=["claude_model=haiku"],
             model=[],

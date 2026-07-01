@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Validate a workflow preset YAML; print ok / errors / warnings.
 # Usage: scripts/validate_preset.sh PRESET_YAML
-#   scripts/validate_preset.sh configs/workflows/claude_only_min.yaml
+#   scripts/validate_preset.sh configs/workflows/claude_subscription_min.yaml
 set -uo pipefail
 PRESET="${1:?usage: validate_preset.sh PRESET_YAML}"
 cd "$(dirname "$0")/.."

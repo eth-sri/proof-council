@@ -2,7 +2,7 @@
 # One-shot status snapshot for a run: cache entries, finished flag,
 # latest batch dashboard log tail, and live python processes.
 # Usage: scripts/run_status.sh RUN [PORT]
-#   scripts/run_status.sh claude_only_min___example-3-example
+#   scripts/run_status.sh claude_subscription_min___example-3-example
 set -uo pipefail
 RUN="${1:?usage: run_status.sh RUN [PORT]}"
 PORT="${2:-5005}"

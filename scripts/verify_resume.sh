@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify a run's interrupted/resumable state and that the Resume button renders.
 # Usage: scripts/verify_resume.sh RUN [PORT]
-#   scripts/verify_resume.sh claude_only_min___example-4-example
+#   scripts/verify_resume.sh claude_subscription_min___example-4-example
 set -uo pipefail
 RUN="${1:?usage: verify_resume.sh RUN [PORT]}"
 PORT="${2:-5005}"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Poll a run until its first node is cached or the run reports finished.
 # Usage: scripts/watch_run.sh RUN [PORT] [MAX_POLLS]
-#   scripts/watch_run.sh claude_only_min___example-3-example
+#   scripts/watch_run.sh claude_subscription_min___example-3-example
 set -uo pipefail
 RUN="${1:?usage: watch_run.sh RUN [PORT] [MAX_POLLS]}"
 PORT="${2:-5005}"
