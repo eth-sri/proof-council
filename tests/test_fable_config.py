@@ -65,7 +65,7 @@ class FablePresetTests(unittest.TestCase):
             preset.component_configs["Author"]["model"],
             "models/anthropic/fable_5_max",
         )
-        self.assertIs(preset.component_configs["Author"]["USE_CONTAINER_FILES"], False)
+        self.assertNotIn("USE_CONTAINER_FILES", preset.component_configs["Author"])
         self.assertEqual(
             preset.inputs["council_models"],
             list(DEFAULT_COUNCIL_MODELS),

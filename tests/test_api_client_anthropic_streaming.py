@@ -173,6 +173,9 @@ class _FakeAnthropic:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.messages = _FakeMessages(stream_messages=self.stream_messages)
+        self.beta = SimpleNamespace(
+            messages=_FakeMessages(stream_messages=self.stream_messages)
+        )
         _FakeAnthropic.last_instance = self
 
 
@@ -229,6 +232,68 @@ class AnthropicStreamingTests(unittest.TestCase):
         self.assertEqual(result.output_tokens, 11)
         self.assertTrue(log_request.call_args.kwargs["stream_anthropic_messages"])
         log_response.assert_called_once()
+
+    def test_anthropic_betas_use_beta_messages_path(self) -> None:
+        with (
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}),
+            patch.object(api_client_module.anthropic, "Anthropic", _FakeAnthropic),
+            patch.object(api_client_module.request_logger, "log_request") as log_request,
+            patch.object(api_client_module.request_logger, "log_response"),
+        ):
+            client = APIClient(
+                model="claude-test",
+                api="anthropic",
+                max_tokens=16,
+                timeout=1800,
+                max_retries=1,
+                max_retries_inner=0,
+                max_wallclock_per_call_s=1800,
+                stream_anthropic_messages=True,
+                anthropic_betas=["files-api-2025-04-14"],
+            )
+            result = client._anthropic_query_with_tools(
+                3,
+                [{"role": "user", "content": "hello"}],
+            )
+
+        instance = _FakeAnthropic.last_instance
+        self.assertEqual(instance.messages.stream_calls, 0)
+        self.assertEqual(instance.beta.messages.stream_calls, 1)
+        self.assertEqual(
+            instance.beta.messages.last_payload["betas"],
+            ["files-api-2025-04-14"],
+        )
+        self.assertEqual(result.conversation[-1]["content"], "streamed answer")
+        self.assertEqual(
+            log_request.call_args.kwargs["request"]["betas"],
+            ["files-api-2025-04-14"],
+        )
+
+    def test_anthropic_container_upload_blocks_survive_preparation(self) -> None:
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}):
+            client = APIClient(
+                model="claude-test",
+                api="anthropic",
+                max_tokens=16,
+            )
+
+        prepared = client._validate_and_prepare_query(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "use files"},
+                        {"type": "container_upload", "file_id": "file_abc123"},
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(prepared[0]["content"][0], {"type": "text", "text": "use files"})
+        self.assertEqual(
+            prepared[0]["content"][1],
+            {"type": "container_upload", "file_id": "file_abc123"},
+        )
 
     def test_anthropic_streaming_enforces_total_wallclock(self) -> None:
         client = APIClient.__new__(APIClient)
@@ -416,6 +481,13 @@ class AnthropicStreamingTests(unittest.TestCase):
         messages = _PauseAnthropic.last_instance.messages
         self.assertEqual(messages.stream_calls, 2)
         self.assertEqual(result.conversation[-1]["content"], "done")
+        preserved_types = [
+            msg.get("type")
+            for msg in result.conversation
+            if msg.get("role") == "assistant"
+        ]
+        self.assertIn("server_tool_use", preserved_types)
+        self.assertIn("web_search_tool_result", preserved_types)
         replay = messages.payloads[1]["messages"][1]
         self.assertEqual(replay["role"], "assistant")
         self.assertEqual(replay["content"][0]["type"], "server_tool_use")

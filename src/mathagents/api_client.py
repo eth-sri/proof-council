@@ -26,9 +26,9 @@ from mathagents.utils import check_for_extra_keys
 
 _ANTHROPIC_FINAL_ANSWER_SALVAGE_PROMPT = (
     "Your previous turn appears to have used its generation budget before producing visible text. "
-    "Use the reasoning represented in that previous assistant turn and now output only your council opinion. "
+    "Use the reasoning represented in that previous assistant turn and now output only the final visible response. "
     "Target at most 1000 words. If more is genuinely necessary, include it rather than stopping early. "
-    "Do not include scratchwork, hidden reasoning, or tool requests."
+    "Do not include scratchwork, hidden reasoning, tool requests, or full generated file bodies."
 )
 
 try:
@@ -236,6 +236,7 @@ class APIClient:
         use_gdm_tools=False,
         stream_openai_chat_completions=False,
         stream_anthropic_messages=False,
+        anthropic_betas=None,
         anthropic_salvage_empty_max_tokens=False,
         anthropic_continue_on_max_tokens=False,
         anthropic_max_token_continuations=3,
@@ -269,6 +270,8 @@ class APIClient:
             use_openai_responses_api (bool, optional): Whether to use OpenAI responses. Defaults to False.
             stream_openai_chat_completions (bool, optional): Whether to stream OpenAI chat completions internally.
             stream_anthropic_messages (bool, optional): Whether to use Anthropic's streaming Messages API.
+            anthropic_betas (list[str], optional): Anthropic beta headers to pass through
+                ``client.beta.messages``. Required for Files API ``container_upload``.
             anthropic_salvage_empty_max_tokens (bool, optional): Whether to follow up an
                 Anthropic max-token response with no visible text by asking for only the final answer.
             anthropic_continue_on_max_tokens (bool, optional): Whether to continue a visible
@@ -347,6 +350,7 @@ class APIClient:
         self.use_google_internal_tools = False
         self.stream_openai_chat_completions = stream_openai_chat_completions
         self.stream_anthropic_messages = stream_anthropic_messages
+        self.anthropic_betas = list(anthropic_betas or [])
         self.anthropic_salvage_empty_max_tokens = anthropic_salvage_empty_max_tokens
         self.anthropic_continue_on_max_tokens = anthropic_continue_on_max_tokens
         self.anthropic_max_token_continuations = max(0, int(anthropic_max_token_continuations or 0))
@@ -709,7 +713,7 @@ class APIClient:
                         new_content.append({"type": "image", "source": source})
                     elif isinstance(block, dict) and block.get("type", "") == "input_text" and "text" in block:
                         new_content.append({"type": "text", "text": block["text"]})
-                    elif isinstance(block, dict) and block.get("type", "") in ["text", "image"]:
+                    elif isinstance(block, dict) and block.get("type", "") in ["text", "image", "container_upload"]:
                         # Already transformed (e.g., during last_chance), keep as-is
                         new_content.append(block)
                     else:
@@ -1422,12 +1426,30 @@ class APIClient:
         except (TypeError, ValueError):
             return remaining
 
+    def _anthropic_payload_with_betas(self, payload: dict) -> dict:
+        anthropic_betas = list(getattr(self, "anthropic_betas", []) or [])
+        if not anthropic_betas:
+            return payload
+        out = dict(payload)
+        configured = list(out.get("betas") or [])
+        for beta in anthropic_betas:
+            if beta not in configured:
+                configured.append(beta)
+        out["betas"] = configured
+        return out
+
+    def _anthropic_messages_api(self, client):
+        if getattr(self, "anthropic_betas", None):
+            return client.beta.messages
+        return client.messages
+
     def _create_anthropic_message(self, client, payload, *, inner_start: float):
+        messages_api = self._anthropic_messages_api(client)
         if not self.stream_anthropic_messages:
-            return client.messages.create(**payload)
+            return messages_api.create(**payload)
 
         start_usage = None
-        with client.messages.stream(**payload) as stream:
+        with messages_api.stream(**payload) as stream:
             for event in stream:
                 if getattr(event, "type", None) == "message_start":
                     message = getattr(event, "message", None)
@@ -1535,6 +1557,7 @@ class APIClient:
                 payload["timeout"] = self._anthropic_request_timeout(inner_start)
                 if system_message is not anthropic.NOT_GIVEN:
                     payload["system"] = system_message
+                payload = self._anthropic_payload_with_betas(payload)
                 request_logger.log_request(
                     ts=ts,
                     batch_idx=idx,
@@ -1812,6 +1835,7 @@ class APIClient:
                         payload["tools"] = anthropic_tools
                     if ignore_tool_calls:
                         payload["tool_choice"] = {"type": "none"}
+                    payload = self._anthropic_payload_with_betas(payload)
                     info = {
                         "nb_executed_tool_calls": nb_executed_tool_calls,
                         "n_retries": n_retries,
@@ -1868,6 +1892,8 @@ class APIClient:
                     conversation.append({"role": "assistant", "type": "cot", "content": getattr(block, "thinking", "")})
                 elif block_type == "tool_use":
                     tool_uses.append(block)
+                elif isinstance(block_dict, dict):
+                    conversation.append({"role": "assistant", **block_dict})
 
             if len(text_blocks) > 0:
                 text_joined = "\n\n".join(text_blocks)
