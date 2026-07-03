@@ -25,6 +25,7 @@ budget:
 components:
   Author:
     model: models/anthropic/fable_5_max
+    USE_CONTAINER_FILES: false
   ACCritic:
     model: models/openai/gpt-55-pro
 dag:

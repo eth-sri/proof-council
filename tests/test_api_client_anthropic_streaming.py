@@ -106,6 +106,15 @@ class _FakeThinkingBlock:
         return {"type": self.type, "thinking": self.thinking, "signature": self.signature}
 
 
+class _FakeServerBlock:
+    def __init__(self, data):
+        self._data = dict(data)
+        self.type = self._data.get("type", "")
+
+    def model_dump(self):
+        return dict(self._data)
+
+
 class _FakeMessage:
     def __init__(self, content=None, usage=None, stop_reason="end_turn"):
         self.usage = usage or _FakeUsage()
@@ -168,6 +177,26 @@ class _FakeAnthropic:
 
 
 class AnthropicStreamingTests(unittest.TestCase):
+    def test_anthropic_maps_provider_tools_to_server_tools(self) -> None:
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}):
+            client = APIClient(
+                model="claude-test",
+                api="anthropic",
+                max_tokens=16,
+                tools=[
+                    (None, {"type": "web_search_preview"}),
+                    (None, {"type": "code_interpreter", "container": {"type": "auto"}}),
+                ],
+            )
+
+        self.assertEqual(
+            client._anthropic_tool_descriptions(),
+            [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"type": "code_execution_20250825", "name": "code_execution"},
+            ],
+        )
+
     def test_anthropic_streaming_uses_stream_manager(self) -> None:
         with (
             patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}),
@@ -328,6 +357,113 @@ class AnthropicStreamingTests(unittest.TestCase):
         self.assertNotIn("output_config", messages.payloads[1])
         self.assertTrue(log_request.call_args.kwargs["anthropic_final_answer_salvage"])
         self.assertEqual(log_response.call_count, 2)
+
+    def test_anthropic_streaming_continues_pause_turn_with_server_blocks(self) -> None:
+        first = _FakeMessage(
+            content=[
+                _FakeServerBlock(
+                    {
+                        "type": "server_tool_use",
+                        "id": "srvtoolu_1",
+                        "name": "web_search",
+                        "input": {"query": "test"},
+                    }
+                ),
+                _FakeServerBlock(
+                    {
+                        "type": "web_search_tool_result",
+                        "tool_use_id": "srvtoolu_1",
+                        "content": [
+                            {
+                                "type": "web_search_result",
+                                "title": "Result",
+                                "url": "https://example.com",
+                                "encrypted_content": "opaque",
+                            }
+                        ],
+                    }
+                ),
+            ],
+            stop_reason="pause_turn",
+        )
+        second = _FakeMessage(content=[_FakeTextBlock("done")])
+
+        class _PauseAnthropic(_FakeAnthropic):
+            stream_messages = [first, second]
+
+        with (
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}),
+            patch.object(api_client_module.anthropic, "Anthropic", _PauseAnthropic),
+            patch.object(api_client_module.request_logger, "log_request"),
+            patch.object(api_client_module.request_logger, "log_response"),
+        ):
+            client = APIClient(
+                model="claude-test",
+                api="anthropic",
+                max_tokens=16,
+                timeout=1800,
+                max_retries=1,
+                max_retries_inner=0,
+                max_wallclock_per_call_s=1800,
+                stream_anthropic_messages=True,
+                tools=[(None, {"type": "web_search_preview"})],
+            )
+            result = client._anthropic_query_with_tools(
+                3,
+                [{"role": "user", "content": "search"}],
+            )
+
+        messages = _PauseAnthropic.last_instance.messages
+        self.assertEqual(messages.stream_calls, 2)
+        self.assertEqual(result.conversation[-1]["content"], "done")
+        replay = messages.payloads[1]["messages"][1]
+        self.assertEqual(replay["role"], "assistant")
+        self.assertEqual(replay["content"][0]["type"], "server_tool_use")
+        self.assertEqual(replay["content"][1]["content"][0]["encrypted_content"], "opaque")
+
+    def test_anthropic_streaming_continues_visible_max_tokens_response(self) -> None:
+        first = _FakeMessage(
+            content=[_FakeTextBlock("part one")],
+            usage=_FakeUsage(input_tokens=20, output_tokens=16),
+            stop_reason="max_tokens",
+        )
+        second = _FakeMessage(
+            content=[_FakeTextBlock("part two")],
+            usage=_FakeUsage(input_tokens=6, output_tokens=4),
+        )
+
+        class _ContinueAnthropic(_FakeAnthropic):
+            stream_messages = [first, second]
+
+        with (
+            patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}),
+            patch.object(api_client_module.anthropic, "Anthropic", _ContinueAnthropic),
+            patch.object(api_client_module.request_logger, "log_request"),
+            patch.object(api_client_module.request_logger, "log_response"),
+        ):
+            client = APIClient(
+                model="claude-test",
+                api="anthropic",
+                max_tokens=16,
+                timeout=1800,
+                max_retries=1,
+                max_retries_inner=0,
+                max_wallclock_per_call_s=1800,
+                stream_anthropic_messages=True,
+                anthropic_continue_on_max_tokens=True,
+            )
+            result = client._anthropic_query_with_tools(
+                3,
+                [{"role": "user", "content": "write a long answer"}],
+            )
+
+        messages = _ContinueAnthropic.last_instance.messages
+        self.assertEqual(messages.stream_calls, 2)
+        self.assertEqual(result.conversation[-1]["content"], "part one\n\npart two")
+        self.assertEqual(result.output_tokens, 20)
+        continue_turn = messages.payloads[1]["messages"][-2]
+        self.assertEqual(continue_turn["role"], "user")
+        self.assertIn("Please continue", continue_turn["content"][0]["text"])
 
 
 if __name__ == "__main__":

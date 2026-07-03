@@ -22,6 +22,7 @@ cache_control:
 batch_processing: false
 stream_anthropic_messages: true
 anthropic_salvage_empty_max_tokens: true
+anthropic_continue_on_max_tokens: true
 # Author-role leash at parity with gpt-55-pro: 3h10m per streaming
 # attempt, with a ~3h53m hard wallclock cap for the retry loop.
 timeout: 11400

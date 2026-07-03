@@ -237,6 +237,9 @@ class APIClient:
         stream_openai_chat_completions=False,
         stream_anthropic_messages=False,
         anthropic_salvage_empty_max_tokens=False,
+        anthropic_continue_on_max_tokens=False,
+        anthropic_max_token_continuations=3,
+        anthropic_max_server_tool_continuations=5,
         max_tool_calls=float("inf"),
         cache_write_cost=0,
         background_timeout_downgrade_after=0,
@@ -268,6 +271,12 @@ class APIClient:
             stream_anthropic_messages (bool, optional): Whether to use Anthropic's streaming Messages API.
             anthropic_salvage_empty_max_tokens (bool, optional): Whether to follow up an
                 Anthropic max-token response with no visible text by asking for only the final answer.
+            anthropic_continue_on_max_tokens (bool, optional): Whether to continue a visible
+                Anthropic response that stopped at max_tokens and stitch the visible chunks.
+            anthropic_max_token_continuations (int, optional): Maximum number of visible
+                max_tokens continuation turns.
+            anthropic_max_server_tool_continuations (int, optional): Maximum number of
+                Anthropic pause_turn continuations for server tools.
             max_tool_calls (int|float|dict, optional): The maximum number of tool calls to make.
                 Defaults to unlimited.
                 Could also be a dict that specifies max calls per tool name.
@@ -339,6 +348,9 @@ class APIClient:
         self.stream_openai_chat_completions = stream_openai_chat_completions
         self.stream_anthropic_messages = stream_anthropic_messages
         self.anthropic_salvage_empty_max_tokens = anthropic_salvage_empty_max_tokens
+        self.anthropic_continue_on_max_tokens = anthropic_continue_on_max_tokens
+        self.anthropic_max_token_continuations = max(0, int(anthropic_max_token_continuations or 0))
+        self.anthropic_max_server_tool_continuations = max(0, int(anthropic_max_server_tool_continuations or 0))
         self.include_max_tool_calls = include_max_tool_calls
         self.cache_write_cost = cache_write_cost
         self.background_timeout_downgrade_after = max(0, int(background_timeout_downgrade_after or 0))
@@ -1567,11 +1579,30 @@ class APIClient:
                         "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
                     }
                 )
+            elif tool_desc.get("type") == "web_search_preview":
+                anthropic_tools.append(
+                    {"type": "web_search_20250305", "name": "web_search"}
+                )
+            elif tool_desc.get("type") == "code_interpreter":
+                anthropic_tools.append(
+                    {"type": "code_execution_20250825", "name": "code_execution"}
+                )
+            elif str(tool_desc.get("type", "")).startswith(
+                ("web_search_", "web_fetch_", "code_execution_")
+            ) and "name" in tool_desc:
+                anthropic_tools.append(tool_desc)
             elif "name" in tool_desc and "input_schema" in tool_desc:
                 anthropic_tools.append(tool_desc)
             else:
                 logger.warning(f"Skipping unsupported Anthropic tool descriptor: {tool_desc}")
         return anthropic_tools
+
+    def _anthropic_response_needs_continuation(self, response, text_blocks) -> bool:
+        if not self.anthropic_continue_on_max_tokens:
+            return False
+        if getattr(response, "stop_reason", None) != "max_tokens":
+            return False
+        return any(str(text).strip() for text in text_blocks)
 
     def _to_anthropic_content_blocks(self, content):
         def _safe_text_block(text, cache_control=None):
@@ -1750,6 +1781,9 @@ class APIClient:
         reasoning_tokens = 0
         total_retries = 0
         inner_start = time.time()
+        server_tool_continuations = 0
+        max_token_continuations = 0
+        continued_text_chunks = []
 
         while not self.terminated:
             response = None
@@ -1836,11 +1870,37 @@ class APIClient:
                     tool_uses.append(block)
 
             if len(text_blocks) > 0:
-                conversation.append({"role": "assistant", "content": "\n\n".join(text_blocks)})
+                text_joined = "\n\n".join(text_blocks)
+                conversation.append({"role": "assistant", "content": text_joined})
+                continued_text_chunks.append(text_joined)
             if len(assistant_blocks) > 0:
                 self._append_anthropic_message(anthropic_messages, "assistant", assistant_blocks)
 
+            if getattr(response, "stop_reason", None) == "pause_turn":
+                if server_tool_continuations >= self.anthropic_max_server_tool_continuations:
+                    logger.warning(
+                        "Anthropic server-tool response returned pause_turn after "
+                        f"{server_tool_continuations} continuation(s); stopping."
+                    )
+                    break
+                server_tool_continuations += 1
+                continue
+
             if len(tool_uses) == 0:
+                if self._anthropic_response_needs_continuation(response, text_blocks):
+                    if max_token_continuations >= self.anthropic_max_token_continuations:
+                        logger.warning(
+                            "Anthropic response stopped at max_tokens after "
+                            f"{max_token_continuations} continuation(s); accepting partial text."
+                        )
+                        break
+                    max_token_continuations += 1
+                    self._append_anthropic_message(
+                        anthropic_messages,
+                        "user",
+                        "Please continue exactly from where you left off. Do not repeat earlier text.",
+                    )
+                    continue
                 if self._anthropic_response_needs_final_answer_salvage(response, text_blocks):
                     salvage_response, salvage_retries = self._anthropic_fetch_final_answer_salvage(
                         client,
@@ -1942,6 +2002,10 @@ class APIClient:
             conversation[-1]["content"] = "Model reached its max allowed token limit. \\boxed{None}"
         elif len(conversation) == len(messages) or conversation[-1].get("type") == "cot":
             conversation.append({"role": "assistant", "content": ""})
+        elif max_token_continuations > 0 and continued_text_chunks:
+            stitched = "\n\n".join(continued_text_chunks)
+            if conversation[-1].get("content") != stitched:
+                conversation.append({"role": "assistant", "content": stitched})
         return self.InternalRequestResult(
             conversation,
             input_tokens,

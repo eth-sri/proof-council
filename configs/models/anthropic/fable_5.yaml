@@ -14,12 +14,13 @@ thinking:
   type: adaptive
   display: omitted
 output_config:
-  effort: xhigh
+  effort: max
 cache_control:
   type: ephemeral
 batch_processing: false
 stream_anthropic_messages: true
 anthropic_salvage_empty_max_tokens: true
+anthropic_continue_on_max_tokens: true
 # Use Anthropic streaming for long adaptive-thinking calls, with a
 # 30-minute total cap for the council seat.
 timeout: 1800

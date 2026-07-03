@@ -25,17 +25,18 @@ class FableModelConfigTests(unittest.TestCase):
         self.assertNotIn("budget_tokens", cfg["thinking"])
         self.assertTrue(cfg["stream_anthropic_messages"])
         self.assertTrue(cfg["anthropic_salvage_empty_max_tokens"])
+        self.assertTrue(cfg["anthropic_continue_on_max_tokens"])
         self.assertEqual(cfg["read_cost"], 10)
         self.assertEqual(cfg["write_cost"], 50)
         self.assertEqual(cfg["cache_read_cost"], 1.0)
         self.assertEqual(cfg["cache_write_cost"], 12.5)
 
-    def test_fable_council_seat_uses_xhigh_streaming_config(self) -> None:
+    def test_fable_council_seat_uses_max_streaming_config(self) -> None:
         cfg = load_solver_config("models/anthropic/fable_5")
 
         self._assert_common_fable_fields(cfg)
         self.assertEqual(cfg["thinking"]["display"], "omitted")
-        self.assertEqual(cfg["output_config"]["effort"], "xhigh")
+        self.assertEqual(cfg["output_config"]["effort"], "max")
         self.assertEqual(cfg["timeout"], 1800)
         self.assertEqual(cfg["max_wallclock_per_call_s"], 1800)
         self.assertEqual(cfg["max_retries"], 1)
@@ -64,6 +65,7 @@ class FablePresetTests(unittest.TestCase):
             preset.component_configs["Author"]["model"],
             "models/anthropic/fable_5_max",
         )
+        self.assertIs(preset.component_configs["Author"]["USE_CONTAINER_FILES"], False)
         self.assertEqual(
             preset.inputs["council_models"],
             list(DEFAULT_COUNCIL_MODELS),

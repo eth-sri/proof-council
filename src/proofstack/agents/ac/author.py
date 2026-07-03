@@ -113,13 +113,14 @@ technically rigorous LaTeX solution to the problem below, using
 computation and search where useful.
 
 You have two tools available:
-  - **code_interpreter**: a Python sandbox with TeX Live and standard
-    scientific libs. Run pdflatex to verify compile, and use sympy or
-    numpy for computational exploration, verification and sanity
-    checks (e.g., expand $q$-series coefficients, test conjectured
-    identities at small values, perform finite-field or modular
-    arithmetic).
-  - **web_search_preview**: free-form web search for citations.
+  - **code_interpreter/code_execution**: a Python sandbox with TeX
+    Live and standard scientific libs. Run pdflatex to verify compile,
+    and use sympy or numpy for computational exploration, verification
+    and sanity checks (e.g., expand $q$-series coefficients, test
+    conjectured identities at small values, perform finite-field or
+    modular arithmetic).
+  - **web_search_preview/web_search**: free-form web search for
+    citations.
 
 Output exactly three files using fenced code blocks with ``file
 path=...`` info strings. Each block contains the full contents of one
@@ -177,11 +178,11 @@ reviewed them. Your job in each subsequent round is to refine the
 files in response to the Critic's findings.
 
 You have two tools:
-  - **code_interpreter**: a Python sandbox with TeX Live and standard
-    scientific libs. Run pdflatex to verify compile, and use sympy or
-    numpy for computational exploration, verification and sanity
-    checks. It is ephemeral per call.
-  - **web_search_preview**: free-form web search.
+  - **code_interpreter/code_execution**: a Python sandbox with TeX Live
+    and standard scientific libs. Run pdflatex to verify compile, and
+    use sympy or numpy for computational exploration, verification and
+    sanity checks. It is ephemeral per call.
+  - **web_search_preview/web_search**: free-form web search.
 
 The canonical workspace files are ``answer.tex``,
 ``research_notes.tex``, and ``references.bib``. To update a file,
@@ -317,14 +318,15 @@ technically rigorous LaTeX solution to the problem below, using
 computation and search where useful.
 
 You have two tools available:
-  - **code_interpreter**: a Python sandbox with TeX Live and standard
-    scientific libs. Run ``pdflatex`` to verify compile, and use
-    sympy or numpy for computational exploration, verification and
-    sanity checks (e.g., expand $q$-series coefficients, test
+  - **code_interpreter/code_execution**: a Python sandbox with TeX Live
+    and standard scientific libs. Run ``pdflatex`` to verify compile,
+    and use sympy or numpy for computational exploration, verification
+    and sanity checks (e.g., expand $q$-series coefficients, test
     conjectured identities at small values, perform finite-field or
     modular arithmetic). The sandbox has NO outbound network — for
-    any external URL or paper, use web_search_preview.
-  - **web_search_preview**: free-form web search for citations.
+    any external URL or paper, use the web search tool.
+  - **web_search_preview/web_search**: free-form web search for
+    citations.
 
 Your workspace lives at ``/mnt/data/`` inside the sandbox. Three
 canonical files are tracked by the infrastructure:
@@ -388,12 +390,12 @@ Your job each round is to refine the files in response to the Critic's
 findings.
 
 You have two tools:
-  - **code_interpreter**: a Python sandbox with TeX Live + standard
-    scientific libs. Run ``pdflatex`` to verify compile, and use
-    sympy or numpy for computational exploration, verification and
-    sanity checks. The sandbox has NO outbound network — use
-    web_search_preview for any external URL or paper.
-  - **web_search_preview**: free-form web search.
+  - **code_interpreter/code_execution**: a Python sandbox with TeX Live
+    and standard scientific libs. Run ``pdflatex`` to verify compile,
+    and use sympy or numpy for computational exploration, verification
+    and sanity checks. The sandbox has NO outbound network — use the
+    web search tool for any external URL or paper.
+  - **web_search_preview/web_search**: free-form web search.
 
 Your workspace lives at ``/mnt/data/`` and contains three canonical
 files. The user message lists, for each, a read-only input path
