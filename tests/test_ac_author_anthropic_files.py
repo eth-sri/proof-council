@@ -181,7 +181,11 @@ class AnthropicContainerFileBridgeTests(unittest.TestCase):
         )
         self.assertEqual(
             {file_id for file_id, _betas in fake_client.files.delete_calls},
-            set(uploaded_ids),
+            {
+                *uploaded_ids,
+                "file_generated_answer",
+                "file_generated_notes",
+            },
         )
         self.assertTrue(
             all(betas == [ANTHROPIC_FILES_BETA] for _file_id, betas in fake_client.files.delete_calls)
@@ -236,12 +240,13 @@ class AuthorAnthropicFilesTests(unittest.TestCase):
             )
             author = Author(ctx)
 
+            anthropic_ctor = MagicMock(return_value=fake_client)
             with (
                 patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key-not-used"}),
                 patch.object(
                     sys.modules["anthropic"],
                     "Anthropic",
-                    MagicMock(return_value=fake_client),
+                    anthropic_ctor,
                 ),
                 patch(
                     "proofstack.agents.ac.author._one_shot_query",
@@ -270,6 +275,48 @@ class AuthorAnthropicFilesTests(unittest.TestCase):
             [tool[1]["type"] for tool in built_configs[0]["tools"]],
             ["code_interpreter", "web_search_preview"],
         )
+        self.assertEqual(built_configs[0]["tools"][1][1]["max_uses"], Author.MAX_TOOL_CALLS)
+        anthropic_ctor.assert_called_once_with(api_key="test-key-not-used")
+        self.assertEqual(len(fake_client.files.upload_calls), len(CANONICAL_FILES))
+        self.assertEqual(len(fake_client.files.delete_calls), len(CANONICAL_FILES) + 1)
+
+    def test_fable_author_round0_raises_when_no_generated_files(self) -> None:
+        fake_client = _FakeAnthropicClient()
+
+        with tempfile.TemporaryDirectory() as td:
+            ctx = RunContext.create(
+                run_id="test_author_anthropic_no_files",
+                root_workdir=Path(td),
+                flat=True,
+                api_client_factory=lambda cfg: SimpleNamespace(model=cfg["model"]),
+                component_configs={
+                    "Author": {"model": "models/anthropic/fable_5_max"}
+                },
+            )
+            author = Author(ctx)
+
+            with (
+                patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key-not-used"}),
+                patch.object(
+                    sys.modules["anthropic"],
+                    "Anthropic",
+                    MagicMock(return_value=fake_client),
+                ),
+                patch(
+                    "proofstack.agents.ac.author._one_shot_query",
+                    return_value=(
+                        0,
+                        [{"role": "assistant", "content": "<ready>false</ready>"}],
+                        {"cost": 0.0, "input_tokens": 1, "output_tokens": 2},
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "no generated canonical files",
+                ):
+                    asyncio.run(author._run_with_container_files(self._input()))
+
         self.assertEqual(len(fake_client.files.upload_calls), len(CANONICAL_FILES))
         self.assertEqual(len(fake_client.files.delete_calls), len(CANONICAL_FILES))
 

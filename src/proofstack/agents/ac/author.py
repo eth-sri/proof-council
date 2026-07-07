@@ -833,7 +833,6 @@ class Author(APICallAgent):
 
             anthropic_client = anthropic.Anthropic(
                 api_key=os.environ["ANTHROPIC_API_KEY"],
-                max_retries=0,
             )
             bridge = AnthropicContainerFileBridge(
                 anthropic_client=anthropic_client,
@@ -914,6 +913,11 @@ class Author(APICallAgent):
                         "ac.author.no_generated_files",
                         {"provider": "anthropic"},
                     )
+                    if inp.round == 0:
+                        raise RuntimeError(
+                            "Anthropic Author produced no generated canonical files "
+                            "on round 0; failing instead of returning empty answer.tex."
+                        )
             finally:
                 try:
                     await asyncio.to_thread(bridge.cleanup)
@@ -1033,7 +1037,7 @@ class Author(APICallAgent):
         cfg = self._container_model_config()
         cfg["tools"] = [
             (None, {"type": "code_interpreter"}),
-            (None, {"type": "web_search_preview"}),
+            (None, {"type": "web_search_preview", "max_uses": self.MAX_TOOL_CALLS}),
         ]
         cfg["max_tool_calls"] = self.MAX_TOOL_CALLS
         betas = list(cfg.get("anthropic_betas") or [])

@@ -201,6 +201,7 @@ class AnthropicContainerFileBridge:
     extra_attachments: list[tuple[Path, str]] = field(default_factory=list)
     betas: tuple[str, ...] = (ANTHROPIC_FILES_BETA,)
     uploaded: list[AnthropicUploadedFile] = field(default_factory=list)
+    downloaded_generated_file_ids: list[str] = field(default_factory=list)
 
     def upload(self) -> list[str]:
         ids: list[str] = []
@@ -293,18 +294,32 @@ class AnthropicContainerFileBridge:
                 betas=list(self.betas),
             )
             out[filename] = _read_binary_response(resp)
+            if file_id not in self.downloaded_generated_file_ids:
+                self.downloaded_generated_file_ids.append(file_id)
         return out
 
     def cleanup(self) -> None:
-        for u in self.uploaded:
+        file_ids: list[str] = []
+        seen: set[str] = set()
+        for file_id in [
+            *[u.platform_file_id for u in self.uploaded],
+            *self.downloaded_generated_file_ids,
+        ]:
+            if file_id in seen:
+                continue
+            seen.add(file_id)
+            file_ids.append(file_id)
+
+        for file_id in file_ids:
             try:
                 self.anthropic_client.beta.files.delete(
-                    u.platform_file_id,
+                    file_id,
                     betas=list(self.betas),
                 )
             except Exception:
                 pass
         self.uploaded.clear()
+        self.downloaded_generated_file_ids.clear()
 
 
 def find_container_id(conversation: Iterable[dict]) -> str | None:

@@ -55,6 +55,7 @@ class FableModelConfigTests(unittest.TestCase):
         self.assertEqual(cfg["max_wallclock_per_call_s"], 14000)
         self.assertEqual(cfg["max_retries"], 2)
         self.assertEqual(cfg["max_retries_inner"], 1)
+        self.assertTrue(cfg["throw_error_on_failure"])
 
 
 class FablePresetTests(unittest.TestCase):

@@ -31,3 +31,4 @@ max_retries: 2
 max_retries_inner: 1
 sleep_on_error: 10
 sleep_on_error_max: 60
+throw_error_on_failure: true

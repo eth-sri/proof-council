@@ -195,8 +195,34 @@ class AnthropicStreamingTests(unittest.TestCase):
         self.assertEqual(
             client._anthropic_tool_descriptions(),
             [
-                {"type": "web_search_20250305", "name": "web_search"},
-                {"type": "code_execution_20250825", "name": "code_execution"},
+                {
+                    "type": "web_search_20260318",
+                    "name": "web_search",
+                    "allowed_callers": ["direct", "code_execution_20260521"],
+                    "max_uses": 20,
+                },
+                {"type": "code_execution_20260521", "name": "code_execution"},
+            ],
+        )
+
+    def test_anthropic_web_search_preview_respects_max_uses(self) -> None:
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test"}):
+            client = APIClient(
+                model="claude-test",
+                api="anthropic",
+                max_tokens=16,
+                tools=[(None, {"type": "web_search_preview", "max_uses": 7})],
+            )
+
+        self.assertEqual(
+            client._anthropic_tool_descriptions(),
+            [
+                {
+                    "type": "web_search_20260318",
+                    "name": "web_search",
+                    "allowed_callers": ["direct", "code_execution_20260521"],
+                    "max_uses": 7,
+                }
             ],
         )
 

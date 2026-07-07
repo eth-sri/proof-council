@@ -1604,11 +1604,16 @@ class APIClient:
                 )
             elif tool_desc.get("type") == "web_search_preview":
                 anthropic_tools.append(
-                    {"type": "web_search_20250305", "name": "web_search"}
+                    {
+                        "type": "web_search_20260318",
+                        "name": "web_search",
+                        "allowed_callers": ["direct", "code_execution_20260521"],
+                        "max_uses": int(tool_desc.get("max_uses", 20)),
+                    }
                 )
             elif tool_desc.get("type") == "code_interpreter":
                 anthropic_tools.append(
-                    {"type": "code_execution_20250825", "name": "code_execution"}
+                    {"type": "code_execution_20260521", "name": "code_execution"}
                 )
             elif str(tool_desc.get("type", "")).startswith(
                 ("web_search_", "web_fetch_", "code_execution_")
