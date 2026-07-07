@@ -64,7 +64,10 @@
                     <div class="output-toolbar">
                         <button type="button" class="copy-prompt-btn">Copy</button>
                         <button type="button" class="prompt-txt-btn">Download .txt</button>
-                        <button type="button" class="prompt-pdf-btn">Download PDF</button>
+                        {% if task.inputs and task.inputs.get('proof') %}
+                        <button type="button" class="prompt-tex-btn" data-tex-url="{{ url_for('run_human_proof_tex', run_id=run.run_id, task=task.response_filename) }}">Download proof .tex</button>
+                        <button type="button" class="proof-pdf-btn" data-pdf-url="{{ url_for('run_human_proof_pdf', run_id=run.run_id, task=task.response_filename) }}">Proof PDF</button>
+                        {% endif %}
                     </div>
                     <pre class="human-task-prompt">{{ task.prompt }}</pre>
                 {% endif %}

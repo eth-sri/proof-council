@@ -2809,28 +2809,17 @@
                 _downloadBlob(new Blob([_humanPromptText(txtBtn)], {type: 'text/plain'}), 'human_prompt.txt');
                 return;
             }
-            const pdfBtn = e.target.closest('.prompt-pdf-btn');
-            if (pdfBtn) {
-                const prev = pdfBtn.textContent;
-                pdfBtn.textContent = 'Rendering…';
-                pdfBtn.disabled = true;
-                try {
-                    const resp = await fetch('{{ url_for("compile_text_pdf") }}', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({text: _humanPromptText(pdfBtn), filename: 'human_prompt'}),
-                    });
-                    if (!resp.ok) {
-                        alert('PDF render failed:\n\n' + (await resp.text()).slice(0, 1200));
-                    } else {
-                        _downloadBlob(await resp.blob(), 'human_prompt.pdf');
-                    }
-                } catch (err) {
-                    alert('PDF render error: ' + err);
-                } finally {
-                    pdfBtn.textContent = prev;
-                    pdfBtn.disabled = false;
-                }
+            const texBtn = e.target.closest('.prompt-tex-btn');
+            if (texBtn) {
+                // Server streams the current proof draft wrapped as a compilable .tex.
+                window.location.href = texBtn.dataset.texUrl;
+                return;
+            }
+            const proofPdfBtn = e.target.closest('.proof-pdf-btn');
+            if (proofPdfBtn) {
+                // Server compiles the current proof draft; shows inline in a new tab
+                // (or a plain-text compile log on failure).
+                window.open(proofPdfBtn.dataset.pdfUrl, '_blank');
                 return;
             }
         });

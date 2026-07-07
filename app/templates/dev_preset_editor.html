@@ -131,6 +131,7 @@
         let currentAgentLabel = {{ preset.label | tojson }};
         const configurablePromptAgent = "proofstack.agents.configurable_prompt.ConfigurablePromptAgent";
         const configurableCliAgent = "proofstack.agents.configurable_cli.ConfigurableCLIAgent";
+        const humanAgent = "proofstack.agents.human_agent.HumanAgent";
         let presetFileVersion = {{ preset.file_version | tojson }};
         let presetRegistryVersion = {{ preset_registry_version | tojson }};
         let componentConfigs = {{ preset.component_configs | tojson }};
@@ -139,9 +140,10 @@
         let exportedPresets = {{ exported_presets | tojson }};
         let toolDefinitions = {{ tool_definitions | tojson }};
         const fieldHelp = {
+            executor: "Who runs this component: an API model, a subscription CLI (Claude or Codex), or a human. Switching keeps the prompt and inputs/outputs and swaps the executor settings (command, model, sandbox) to defaults.",
             model: "Model config used for this component's API call.",
             cliModel: "Model for this node. 'Default' inherits the workflow model; pick a specific model to override just this node.",
-            cliReasoningEffort: "Reasoning effort passed to Codex as model_reasoning_effort.",
+            cliReasoningEffort: "Reasoning effort for this node: --effort for Claude, model_reasoning_effort for Codex. 'default' uses the CLI's own default.",
             systemPrompt: "High-level instructions that set the component's role and behavior.",
             userPrompt: "The message template sent to the model for each run. Placeholders such as {problem} are filled from graph inputs.",
             promptVariables: "Optional type hints for prompt inputs. The input names are inferred from prompt placeholders.",
@@ -2722,6 +2724,7 @@
             const isVisualBodyNode = node.visual?.type === 'loop_body';
             const hidesLowLevel = isVisualBodyNode || ['map_chain'].includes(node.kind);
             const behavior = [
+                executorSection(node),
                 nodeConditionSection(node),
                 nodeLoopSection(node),
                 nodeWorkflowRefSection(node),
@@ -4858,6 +4861,73 @@
                 if (part.startsWith('--model=')) return part.slice('--model='.length);
             }
             return '';
+        }
+
+        // Executor picker: the same component (prompt + inputs/outputs) can be
+        // run by an API model, a subscription CLI (Claude or Codex), or a human.
+        // Switching posts a set_executor mutation that swaps the executor-owned
+        // config (cmd/env/usage/sandbox/model/...) while keeping the task keys.
+        const executorLabels = {
+            api: 'API model',
+            claude_cli: 'Claude CLI (subscription)',
+            codex_cli: 'Codex CLI (subscription)',
+            human: 'Human',
+        };
+
+        function executorOf(node) {
+            if (node?.agent === humanAgent) return 'human';
+            if (node?.agent === configurablePromptAgent) return 'api';
+            if (node?.agent === configurableCliAgent) {
+                const name = node.component_key || node.name || '';
+                const cfg = node.component_config || componentConfigs[name] || {};
+                return cliCommandParts(cfg.cmd)[0] === 'codex' ? 'codex_cli' : 'claude_cli';
+            }
+            return '';
+        }
+
+        function executorSection(node) {
+            const current = executorOf(node);
+            const name = node?.component_key || node?.name || '';
+            if (!current || !name) return '';
+            const opts = Object.entries(executorLabels).map(([value, label]) => `
+                <option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>
+            `).join('');
+            return `
+                <div class="inspector-grid">
+                    <label>${fieldLabel('Executor', fieldHelp.executor)}
+                        <select onchange="onExecutorChange('${escapeAttr(name)}', this.value, '${escapeAttr(current)}', this)">${opts}</select>
+                    </label>
+                </div>
+            `;
+        }
+
+        async function onExecutorChange(name, executor, current, select) {
+            if (executor === current) return;
+            // Almost always a component backs exactly one node; only warn about
+            // shared components when the switch really would change several nodes.
+            const nodes = (currentCanvasNodes && currentCanvasNodes.length) ? currentCanvasNodes : (currentReport.nodes || []);
+            const users = nodes.filter((node) => node?.agent && (node.component_key || node.name || '') === name);
+            const shared = users.length > 1
+                ? ` Note: ${users.length} nodes share this component (${users.map((node) => displayLabel(node)).join(', ')}); all of them switch together.`
+                : '';
+            const ok = await confirmAction({
+                title: 'Switch executor?',
+                message: `Run "${name}" as ${executorLabels[executor] || executor}? Its prompt and inputs/outputs are kept; its executor settings (command, model, sandbox) are replaced by defaults for the new executor. Other nodes are not affected.${shared}`,
+                confirmLabel: 'Switch',
+            });
+            if (!ok) {
+                if (select) select.value = current;
+                return;
+            }
+            const payload = await mutateEditor(
+                {op: 'set_executor', name, executor},
+                {status: 'Switching executor...'},
+            );
+            if (payload?.ok) {
+                renderNodeInspector();
+            } else if (select) {
+                select.value = current;
+            }
         }
 
         // Per-node model picker for CLI nodes. "Default" clears the override so
