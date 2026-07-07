@@ -98,9 +98,41 @@ class ConfigurableCLIAgent(CLIAgent):
         fields = self._fields(inp, workspace=self._active_workspace_root)
         raw = self.component_config.get("prompt") or ""
         text = _format_template(str(raw), fields)
+        if self.component_config.get("contract") == "auto":
+            text = text.rstrip("\n") + "\n" + self._contract_tail()
         if self.component_config.get("append_prompt_newline", True) and not text.endswith("\n"):
             text += "\n"
         return text
+
+    def _contract_tail(self) -> str:
+        # With `contract: auto` the component prompt describes only the task;
+        # the delivery mechanics (which files to write, the finish handshake)
+        # are generated here from output_files/done_outputs. This keeps prompts
+        # free of executor boilerplate so the same component text can be run by
+        # a different backend (API model, human) whose adapter supplies its own
+        # delivery contract.
+        lines = ["", "----", "HOW TO DELIVER YOUR OUTPUT:"]
+        files: list[tuple[str, str]] = []
+        raw = self.component_config.get("output_files") or {}
+        if isinstance(raw, dict):
+            for field, spec in raw.items():
+                relpath, kind, _default = _output_file_spec(spec)
+                if kind in {"path", "exists", "listing"} or not relpath:
+                    continue
+                files.append((str(field), relpath))
+        step = 1
+        if files:
+            lines.append(f"{step}. Write these file(s) in the current working directory:")
+            for field, relpath in files:
+                lines.append(f"   - {relpath}  (your {field.replace('_', ' ')})")
+            step += 1
+        lines.append(
+            f"{step}. When everything is written, signal completion by running exactly"
+        )
+        lines.append("   this shell command:")
+        lines.append('   finish \'{"status":"done","summary":"<one line: what you did>"}\'')
+        lines.append("Work autonomously; do not ask questions.")
+        return "\n".join(lines) + "\n"
 
     def extra_env(self, sandbox: Sandbox, inp: BaseModel) -> dict[str, str]:
         fields = self._fields(inp, workspace=sandbox.root)
@@ -221,6 +253,9 @@ class ConfigurableCLIAgent(CLIAgent):
             model = str(self.component_config.get("model") or "").strip()
             if model:
                 cmd = _with_claude_model(cmd, model)
+            reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
+            if reasoning_effort and _is_claude_cmd(cmd):
+                cmd = _with_claude_effort(cmd, reasoning_effort)
         if self.component_config.get("prompt") and _is_codex_exec_cmd(cmd) and _codex_prompt_arg_index(cmd) is None:
             cmd = [*cmd, "-"]
         codex_sandbox = str(self.component_config.get("codex_sandbox") or "").strip()
@@ -387,6 +422,27 @@ def _with_claude_model(cmd: list[str], model: str) -> list[str]:
             out[i] = f"--model={model}"
             return out
     return [*out, "--model", model]
+
+
+def _is_claude_cmd(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "claude"
+
+
+def _with_claude_effort(cmd: list[str], effort: str) -> list[str]:
+    """Set the claude CLI reasoning effort (``--effort low|medium|high|xhigh|max``).
+    The shared editor vocabulary includes codex's ``minimal``, which claude does
+    not accept — map it to ``low``."""
+    if effort == "minimal":
+        effort = "low"
+    out = list(cmd)
+    for i, part in enumerate(out):
+        if part == "--effort" and i + 1 < len(out):
+            out[i + 1] = effort
+            return out
+        if part.startswith("--effort="):
+            out[i] = f"--effort={effort}"
+            return out
+    return [*out, "--effort", effort]
 
 
 def _without_codex_model(cmd: list[str]) -> list[str]:

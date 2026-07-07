@@ -222,6 +222,34 @@ A CLI node using that component is just a normal agent node:
 
 Prefer file outputs and `done_outputs` over custom Python collection code. Only add a specialized Python CLI agent if the behavior cannot be represented as prompt, setup files, output files, and `finish` metadata.
 
+### Auto-generated output contract (`contract: auto`)
+
+Set `contract: auto` on a CLI component to have the delivery boilerplate appended
+to the prompt automatically: the agent generates a "HOW TO DELIVER YOUR OUTPUT"
+tail listing the files to write (from `output_files`, skipping passive kinds
+`path`/`exists`/`listing`) and the exact `finish '{"status":"done",...}'` command.
+The prompt should then describe only the task — do not also hand-write
+"write your brief to hint.txt, then run finish" instructions. This keeps prompts
+free of executor mechanics, so the same component text stays portable across
+backends (CLI, API, human). Components with unusual delivery semantics (e.g. a
+file that must contain EXACTLY one word) should state those constraints in the
+prompt body; the tail only covers the mechanics.
+
+### Switching a component's executor
+
+In the dashboard preset editor, every agent node has an **Executor** dropdown
+(API model / Claude CLI / Codex CLI / Human). Switching keeps the component's
+task identity (prompt, `input_schema`/`output_schema`, `output_files`,
+`done_outputs`, tools) and replaces the executor-owned keys (`cmd`, `env`,
+`usage`, `sandbox`, `model`, `contract`, ...) with defaults for the new
+executor; the node's `agent:` class is updated everywhere the component is
+used. CLI executors get `contract: auto`; the API executor maps a single text
+output to `output.default_field` (multiple outputs become `xml_tags`).
+CLI scaffolds bind their model to a declared workflow knob when one exists
+(`{claude_model}`/`{base_model}` for Claude, `{codex_model}`/`{gpt_model}` for
+Codex) and only fall back to a literal model when the preset declares none, so
+tiered presets keep steering switched nodes.
+
 ## Tools
 
 Put tools on the component, not the node. Use `tool_refs` for tools defined in `configs/tools`.
