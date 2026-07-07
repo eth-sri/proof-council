@@ -59,19 +59,16 @@ components:
     sandbox:
       backend: subprocess      # host, not Docker
       timeout_s: 900           # 15 min: hard kill ceiling for this call
+    # Delivery mechanics are auto-appended: with `contract: auto` the framework
+    # tells the model which files to write (from output_files) and how to signal
+    # completion (the `finish` command), so the prompt describes only the task.
+    contract: auto
     prompt: |
       You are a research mathematician. Solve the problem below with a complete,
-      rigorous proof.
+      rigorous proof, written as a self-contained LaTeX document.
 
       Problem:
       {problem}
-
-      Instructions:
-      1. Write your full solution as a self-contained LaTeX document to a file
-         named  answer.tex  in the current directory.
-      2. When you are finished, run this exact shell command to signal completion:
-           finish '{"status":"done","summary":"proof written to answer.tex"}'
-      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       workspace: string
