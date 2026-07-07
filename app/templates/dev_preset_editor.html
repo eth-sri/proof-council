@@ -162,7 +162,7 @@
         // tab. Editable: a "Custom…" option always lets you type a value the
         // list doesn't have yet (model names change over time).
         const workflowInputChoices = {
-            claude_model: ['opus', 'sonnet', 'haiku'],
+            claude_model: ['claude-fable-5', 'opus', 'sonnet', 'haiku'],
             codex_model: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
             codex_effort: ['high', 'medium', 'low', 'minimal'],
         };
@@ -4939,7 +4939,7 @@
             const bound = cliModelFromCmd(cfg.cmd);
             const boundIsBinding = /^\{[A-Za-z_][\w]*\}$/.test(bound);
             const isCodex = cliCommandParts(cfg.cmd).includes('codex');
-            const known = isCodex ? ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['opus', 'sonnet', 'haiku'];
+            const known = isCodex ? ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['claude-fable-5', 'opus', 'sonnet', 'haiku'];
             const isCustom = override !== '' && !known.includes(override);
             const defaultLabel = boundIsBinding
                 ? `Workflow default (${bound})`
