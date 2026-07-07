@@ -1605,9 +1605,8 @@ class APIClient:
             elif tool_desc.get("type") == "web_search_preview":
                 anthropic_tools.append(
                     {
-                        "type": "web_search_20260318",
+                        "type": "web_search_20260209",
                         "name": "web_search",
-                        "allowed_callers": ["direct", "code_execution_20260521"],
                         "max_uses": int(tool_desc.get("max_uses", 20)),
                     }
                 )

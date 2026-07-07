@@ -196,9 +196,8 @@ class AnthropicStreamingTests(unittest.TestCase):
             client._anthropic_tool_descriptions(),
             [
                 {
-                    "type": "web_search_20260318",
+                    "type": "web_search_20260209",
                     "name": "web_search",
-                    "allowed_callers": ["direct", "code_execution_20260521"],
                     "max_uses": 20,
                 },
                 {"type": "code_execution_20260521", "name": "code_execution"},
@@ -218,9 +217,8 @@ class AnthropicStreamingTests(unittest.TestCase):
             client._anthropic_tool_descriptions(),
             [
                 {
-                    "type": "web_search_20260318",
+                    "type": "web_search_20260209",
                     "name": "web_search",
-                    "allowed_callers": ["direct", "code_execution_20260521"],
                     "max_uses": 7,
                 }
             ],
