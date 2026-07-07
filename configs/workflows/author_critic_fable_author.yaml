@@ -1,0 +1,211 @@
+workflow: proofstack.agents.ac.ACDAGWorkflow
+description: 'Long Author/Critic research workflow with Claude Fable 5 as the Author: 10 rounds
+  with Fable Author, Pro Critic, council, and compute enabled for serious First Proof-style runs.
+
+  '
+inputs:
+  n_rounds: 10
+  full_critic_interval: 3
+  enable_council: true
+  enable_compute: true
+  compute_model: gpt-5.5
+  compute_reasoning_effort: xhigh
+  compute_cost_config: models/openai/gpt-55-high
+  compute_sandbox_backend: subprocess
+  compute_codex_sandbox: docker-bypass
+  enable_final_critic: false
+  council_models:
+  - models/openai/gpt-55-pro
+  - models/anthropic/opus_47_max
+  - models/gemini/gemini-31-pro
+  page_limit: 12
+budget:
+  max_usd: 1000.0
+  max_wallclock_s: 86400
+components:
+  Author:
+    model: models/anthropic/fable_5_max
+  ACCritic:
+    model: models/openai/gpt-55-pro
+dag:
+  nodes:
+  - id: problem
+    kind: agent
+    agent: proofstack.agents.ac.ACInitBlock
+    ui:
+      label: Problem
+      subtitle: statement + resume state
+      x: -804
+      y: 47
+  - id: author_critic_loop
+    kind: repeat
+    needs:
+    - problem
+    max_iterations:
+      add:
+      - $input.n_rounds
+      - 1
+    initial_state:
+      ac_state: $node.problem.state
+    condition:
+      python: not inputs.get("ac_state", {}).get("loop_done") and int(inputs.get("ac_state", {}).get("next_round",
+        0) or 0) <= int(inputs.get("ac_state", {}).get("n_rounds", 0) or 0)
+    body:
+      nodes:
+      - id: author
+        kind: agent
+        agent: proofstack.agents.ac.ACAuthorBlock
+        inputs:
+          state: $state.ac_state
+        ui:
+          label: Author
+          subtitle: edits proof
+          x: 18
+          y: 140
+      - id: stateful_critic
+        kind: agent
+        needs:
+        - author
+        agent: proofstack.agents.ac.ACStatefulCriticBlock
+        inputs:
+          state: $node.author.state
+        ui:
+          label: Stateful Critic
+          subtitle: continuing
+          x: 388
+          y: 36
+      - id: llm_council
+        kind: agent
+        needs:
+        - author
+        agent: proofstack.agents.ac.ACCouncilBlock
+        inputs:
+          state: $node.author.state
+        ui:
+          label: LLM Council
+          subtitle: Other LLMs
+          x: 388
+          y: -160
+      - id: compute_node
+        kind: agent
+        needs:
+        - author
+        agent: proofstack.agents.ac.ACComputeBlock
+        inputs:
+          state: $node.author.state
+        ui:
+          label: Compute Node
+          subtitle: CAS worker
+          x: 388
+          y: 260
+      - id: fresh_critic
+        kind: agent
+        needs:
+        - stateful_critic
+        agent: proofstack.agents.ac.ACFreshCriticBlock
+        inputs:
+          state: $node.stateful_critic.state
+        ui:
+          label: Fresh Critic
+          subtitle: independent
+          x: 762
+          y: 345
+      - id: review_join
+        kind: agent
+        needs:
+        - fresh_critic
+        - llm_council
+        - compute_node
+        agent: proofstack.agents.ac.ACReviewJoinBlock
+        inputs:
+          base_state: $node.author.state
+          stateful_state: $node.stateful_critic.state
+          fresh_state: $node.fresh_critic.state
+          council_state: $node.llm_council.state
+          compute_state: $node.compute_node.state
+        ui:
+          label: Review Join
+          subtitle: collects reports
+          x: 1088
+          y: 120
+      - id: ready_gate
+        kind: if_else
+        needs:
+        - review_join
+        inputs:
+          ready_for_gate: $node.review_join.ready_for_gate
+        condition:
+          python: bool(inputs.get("ready_for_gate"))
+        then_label: ready
+        else_label: revise
+        outputs:
+          ready: false
+        then:
+          ready: true
+        else:
+          ready: false
+        ui:
+          label: Ready gate
+          subtitle: Author + Critic ready
+          x: 1429
+          y: 33
+      - id: compile_gate
+        kind: agent
+        needs:
+        - ready_gate
+        agent: proofstack.agents.ac.ACCompileGateBlock
+        inputs:
+          state: $node.review_join.state
+          ready: $node.ready_gate.ready
+        ui:
+          label: Compile Gate
+          subtitle: PDF builds within limit
+          x: 1775
+          y: 142
+      state_updates:
+        ac_state: $node.compile_gate.state
+    outputs:
+      state: $state.ac_state
+    ui:
+      label: Author/Critic loop
+      x: 390
+      y: 80
+      repeat_input:
+        x: -355
+        y: 83
+      repeat_output:
+        x: 2128
+        y: 120
+  - id: return
+    kind: agent
+    needs:
+    - author_critic_loop
+    agent: proofstack.agents.ac.ACReturnBlock
+    inputs:
+      state: $node.author_critic_loop.state
+    ui:
+      label: Return
+      subtitle: final files
+      x: 2566
+      y: 66
+  outputs:
+    problem_id: $node.return.problem_id
+    answer_tex: $node.return.answer_tex
+    research_notes_tex: $node.return.research_notes_tex
+    references_bib: $node.return.references_bib
+    compiled: $node.return.compiled
+    pages: $node.return.pages
+    rounds_completed: $node.return.rounds_completed
+    early_stopped: $node.return.early_stopped
+    last_critic_accepted: $node.return.last_critic_accepted
+    final_critic_answer_ready: $node.return.final_critic_answer_ready
+    final_critic_mode_run: $node.return.final_critic_mode_run
+    final_critic_review_md: $node.return.final_critic_review_md
+    last_gasp: $node.return.last_gasp
+    error: $node.return.error
+  ui:
+    workflow_output:
+      x: 3007
+      y: 60
+export:
+  label: Author Critic (Fable Author)

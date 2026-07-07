@@ -62,6 +62,8 @@ from proofstack.agents.ac.blocks import (
     parse_author_output,
 )
 from proofstack.agents.ac.container_files import (
+    ANTHROPIC_FILES_BETA,
+    AnthropicContainerFileBridge,
     ContainerFileBridge,
     find_container_id,
 )
@@ -113,13 +115,14 @@ technically rigorous LaTeX solution to the problem below, using
 computation and search where useful.
 
 You have two tools available:
-  - **code_interpreter**: a Python sandbox with TeX Live and standard
-    scientific libs. Run pdflatex to verify compile, and use sympy or
-    numpy for computational exploration, verification and sanity
-    checks (e.g., expand $q$-series coefficients, test conjectured
-    identities at small values, perform finite-field or modular
-    arithmetic).
-  - **web_search_preview**: free-form web search for citations.
+  - **code_interpreter/code_execution**: a Python sandbox with TeX
+    Live and standard scientific libs. Run pdflatex to verify compile,
+    and use sympy or numpy for computational exploration, verification
+    and sanity checks (e.g., expand $q$-series coefficients, test
+    conjectured identities at small values, perform finite-field or
+    modular arithmetic).
+  - **web_search_preview/web_search**: free-form web search for
+    citations.
 
 Output exactly three files using fenced code blocks with ``file
 path=...`` info strings. Each block contains the full contents of one
@@ -177,11 +180,11 @@ reviewed them. Your job in each subsequent round is to refine the
 files in response to the Critic's findings.
 
 You have two tools:
-  - **code_interpreter**: a Python sandbox with TeX Live and standard
-    scientific libs. Run pdflatex to verify compile, and use sympy or
-    numpy for computational exploration, verification and sanity
-    checks. It is ephemeral per call.
-  - **web_search_preview**: free-form web search.
+  - **code_interpreter/code_execution**: a Python sandbox with TeX Live
+    and standard scientific libs. Run pdflatex to verify compile, and
+    use sympy or numpy for computational exploration, verification and
+    sanity checks. It is ephemeral per call.
+  - **web_search_preview/web_search**: free-form web search.
 
 The canonical workspace files are ``answer.tex``,
 ``research_notes.tex``, and ``references.bib``. To update a file,
@@ -317,14 +320,15 @@ technically rigorous LaTeX solution to the problem below, using
 computation and search where useful.
 
 You have two tools available:
-  - **code_interpreter**: a Python sandbox with TeX Live and standard
-    scientific libs. Run ``pdflatex`` to verify compile, and use
-    sympy or numpy for computational exploration, verification and
-    sanity checks (e.g., expand $q$-series coefficients, test
+  - **code_interpreter/code_execution**: a Python sandbox with TeX Live
+    and standard scientific libs. Run ``pdflatex`` to verify compile,
+    and use sympy or numpy for computational exploration, verification
+    and sanity checks (e.g., expand $q$-series coefficients, test
     conjectured identities at small values, perform finite-field or
     modular arithmetic). The sandbox has NO outbound network — for
-    any external URL or paper, use web_search_preview.
-  - **web_search_preview**: free-form web search for citations.
+    any external URL or paper, use the web search tool.
+  - **web_search_preview/web_search**: free-form web search for
+    citations.
 
 Your workspace lives at ``/mnt/data/`` inside the sandbox. Three
 canonical files are tracked by the infrastructure:
@@ -341,20 +345,30 @@ it into a changelog or a reply to the Critic** — that is what your
 free-text thinking summary is for. A future Author turn should be able
 to read research_notes.tex and pick up where it left off.
 
-The user message will list, for each canonical file, the **read-only
-input path** (a platform-prefixed path like
-``/mnt/data/file-{{id}}-answer.tex`` containing whatever was on disk
-before this turn) and the **canonical write path** (``/mnt/data/<name>``
-without prefix) where you must write the new contents.
+The user message will list, for each canonical file, either:
+
+  - a **read-only input path** (a platform-prefixed path like
+    ``/mnt/data/file-{{id}}-answer.tex`` containing whatever was on
+    disk before this turn) and the **canonical write path**
+    (``/mnt/data/<name>`` without prefix) where you must write the new
+    contents; or
+  - Anthropic Files API ``container_upload`` attachments. In that
+    case, inspect the attached files in ``code_execution`` and create
+    generated files named exactly ``answer.tex``,
+    ``research_notes.tex``, and ``references.bib``. The
+    infrastructure downloads generated files by exact filename.
 
 How to work:
-  1. Read each input file from its read-only path (it will be empty
-     on round 0).
+  1. Read each input file from its read-only path or attached upload
+     (it will be empty on round 0).
   2. Build the new contents (in memory, or by copying then editing).
   3. Write the new contents to the canonical write path with
-     ``Path("/mnt/data/<name>").write_text(...)``. Do not write to
-     ``.new`` / ``.bak`` / sibling paths — only the canonical paths
-     are picked up by the infrastructure after your turn.
+     ``Path("/mnt/data/<name>").write_text(...)`` when such paths are
+     available. With Anthropic Files API attachments, create generated
+     files named exactly ``answer.tex``, ``research_notes.tex``, and
+     ``references.bib``. Do not write to ``.new`` / ``.bak`` / sibling
+     paths — only the canonical filenames are picked up by the
+     infrastructure after your turn.
   4. Run ``pdflatex /mnt/data/answer.tex`` from a code_interpreter
      cell to confirm it compiles before claiming readiness.
 
@@ -388,25 +402,31 @@ Your job each round is to refine the files in response to the Critic's
 findings.
 
 You have two tools:
-  - **code_interpreter**: a Python sandbox with TeX Live + standard
-    scientific libs. Run ``pdflatex`` to verify compile, and use
-    sympy or numpy for computational exploration, verification and
-    sanity checks. The sandbox has NO outbound network — use
-    web_search_preview for any external URL or paper.
-  - **web_search_preview**: free-form web search.
+  - **code_interpreter/code_execution**: a Python sandbox with TeX Live
+    and standard scientific libs. Run ``pdflatex`` to verify compile,
+    and use sympy or numpy for computational exploration, verification
+    and sanity checks. The sandbox has NO outbound network — use the
+    web search tool for any external URL or paper.
+  - **web_search_preview/web_search**: free-form web search.
 
-Your workspace lives at ``/mnt/data/`` and contains three canonical
-files. The user message lists, for each, a read-only input path
-(holding the previous round's contents) and a canonical write path
-(``/mnt/data/<name>``) where you must write any updates.
+Your workspace contains three canonical files. The user message lists,
+for each, either a read-only input path (holding the previous round's
+contents) and a canonical write path (``/mnt/data/<name>``), or
+Anthropic Files API ``container_upload`` attachments. For Anthropic
+attachments, inspect the uploaded files in ``code_execution`` and
+create generated files named exactly ``answer.tex``,
+``research_notes.tex``, and ``references.bib``.
 
 How to update a file:
-  1. Read its current contents from the listed read-only path.
+  1. Read its current contents from the listed read-only path or
+     attached upload.
   2. Build the new contents.
   3. Write to the canonical write path with
-     ``Path("/mnt/data/<name>").write_text(...)``. Do not write to
-     ``.new``/``.bak``/sibling paths — only canonical write paths are
-     picked up.
+     ``Path("/mnt/data/<name>").write_text(...)`` when available. With
+     Anthropic Files API attachments, create generated files named
+     exactly ``answer.tex``, ``research_notes.tex``, and
+     ``references.bib``. Do not write to ``.new``/``.bak``/sibling
+     paths — only canonical filenames are picked up.
   4. Compile-check answer.tex with ``pdflatex`` before claiming
      readiness.
 
@@ -650,6 +670,18 @@ class Author(APICallAgent):
         return await self._run_with_container_files(inp)
 
     async def _run_with_container_files(self, inp: Inputs) -> Outputs:
+        provider_api = self._container_file_provider_api()
+        if provider_api == "anthropic":
+            return await self._run_with_anthropic_container_files(inp)
+        if provider_api == "openai":
+            return await self._run_with_openai_container_files(inp)
+        await self.events.emit(
+            "ac.author.container_files_unsupported_provider",
+            {"api": provider_api},
+        )
+        return await super().run(inp)
+
+    async def _run_with_openai_container_files(self, inp: Inputs) -> Outputs:
         # Surface budget warnings the same way APICallAgent.run does.
         for scope, kind, used, limit in self.tracker.check():
             await self.events.emit(
@@ -670,29 +702,14 @@ class Author(APICallAgent):
             )
 
             openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-            extra_attachments: list[tuple[Path, str]] = []
-            if inp.compute_zip_path is not None:
-                zip_path = Path(inp.compute_zip_path)
-                if zip_path.exists():
-                    extra_attachments.append(
-                        (
-                            zip_path,
-                            (
-                                "Zip of the previous round's compute-worker "
-                                "workspace. Unzip via code_interpreter to "
-                                "inspect responses/, code/, data/, papers/, "
-                                "notes/, etc."
-                            ),
-                        )
-                    )
             bridge = ContainerFileBridge(
                 openai_client=openai_client,
                 workspace=td_path,
                 names=CANONICAL_FILES,
-                extra_attachments=extra_attachments,
+                extra_attachments=self._extra_attachments(inp),
             )
-            file_ids = bridge.upload()
             try:
+                file_ids = bridge.upload()
                 workspace_listing = bridge.render_workspace_listing()
 
                 messages = self._render_container_messages(inp, workspace_listing)
@@ -791,8 +808,145 @@ class Author(APICallAgent):
                     )
 
         return self._build_outputs_from_container(
-            inp, raw_text, modified, container_id
+            inp, raw_text, modified, container_id, via="container_files"
         )
+
+    async def _run_with_anthropic_container_files(self, inp: Inputs) -> Outputs:
+        # Surface budget warnings the same way APICallAgent.run does.
+        for scope, kind, used, limit in self.tracker.check():
+            await self.events.emit(
+                "budget.warn",
+                {"scope": scope, "kind": kind, "used": used, "limit": limit},
+            )
+
+        import anthropic  # imported lazily so non-Anthropic tests stay light
+
+        with tempfile.TemporaryDirectory(prefix="ac_author_anthropic_upload_") as td:
+            td_path = Path(td)
+            (td_path / "answer.tex").write_text(inp.answer_tex or "", encoding="utf-8")
+            (td_path / "research_notes.tex").write_text(
+                inp.research_notes_tex or "", encoding="utf-8"
+            )
+            (td_path / "references.bib").write_text(
+                inp.references_bib or "", encoding="utf-8"
+            )
+
+            anthropic_client = anthropic.Anthropic(
+                api_key=os.environ["ANTHROPIC_API_KEY"],
+            )
+            bridge = AnthropicContainerFileBridge(
+                anthropic_client=anthropic_client,
+                workspace=td_path,
+                names=CANONICAL_FILES,
+                extra_attachments=self._extra_attachments(inp),
+            )
+            try:
+                bridge.upload()
+                workspace_listing = bridge.render_workspace_listing()
+                upload_blocks = bridge.render_container_upload_blocks()
+                messages = self._render_anthropic_container_messages(
+                    inp, workspace_listing, upload_blocks
+                )
+                try:
+                    (self.workdir / "messages.json").write_text(
+                        json.dumps(messages, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+
+                api_client = self._build_anthropic_api_client_with_files()
+
+                call_id = new_call_id()
+                await self.events.emit(
+                    "model.call.start",
+                    {"model": getattr(api_client, "model", str(self.MODEL))},
+                    call_id=call_id,
+                )
+                start = time.monotonic()
+                _idx, conversation, cost = await asyncio.to_thread(
+                    _one_shot_query, api_client, messages
+                )
+                elapsed = time.monotonic() - start
+
+                usd = float(cost.get("cost", 0.0))
+                in_tok = int(cost.get("input_tokens", 0) or 0)
+                out_tok = int(cost.get("output_tokens", 0) or 0)
+                reasoning_tok = int(cost.get("reasoning_tokens", 0) or 0)
+                self.tracker.add_usd(usd)
+                self.tracker.add_tokens(in_tok + out_tok)
+                await self.events.emit(
+                    "model.call",
+                    {
+                        "model": getattr(api_client, "model", str(self.MODEL)),
+                        "in_tokens": in_tok,
+                        "out_tokens": out_tok,
+                        "reasoning_tokens": reasoning_tok,
+                        "cost_usd": usd,
+                        "duration_s": elapsed,
+                        "via": "anthropic_container_files",
+                    },
+                    call_id=call_id,
+                )
+                for scope, kind, used, limit in self.tracker.check():
+                    await self.events.emit(
+                        "budget.warn",
+                        {"scope": scope, "kind": kind, "used": used, "limit": limit},
+                    )
+
+                raw_text = _assistant_text(conversation)
+                try:
+                    (self.workdir / "raw_response.txt").write_text(raw_text, encoding="utf-8")
+                except OSError:
+                    pass
+
+                try:
+                    modified = await asyncio.to_thread(bridge.download, conversation)
+                except Exception as e:
+                    modified = {}
+                    await self.events.emit(
+                        "ac.author.anthropic_download_failed",
+                        {"type": type(e).__name__, "msg": str(e)},
+                    )
+                if not modified:
+                    await self.events.emit(
+                        "ac.author.no_generated_files",
+                        {"provider": "anthropic"},
+                    )
+                    if inp.round == 0:
+                        raise RuntimeError(
+                            "Anthropic Author produced no generated canonical files "
+                            "on round 0; failing instead of returning empty answer.tex."
+                        )
+            finally:
+                try:
+                    await asyncio.to_thread(bridge.cleanup)
+                except Exception as e:
+                    await self.events.emit(
+                        "ac.author.cleanup_failed",
+                        {"type": type(e).__name__, "msg": str(e)},
+                    )
+
+        return self._build_outputs_from_container(
+            inp, raw_text, modified, None, via="anthropic_container_files"
+        )
+
+    def _extra_attachments(self, inp: Inputs) -> list[tuple[Path, str]]:
+        extra_attachments: list[tuple[Path, str]] = []
+        if inp.compute_zip_path is not None:
+            zip_path = Path(inp.compute_zip_path)
+            if zip_path.exists():
+                extra_attachments.append(
+                    (
+                        zip_path,
+                        (
+                            "Zip of the previous round's compute-worker "
+                            "workspace. Unzip via code_interpreter/code_execution "
+                            "to inspect responses/, code/, data/, papers/, notes/, etc."
+                        ),
+                    )
+                )
+        return extra_attachments
 
     def _render_container_messages(
         self, inp: Inputs, workspace_listing: str
@@ -818,6 +972,46 @@ class Author(APICallAgent):
             {"role": "user", "content": AUTHOR_LOOP_USER_CONTAINER.format(**fields)},
         ]
 
+    def _render_anthropic_container_messages(
+        self,
+        inp: Inputs,
+        workspace_listing: str,
+        upload_blocks: list[dict[str, str]],
+    ) -> list[dict[str, Any]]:
+        messages = self._render_container_messages(inp, workspace_listing)
+        mode_note = (
+            "### Anthropic Files API workspace mode ###\n"
+            "The attached `container_upload` blocks are the source of truth for "
+            "the current canonical files and any compute zip. In code_execution, "
+            "inspect those uploads and create generated files named exactly "
+            "`answer.tex`, `research_notes.tex`, and `references.bib`. If "
+            "`/mnt/data` paths are not present in this sandbox, write those exact "
+            "filenames in the current working directory and compile with "
+            "`pdflatex answer.tex`. Do not paste full file bodies in the reply "
+            "text; generated files are downloaded by exact filename.\n\n"
+        )
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            text = str(msg.get("content", ""))
+            msg["content"] = [
+                {"type": "text", "text": mode_note + text},
+                *upload_blocks,
+            ]
+            break
+        return messages
+
+    def _container_model_config(self) -> dict[str, Any]:
+        from mathagents import load_solver_config
+
+        spec = self.ctx.model_for(self, self.MODEL)
+        cfg = load_solver_config(spec)
+        return {k: v for k, v in cfg.items() if not k.startswith("__")}
+
+    def _container_file_provider_api(self) -> str:
+        cfg = self._container_model_config()
+        return str(cfg.get("api", "openai")).lower()
+
     def _build_api_client_with_file_ids(self, file_ids: list[str]):
         """Construct a fresh APIClient whose code_interpreter tool has
         the round's uploaded ``file_ids`` attached.
@@ -825,11 +1019,7 @@ class Author(APICallAgent):
         We bypass the parent class's cached client because the file_ids
         change every call.
         """
-        from mathagents import load_solver_config
-
-        spec = self.ctx.model_for(self, self.MODEL)
-        cfg = load_solver_config(spec)
-        cfg = {k: v for k, v in cfg.items() if not k.startswith("__")}
+        cfg = self._container_model_config()
         cfg["tools"] = [
             (
                 None,
@@ -843,12 +1033,27 @@ class Author(APICallAgent):
         cfg["max_tool_calls"] = self.MAX_TOOL_CALLS
         return self.ctx.api_client_factory(cfg)
 
+    def _build_anthropic_api_client_with_files(self):
+        cfg = self._container_model_config()
+        cfg["tools"] = [
+            (None, {"type": "code_interpreter"}),
+            (None, {"type": "web_search_preview", "max_uses": self.MAX_TOOL_CALLS}),
+        ]
+        cfg["max_tool_calls"] = self.MAX_TOOL_CALLS
+        betas = list(cfg.get("anthropic_betas") or [])
+        if ANTHROPIC_FILES_BETA not in betas:
+            betas.append(ANTHROPIC_FILES_BETA)
+        cfg["anthropic_betas"] = betas
+        return self.ctx.api_client_factory(cfg)
+
     def _build_outputs_from_container(
         self,
         inp: Inputs,
         raw_text: str,
         modified: dict[str, str],
         container_id: str | None,
+        *,
+        via: str = "container_files",
     ) -> Outputs:
         # We still parse the response text for the optional control
         # blocks (council, ready, thinking_summary). Any fenced
@@ -904,7 +1109,7 @@ class Author(APICallAgent):
             parse_warnings=warnings,
             raw_text=raw_text,
             container_id=container_id,
-            via="container_files",
+            via=via,
         )
 
 

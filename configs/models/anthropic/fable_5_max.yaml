@@ -1,0 +1,34 @@
+model: claude-fable-5
+api: anthropic
+max_tokens: 128000
+concurrent_requests: 32
+temperature: null
+top_p: null
+cache_write_cost: 12.5
+cache_read_cost: 1.0
+read_cost: 10
+write_cost: 50
+# Fable 5 always thinks: adaptive is the only accepted explicit config
+# (budget_tokens or type: disabled are rejected with a 400). Summarized
+# display surfaces reasoning summaries in the conversation record, at
+# parity with the gpt-55-pro Author's `reasoning: {summary: auto}`.
+thinking:
+  type: adaptive
+  display: summarized
+output_config:
+  effort: max
+cache_control:
+  type: ephemeral
+batch_processing: false
+stream_anthropic_messages: true
+anthropic_salvage_empty_max_tokens: true
+anthropic_continue_on_max_tokens: true
+# Author-role leash at parity with gpt-55-pro: 3h10m per streaming
+# attempt, with a ~3h53m hard wallclock cap for the retry loop.
+timeout: 11400
+max_wallclock_per_call_s: 14000
+max_retries: 2
+max_retries_inner: 1
+sleep_on_error: 10
+sleep_on_error_max: 60
+throw_error_on_failure: true
