@@ -174,12 +174,23 @@ class RunMonitorTests(unittest.TestCase):
         self.assertEqual(normalize_monitor_model_spec("gpt-5.5"), "models/openai/gpt-54-mini")
         self.assertEqual(normalize_monitor_model_spec("openai/gpt-55-mini"), "models/openai/gpt-54-mini")
 
-    def test_monitor_maps_sol_aliases_to_sol_pro_config(self) -> None:
-        expected = "models/openai/gpt-56-sol-pro"
-
-        aliases = ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-sol--max", "gpt-5.6-sol-pro")
-        for alias in aliases:
-            self.assertEqual(normalize_monitor_model_spec(alias), expected)
+    def test_monitor_keeps_standard_sol_aliases_out_of_pro_mode(self) -> None:
+        self.assertEqual(
+            normalize_monitor_model_spec("gpt-5.6"),
+            "models/openai/gpt-56-sol",
+        )
+        self.assertEqual(
+            normalize_monitor_model_spec("gpt-5.6-sol"),
+            "models/openai/gpt-56-sol",
+        )
+        self.assertEqual(
+            normalize_monitor_model_spec("gpt-5.6-sol--max"),
+            "models/openai/gpt-56-sol-max",
+        )
+        self.assertEqual(
+            normalize_monitor_model_spec("gpt-5.6-sol-pro"),
+            "models/openai/gpt-56-sol-pro",
+        )
 
     def test_monitor_accepts_relative_config_ref(self) -> None:
         self.assertEqual(normalize_monitor_model_spec("openai/gpt-54-mini"), "models/openai/gpt-54-mini")

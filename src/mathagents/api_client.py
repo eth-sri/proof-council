@@ -244,6 +244,9 @@ class APIClient:
         max_tool_calls=float("inf"),
         cache_write_cost=0,
         cache_write_tokens_in_input=False,
+        long_context_threshold_tokens=None,
+        long_context_input_multiplier=1,
+        long_context_output_multiplier=1,
         background_timeout_downgrade_after=0,
         background_timeout_reasoning_efforts=None,
         tools=None,
@@ -286,6 +289,11 @@ class APIClient:
                 Could also be a dict that specifies max calls per tool name.
             cache_write_tokens_in_input (bool, optional): Whether reported cache-write
                 tokens are already included in the input-token total.
+            long_context_threshold_tokens (int, optional): Input-token threshold above
+                which the configured long-context multipliers apply to the full request.
+            long_context_input_multiplier (float, optional): Long-context multiplier for
+                all input categories, including cache reads and writes.
+            long_context_output_multiplier (float, optional): Long-context output multiplier.
             background_timeout_downgrade_after (int, optional): Number of OpenAI Responses
                 background poll timeouts before using background_timeout_reasoning_efforts.
             background_timeout_reasoning_efforts (list[str], optional): Reasoning efforts
@@ -306,6 +314,14 @@ class APIClient:
                 raise ValueError(
                     "cache_write_cost must be positive when cache_write_tokens_in_input is true"
                 )
+        if long_context_threshold_tokens is not None:
+            long_context_threshold_tokens = int(long_context_threshold_tokens)
+            if long_context_threshold_tokens <= 0:
+                raise ValueError("long_context_threshold_tokens must be positive")
+        long_context_input_multiplier = float(long_context_input_multiplier)
+        long_context_output_multiplier = float(long_context_output_multiplier)
+        if long_context_input_multiplier <= 0 or long_context_output_multiplier <= 0:
+            raise ValueError("long-context cost multipliers must be positive")
 
         # Max tool calls
         has_local_tools = any(func is not None for func, _ in (tools or []))
@@ -375,6 +391,9 @@ class APIClient:
         self.include_max_tool_calls = include_max_tool_calls
         self.cache_write_cost = cache_write_cost
         self.cache_write_tokens_in_input = cache_write_tokens_in_input
+        self.long_context_threshold_tokens = long_context_threshold_tokens
+        self.long_context_input_multiplier = long_context_input_multiplier
+        self.long_context_output_multiplier = long_context_output_multiplier
         self.background_timeout_downgrade_after = max(0, int(background_timeout_downgrade_after or 0))
         self.background_timeout_reasoning_efforts = list(background_timeout_reasoning_efforts or [])
         self.background = background
@@ -556,7 +575,7 @@ class APIClient:
     class InternalRequestResult:
         """A class to hold the result of a request internally (below run_queries)."""
 
-        def __init__(self, conversation, input_tokens, output_tokens, cached_input_tokens=0, cached_write_tokens=0, reasoning_tokens=0, n_retries=0, time=0):
+        def __init__(self, conversation, input_tokens, output_tokens, cached_input_tokens=0, cached_write_tokens=0, reasoning_tokens=0, n_retries=0, time=0, cost_usd=None):
             self.conversation = conversation
             self.input_tokens = input_tokens
             self.output_tokens = output_tokens
@@ -569,6 +588,7 @@ class APIClient:
             self.reasoning_tokens = reasoning_tokens
             self.n_retries = n_retries
             self.time = time
+            self.cost_usd = cost_usd
 
     def run_queries(self, queries, no_tqdm=False, ignore_tool_calls=False, custom_indices=None):
         """Only entry point: runs a given list of queries through the API.
@@ -617,7 +637,7 @@ class APIClient:
                     conversation = [m.copy() for m in queries[idx]] + [{"role": "assistant", "content": ""}]
                     result = self.InternalRequestResult(conversation, input_tokens=0, output_tokens=0)
                 detailed_cost = {
-                    "cost": self._get_cost(
+                    "cost": result.cost_usd if result.cost_usd is not None else self._get_cost(
                         result.input_tokens, result.output_tokens, result.cached_input_tokens, result.cached_write_tokens
                     ),
                     "input_tokens": result.input_tokens,
@@ -650,7 +670,7 @@ class APIClient:
                     conversation = [m.copy() for m in queries[idx]] + [{"role": "assistant", "content": ""}]
                     result = self.InternalRequestResult(conversation, input_tokens=0, output_tokens=0)
                 detailed_cost = {
-                    "cost": self._get_cost(
+                    "cost": result.cost_usd if result.cost_usd is not None else self._get_cost(
                         result.input_tokens,
                         result.output_tokens,
                         result.cached_input_tokens,
@@ -816,6 +836,7 @@ class APIClient:
         cached_input_tokens = (
             usage_dict.get("cached_input_tokens")
             or usage_dict.get("cache_read_input_tokens")
+            or usage_dict.get("cached_tokens")
             or input_details.get("cached_tokens")
             or prompt_details.get("cached_tokens")
             or 0
@@ -826,6 +847,7 @@ class APIClient:
         cached_input_tokens = min(max(cached_input_tokens, 0), max(input_tokens, 0))
         cached_creation_input_tokens = (
             usage_dict.get("cache_creation_input_tokens")
+            or usage_dict.get("cache_write_tokens")
             or input_details.get("cache_write_tokens")
             or prompt_details.get("cache_write_tokens")
             or 0
@@ -905,11 +927,20 @@ class APIClient:
                 uncached_input_tokens,
             )
             uncached_input_tokens -= cached_creation_input_tokens
+        long_context = (
+            self.long_context_threshold_tokens is not None
+            and input_tokens > self.long_context_threshold_tokens
+        )
+        input_multiplier = self.long_context_input_multiplier if long_context else 1
+        output_multiplier = self.long_context_output_multiplier if long_context else 1
         return (
-            uncached_input_tokens * self.read_cost
-            + cached_input_tokens * self.cache_read_cost
-            + output_tokens * self.write_cost
-            + cached_creation_input_tokens * self.cache_write_cost
+            (
+                uncached_input_tokens * self.read_cost
+                + cached_input_tokens * self.cache_read_cost
+                + cached_creation_input_tokens * self.cache_write_cost
+            )
+            * input_multiplier
+            + output_tokens * self.write_cost * output_multiplier
         ) / 1e6
 
     def _get_messages_from_anthropic_content(self, content):
@@ -1851,6 +1882,7 @@ class APIClient:
         cached_input_tokens = 0
         cached_write_tokens = 0
         reasoning_tokens = 0
+        cost_usd = 0.0
         total_retries = 0
         inner_start = time.time()
         server_tool_continuations = 0
@@ -1926,6 +1958,12 @@ class APIClient:
             cached_input_tokens += step_cached_input
             cached_write_tokens += step_write_cache
             reasoning_tokens += step_reasoning
+            cost_usd += self._get_cost(
+                step_input,
+                step_output,
+                step_cached_input,
+                step_write_cache,
+            )
 
             assistant_blocks = []
             text_blocks = []
@@ -1995,6 +2033,12 @@ class APIClient:
                     cached_input_tokens += step_cached_input
                     cached_write_tokens += step_write_cache
                     reasoning_tokens += step_reasoning
+                    cost_usd += self._get_cost(
+                        step_input,
+                        step_output,
+                        step_cached_input,
+                        step_write_cache,
+                    )
                     salvage_assistant_blocks, salvage_text_blocks, _ = self._anthropic_content_summary(
                         salvage_response
                     )
@@ -2030,6 +2074,15 @@ class APIClient:
                             output, additional_cost = output
                             input_tokens += additional_cost["input_tokens"]
                             output_tokens += additional_cost["output_tokens"]
+                            cost_usd += float(
+                                additional_cost.get(
+                                    "cost",
+                                    self._get_cost(
+                                        additional_cost["input_tokens"],
+                                        additional_cost["output_tokens"],
+                                    ),
+                                )
+                            )
                         nb_executed_tool_calls[tool_key] += 1
 
                 nb_tool_calls_left = max_tool_calls.get("any", 0) - nb_executed_tool_calls.get("any", 0)
@@ -2089,6 +2142,7 @@ class APIClient:
             cached_write_tokens=cached_write_tokens,
             reasoning_tokens=reasoning_tokens,
             n_retries=total_retries,
+            cost_usd=cost_usd,
         )
 
     def _openai_query_with_tools(self, idx, query, is_together=False, ignore_tool_calls=False):
@@ -2152,6 +2206,7 @@ class APIClient:
         cached_input_tokens = 0
         cached_write_tokens = 0
         reasoning_tokens = 0
+        cost_usd = 0.0
         total_retries = 0
         background_timeout_count = 0
         inner_start = time.time()
@@ -2319,6 +2374,12 @@ class APIClient:
             cached_input_tokens += step_cached_input
             cached_write_tokens += step_cached_write
             reasoning_tokens += step_reasoning
+            cost_usd += self._get_cost(
+                step_input,
+                step_output,
+                step_cached_input,
+                step_cached_write,
+            )
 
             was_tool_call_executed = False
             for out in response.output:
@@ -2363,6 +2424,15 @@ class APIClient:
                         additional_cost = output[1]
                         input_tokens += additional_cost["input_tokens"]
                         output_tokens += additional_cost["output_tokens"]
+                        cost_usd += float(
+                            additional_cost.get(
+                                "cost",
+                                self._get_cost(
+                                    additional_cost["input_tokens"],
+                                    additional_cost["output_tokens"],
+                                ),
+                            )
+                        )
                         output = output[0]
                     conversation.append(
                         {
@@ -2426,6 +2496,7 @@ class APIClient:
             cached_write_tokens=cached_write_tokens,
             reasoning_tokens=reasoning_tokens,
             n_retries=total_retries,
+            cost_usd=cost_usd,
         )
 
     def _openai_query_chat_completions_api(self, client, idx, messages, ignore_tool_calls=False):
@@ -2461,6 +2532,7 @@ class APIClient:
         cached_input_tokens = 0
         cached_write_tokens = 0
         reasoning_tokens = 0
+        cost_usd = 0.0
         total_retries = 0
         max_output_tokens = self.kwargs.get(self.max_tokens_param, None)
         inner_start = time.time()
@@ -2528,6 +2600,12 @@ class APIClient:
             cached_input_tokens += step_cached_input
             cached_write_tokens += step_cached_write
             reasoning_tokens += step_reasoning
+            cost_usd += self._get_cost(
+                step_input,
+                step_output,
+                step_cached_input,
+                step_cached_write,
+            )
             message = response.choices[0].message
             if self.context_limit is not None:
                 max_output_tokens = self.context_limit
@@ -2601,6 +2679,15 @@ class APIClient:
                             output, extra_cost = output
                             input_tokens += extra_cost["input_tokens"]
                             output_tokens += extra_cost["output_tokens"]
+                            cost_usd += float(
+                                extra_cost.get(
+                                    "cost",
+                                    self._get_cost(
+                                        extra_cost["input_tokens"],
+                                        extra_cost["output_tokens"],
+                                    ),
+                                )
+                            )
 
                         nb_executed_tool_calls[tool_key] += 1
 
@@ -2634,6 +2721,7 @@ class APIClient:
             cached_write_tokens=cached_write_tokens,
             reasoning_tokens=reasoning_tokens,
             n_retries=total_retries,
+            cost_usd=cost_usd,
         )
 
     def _openai_query_chat_completions_streaming(self, client, idx, messages):

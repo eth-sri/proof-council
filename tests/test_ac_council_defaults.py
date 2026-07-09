@@ -70,6 +70,9 @@ class ACCouncilDefaultsTests(unittest.TestCase):
         self.assertEqual(cfg["cache_read_cost"], 0.5)
         self.assertEqual(cfg["cache_write_cost"], 6.25)
         self.assertEqual(cfg["write_cost"], 30)
+        self.assertEqual(cfg["long_context_threshold_tokens"], 272000)
+        self.assertEqual(cfg["long_context_input_multiplier"], 2)
+        self.assertEqual(cfg["long_context_output_multiplier"], 1.5)
         self.assertTrue(cfg["cache_write_tokens_in_input"])
         self.assertTrue(cfg["background"])
         self.assertTrue(cfg["use_openai_responses_api"])
@@ -88,6 +91,15 @@ class ACCouncilDefaultsTests(unittest.TestCase):
         self.assertEqual(client.background_timeout_downgrade_after, 1)
         self.assertEqual(client.background_timeout_reasoning_efforts, ["high"])
 
+    def test_standard_sol_configs_do_not_enable_pro_mode(self) -> None:
+        standard = load_solver_config("models/openai/gpt-56-sol")
+        maximum = load_solver_config("models/openai/gpt-56-sol-max")
+
+        self.assertEqual(standard["model"], "gpt-5.6-sol")
+        self.assertEqual(standard["reasoning"], {"summary": "auto"})
+        self.assertEqual(maximum["model"], "gpt-5.6-sol--max")
+        self.assertEqual(maximum["reasoning"], {"summary": "auto"})
+
     def test_prescreen_uses_sol_pro(self) -> None:
         preset = load_preset("prescreen")
 
@@ -95,6 +107,18 @@ class ACCouncilDefaultsTests(unittest.TestCase):
             preset.component_configs["cfg_prescreen"]["model"],
             "models/openai/gpt-56-sol-pro",
         )
+
+    def test_workflow_inputs_reject_invalid_compute_timeout_pair(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "compute_soft_timeout_s must be less than compute_hard_timeout_s",
+        ):
+            ACWorkflow.Inputs(
+                problem="P",
+                problem_id="p",
+                compute_soft_timeout_s=100,
+                compute_hard_timeout_s=100,
+            )
 
     def test_opus_council_member_uses_max_adaptive_streaming_config(self) -> None:
         cfg = load_solver_config("models/anthropic/opus_47_max")

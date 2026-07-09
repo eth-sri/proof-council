@@ -199,6 +199,77 @@ class ResponsesToolLoopTests(unittest.TestCase):
         expected = (200 * 5 + 200 * 0.5 + 600 * 6.25 + 10 * 30) / 1_000_000
         self.assertAlmostEqual(api._get_cost(*extracted), expected)
 
+    def test_flat_cache_fields_are_extracted(self) -> None:
+        api = APIClient(model="fake", api="custom")
+        usage = SimpleNamespace(
+            input_tokens=1000,
+            cached_tokens=200,
+            cache_write_tokens=300,
+            output_tokens=10,
+        )
+
+        self.assertEqual(api._extract_usage_tokens(usage), (1000, 10, 200, 300))
+
+    def test_long_context_multiplier_applies_to_the_full_request(self) -> None:
+        api = APIClient(
+            model="fake",
+            api="custom",
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+            long_context_threshold_tokens=272000,
+            long_context_input_multiplier=2,
+            long_context_output_multiplier=1.5,
+        )
+
+        at_threshold = api._get_cost(272000, 1000, 100000, 50000)
+        above_threshold = api._get_cost(272001, 1000, 100000, 50000)
+        base_input = (122000 * 5 + 100000 * 0.5 + 50000 * 6.25) / 1_000_000
+        above_base_input = (122001 * 5 + 100000 * 0.5 + 50000 * 6.25) / 1_000_000
+
+        self.assertAlmostEqual(at_threshold, base_input + 1000 * 30 / 1_000_000)
+        self.assertAlmostEqual(
+            above_threshold,
+            above_base_input * 2 + 1000 * 30 * 1.5 / 1_000_000,
+        )
+
+    def test_long_context_cost_is_computed_per_provider_request(self) -> None:
+        def list_persisted_files() -> dict:
+            return {"ok": True, "files": []}
+
+        api = APIClient(
+            model="fake",
+            api="custom",
+            use_openai_responses_api=True,
+            read_cost=5,
+            write_cost=30,
+            long_context_threshold_tokens=272000,
+            long_context_input_multiplier=2,
+            long_context_output_multiplier=1.5,
+            tools=[(list_persisted_files, _function_tool())],
+        )
+        first = _response(_function_call())
+        first.usage = {"input_tokens": 200000, "output_tokens": 10}
+        second = _response(_message("done"))
+        second.usage = {"input_tokens": 200000, "output_tokens": 10}
+        client = SimpleNamespace(responses=_Responses([first, second]))
+
+        with patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ):
+            result = api._openai_query_responses_api(
+                client, 0, [{"role": "user", "content": "hi"}]
+            )
+
+        expected = 2 * (200000 * 5 + 10 * 30) / 1_000_000
+        self.assertAlmostEqual(result.cost_usd, expected)
+        self.assertGreater(
+            api._get_cost(result.input_tokens, result.output_tokens),
+            result.cost_usd,
+        )
+
     def test_chat_completions_propagates_cache_write_tokens(self) -> None:
         usage = _cache_usage()
         message = SimpleNamespace(
@@ -208,7 +279,11 @@ class ResponsesToolLoopTests(unittest.TestCase):
             tool_calls=[],
             model_dump=lambda: {"role": "assistant", "content": "done", "tool_calls": []},
         )
-        response = SimpleNamespace(usage=usage, choices=[SimpleNamespace(message=message)])
+        response = SimpleNamespace(
+            usage=usage,
+            choices=[SimpleNamespace(message=message)],
+            model_dump=lambda: {"usage": usage.model_dump()},
+        )
         completions = SimpleNamespace(create=lambda **kwargs: response)
         client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
         api = APIClient(model="fake", api="custom")

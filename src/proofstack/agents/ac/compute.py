@@ -35,9 +35,9 @@ import re
 import shutil
 import zipfile
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from proofstack.cli_usage import (
     cost_for_codex_usage,
@@ -59,6 +59,7 @@ DEFAULT_DOCKER_IMAGE = "proofstack-pwc-sandbox:latest"
 # ``auto`` resolves to ``--dangerously-bypass-approvals-and-sandbox``
 # under docker and ``--sandbox workspace-write`` under subprocess.
 DEFAULT_CODEX_SANDBOX = "auto"
+MIN_CODEX_VERSION: Final[tuple[int, int, int]] = (0, 144, 0)
 
 # Directories to exclude from the workspace zip handed back to the Author.
 # - problem_documents_readonly/ is already what the Author has.
@@ -265,6 +266,12 @@ class Compute(CLIAgent):
         # ``docker-bypass``, or ``none``.
         codex_sandbox: str = DEFAULT_CODEX_SANDBOX
 
+        @model_validator(mode="after")
+        def validate_timeouts(self) -> Self:
+            if self.soft_timeout_s >= self.hard_timeout_s:
+                raise ValueError("soft_timeout_s must be less than hard_timeout_s")
+            return self
+
     class Outputs(BaseModel):
         response_md: str = ""
         zip_path: Path | None = None
@@ -293,8 +300,6 @@ class Compute(CLIAgent):
         self._last_cost_config = inp.cost_config  # type: ignore[attr-defined]
         soft_timeout_s = int(inp.soft_timeout_s)  # type: ignore[attr-defined]
         hard_timeout_s = int(inp.hard_timeout_s)  # type: ignore[attr-defined]
-        if soft_timeout_s >= hard_timeout_s:
-            raise ValueError("soft_timeout_s must be less than hard_timeout_s")
         self.SOFT_TIMEOUT_S = soft_timeout_s
         codex_home_host, codex_home_env, docker_extra_args = self._codex_home_paths(inp)
         self._codex_home_host = codex_home_host
@@ -319,6 +324,9 @@ class Compute(CLIAgent):
         return await super().run(inp)
 
     async def setup(self, sandbox: Sandbox, inp: BaseModel) -> None:
+        codex_home = self._ensure_codex_home(inp)
+        codex_home.mkdir(parents=True, exist_ok=True)
+        await _require_codex_cli_version(sandbox)
         root = sandbox.root
         ro = root / "problem_documents_readonly"
         # Wipe & resync: the Author's canonical files may have changed
@@ -344,8 +352,6 @@ class Compute(CLIAgent):
         (root / "code" / "__init__.py").touch()
         _write_helper_if_missing(root / "compute_utils.py", _COMPUTE_UTILS)
         _write_helper_if_missing(root / "sitecustomize.py", _SITECUSTOMIZE)
-        codex_home = self._ensure_codex_home(inp)
-        codex_home.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(root / ".codex-home", ignore_errors=True)
         try:
             (root / _CODEX_LAST_MESSAGE_REL).unlink()
@@ -488,6 +494,20 @@ class Compute(CLIAgent):
         )
 
 # --- helpers ----------------------------------------------------------------
+
+
+async def _require_codex_cli_version(sandbox: Sandbox) -> None:
+    result = await sandbox.run_command(["codex", "--version"], timeout_s=10)
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", output)
+    if result.returncode != 0 or match is None:
+        raise RuntimeError(f"Could not determine Codex CLI version: {output or 'no output'}")
+    version = tuple(int(part) for part in match.groups())
+    if version < MIN_CODEX_VERSION:
+        minimum = ".".join(str(part) for part in MIN_CODEX_VERSION)
+        raise RuntimeError(
+            f"Codex CLI {minimum} or newer is required for gpt-5.6-sol with max effort; found {match.group(0)}"
+        )
 
 
 def _build_codex_cmd(

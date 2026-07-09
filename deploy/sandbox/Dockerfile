@@ -24,11 +24,10 @@ RUN apt-get update \
         poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Codex CLI. Pulls @latest at image build time; tandem reproducibility
-# across rebuilds therefore depends on rebuilding both ends together.
-# Swap to a fixed version (e.g. @openai/codex@0.X.Y) once a release
-# stabilises.
-RUN npm install -g @openai/codex@latest
+# Codex CLI. GPT-5.6 Sol and max effort require a current runtime.
+ARG OPENAI_CODEX_VERSION=0.144.0
+RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION} \
+    && codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"
 
 # The node:20 base already has a non-root `node` user at uid 1000;
 # reuse it rather than creating a duplicate. At runtime DockerSandbox

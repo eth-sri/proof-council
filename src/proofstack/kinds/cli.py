@@ -197,6 +197,7 @@ class CLIAgent(Agent):
 
             spawn_call_id = new_call_id()
             timeout_s = self._effective_timeout_s()
+            soft_timeout_s = self._effective_soft_timeout_s(timeout_s)
             await self.events.emit(
                 "cli.spawn",
                 {
@@ -204,7 +205,7 @@ class CLIAgent(Agent):
                     "sandbox": str(sandbox.root),
                     "backend": resolve_backend(self.SANDBOX),
                     "timeout_s": timeout_s,
-                    "soft_timeout_s": int(self.SOFT_TIMEOUT_S) or None,
+                    "soft_timeout_s": soft_timeout_s or None,
                     "persistent_workspace": persistent,
                 },
                 call_id=spawn_call_id,
@@ -235,6 +236,7 @@ class CLIAgent(Agent):
                 done_path,
                 spawn_call_id=spawn_call_id,
                 wrap_up_path=wrap_up_path,
+                soft_timeout_s=soft_timeout_s,
             )
             try:
                 await self.record_cli_usage(stream.stdout, stream.stderr, done)
@@ -300,12 +302,12 @@ class CLIAgent(Agent):
         *,
         spawn_call_id: str,
         wrap_up_path: Path | None = None,
+        soft_timeout_s: int = 0,
     ) -> CLIDoneRecord:
         spawn_t = time.monotonic()
         last_heartbeat = spawn_t
         cleanup_warned = False
         wrap_up_signaled = False
-        soft_timeout_s = int(self.SOFT_TIMEOUT_S) if self.SOFT_TIMEOUT_S else 0
         while True:
             if done_path.exists():
                 grace_deadline = time.monotonic() + float(self.DONE_DRAIN_GRACE_S)
@@ -448,6 +450,15 @@ class CLIAgent(Agent):
         if timeout_s <= 0:
             raise BudgetExhausted("run", "wallclock_s", 0.0, 0.0)
         return timeout_s
+
+    def _effective_soft_timeout_s(self, hard_timeout_s: int) -> int:
+        configured_soft = int(self.SOFT_TIMEOUT_S) if self.SOFT_TIMEOUT_S else 0
+        if configured_soft <= 0 or hard_timeout_s <= 1:
+            return 0
+        configured_hard = max(1, int(self.SANDBOX.timeout_s))
+        configured_grace = max(1, configured_hard - configured_soft)
+        effective_grace = min(configured_grace, max(1, hard_timeout_s // 2))
+        return min(configured_soft, max(1, hard_timeout_s - effective_grace))
 
     def _install_shell_startup(
         self,

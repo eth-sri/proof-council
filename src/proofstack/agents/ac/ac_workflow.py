@@ -50,9 +50,9 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from proofstack.agent import Agent
 from proofstack.agents.ac.author import Author
@@ -421,6 +421,14 @@ class ACWorkflow(Agent):
         # First Proof staged runs need intermediate batch boundaries to end
         # after a Critic review, not with the normal final Author-only turn.
         stop_after_review_round: bool = False
+
+        @model_validator(mode="after")
+        def validate_compute_timeouts(self) -> Self:
+            if self.compute_soft_timeout_s >= self.compute_hard_timeout_s:
+                raise ValueError(
+                    "compute_soft_timeout_s must be less than compute_hard_timeout_s"
+                )
+            return self
 
     class Outputs(BaseModel):
         problem_id: str
