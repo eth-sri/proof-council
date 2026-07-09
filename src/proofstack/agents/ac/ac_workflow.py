@@ -67,6 +67,12 @@ from proofstack.agents.ac.compute import (
     DEFAULT_REASONING_EFFORT as DEFAULT_COMPUTE_REASONING_EFFORT,
 )
 from proofstack.agents.ac.compute import (
+    DEFAULT_HARD_TIMEOUT_S as DEFAULT_COMPUTE_HARD_TIMEOUT_S,
+)
+from proofstack.agents.ac.compute import (
+    DEFAULT_SOFT_TIMEOUT_S as DEFAULT_COMPUTE_SOFT_TIMEOUT_S,
+)
+from proofstack.agents.ac.compute import (
     Compute,
     render_compute_reply_for_author,
 )
@@ -390,6 +396,8 @@ class ACWorkflow(Agent):
         compute_model: str = DEFAULT_COMPUTE_MODEL
         compute_reasoning_effort: str = DEFAULT_COMPUTE_REASONING_EFFORT
         compute_cost_config: str = DEFAULT_COMPUTE_COST_CONFIG
+        compute_soft_timeout_s: int = Field(default=DEFAULT_COMPUTE_SOFT_TIMEOUT_S, ge=0)
+        compute_hard_timeout_s: int = Field(default=DEFAULT_COMPUTE_HARD_TIMEOUT_S, ge=1)
         # ``docker`` (default) or ``subprocess`` (host CLI; needed when
         # the pwc sandbox image is unavailable). Forwarded to
         # ``Compute.Inputs.sandbox_backend``.
@@ -2066,6 +2074,8 @@ class ACWorkflow(Agent):
                 model=inp.compute_model,
                 reasoning_effort=inp.compute_reasoning_effort,
                 cost_config=inp.compute_cost_config,
+                soft_timeout_s=inp.compute_soft_timeout_s,
+                hard_timeout_s=inp.compute_hard_timeout_s,
                 sandbox_backend=inp.compute_sandbox_backend,
                 docker_image=inp.compute_docker_image,
                 codex_sandbox=inp.compute_codex_sandbox,

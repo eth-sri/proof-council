@@ -161,8 +161,8 @@
         // list doesn't have yet (model names change over time).
         const workflowInputChoices = {
             claude_model: ['opus', 'sonnet', 'haiku'],
-            codex_model: ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
-            codex_effort: ['high', 'medium', 'low', 'minimal'],
+            codex_model: ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
+            codex_effort: ['max', 'xhigh', 'high', 'medium', 'low', 'minimal'],
         };
         let currentReport = {{ report | tojson }};
         let selectedNodeId = null;
@@ -4836,7 +4836,7 @@
         }
 
         function cliReasoningEffortSelect(prefix, selected) {
-            const values = ['', 'low', 'medium', 'high', 'xhigh'];
+            const values = ['', 'low', 'medium', 'high', 'xhigh', 'max'];
             const selectedValue = selected || '';
             const allValues = values.includes(selectedValue) ? values : [...values, selectedValue];
             return `
@@ -4869,7 +4869,7 @@
             const bound = cliModelFromCmd(cfg.cmd);
             const boundIsBinding = /^\{[A-Za-z_][\w]*\}$/.test(bound);
             const isCodex = cliCommandParts(cfg.cmd).includes('codex');
-            const known = isCodex ? ['gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['opus', 'sonnet', 'haiku'];
+            const known = isCodex ? ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['opus', 'sonnet', 'haiku'];
             const isCustom = override !== '' && !known.includes(override);
             const defaultLabel = boundIsBinding
                 ? `Workflow default (${bound})`

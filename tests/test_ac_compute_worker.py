@@ -18,8 +18,10 @@ from proofstack.agents.ac.compute import (  # noqa: E402
     _zip_workspace,
     Compute,
     DEFAULT_COST_CONFIG,
+    DEFAULT_HARD_TIMEOUT_S,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
+    DEFAULT_SOFT_TIMEOUT_S,
 )
 from proofstack.context import RunContext  # noqa: E402
 from proofstack.kinds.cli import CLIDoneRecord  # noqa: E402
@@ -73,6 +75,31 @@ def test_compute_inputs_default_to_sol_max_with_matching_cost_config() -> None:
     assert inp.model == DEFAULT_MODEL
     assert inp.reasoning_effort == DEFAULT_REASONING_EFFORT
     assert inp.cost_config == DEFAULT_COST_CONFIG
+    assert inp.soft_timeout_s == DEFAULT_SOFT_TIMEOUT_S == 7200
+    assert inp.hard_timeout_s == DEFAULT_HARD_TIMEOUT_S == 9000
+
+
+def test_compute_rejects_soft_timeout_at_or_after_hard_timeout() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="p",
+            round=1,
+            instructions="compute",
+            compute_workspace=temp / "compute",
+            soft_timeout_s=100,
+            hard_timeout_s=100,
+        )
+
+        try:
+            asyncio.run(agent.run(inp))
+        except ValueError as e:
+            assert str(e) == "soft_timeout_s must be less than hard_timeout_s"
+        else:
+            raise AssertionError("invalid timeout ordering was accepted")
 
 
 def test_dockerfile_pins_and_smokes_codex_cli() -> None:
@@ -82,7 +109,8 @@ def test_dockerfile_pins_and_smokes_codex_cli() -> None:
     )
 
     assert "@openai/codex@${OPENAI_CODEX_VERSION}" in text
-    assert "OPENAI_CODEX_VERSION=" in text
+    assert "ARG OPENAI_CODEX_VERSION=0.144.0" in text
+    assert 'codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"' in text
     assert "codex exec --help | grep -q -- '--output-last-message'" in text
     assert "gmpy2 python-flint z3-solver cvxpy" in text
     assert "git file column time" in text

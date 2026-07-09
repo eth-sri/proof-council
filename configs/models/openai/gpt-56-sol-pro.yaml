@@ -15,6 +15,9 @@ use_openai_responses_api: true
 timeout: 11400
 throw_error_on_failure: true
 max_wallclock_per_call_s: 14000
+background_timeout_downgrade_after: 1
+background_timeout_reasoning_efforts:
+  - high
 reasoning:
   mode: "pro"
   summary: "auto"

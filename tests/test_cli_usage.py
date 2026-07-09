@@ -2,7 +2,73 @@ import json
 import unittest
 
 from proofstack.budget import BudgetExhausted, BudgetSpec, BudgetTracker
-from proofstack.cli_usage import parse_claude_json
+from proofstack.cli_usage import (
+    CodexUsage,
+    cost_for_codex_usage,
+    load_cost_rates,
+    parse_claude_json,
+    parse_codex_jsonl,
+)
+
+
+class CodexUsageTests(unittest.TestCase):
+    def test_parser_collects_cache_write_tokens_when_cli_exposes_them(self) -> None:
+        usage = parse_codex_jsonl(
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 200,
+                        "cache_write_tokens": 300,
+                        "output_tokens": 10,
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(usage.cache_write_input_tokens, 300)
+
+    def test_explicit_cache_write_tokens_use_cache_write_rate(self) -> None:
+        usage = CodexUsage(
+            input_tokens=1000,
+            cached_input_tokens=200,
+            cache_write_input_tokens=300,
+            output_tokens=10,
+        )
+
+        cost = cost_for_codex_usage(
+            usage,
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+        )
+
+        expected = (500 * 5 + 200 * 0.5 + 300 * 6.25 + 10 * 30) / 1_000_000
+        self.assertAlmostEqual(cost, expected)
+
+    def test_missing_cli_cache_write_count_is_conservatively_costed(self) -> None:
+        usage = CodexUsage(input_tokens=1000, cached_input_tokens=200)
+
+        cost = cost_for_codex_usage(
+            usage,
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+        )
+
+        expected = (200 * 0.5 + 800 * 6.25) / 1_000_000
+        self.assertAlmostEqual(cost, expected)
+
+    def test_sol_cost_config_loads_cache_write_rate(self) -> None:
+        rates = load_cost_rates("models/openai/gpt-56-sol-pro")
+
+        self.assertEqual(rates["cache_write_cost"], 6.25)
+        self.assertTrue(rates["cache_write_tokens_in_input"])
 
 
 class ParseClaudeJsonTests(unittest.TestCase):

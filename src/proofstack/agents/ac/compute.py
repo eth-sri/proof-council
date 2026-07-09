@@ -26,8 +26,8 @@ After it finishes, the workflow:
      next Author container call.
 
 Same docker sandbox / soft-timeout / codex-jsonl usage accounting as
-the PWC Worker. Defaults can be overridden per-call via the ``model``,
-``reasoning_effort``, and ``cost_config`` ``Inputs`` fields.
+the PWC Worker. Model, effort, cost config, and timeout defaults can be
+overridden per call through ``Inputs``.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, ClassVar, Final
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from proofstack.cli_usage import (
     cost_for_codex_usage,
@@ -52,8 +52,8 @@ from proofstack.sandbox.base import Sandbox, SandboxSpec
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_REASONING_EFFORT = "max"
 DEFAULT_COST_CONFIG = "models/openai/gpt-56-sol-pro"
-DEFAULT_SOFT_TIMEOUT_S = 3600
-DEFAULT_HARD_TIMEOUT_S = 4500
+DEFAULT_SOFT_TIMEOUT_S = 7200
+DEFAULT_HARD_TIMEOUT_S = 9000
 DEFAULT_SANDBOX_BACKEND = "docker"
 DEFAULT_DOCKER_IMAGE = "proofstack-pwc-sandbox:latest"
 # ``auto`` resolves to ``--dangerously-bypass-approvals-and-sandbox``
@@ -252,6 +252,8 @@ class Compute(CLIAgent):
         model: str = DEFAULT_MODEL
         reasoning_effort: str = DEFAULT_REASONING_EFFORT
         cost_config: str = DEFAULT_COST_CONFIG
+        soft_timeout_s: int = Field(default=DEFAULT_SOFT_TIMEOUT_S, ge=0)
+        hard_timeout_s: int = Field(default=DEFAULT_HARD_TIMEOUT_S, ge=1)
         # ``docker`` (default, image=DEFAULT_DOCKER_IMAGE) or
         # ``subprocess`` (runs codex directly on the host; needed when
         # the pwc docker image is not available locally).
@@ -289,6 +291,11 @@ class Compute(CLIAgent):
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
         self._last_model = inp.model  # type: ignore[attr-defined]
         self._last_cost_config = inp.cost_config  # type: ignore[attr-defined]
+        soft_timeout_s = int(inp.soft_timeout_s)  # type: ignore[attr-defined]
+        hard_timeout_s = int(inp.hard_timeout_s)  # type: ignore[attr-defined]
+        if soft_timeout_s >= hard_timeout_s:
+            raise ValueError("soft_timeout_s must be less than hard_timeout_s")
+        self.SOFT_TIMEOUT_S = soft_timeout_s
         codex_home_host, codex_home_env, docker_extra_args = self._codex_home_paths(inp)
         self._codex_home_host = codex_home_host
         self._codex_home_env = codex_home_env
@@ -297,7 +304,7 @@ class Compute(CLIAgent):
         self.SANDBOX = SandboxSpec(
             cpu_limit=4,
             memory_gb=8,
-            timeout_s=DEFAULT_HARD_TIMEOUT_S,
+            timeout_s=hard_timeout_s,
             backend=str(inp.sandbox_backend or DEFAULT_SANDBOX_BACKEND),  # type: ignore[attr-defined,arg-type]
             docker_image=str(inp.docker_image or DEFAULT_DOCKER_IMAGE),  # type: ignore[attr-defined]
             docker_no_new_privileges=False,
@@ -469,6 +476,7 @@ class Compute(CLIAgent):
                 "model": self._last_model or DEFAULT_MODEL,
                 "in_tokens": usage.input_tokens,
                 "cached_in_tokens": usage.cached_input_tokens,
+                "cache_write_in_tokens": usage.cache_write_input_tokens,
                 "out_tokens": usage.output_tokens,
                 "reasoning_out_tokens": usage.reasoning_output_tokens,
                 "cost_usd": cost,

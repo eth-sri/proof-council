@@ -293,6 +293,20 @@ class APIClient:
             tools (list, optional): A list of tools to use. Defaults to None.
             **kwargs: Additional keyword arguments for the API.
         """
+        if not isinstance(cache_write_tokens_in_input, bool):
+            raise ValueError("cache_write_tokens_in_input must be a boolean")
+        if cache_write_tokens_in_input:
+            try:
+                cache_write_cost = float(cache_write_cost)
+            except (TypeError, ValueError) as e:
+                raise ValueError(
+                    "cache_write_cost must be positive when cache_write_tokens_in_input is true"
+                ) from e
+            if cache_write_cost <= 0:
+                raise ValueError(
+                    "cache_write_cost must be positive when cache_write_tokens_in_input is true"
+                )
+
         # Max tool calls
         has_local_tools = any(func is not None for func, _ in (tools or []))
         max_tool_calls = self._normalize_max_tool_calls(max_tool_calls)
@@ -767,7 +781,8 @@ class APIClient:
             val = getattr(usage, key, None)
             if val is not None:
                 out[key] = val
-        # Preserve nested cache and reasoning details from duck-typed SDK objects.
+        # Keep nested details intact because both token extractors accept either
+        # dictionaries or attribute-bearing SDK objects.
         for nested in (
             "input_tokens_details",
             "prompt_tokens_details",
@@ -1125,13 +1140,19 @@ class APIClient:
                     content = result["response"]["body"]["choices"][0]["message"]["content"]
                     conversation = [m.copy() for m in queries[pos]] + [{"role": "assistant", "content": content}]
                     usage = result["response"]["body"]["usage"]
-                    input_tokens, output_tokens, cached_input_tokens, _ = self._extract_usage_tokens(usage)
+                    (
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        cached_write_tokens,
+                    ) = self._extract_usage_tokens(usage)
                     reasoning_tokens = self._extract_reasoning_tokens(usage)
                     results[pos] = self.InternalRequestResult(
                         conversation,
                         input_tokens,
                         output_tokens,
                         cached_input_tokens=cached_input_tokens,
+                        cached_write_tokens=cached_write_tokens,
                         reasoning_tokens=reasoning_tokens,
                         n_retries=retry_idx,
                     )
@@ -1240,9 +1261,12 @@ class APIClient:
             if raw_result.result.type == "succeeded":
                 new_messages = self._get_messages_from_anthropic_content(raw_result.result.message.content)
                 conversation = [m.copy() for m in queries[i]] + new_messages
-                input_tokens, output_tokens, cached_input_tokens, _ = self._extract_usage_tokens(
-                    raw_result.result.message.usage
-                )
+                (
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    cached_write_tokens,
+                ) = self._extract_usage_tokens(raw_result.result.message.usage)
                 reasoning_tokens = self._extract_reasoning_tokens(raw_result.result.message.usage)
                 results.append(
                     self.InternalRequestResult(
@@ -1250,6 +1274,7 @@ class APIClient:
                         input_tokens,
                         output_tokens,
                         cached_input_tokens=cached_input_tokens,
+                        cached_write_tokens=cached_write_tokens,
                         reasoning_tokens=reasoning_tokens,
                         n_retries=retry_idx,
                     )
@@ -2434,6 +2459,7 @@ class APIClient:
         input_tokens = 0
         output_tokens = 0
         cached_input_tokens = 0
+        cached_write_tokens = 0
         reasoning_tokens = 0
         total_retries = 0
         max_output_tokens = self.kwargs.get(self.max_tokens_param, None)
@@ -2493,11 +2519,14 @@ class APIClient:
                 raise ValueError("Max inner retries reached.")
 
             # Update state: token counts and conversation (potentially execute tool calls)
-            step_input, step_output, step_cached_input, _ = self._extract_usage_tokens(response.usage)
+            step_input, step_output, step_cached_input, step_cached_write = (
+                self._extract_usage_tokens(response.usage)
+            )
             step_reasoning = self._extract_reasoning_tokens(response.usage)
             input_tokens += step_input
             output_tokens += step_output
             cached_input_tokens += step_cached_input
+            cached_write_tokens += step_cached_write
             reasoning_tokens += step_reasoning
             message = response.choices[0].message
             if self.context_limit is not None:
@@ -2602,6 +2631,7 @@ class APIClient:
             input_tokens,
             output_tokens,
             cached_input_tokens=cached_input_tokens,
+            cached_write_tokens=cached_write_tokens,
             reasoning_tokens=reasoning_tokens,
             n_retries=total_retries,
         )
@@ -2615,6 +2645,7 @@ class APIClient:
         input_tokens = 0
         output_tokens = 0
         cached_input_tokens = 0
+        cached_write_tokens = 0
         reasoning_tokens = 0
         total_retries = 0
         max_output_tokens = self.kwargs.get(self.max_tokens_param, None)
@@ -2689,7 +2720,9 @@ class APIClient:
         conversation.append({"role": "assistant", "content": content})
 
         if final_usage is not None:
-            input_tokens, output_tokens, cached_input_tokens, _ = self._extract_usage_tokens(final_usage)
+            input_tokens, output_tokens, cached_input_tokens, cached_write_tokens = (
+                self._extract_usage_tokens(final_usage)
+            )
             reasoning_tokens = self._extract_reasoning_tokens(final_usage)
 
         request_logger.log_response(
@@ -2708,6 +2741,7 @@ class APIClient:
             input_tokens,
             output_tokens,
             cached_input_tokens=cached_input_tokens,
+            cached_write_tokens=cached_write_tokens,
             reasoning_tokens=reasoning_tokens,
             n_retries=total_retries,
         )

@@ -85,7 +85,16 @@ class ACCouncilDefaultsTests(unittest.TestCase):
             {"mode": "pro", "summary": "auto", "effort": "max"},
         )
         self.assertEqual(client.kwargs["max_output_tokens"], 128000)
-        self.assertEqual(client.background_timeout_reasoning_efforts, [])
+        self.assertEqual(client.background_timeout_downgrade_after, 1)
+        self.assertEqual(client.background_timeout_reasoning_efforts, ["high"])
+
+    def test_prescreen_uses_sol_pro(self) -> None:
+        preset = load_preset("prescreen")
+
+        self.assertEqual(
+            preset.component_configs["cfg_prescreen"]["model"],
+            "models/openai/gpt-56-sol-pro",
+        )
 
     def test_opus_council_member_uses_max_adaptive_streaming_config(self) -> None:
         cfg = load_solver_config("models/anthropic/opus_47_max")

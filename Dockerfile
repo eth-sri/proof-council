@@ -79,8 +79,9 @@ RUN set -eux; \
 
 # Coding-CLI binaries used by ConfigurableCLIAgent.
 # Pin Codex because workflow command flags are part of the runtime contract.
-ARG OPENAI_CODEX_VERSION=0.132.0
+ARG OPENAI_CODEX_VERSION=0.144.0
 RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION} @anthropic-ai/claude-code \
+ && codex --version | grep -q -- "${OPENAI_CODEX_VERSION}" \
  && codex exec --help | grep -q -- '--output-last-message' \
  && codex exec --help | grep -q -- '--sandbox' \
  && codex exec --help | grep -q -- '--dangerously-bypass-approvals-and-sandbox'
