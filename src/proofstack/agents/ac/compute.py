@@ -49,9 +49,9 @@ from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
 
 
-DEFAULT_MODEL = "gpt-5.5"
-DEFAULT_REASONING_EFFORT = "xhigh"
-DEFAULT_COST_CONFIG = "models/openai/gpt-55-high"
+DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_REASONING_EFFORT = "max"
+DEFAULT_COST_CONFIG = "models/openai/gpt-56-sol-pro"
 DEFAULT_SOFT_TIMEOUT_S = 3600
 DEFAULT_HARD_TIMEOUT_S = 4500
 DEFAULT_SANDBOX_BACKEND = "docker"

@@ -144,6 +144,31 @@ class _Responses:
 
 
 class ResponsesToolLoopTests(unittest.TestCase):
+    def test_cache_write_tokens_are_billed_as_an_input_category(self) -> None:
+        api = APIClient(
+            model="fake",
+            api="custom",
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+        )
+        usage = SimpleNamespace(
+            input_tokens=1000,
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=200,
+                cache_write_tokens=600,
+            ),
+            output_tokens=10,
+        )
+
+        extracted = api._extract_usage_tokens(usage)
+
+        self.assertEqual(extracted, (1000, 10, 200, 600))
+        expected = (200 * 5 + 200 * 0.5 + 600 * 6.25 + 10 * 30) / 1_000_000
+        self.assertAlmostEqual(api._get_cost(*extracted), expected)
+
     def test_default_tool_budget_is_unbounded_and_reaches_final_message(self) -> None:
         def list_persisted_files() -> dict:
             return {"ok": True, "files": []}

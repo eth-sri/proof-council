@@ -6,16 +6,20 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from proofstack.agents.ac.ac_workflow import ACWorkflow, DEFAULT_COUNCIL_MODELS  # noqa: E402
+from proofstack.agents.ac.author import Author  # noqa: E402
+from proofstack.agents.ac.council import CouncilMember, _strip_visible_thought_blocks  # noqa: E402
+from proofstack.agents.ac.critic import ACCritic  # noqa: E402
 from proofstack.registry import load_preset  # noqa: E402
 from app.dev import _api_key_requirements_for_preset  # noqa: E402
+from mathagents.api_client import APIClient  # noqa: E402
 from mathagents.config_loader import load_solver_config  # noqa: E402
-from proofstack.agents.ac.council import _strip_visible_thought_blocks  # noqa: E402
 
 
 class ACCouncilDefaultsTests(unittest.TestCase):
@@ -23,7 +27,7 @@ class ACCouncilDefaultsTests(unittest.TestCase):
         self.assertEqual(
             DEFAULT_COUNCIL_MODELS,
             (
-                "models/openai/gpt-55-pro",
+                "models/openai/gpt-56-sol-pro",
                 "models/anthropic/opus_47_max",
                 "models/gemini/gemini-31-pro",
             ),
@@ -37,9 +41,51 @@ class ACCouncilDefaultsTests(unittest.TestCase):
         preset = load_preset("author_critic")
 
         self.assertEqual(
+            preset.component_configs["Author"]["model"],
+            "models/openai/gpt-56-sol-pro",
+        )
+        self.assertEqual(
+            preset.component_configs["ACCritic"]["model"],
+            "models/openai/gpt-56-sol-pro",
+        )
+        self.assertEqual(
             preset.inputs["council_models"],
             list(DEFAULT_COUNCIL_MODELS),
         )
+
+    def test_runtime_author_critic_and_council_defaults_use_sol_pro(self) -> None:
+        expected = "models/openai/gpt-56-sol-pro"
+
+        self.assertEqual(Author.MODEL, expected)
+        self.assertEqual(ACCritic.MODEL, expected)
+        self.assertEqual(CouncilMember.MODEL, expected)
+
+    def test_sol_pro_config_uses_pro_mode_and_max_reasoning(self) -> None:
+        cfg = load_solver_config("models/openai/gpt-56-sol-pro")
+
+        self.assertEqual(cfg["model"], "gpt-5.6-sol--max")
+        self.assertEqual(cfg["api"], "openai")
+        self.assertEqual(cfg["max_tokens"], 128000)
+        self.assertEqual(cfg["read_cost"], 5)
+        self.assertEqual(cfg["cache_read_cost"], 0.5)
+        self.assertEqual(cfg["cache_write_cost"], 6.25)
+        self.assertEqual(cfg["write_cost"], 30)
+        self.assertTrue(cfg["cache_write_tokens_in_input"])
+        self.assertTrue(cfg["background"])
+        self.assertTrue(cfg["use_openai_responses_api"])
+        self.assertEqual(cfg["reasoning"], {"mode": "pro", "summary": "auto"})
+
+        client_cfg = {key: value for key, value in cfg.items() if not key.startswith("__")}
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test"}):
+            client = APIClient(**client_cfg)
+
+        self.assertEqual(client.model, "gpt-5.6-sol")
+        self.assertEqual(
+            client.kwargs["reasoning"],
+            {"mode": "pro", "summary": "auto", "effort": "max"},
+        )
+        self.assertEqual(client.kwargs["max_output_tokens"], 128000)
+        self.assertEqual(client.background_timeout_reasoning_efforts, [])
 
     def test_opus_council_member_uses_max_adaptive_streaming_config(self) -> None:
         cfg = load_solver_config("models/anthropic/opus_47_max")

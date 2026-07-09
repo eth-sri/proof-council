@@ -354,7 +354,7 @@ def _simple_compile_latex(
 
 DEFAULT_PAGE_LIMIT = DEFAULT_FIRSTPROOF_PAGE_LIMIT
 DEFAULT_COUNCIL_MODELS: tuple[str, ...] = (
-    "models/openai/gpt-55-pro",
+    "models/openai/gpt-56-sol-pro",
     "models/anthropic/opus_47_max",
     "models/gemini/gemini-31-pro",
 )

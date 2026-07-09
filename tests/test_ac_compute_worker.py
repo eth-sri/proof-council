@@ -17,6 +17,9 @@ from proofstack.agents.ac.compute import (  # noqa: E402
     _build_codex_cmd,
     _zip_workspace,
     Compute,
+    DEFAULT_COST_CONFIG,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
 )
 from proofstack.context import RunContext  # noqa: E402
 from proofstack.kinds.cli import CLIDoneRecord  # noqa: E402
@@ -33,13 +36,15 @@ class FakeSandbox(SimpleNamespace):
 
 def test_compute_codex_command_uses_current_exec_flags() -> None:
     cmd = _build_codex_cmd(
-        model="gpt-5.5",
-        reasoning_effort="xhigh",
+        model=DEFAULT_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
         sandbox=SandboxSpec(backend="subprocess"),
         codex_sandbox="docker-bypass",
     )
 
     assert cmd[:2] == ["codex", "exec"]
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-sol"
+    assert cmd[cmd.index("-c") + 1] == 'model_reasoning_effort="max"'
     assert "--ignore-user-config" not in cmd
     assert "--ephemeral" not in cmd
     assert "--output-last-message" in cmd
@@ -50,6 +55,26 @@ def test_compute_codex_command_uses_current_exec_flags() -> None:
     assert "--sandbox" not in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert cmd[-1] == "-"
+
+
+def test_compute_inputs_default_to_sol_max_with_matching_cost_config() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="p",
+            round=1,
+            instructions="compute",
+            compute_workspace=Path(temp_dir),
+        )
+
+    assert inp.model == "gpt-5.6-sol"
+    assert inp.reasoning_effort == "max"
+    assert inp.cost_config == "models/openai/gpt-56-sol-pro"
+    assert inp.model == DEFAULT_MODEL
+    assert inp.reasoning_effort == DEFAULT_REASONING_EFFORT
+    assert inp.cost_config == DEFAULT_COST_CONFIG
+
+
 def test_dockerfile_pins_and_smokes_codex_cli() -> None:
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     pwc_text = (ROOT / "deploy" / "sandbox" / "Dockerfile.pwc").read_text(

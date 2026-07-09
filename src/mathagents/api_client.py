@@ -243,6 +243,7 @@ class APIClient:
         anthropic_max_server_tool_continuations=5,
         max_tool_calls=float("inf"),
         cache_write_cost=0,
+        cache_write_tokens_in_input=False,
         background_timeout_downgrade_after=0,
         background_timeout_reasoning_efforts=None,
         tools=None,
@@ -283,6 +284,8 @@ class APIClient:
             max_tool_calls (int|float|dict, optional): The maximum number of tool calls to make.
                 Defaults to unlimited.
                 Could also be a dict that specifies max calls per tool name.
+            cache_write_tokens_in_input (bool, optional): Whether reported cache-write
+                tokens are already included in the input-token total.
             background_timeout_downgrade_after (int, optional): Number of OpenAI Responses
                 background poll timeouts before using background_timeout_reasoning_efforts.
             background_timeout_reasoning_efforts (list[str], optional): Reasoning efforts
@@ -357,6 +360,7 @@ class APIClient:
         self.anthropic_max_server_tool_continuations = max(0, int(anthropic_max_server_tool_continuations or 0))
         self.include_max_tool_calls = include_max_tool_calls
         self.cache_write_cost = cache_write_cost
+        self.cache_write_tokens_in_input = cache_write_tokens_in_input
         self.background_timeout_downgrade_after = max(0, int(background_timeout_downgrade_after or 0))
         self.background_timeout_reasoning_efforts = list(background_timeout_reasoning_efforts or [])
         self.background = background
@@ -747,6 +751,8 @@ class APIClient:
             "prompt_tokens",
             "completion_tokens",
             "cached_input_tokens",
+            "cached_tokens",
+            "cache_write_tokens",
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
             # Reasoning / thinking flat fields. ``_extract_reasoning_tokens``
@@ -761,10 +767,13 @@ class APIClient:
             val = getattr(usage, key, None)
             if val is not None:
                 out[key] = val
-        # Nested detail objects holding the reasoning count. Preserve
-        # them verbatim so ``_extract_reasoning_tokens._from_details``
-        # can read either a dict or an attribute-bearing object.
-        for nested in ("output_tokens_details", "completion_tokens_details"):
+        # Preserve nested cache and reasoning details from duck-typed SDK objects.
+        for nested in (
+            "input_tokens_details",
+            "prompt_tokens_details",
+            "output_tokens_details",
+            "completion_tokens_details",
+        ):
             sub = getattr(usage, nested, None)
             if sub is not None:
                 out[nested] = sub
@@ -800,7 +809,12 @@ class APIClient:
             input_tokens += cached_input_tokens  # if cache_read_input_tokens is provided, Anthropic doesn't count those in input_tokens, so we add them back for consistency with other APIs.
 
         cached_input_tokens = min(max(cached_input_tokens, 0), max(input_tokens, 0))
-        cached_creation_input_tokens = usage_dict.get("cache_creation_input_tokens", 0)
+        cached_creation_input_tokens = (
+            usage_dict.get("cache_creation_input_tokens")
+            or input_details.get("cache_write_tokens")
+            or prompt_details.get("cache_write_tokens")
+            or 0
+        )
         return input_tokens, output_tokens, cached_input_tokens, cached_creation_input_tokens
 
     def _extract_reasoning_tokens(self, usage) -> int:
@@ -870,6 +884,12 @@ class APIClient:
         output_tokens = max(output_tokens, 0)
         cached_input_tokens = min(max(cached_input_tokens, 0), input_tokens)
         uncached_input_tokens = input_tokens - cached_input_tokens
+        if self.cache_write_tokens_in_input:
+            cached_creation_input_tokens = min(
+                max(cached_creation_input_tokens, 0),
+                uncached_input_tokens,
+            )
+            uncached_input_tokens -= cached_creation_input_tokens
         return (
             uncached_input_tokens * self.read_cost
             + cached_input_tokens * self.cache_read_cost
@@ -2105,6 +2125,7 @@ class APIClient:
         input_tokens = 0
         output_tokens = 0
         cached_input_tokens = 0
+        cached_write_tokens = 0
         reasoning_tokens = 0
         total_retries = 0
         background_timeout_count = 0
@@ -2266,11 +2287,12 @@ class APIClient:
                 raise ValueError("Max inner retries reached.")
 
             # Update state: token counts and conversation (potentially execute tool calls)
-            step_input, step_output, step_cached_input, _ = self._extract_usage_tokens(response.usage)
+            step_input, step_output, step_cached_input, step_cached_write = self._extract_usage_tokens(response.usage)
             step_reasoning = self._extract_reasoning_tokens(response.usage)
             input_tokens += step_input
             output_tokens += step_output
             cached_input_tokens += step_cached_input
+            cached_write_tokens += step_cached_write
             reasoning_tokens += step_reasoning
 
             was_tool_call_executed = False
@@ -2376,6 +2398,7 @@ class APIClient:
             input_tokens,
             output_tokens,
             cached_input_tokens=cached_input_tokens,
+            cached_write_tokens=cached_write_tokens,
             reasoning_tokens=reasoning_tokens,
             n_retries=total_retries,
         )
