@@ -544,7 +544,7 @@ class Author(APICallAgent):
     )
     SYSTEM_PROMPT: ClassVar[str] = AUTHOR_LOOP_SYSTEM
     USER_PROMPT: ClassVar[str] = AUTHOR_LOOP_USER
-    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-55-pro"
+    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-56-sol-pro"
     # Generous tool-call budget — Author may run several CI cells (compile,
     # sympy, sanity checks) plus web searches per round.
     MAX_TOOL_CALLS: ClassVar[int] = 30

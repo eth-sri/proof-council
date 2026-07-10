@@ -8,14 +8,14 @@ inputs:
   full_critic_interval: 3
   enable_council: true
   enable_compute: true
-  compute_model: gpt-5.5
-  compute_reasoning_effort: xhigh
-  compute_cost_config: models/openai/gpt-55-high
+  compute_model: gpt-5.6-sol
+  compute_reasoning_effort: max
+  compute_cost_config: models/openai/gpt-56-sol-pro
   compute_sandbox_backend: subprocess
   compute_codex_sandbox: docker-bypass
   enable_final_critic: false
   council_models:
-  - models/openai/gpt-55-pro
+  - models/openai/gpt-56-sol-pro
   - models/anthropic/opus_47_max
   - models/gemini/gemini-31-pro
   page_limit: 12
@@ -24,9 +24,9 @@ budget:
   max_wallclock_s: 86400
 components:
   Author:
-    model: models/openai/gpt-55-pro
+    model: models/openai/gpt-56-sol-pro
   ACCritic:
-    model: models/openai/gpt-55-pro
+    model: models/openai/gpt-56-sol-pro
 dag:
   nodes:
   - id: problem

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 import unittest
@@ -61,6 +62,7 @@ if "loguru" not in sys.modules:
     loguru.logger = _Logger()
     sys.modules["loguru"] = loguru
 
+from mathagents import api_client as api_client_module  # noqa: E402
 from mathagents.api_client import APIClient  # noqa: E402
 
 
@@ -131,6 +133,28 @@ def _response(*outputs):
     )
 
 
+def _cache_usage(*, input_tokens=1000, cached_tokens=200, cache_write_tokens=300, output_tokens=10):
+    dumped = {
+        "input_tokens": input_tokens,
+        "input_tokens_details": {
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
+        },
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    return SimpleNamespace(
+        input_tokens=input_tokens,
+        input_tokens_details=SimpleNamespace(
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+        ),
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        model_dump=lambda: dumped,
+    )
+
+
 class _Responses:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -144,6 +168,232 @@ class _Responses:
 
 
 class ResponsesToolLoopTests(unittest.TestCase):
+    def test_cache_write_config_requires_boolean_flag_and_positive_rate(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cache_write_tokens_in_input must be a boolean"):
+            APIClient(model="fake", api="custom", cache_write_tokens_in_input=1)
+        with self.assertRaisesRegex(ValueError, "cache_write_cost must be positive"):
+            APIClient(model="fake", api="custom", cache_write_tokens_in_input=True)
+
+    def test_cache_write_tokens_are_billed_as_an_input_category(self) -> None:
+        api = APIClient(
+            model="fake",
+            api="custom",
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+        )
+        usage = SimpleNamespace(
+            input_tokens=1000,
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=200,
+                cache_write_tokens=600,
+            ),
+            output_tokens=10,
+        )
+
+        extracted = api._extract_usage_tokens(usage)
+
+        self.assertEqual(extracted, (1000, 10, 200, 600))
+        expected = (200 * 5 + 200 * 0.5 + 600 * 6.25 + 10 * 30) / 1_000_000
+        self.assertAlmostEqual(api._get_cost(*extracted), expected)
+
+    def test_flat_cache_fields_are_extracted(self) -> None:
+        api = APIClient(model="fake", api="custom")
+        usage = SimpleNamespace(
+            input_tokens=1000,
+            cached_tokens=200,
+            cache_write_tokens=300,
+            output_tokens=10,
+        )
+
+        self.assertEqual(api._extract_usage_tokens(usage), (1000, 10, 200, 300))
+
+    def test_long_context_multiplier_applies_to_the_full_request(self) -> None:
+        api = APIClient(
+            model="fake",
+            api="custom",
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+            long_context_threshold_tokens=272000,
+            long_context_input_multiplier=2,
+            long_context_output_multiplier=1.5,
+        )
+
+        at_threshold = api._get_cost(272000, 1000, 100000, 50000)
+        above_threshold = api._get_cost(272001, 1000, 100000, 50000)
+        base_input = (122000 * 5 + 100000 * 0.5 + 50000 * 6.25) / 1_000_000
+        above_base_input = (122001 * 5 + 100000 * 0.5 + 50000 * 6.25) / 1_000_000
+
+        self.assertAlmostEqual(at_threshold, base_input + 1000 * 30 / 1_000_000)
+        self.assertAlmostEqual(
+            above_threshold,
+            above_base_input * 2 + 1000 * 30 * 1.5 / 1_000_000,
+        )
+
+    def test_long_context_cost_is_computed_per_provider_request(self) -> None:
+        def list_persisted_files() -> dict:
+            return {"ok": True, "files": []}
+
+        api = APIClient(
+            model="fake",
+            api="custom",
+            use_openai_responses_api=True,
+            read_cost=5,
+            write_cost=30,
+            long_context_threshold_tokens=272000,
+            long_context_input_multiplier=2,
+            long_context_output_multiplier=1.5,
+            tools=[(list_persisted_files, _function_tool())],
+        )
+        first = _response(_function_call())
+        first.usage = {"input_tokens": 200000, "output_tokens": 10}
+        second = _response(_message("done"))
+        second.usage = {"input_tokens": 200000, "output_tokens": 10}
+        client = SimpleNamespace(responses=_Responses([first, second]))
+
+        with patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ):
+            result = api._openai_query_responses_api(
+                client, 0, [{"role": "user", "content": "hi"}]
+            )
+
+        expected = 2 * (200000 * 5 + 10 * 30) / 1_000_000
+        self.assertAlmostEqual(result.cost_usd, expected)
+        self.assertGreater(
+            api._get_cost(result.input_tokens, result.output_tokens),
+            result.cost_usd,
+        )
+
+    def test_chat_completions_propagates_cache_write_tokens(self) -> None:
+        usage = _cache_usage()
+        message = SimpleNamespace(
+            reasoning_details=None,
+            reasoning=None,
+            reasoning_content=None,
+            tool_calls=[],
+            model_dump=lambda: {"role": "assistant", "content": "done", "tool_calls": []},
+        )
+        response = SimpleNamespace(
+            usage=usage,
+            choices=[SimpleNamespace(message=message)],
+            model_dump=lambda: {"usage": usage.model_dump()},
+        )
+        completions = SimpleNamespace(create=lambda **kwargs: response)
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        api = APIClient(model="fake", api="custom")
+
+        with patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ):
+            result = api._openai_query_chat_completions_api(
+                client, 0, [{"role": "user", "content": "hi"}]
+            )
+
+        self.assertEqual(result.cached_write_tokens, 300)
+
+    def test_streaming_chat_completions_propagates_cache_write_tokens(self) -> None:
+        usage = _cache_usage()
+        response = [
+            SimpleNamespace(
+                usage=None,
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="done", reasoning=None))],
+            ),
+            SimpleNamespace(usage=usage, choices=[]),
+        ]
+        completions = SimpleNamespace(create=lambda **kwargs: response)
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+        api = APIClient(model="fake", api="custom", stream_openai_chat_completions=True)
+
+        with patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ):
+            result = api._openai_query_chat_completions_api(
+                client, 0, [{"role": "user", "content": "hi"}]
+            )
+
+        self.assertEqual(result.cached_write_tokens, 300)
+
+    def test_openai_batch_propagates_cache_write_tokens(self) -> None:
+        usage = _cache_usage().model_dump()
+        row = {
+            "custom_id": "apiquery-0",
+            "response": {
+                "status_code": 200,
+                "body": {
+                    "choices": [{"message": {"content": "done"}}],
+                    "usage": usage,
+                },
+            },
+        }
+        batch = SimpleNamespace(
+            id="batch-1",
+            request_counts={"completed": 1, "failed": 0},
+            status="completed",
+            output_file_id="output-1",
+        )
+        files = SimpleNamespace(
+            create=lambda **kwargs: SimpleNamespace(id="input-1"),
+            content=lambda **kwargs: SimpleNamespace(iter_lines=lambda: [json.dumps(row)]),
+        )
+        batches = SimpleNamespace(create=lambda **kwargs: batch, retrieve=lambda batch_id: batch)
+        fake_client = SimpleNamespace(files=files, batches=batches)
+        api = APIClient(model="fake", api="custom", max_retries=1)
+
+        with patch.object(api_client_module, "OpenAI", return_value=fake_client):
+            result = api._openai_batch_processing(
+                [[{"role": "user", "content": "hi"}]], [0]
+            )[0]
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.cached_write_tokens, 300)
+
+    def test_anthropic_batch_propagates_cache_write_tokens(self) -> None:
+        usage = SimpleNamespace(
+            input_tokens=100,
+            cache_read_input_tokens=20,
+            cache_creation_input_tokens=30,
+            output_tokens=10,
+        )
+        raw_result = SimpleNamespace(
+            result=SimpleNamespace(
+                type="succeeded",
+                message=SimpleNamespace(content=[], usage=usage),
+            ),
+            model_dump=lambda: {},
+        )
+        batch = SimpleNamespace(
+            id="batch-1",
+            request_counts={"succeeded": 1},
+            processing_status="ended",
+        )
+        batches = SimpleNamespace(
+            create=lambda **kwargs: batch,
+            retrieve=lambda **kwargs: batch,
+            results=lambda **kwargs: [raw_result],
+        )
+        fake_client = SimpleNamespace(messages=SimpleNamespace(batches=batches))
+        api = APIClient(model="fake", api="custom", max_retries=1)
+
+        with patch.object(api_client_module.anthropic, "Anthropic", return_value=fake_client), patch.object(
+            api,
+            "_get_messages_from_anthropic_content",
+            return_value=[{"role": "assistant", "content": "done"}],
+        ), patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ):
+            result = api._anthropic_batch_processing(
+                [[{"role": "user", "content": "hi"}]], [0]
+            )[0]
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.cached_write_tokens, 30)
+
     def test_default_tool_budget_is_unbounded_and_reaches_final_message(self) -> None:
         def list_persisted_files() -> dict:
             return {"ok": True, "files": []}
