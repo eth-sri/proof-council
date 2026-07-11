@@ -1,0 +1,3 @@
+base: models/openai/gpt-56-sol-max
+reasoning:
+  mode: "pro"

@@ -1,10 +1,10 @@
 workflow: proofstack.agents.ac.ACDAGWorkflow
-description: 'FirstProof submission preset: serious Author/Critic workflow with Pro
-  Author/Critic, runtime council, compute worker, 12-page limit, and a 200-round cap
-  for app launches. The FirstProof entrypoint wraps this preset in adaptive continuation
-  stages.'
+description: 'Long Author/Critic research workflow with Claude Fable 5 on the council: 10 rounds
+  with Pro Author/Critic, a Fable council seat, and compute enabled for serious First Proof-style runs.
+
+  '
 inputs:
-  n_rounds: 200
+  n_rounds: 10
   full_critic_interval: 3
   enable_council: true
   enable_compute: true
@@ -16,7 +16,7 @@ inputs:
   enable_final_critic: false
   council_models:
   - models/openai/gpt-56-sol-pro
-  - models/anthropic/opus_47_max
+  - models/anthropic/fable_5
   - models/gemini/gemini-31-pro
   page_limit: 12
 budget:
@@ -35,8 +35,8 @@ dag:
     ui:
       label: Problem
       subtitle: statement + resume state
-      x: 80
-      y: 220
+      x: -804
+      y: 47
   - id: author_critic_loop
     kind: repeat
     needs:
@@ -48,9 +48,8 @@ dag:
     initial_state:
       ac_state: $node.problem.state
     condition:
-      python: not inputs.get("ac_state", {}).get("loop_done") and int(inputs.get("ac_state",
-        {}).get("next_round", 0) or 0) <= int(inputs.get("ac_state", {}).get("n_rounds",
-        0) or 0)
+      python: not inputs.get("ac_state", {}).get("loop_done") and int(inputs.get("ac_state", {}).get("next_round",
+        0) or 0) <= int(inputs.get("ac_state", {}).get("n_rounds", 0) or 0)
     body:
       nodes:
       - id: author
@@ -61,8 +60,8 @@ dag:
         ui:
           label: Author
           subtitle: edits proof
-          x: 40
-          y: 180
+          x: 18
+          y: 140
       - id: stateful_critic
         kind: agent
         needs:
@@ -73,8 +72,8 @@ dag:
         ui:
           label: Stateful Critic
           subtitle: continuing
-          x: 410
-          y: 80
+          x: 388
+          y: 36
       - id: llm_council
         kind: agent
         needs:
@@ -85,8 +84,8 @@ dag:
         ui:
           label: LLM Council
           subtitle: Other LLMs
-          x: 410
-          y: -120
+          x: 388
+          y: -160
       - id: compute_node
         kind: agent
         needs:
@@ -97,8 +96,8 @@ dag:
         ui:
           label: Compute Node
           subtitle: CAS worker
-          x: 410
-          y: 300
+          x: 388
+          y: 260
       - id: fresh_critic
         kind: agent
         needs:
@@ -109,8 +108,8 @@ dag:
         ui:
           label: Fresh Critic
           subtitle: independent
-          x: 770
-          y: 160
+          x: 762
+          y: 345
       - id: review_join
         kind: agent
         needs:
@@ -127,8 +126,8 @@ dag:
         ui:
           label: Review Join
           subtitle: collects reports
-          x: 1110
-          y: 160
+          x: 1088
+          y: 120
       - id: ready_gate
         kind: if_else
         needs:
@@ -148,8 +147,8 @@ dag:
         ui:
           label: Ready gate
           subtitle: Author + Critic ready
-          x: 1460
-          y: 160
+          x: 1429
+          y: 33
       - id: compile_gate
         kind: agent
         needs:
@@ -161,8 +160,8 @@ dag:
         ui:
           label: Compile Gate
           subtitle: PDF builds within limit
-          x: 1810
-          y: 160
+          x: 1775
+          y: 142
       state_updates:
         ac_state: $node.compile_gate.state
     outputs:
@@ -172,11 +171,11 @@ dag:
       x: 390
       y: 80
       repeat_input:
-        x: -270
-        y: 160
+        x: -355
+        y: 83
       repeat_output:
-        x: 2150
-        y: 160
+        x: 2128
+        y: 120
   - id: return
     kind: agent
     needs:
@@ -187,8 +186,8 @@ dag:
     ui:
       label: Return
       subtitle: final files
-      x: 2570
-      y: 220
+      x: 2566
+      y: 66
   outputs:
     problem_id: $node.return.problem_id
     answer_tex: $node.return.answer_tex
@@ -206,9 +205,7 @@ dag:
     error: $node.return.error
   ui:
     workflow_output:
-      x: 2980
-      y: 220
+      x: 3007
+      y: 60
 export:
-  label: FirstProof Submission
-  description: Submission-grade adaptive Author/Critic preset for FirstProof-style
-    runs.
+  label: Author Critic (Fable Council)

@@ -2,7 +2,8 @@
 
 The Council is invoked when the Author emits a ``<council>...</council>``
 block in its turn. Each council member is a single API call to a
-strong model (gpt-5.5-pro, claude-opus-4.x, gemini-3.x-pro, …) given
+strong model (gpt-5.6-sol in Pro mode, claude-opus-4.x,
+gemini-3.x-pro, …) given
 the same workspace files plus the Author's question. Members run in
 parallel; a placeholder ``synthesizer_model`` field is reserved for a
 future Pro-vetted summarizer (the user prefers raw replies for now to
@@ -99,7 +100,7 @@ class CouncilMember(APICallAgent):
     )
     SYSTEM_PROMPT: ClassVar[str] = COUNCIL_MEMBER_SYSTEM
     USER_PROMPT: ClassVar[str] = COUNCIL_MEMBER_USER
-    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-55-pro"
+    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-56-sol-pro"
 
     class Inputs(BaseModel):
         author_question: str
@@ -249,7 +250,7 @@ class Council(Agent):
 def _short_label(model_ref: str) -> str:
     """Best-effort short label for an event-log column.
 
-    ``models/openai/gpt-55-pro`` -> ``gpt-55-pro``;
+    ``models/openai/gpt-56-sol-pro`` -> ``gpt-56-sol-pro``;
     ``models/anthropic/opus_47_max`` -> ``opus_47_max``;
     fallback: the ref itself.
     """

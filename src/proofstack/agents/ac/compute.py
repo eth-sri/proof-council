@@ -26,8 +26,8 @@ After it finishes, the workflow:
      next Author container call.
 
 Same docker sandbox / soft-timeout / codex-jsonl usage accounting as
-the PWC Worker. Defaults can be overridden per-call via the ``model``,
-``reasoning_effort``, and ``cost_config`` ``Inputs`` fields.
+the PWC Worker. Model, effort, cost config, and timeout defaults can be
+overridden per call through ``Inputs``.
 """
 from __future__ import annotations
 
@@ -35,9 +35,9 @@ import re
 import shutil
 import zipfile
 from pathlib import Path
-from typing import Any, ClassVar, Final
+from typing import Any, ClassVar, Final, Self
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from proofstack.cli_usage import (
     cost_for_codex_usage,
@@ -49,16 +49,17 @@ from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
 
 
-DEFAULT_MODEL = "gpt-5.5"
-DEFAULT_REASONING_EFFORT = "xhigh"
-DEFAULT_COST_CONFIG = "models/openai/gpt-55-high"
-DEFAULT_SOFT_TIMEOUT_S = 3600
-DEFAULT_HARD_TIMEOUT_S = 4500
+DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_REASONING_EFFORT = "max"
+DEFAULT_COST_CONFIG = "models/openai/gpt-56-sol-pro"
+DEFAULT_SOFT_TIMEOUT_S = 7200
+DEFAULT_HARD_TIMEOUT_S = 9000
 DEFAULT_SANDBOX_BACKEND = "docker"
 DEFAULT_DOCKER_IMAGE = "proofstack-pwc-sandbox:latest"
 # ``auto`` resolves to ``--dangerously-bypass-approvals-and-sandbox``
 # under docker and ``--sandbox workspace-write`` under subprocess.
 DEFAULT_CODEX_SANDBOX = "auto"
+MIN_CODEX_VERSION: Final[tuple[int, int, int]] = (0, 144, 0)
 
 # Directories to exclude from the workspace zip handed back to the Author.
 # - problem_documents_readonly/ is already what the Author has.
@@ -252,6 +253,8 @@ class Compute(CLIAgent):
         model: str = DEFAULT_MODEL
         reasoning_effort: str = DEFAULT_REASONING_EFFORT
         cost_config: str = DEFAULT_COST_CONFIG
+        soft_timeout_s: int = Field(default=DEFAULT_SOFT_TIMEOUT_S, ge=0)
+        hard_timeout_s: int = Field(default=DEFAULT_HARD_TIMEOUT_S, ge=1)
         # ``docker`` (default, image=DEFAULT_DOCKER_IMAGE) or
         # ``subprocess`` (runs codex directly on the host; needed when
         # the pwc docker image is not available locally).
@@ -262,6 +265,12 @@ class Compute(CLIAgent):
         # docker, workspace-write under subprocess), ``workspace-write``,
         # ``docker-bypass``, or ``none``.
         codex_sandbox: str = DEFAULT_CODEX_SANDBOX
+
+        @model_validator(mode="after")
+        def validate_timeouts(self) -> Self:
+            if self.soft_timeout_s >= self.hard_timeout_s:
+                raise ValueError("soft_timeout_s must be less than hard_timeout_s")
+            return self
 
     class Outputs(BaseModel):
         response_md: str = ""
@@ -289,6 +298,9 @@ class Compute(CLIAgent):
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
         self._last_model = inp.model  # type: ignore[attr-defined]
         self._last_cost_config = inp.cost_config  # type: ignore[attr-defined]
+        soft_timeout_s = int(inp.soft_timeout_s)  # type: ignore[attr-defined]
+        hard_timeout_s = int(inp.hard_timeout_s)  # type: ignore[attr-defined]
+        self.SOFT_TIMEOUT_S = soft_timeout_s
         codex_home_host, codex_home_env, docker_extra_args = self._codex_home_paths(inp)
         self._codex_home_host = codex_home_host
         self._codex_home_env = codex_home_env
@@ -297,7 +309,7 @@ class Compute(CLIAgent):
         self.SANDBOX = SandboxSpec(
             cpu_limit=4,
             memory_gb=8,
-            timeout_s=DEFAULT_HARD_TIMEOUT_S,
+            timeout_s=hard_timeout_s,
             backend=str(inp.sandbox_backend or DEFAULT_SANDBOX_BACKEND),  # type: ignore[attr-defined,arg-type]
             docker_image=str(inp.docker_image or DEFAULT_DOCKER_IMAGE),  # type: ignore[attr-defined]
             docker_no_new_privileges=False,
@@ -312,6 +324,9 @@ class Compute(CLIAgent):
         return await super().run(inp)
 
     async def setup(self, sandbox: Sandbox, inp: BaseModel) -> None:
+        codex_home = self._ensure_codex_home(inp)
+        codex_home.mkdir(parents=True, exist_ok=True)
+        await _require_codex_cli_version(sandbox)
         root = sandbox.root
         ro = root / "problem_documents_readonly"
         # Wipe & resync: the Author's canonical files may have changed
@@ -337,8 +352,6 @@ class Compute(CLIAgent):
         (root / "code" / "__init__.py").touch()
         _write_helper_if_missing(root / "compute_utils.py", _COMPUTE_UTILS)
         _write_helper_if_missing(root / "sitecustomize.py", _SITECUSTOMIZE)
-        codex_home = self._ensure_codex_home(inp)
-        codex_home.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(root / ".codex-home", ignore_errors=True)
         try:
             (root / _CODEX_LAST_MESSAGE_REL).unlink()
@@ -469,6 +482,7 @@ class Compute(CLIAgent):
                 "model": self._last_model or DEFAULT_MODEL,
                 "in_tokens": usage.input_tokens,
                 "cached_in_tokens": usage.cached_input_tokens,
+                "cache_write_in_tokens": usage.cache_write_input_tokens,
                 "out_tokens": usage.output_tokens,
                 "reasoning_out_tokens": usage.reasoning_output_tokens,
                 "cost_usd": cost,
@@ -480,6 +494,20 @@ class Compute(CLIAgent):
         )
 
 # --- helpers ----------------------------------------------------------------
+
+
+async def _require_codex_cli_version(sandbox: Sandbox) -> None:
+    result = await sandbox.run_command(["codex", "--version"], timeout_s=10)
+    output = f"{result.stdout}\n{result.stderr}".strip()
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", output)
+    if result.returncode != 0 or match is None:
+        raise RuntimeError(f"Could not determine Codex CLI version: {output or 'no output'}")
+    version = tuple(int(part) for part in match.groups())
+    if version < MIN_CODEX_VERSION:
+        minimum = ".".join(str(part) for part in MIN_CODEX_VERSION)
+        raise RuntimeError(
+            f"Codex CLI {minimum} or newer is required for gpt-5.6-sol with max effort; found {match.group(0)}"
+        )
 
 
 def _build_codex_cmd(

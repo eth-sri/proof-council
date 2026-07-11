@@ -42,6 +42,16 @@ class EditorTemplateContractTests(unittest.TestCase):
         self.assertIn("monitor_model: document.getElementById('sample-monitor-model')", template)
         self.assertIn(".sample-runner select", base)
 
+    def test_codex_pickers_include_sol_and_max_effort(self) -> None:
+        run_agent = (ROOT / "app" / "templates" / "dev_run_agent.html").read_text()
+        editor = (ROOT / "app" / "templates" / "dev_preset_editor.html").read_text()
+
+        for template in (run_agent, editor):
+            self.assertIn("codex_model: ['gpt-5.6-sol'", template)
+            self.assertIn("codex_effort: ['max', 'xhigh'", template)
+        self.assertIn("const values = ['', 'low', 'medium', 'high', 'xhigh', 'max'];", editor)
+        self.assertIn("const known = isCodex ? ['gpt-5.6-sol'", editor)
+
     def test_run_detail_has_live_monitor_section(self) -> None:
         template = (ROOT / "app" / "templates" / "dev_run_detail.html").read_text()
         base = (ROOT / "app" / "templates" / "dev_base.html").read_text()

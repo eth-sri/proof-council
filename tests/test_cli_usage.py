@@ -2,7 +2,143 @@ import json
 import unittest
 
 from proofstack.budget import BudgetExhausted, BudgetSpec, BudgetTracker
-from proofstack.cli_usage import parse_claude_json
+from proofstack.cli_usage import (
+    CodexUsage,
+    cost_for_codex_usage,
+    load_cost_rates,
+    parse_claude_json,
+    parse_codex_jsonl,
+)
+
+
+class CodexUsageTests(unittest.TestCase):
+    def test_parser_collects_cache_write_tokens_when_cli_exposes_them(self) -> None:
+        usage = parse_codex_jsonl(
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 200,
+                        "cache_write_tokens": 300,
+                        "output_tokens": 10,
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(usage.cache_write_input_tokens, 300)
+        self.assertEqual(len(usage.turns), 1)
+
+    def test_explicit_cache_write_tokens_use_cache_write_rate(self) -> None:
+        usage = CodexUsage(
+            input_tokens=1000,
+            cached_input_tokens=200,
+            cache_write_input_tokens=300,
+            output_tokens=10,
+        )
+
+        cost = cost_for_codex_usage(
+            usage,
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+        )
+
+        expected = (500 * 5 + 200 * 0.5 + 300 * 6.25 + 10 * 30) / 1_000_000
+        self.assertAlmostEqual(cost, expected)
+
+    def test_missing_cli_cache_write_count_is_conservatively_costed(self) -> None:
+        usage = CodexUsage(input_tokens=1000, cached_input_tokens=200)
+
+        cost = cost_for_codex_usage(
+            usage,
+            read_cost=5,
+            cache_read_cost=0.5,
+            cache_write_cost=6.25,
+            cache_write_tokens_in_input=True,
+            write_cost=30,
+        )
+
+        expected = (200 * 0.5 + 800 * 6.25) / 1_000_000
+        self.assertAlmostEqual(cost, expected)
+
+    def test_legacy_config_does_not_double_bill_reported_cache_writes(self) -> None:
+        usage = CodexUsage(
+            input_tokens=1000,
+            cache_write_input_tokens=300,
+            output_tokens=10,
+        )
+
+        cost = cost_for_codex_usage(
+            usage,
+            read_cost=5,
+            write_cost=30,
+        )
+
+        self.assertAlmostEqual(cost, (1000 * 5 + 10 * 30) / 1_000_000)
+
+    def test_long_context_multiplier_is_applied_per_codex_turn(self) -> None:
+        lines = [
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 200000, "output_tokens": 10},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 200000, "output_tokens": 10},
+                }
+            ),
+        ]
+        usage = parse_codex_jsonl("\n".join(lines))
+
+        cost = cost_for_codex_usage(
+            usage,
+            read_cost=5,
+            write_cost=30,
+            long_context_threshold_tokens=272000,
+            long_context_input_multiplier=2,
+            long_context_output_multiplier=1.5,
+        )
+
+        self.assertEqual(len(usage.turns), 2)
+        self.assertAlmostEqual(cost, 2 * (200000 * 5 + 10 * 30) / 1_000_000)
+
+    def test_long_context_multiplier_applies_to_single_large_codex_turn(self) -> None:
+        usage = parse_codex_jsonl(
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 272001, "output_tokens": 100},
+                }
+            )
+        )
+
+        cost = cost_for_codex_usage(
+            usage,
+            read_cost=5,
+            write_cost=30,
+            long_context_threshold_tokens=272000,
+            long_context_input_multiplier=2,
+            long_context_output_multiplier=1.5,
+        )
+
+        expected = (272001 * 5 * 2 + 100 * 30 * 1.5) / 1_000_000
+        self.assertAlmostEqual(cost, expected)
+
+    def test_sol_cost_config_loads_cache_write_rate(self) -> None:
+        rates = load_cost_rates("models/openai/gpt-56-sol-pro")
+
+        self.assertEqual(rates["cache_write_cost"], 6.25)
+        self.assertTrue(rates["cache_write_tokens_in_input"])
+        self.assertEqual(rates["long_context_threshold_tokens"], 272000)
+        self.assertEqual(rates["long_context_input_multiplier"], 2)
+        self.assertEqual(rates["long_context_output_multiplier"], 1.5)
 
 
 class ParseClaudeJsonTests(unittest.TestCase):

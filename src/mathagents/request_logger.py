@@ -6,7 +6,6 @@ import json
 import os
 from loguru import logger
 from collections import OrderedDict
-import random
 
 
 class RequestLogger:
@@ -56,7 +55,7 @@ class RequestLogger:
         )
 
         with open(logfile, "w") as f:
-            json.dump(data, f, indent=4)
+            json.dump(data, f, indent=4, default=str)
 
     def log_response(self, ts, batch_idx, response=None, **info):
         if self.comp_name is None:
@@ -71,15 +70,33 @@ class RequestLogger:
             logger.warning(f"Can't log response, log file does not exist: {logfile}")
             return
 
-        with open(logfile, "r") as f:
-            data = json.load(f, object_pairs_hook=OrderedDict)
+        try:
+            with open(logfile, "r") as f:
+                data = json.load(f, object_pairs_hook=OrderedDict)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(
+                f"Recovering malformed request log {logfile}: {type(e).__name__}: {e}"
+            )
+            data = OrderedDict(
+                {
+                    "comp_name": self.comp_name,
+                    "solver_name": self.solver_name,
+                    "timestamp": ts,
+                    "problem_idx": problem_idx if self.comp_name is not None else -1,
+                    "batch_idx": batch_idx,
+                    "request_log_recovery": {
+                        "type": type(e).__name__,
+                        "msg": str(e),
+                    },
+                }
+            )
 
         # Update the data with the response information
         data["response_info"] = info
         if response is not None:
             data["response"] = response
         with open(logfile, "w") as f:
-            json.dump(data, f, indent=4)
+            json.dump(data, f, indent=4, default=str)
 
 
 request_logger = RequestLogger()
