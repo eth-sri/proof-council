@@ -31,11 +31,13 @@ budget:
 
 inputs:
   problem: ''
-  # Verified working on a ChatGPT-account login: gpt-5.5 (top), gpt-5.4,
-  # gpt-5.4-mini (cheap test). Rejected: gpt-5, *-codex, *-mini on the 5/5.5
-  # lines, o3, o4-mini.
-  codex_model: gpt-5.5
-  codex_effort: high     # high (serious) | medium | low | minimal (cheap test)
+  # Verified working on a ChatGPT-account login: gpt-5.6-sol (top; needs codex
+  # CLI >= 0.144 — older CLIs reject it with "requires a newer version of
+  # Codex"), gpt-5.5, gpt-5.4, gpt-5.4-mini (cheap test). Rejected: gpt-5,
+  # *-codex, *-mini on the 5/5.5 lines, o3, o4-mini.
+  codex_model: gpt-5.6-sol
+  codex_effort: high     # high (serious) | medium | low | minimal (cheap test);
+                         # gpt-5.6-sol also accepts xhigh and max (both verified)
 
 components:
   codex_solver:
