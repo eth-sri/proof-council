@@ -123,6 +123,65 @@ class ConfigurableCLITests(unittest.TestCase):
             self.assertEqual(out.hint, "brief")
             self.assertEqual(out.status, "done")
 
+    def test_contract_auto_requests_configured_done_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["true"],
+                        "contract": "auto",
+                        "prompt": "Task.",
+                        "output_schema": {
+                            "workspace": "string",
+                            "status": "string",
+                            "notes": "string",
+                            "questions": "string",
+                        },
+                        "output_files": {"notes": "notes.md"},
+                        "done_outputs": {
+                            "status": "status",
+                            "questions": {"field": "open_questions", "join": True},
+                            "changes": "diff_summary",
+                        },
+                    }
+                },
+            )
+            tail = ConfigurableCLIAgent(ctx, name="cfg_cli")._contract_tail()
+
+            # the finish example must ask for every configured done field, or
+            # the model never supplies it and the output silently defaults
+            self.assertIn('"open_questions"', tail)
+            self.assertIn('"diff_summary"', tail)
+            self.assertIn('"status":"done"', tail)
+            self.assertNotIn('"artifacts"', tail)  # not configured
+
+    def test_contract_auto_defaults_to_status_summary_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["true"],
+                        "contract": "auto",
+                        "prompt": "Task.",
+                        "output_schema": {"workspace": "string", "answer_tex": "string"},
+                        "output_files": {"answer_tex": "answer.tex"},
+                        "done_outputs": {"status": "status"},
+                    }
+                },
+            )
+            tail = ConfigurableCLIAgent(ctx, name="cfg_cli")._contract_tail()
+
+            self.assertIn('"status":"done"', tail)
+            self.assertIn('"summary"', tail)
+            for absent in ('"open_questions"', '"diff_summary"', '"artifacts"'):
+                self.assertNotIn(absent, tail)
+
     def test_prompt_unchanged_without_contract_auto(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ctx = RunContext.create(

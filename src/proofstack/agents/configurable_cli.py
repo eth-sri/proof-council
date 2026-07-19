@@ -130,9 +130,38 @@ class ConfigurableCLIAgent(CLIAgent):
             f"{step}. When everything is written, signal completion by running exactly"
         )
         lines.append("   this shell command:")
-        lines.append('   finish \'{"status":"done","summary":"<one line: what you did>"}\'')
+        lines.append(f"   finish '{self._finish_payload_example()}'")
         lines.append("Work autonomously; do not ask questions.")
         return "\n".join(lines) + "\n"
+
+    # placeholders for each done.json field a component may request; the finish
+    # example must ask for every configured field or the model never supplies
+    # it and done_outputs silently receives the CLIDoneRecord default
+    _DONE_FIELD_PLACEHOLDERS: ClassVar[dict[str, Any]] = {
+        "status": "done",
+        "summary": "<one line: what you did>",
+        "diff_summary": "<short summary of what changed>",
+        "open_questions": ["<an unresolved question, if any>"],
+        "artifacts": [{"path": "<relative file path>", "note": "<what it is>"}],
+    }
+
+    def _finish_payload_example(self) -> str:
+        raw_done = self.component_config.get("done_outputs")
+        if isinstance(raw_done, dict):
+            wanted = {
+                str(spec.get("field") if isinstance(spec, dict) else spec)
+                for spec in raw_done.values()
+            }
+        else:
+            # mirror _done_outputs' auto-derivation from declared output fields
+            wanted = _configured_output_fields(self.component_config)
+        payload = {
+            field: placeholder
+            for field, placeholder in self._DONE_FIELD_PLACEHOLDERS.items()
+            if field in ("status", "summary") or field in wanted
+        }
+        # compact separators: keeps the long-standing finish-example format
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def extra_env(self, sandbox: Sandbox, inp: BaseModel) -> dict[str, str]:
         fields = self._fields(inp, workspace=sandbox.root)
