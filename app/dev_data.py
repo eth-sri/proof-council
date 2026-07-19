@@ -4183,6 +4183,7 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
                 output.pop("xml_lists", None)
             handled_fields.update({"xml_list_field", "xml_list_tag"})
         _ensure_multi_output_prompt_instruction(cfg, output)
+        _sync_output_schema_with_api_spec(cfg)
 
     for key, value in fields.items():
         if key in handled_fields or str(key).startswith("__"):
@@ -4190,9 +4191,33 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         cfg[str(key)] = value
 
 
+def _sync_output_schema_with_api_spec(cfg: dict[str, Any]) -> None:
+    """Keep the canonical output_schema in step with API output-spec edits.
+
+    The spec is what the API executor actually parses, so a rename/removal
+    there must reach the schema too — otherwise the next executor swap
+    resurrects the old field from the stale schema entry (renaming `output`
+    to `answer` used to produce both output.txt and answer.txt).
+    """
+    spec_contract = _absorbed_output_contract(
+        {"output": cfg.get("output")}
+    )
+    if not spec_contract:
+        return
+    schema = cfg.get("output_schema")
+    schema = schema if isinstance(schema, dict) else {}
+    # names come from the edited spec; richer types already declared survive
+    cfg["output_schema"] = {
+        field: schema.get(field, type_spec) for field, type_spec in spec_contract.items()
+    }
+
+
 # Component config keys owned by the executor; replaced wholesale on a swap.
-# Task-identity keys (prompt, schemas, output_files, done_outputs, tools) are
-# preserved so a component keeps meaning the same work whoever executes it.
+# Task identity (prompt, input_schema, tools, and the canonical typed
+# output_schema) is preserved. Output PROJECTIONS — the API `output` parse
+# spec, output_files, done_outputs — are executor-owned: they are absorbed
+# into output_schema before the swap and regenerated from it afterwards, so
+# they can neither drop outputs nor resurrect renamed ones.
 _EXECUTOR_OWNED_KEYS = (
     "cmd",
     "env",
@@ -4207,6 +4232,8 @@ _EXECUTOR_OWNED_KEYS = (
     "contract",
     "messages",
     "output",
+    "output_files",
+    "done_outputs",
 )
 
 _EXECUTOR_AGENTS = {
@@ -4216,9 +4243,6 @@ _EXECUTOR_AGENTS = {
     "human": HUMAN_AGENT,
 }
 
-# done.json fields a CLI worker reports directly (see CLIDoneRecord); every
-# other declared output must come from a file the worker writes.
-_DONE_RECORD_FIELDS = {"status", "summary", "diff_summary", "open_questions", "artifacts"}
 _KNOWN_FILE_SUFFIXES = ("tex", "md", "json", "txt", "py", "lean", "csv")
 
 
@@ -4227,34 +4251,6 @@ def _default_output_filename(field: str) -> str:
     if stem and suffix in _KNOWN_FILE_SUFFIXES:
         return f"{stem}.{suffix}"  # answer_tex -> answer.tex
     return f"{field}.txt"
-
-
-def _ensure_cli_output_files(cfg: dict[str, Any], out_schema: dict[str, Any]) -> None:
-    """Map every declared output a CLI executor cannot otherwise produce to a file.
-
-    A CLI component only produces outputs from files it writes (output_files)
-    or done.json fields (done_outputs). After an executor swap the schema may
-    declare business outputs (report, verdict, ...) with neither source —
-    validation passes but downstream $node refs break at runtime.
-    """
-    files = cfg.get("output_files") if isinstance(cfg.get("output_files"), dict) else {}
-    done_cfg = cfg.get("done_outputs")
-    if isinstance(done_cfg, dict):
-        # explicit mapping: only its keys are produced; the framework needs
-        # status reported, so make sure the mapping keeps carrying it
-        done_cfg.setdefault("status", "status")
-        done_covered = set(done_cfg)
-    else:
-        # unset: ConfigurableCLIAgent auto-maps done-record-named fields
-        done_covered = _DONE_RECORD_FIELDS
-    covered = {"workspace"} | set(files) | done_covered
-    added = {
-        str(field): _default_output_filename(str(field))
-        for field in out_schema
-        if str(field) not in covered
-    }
-    if added:
-        cfg["output_files"] = {**files, **added}
 
 
 def _iter_agent_nodes(nodes: Any):
@@ -4361,63 +4357,128 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
 
 _OUTPUT_MECHANICS_FIELDS = {"workspace", "status", "summary"}
 
+# done.json fields carry known shapes (see CLIDoneRecord)
+_DONE_FIELD_TYPES: dict[str, Any] = {
+    "status": "string",
+    "summary": "string",
+    "diff_summary": "string",
+    "open_questions": {"type": "array", "items": {"type": "string"}},
+    "artifacts": {"type": "array", "items": {"type": "object"}},
+}
 
-def _component_business_outputs(cfg: dict[str, Any]) -> list[str]:
-    """Every business output the component declares, whatever supplies it.
+_ARRAY_TYPE = {"type": "array", "items": {"type": "string"}}
 
-    The single source of truth for executor swaps: outputs may live in
-    output_schema, the API `output` extraction spec (default_field/xml_tags/
-    xml_lists/json_*), output_files, or done_outputs — and a component may use
-    any mix (Basic I/O declares ONLY output.default_field). Deriving from one
-    source per swap direction is how outputs got silently dropped.
+
+def _is_array_type(type_spec: Any) -> bool:
+    if isinstance(type_spec, str):
+        return type_spec.strip().lower() in {"array", "list"}
+    return isinstance(type_spec, dict) and str(type_spec.get("type") or "") == "array"
+
+
+def _is_object_type(type_spec: Any) -> bool:
+    if isinstance(type_spec, str):
+        return type_spec.strip().lower() in {"object", "dict", "any"}
+    return isinstance(type_spec, dict) and (
+        not type_spec or str(type_spec.get("type") or "") == "object"
+    )
+
+
+def _absorbed_output_contract(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The component's business outputs with their TYPES, from every source.
+
+    This is the canonical contract for executor swaps: output_schema is the
+    one portable, typed declaration; the API `output` parse spec, output_files
+    and done_outputs are per-executor projections of it. Outputs may be
+    declared in any mix of the four (Basic I/O declares only
+    output.default_field; the ideator only output.xml_lists), so before a swap
+    every projection is absorbed here — with existing schema types winning, so
+    a projection can never silently narrow a declared type — and afterwards
+    the new executor's projections are regenerated from the schema. Typing of
+    the API spec mirrors dag_schema._configured_prompt_outputs.
     """
-    fields: list[str] = []
+    contract: dict[str, Any] = {}
 
-    def add(name: Any) -> None:
+    def add(name: Any, type_spec: Any) -> None:
         text = str(name or "")
-        if text and text not in _OUTPUT_MECHANICS_FIELDS and text not in fields:
-            fields.append(text)
+        if text and text not in _OUTPUT_MECHANICS_FIELDS and text not in contract:
+            contract[text] = type_spec
 
     schema = cfg.get("output_schema")
     if isinstance(schema, dict):
-        for key in schema:
-            add(key)
+        for key, type_spec in schema.items():
+            add(key, type_spec if type_spec else "string")
     output = cfg.get("output")
     if isinstance(output, dict):
-        add(output.get("default_field"))
-        for key in output.get("xml_tags") or []:
-            add(key)
         for key in output.get("xml_lists") or {}:
-            add(key)
-        add(output.get("json_field"))
-        for key in output.get("json_tags") or {}:
-            add(key)
+            add(key, _ARRAY_TYPE)
+        for key in output.get("xml_tags") or []:
+            add(key, "string")
+        if isinstance(output.get("json_field"), str):
+            add(output["json_field"], "object")
+        json_tags = output.get("json_tags")
+        if isinstance(json_tags, dict):
+            for key in json_tags:
+                add(key, "object")
+        regex_fields = output.get("regex_fields")
+        if isinstance(regex_fields, dict):
+            for key in regex_fields:
+                add(key, "string")
+        add(output.get("default_field"), "string")
     raw_files = cfg.get("output_files")
     if isinstance(raw_files, dict):
-        for key in raw_files:
-            add(key)
+        for key, spec in raw_files.items():
+            kind = str(spec.get("type") or "text") if isinstance(spec, dict) else "text"
+            add(str(key).split(".", 1)[0], "object" if kind == "json" else "string")
     done = cfg.get("done_outputs")
     if isinstance(done, dict):
-        for key in done:
-            add(key)
-    return fields
+        for key, spec in done.items():
+            source = str(spec.get("field") if isinstance(spec, dict) else spec)
+            type_spec = _DONE_FIELD_TYPES.get(source, "string")
+            if isinstance(spec, dict) and spec.get("join"):
+                type_spec = "string"
+            add(key, type_spec)
+    return contract
 
 
-def _api_output_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
-    """Derive the API output extraction spec from the declared output schema.
+def _singular_tag(field: str) -> str:
+    # approaches -> approach, strategies -> strategy, hints -> hint; matches
+    # the per-item tag names prompts typically instruct
+    if len(field) > 3 and field.endswith("ies"):
+        return field[:-3] + "y"
+    if len(field) > 2 and any(
+        field.endswith(suffix) for suffix in ("ches", "shes", "sses", "xes", "zes")
+    ):
+        return field[:-2]
+    if len(field) > 1 and field.endswith("s") and not field.endswith("ss"):
+        return field[:-1]
+    return f"{field}_item"
 
-    Called after _op_set_executor has backfilled output_schema with every
-    business output, so the schema is authoritative here. Single text output
-    -> the whole response is that field (default_field). Several -> xml_tags
-    per field, so parse_output can split the response.
+
+def _api_output_spec_from_contract(contract: dict[str, Any]) -> dict[str, Any] | None:
+    """Regenerate the API parse spec from the canonical contract.
+
+    Typed round-trip: array fields become xml_lists (NOT scalar tags — that is
+    how list outputs were silently flattened to strings), object fields become
+    json_tags, scalars xml_tags. A single scalar stays default_field-only so
+    the common shapes (Basic I/O, the ideator) regenerate to their original
+    spec exactly.
     """
-    schema = cfg.get("output_schema") or {}
-    fields = [str(f) for f in schema if str(f) not in _OUTPUT_MECHANICS_FIELDS]
-    if not fields:
+    if not contract:
         return None
-    if len(fields) == 1:
-        return {"default_field": fields[0]}
-    return {"xml_tags": fields, "default_field": fields[0]}
+    lists = {f: _singular_tag(f) for f, t in contract.items() if _is_array_type(t)}
+    objects = [f for f, t in contract.items() if f not in lists and _is_object_type(t)]
+    scalars = [f for f in contract if f not in lists and f not in objects]
+    spec: dict[str, Any] = {}
+    if lists:
+        spec["xml_lists"] = lists
+    if objects:
+        spec["json_tags"] = {f: f for f in objects}
+    if len(scalars) == 1 and not lists and not objects:
+        return {"default_field": scalars[0]}
+    if len(scalars) > 1:
+        spec["xml_tags"] = scalars
+    spec["default_field"] = scalars[0] if scalars else "text"
+    return spec
 
 
 def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
@@ -4444,46 +4505,56 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
             user = str(cfg.pop("user_prompt") or "")
             cfg["prompt"] = f"{system}\n\n{user}" if system else user
 
-    # Capture business outputs BEFORE popping executor-owned keys: the API
-    # `output` spec may be their only declaration (Basic I/O components have
-    # output.default_field and no output_schema), and popping it first would
-    # silently drop the component's outputs across the swap.
-    business_outputs = _component_business_outputs(cfg)
+    # Absorb the outgoing executor's output projections into the canonical
+    # typed contract BEFORE popping them: the API `output` spec may be the
+    # only declaration (Basic I/O), and types like xml_lists' list-ness live
+    # nowhere else.
+    contract = _absorbed_output_contract(cfg)
 
     for key in _EXECUTOR_OWNED_KEYS:
         cfg.pop(key, None)
 
     cfg.update(_executor_scaffold(executor, raw))
 
-    # Backfill the portable schema so every executor's mechanics (API parsing,
-    # CLI output_files, the human form's fields) see the same output set.
-    if business_outputs:
-        schema = cfg.get("output_schema")
-        if not isinstance(schema, dict):
-            schema = {}
-            cfg["output_schema"] = schema
-        for field in business_outputs:
-            schema.setdefault(field, "string")
+    # The canonical schema is exactly the business contract; executor
+    # mechanics (workspace/status) are added or stripped per executor below,
+    # never carried across as if they were the component's outputs.
+    if contract or isinstance(cfg.get("output_schema"), dict):
+        cfg["output_schema"] = dict(contract)
 
     if executor == "api":
-        output = _api_output_config(cfg)
+        input_schema = cfg.get("input_schema")
+        if isinstance(input_schema, dict):
+            input_schema.pop("workspace", None)
+        output = _api_output_spec_from_contract(contract)
         if output is not None:
             cfg["output"] = output
             _ensure_multi_output_prompt_instruction(cfg, output)
-
-    if executor in ("claude_cli", "codex_cli"):
+    elif executor in ("claude_cli", "codex_cli"):
         # The CLI executor reports its sandbox as a workspace output (and can
-        # accept one as input); make sure the schemas declare it.
-        for schema_key in ("input_schema", "output_schema"):
-            schema = cfg.get(schema_key)
-            if isinstance(schema, dict):
-                schema.setdefault("workspace", "string")
-        out_schema = cfg.get("output_schema")
-        if isinstance(out_schema, dict):
-            out_schema.setdefault("status", "string")
-            _ensure_cli_output_files(cfg, out_schema)
+        # accept one as input) and signals completion via done.json status.
+        input_schema = cfg.get("input_schema")
+        if isinstance(input_schema, dict):
+            input_schema.setdefault("workspace", "string")
+        out_schema = cfg.setdefault("output_schema", {})
+        out_schema.setdefault("workspace", "string")
+        out_schema.setdefault("status", "string")
+        # Regenerate the CLI projections from the contract: every business
+        # output comes from a file (structured ones as parsed JSON so their
+        # types survive), status from done.json. Stale entries from before a
+        # rename cannot survive because nothing old is merged in.
+        cfg["output_files"] = {
+            field: (
+                {"path": f"{field}.json", "type": "json"}
+                if _is_array_type(type_spec) or _is_object_type(type_spec)
+                else _default_output_filename(field)
+            )
+            for field, type_spec in contract.items()
+        }
+        cfg["done_outputs"] = {"status": "status"}
     elif executor == "human":
-        # workspace is CLI mechanics; a human answers through the web form.
+        # workspace/status are CLI mechanics; a human answers through the web
+        # form, whose fields come from output_schema — the contract alone.
         for schema_key in ("input_schema", "output_schema"):
             schema = cfg.get(schema_key)
             if isinstance(schema, dict):

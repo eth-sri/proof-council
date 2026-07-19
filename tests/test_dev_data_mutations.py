@@ -1731,19 +1731,21 @@ class SetExecutorCoverageTests(unittest.TestCase):
         self.assertEqual(cfg["output_schema"]["workspace"], "string")
         self.assertEqual(cfg["output_schema"]["status"], "string")
 
-    def test_switch_to_cli_preserves_existing_output_files_and_done_outputs(self) -> None:
+    def test_switch_to_cli_regenerates_projections_from_the_contract(self) -> None:
         raw = _raw(API_OUTPUTS_FIXTURE)
         cfg = raw["components"]["cfg_review"]
+        # pre-existing projections are absorbed into the contract, then
+        # regenerated — stale or custom mappings are not merged back (that is
+        # how renamed outputs used to resurrect)
         cfg["output_files"] = {"report": "report.md"}
         cfg["done_outputs"] = {"verdict": "summary"}
         _op_set_executor(raw, {"executor": "codex_cli", "name": "cfg_review"})
 
-        # configured sources win; only the uncovered field gets a default file,
-        # and an explicit done_outputs keeps reporting status
         self.assertEqual(
-            cfg["output_files"], {"report": "report.md", "answer_tex": "answer.tex"}
+            cfg["output_files"],
+            {"report": "report.txt", "verdict": "verdict.txt", "answer_tex": "answer.tex"},
         )
-        self.assertEqual(cfg["done_outputs"], {"verdict": "summary", "status": "status"})
+        self.assertEqual(cfg["done_outputs"], {"status": "status"})
 
     def test_switch_basic_io_component_keeps_its_only_output(self) -> None:
         # Basic I/O shape: output.default_field is the ONLY declaration of the
@@ -1799,6 +1801,12 @@ class SetExecutorCoverageTests(unittest.TestCase):
         self.assertEqual(
             cfg["output"], {"xml_tags": ["notes", "verdict"], "default_field": "notes"}
         )
+        # CLI mechanics must not be advertised as API outputs/inputs: the API
+        # parser never emits workspace or status
+        self.assertNotIn("workspace", cfg["output_schema"])
+        self.assertNotIn("status", cfg["output_schema"])
+        self.assertNotIn("workspace", cfg["input_schema"])
+        self.assertEqual(cfg["output_schema"], {"notes": "string", "verdict": "string"})
 
     def test_set_executor_retargets_join_or_agent_and_map_chain_steps(self) -> None:
         raw = {
