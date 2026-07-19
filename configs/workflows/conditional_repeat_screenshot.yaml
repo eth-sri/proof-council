@@ -1,0 +1,114 @@
+# Editor-screenshot demo: a conditional repeat in which the improver only runs
+# on an "incorrect" verdict. The state update MUST coalesce the improver's
+# output with the carried solution — on iterations where the improver is
+# skipped, `$node.improve_draft.solution` is empty and a plain reference would
+# wipe the solution out of the repeat state.
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: 'Demo: conditional repeat that keeps the carried solution when the improver is skipped.'
+
+budget:
+  max_usd: 5.0
+  max_wallclock_s: 1800
+
+inputs:
+  problem: ''
+
+components:
+  cfg_draft:
+    model: models/anthropic/sonnet_46
+    system_prompt: You are a careful research mathematician.
+    user_prompt: |
+      Write a complete, rigorous solution to the problem below.
+
+      Problem:
+      {problem}
+    input_schema:
+      problem: string
+    output_schema:
+      solution: string
+    output:
+      default_field: solution
+  cfg_verify:
+    model: models/anthropic/sonnet_46
+    system_prompt: You are a strict proof verifier.
+    user_prompt: |
+      Assess the solution. Answer with the single word "correct" or
+      "incorrect" on the first line, then your reasons.
+
+      Solution:
+      {solution}
+    input_schema:
+      solution: string
+    output_schema:
+      verdict: string
+    output:
+      default_field: verdict
+  cfg_improve:
+    model: models/anthropic/sonnet_46
+    system_prompt: You are a careful research mathematician.
+    user_prompt: |
+      The verifier rejected this solution. Repair it; output the full
+      corrected solution.
+
+      Verifier verdict:
+      {verdict}
+
+      Solution:
+      {solution}
+    input_schema:
+      solution: string
+      verdict: string
+    output_schema:
+      solution: string
+    output:
+      default_field: solution
+
+dag:
+  nodes:
+    - id: draft
+      kind: agent
+      agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+      name: cfg_draft
+      inputs:
+        problem: $input.problem
+    - id: refine
+      kind: repeat
+      needs:
+        - draft
+      max_iterations: 3
+      initial_state:
+        solution: $node.draft.solution
+        verdict: ''
+      condition:
+        python: iteration == 0 or inputs.get("verdict") != "correct"
+      body:
+        nodes:
+          - id: verify
+            kind: agent
+            agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+            name: cfg_verify
+            inputs:
+              solution: $state.solution
+          - id: improve_draft
+            kind: agent
+            needs:
+              - verify
+            agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+            name: cfg_improve
+            when:
+              inputs:
+                verdict: $node.verify.verdict
+              python: inputs.get("verdict") != "correct"
+            inputs:
+              solution: $state.solution
+              verdict: $node.verify.verdict
+        state_updates:
+          # first non-empty wins: the improver's rewrite when it ran, the
+          # carried solution when the verdict was "correct" and it was skipped
+          solution:
+            coalesce:
+              - $node.improve_draft.solution
+              - $state.solution
+          verdict: $node.verify.verdict
+  outputs:
+    solution: $state.solution
