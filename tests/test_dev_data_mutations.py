@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from app.dev_data import (  # noqa: E402
+    CONFIGURABLE_CLI_AGENT,
+    _op_set_executor,
     discover_exported_presets,
     discover_presets,
     mutate_preset_yaml,
@@ -1675,6 +1677,113 @@ class DevDataMutationTests(unittest.TestCase):
         self.assertNotIn("done", repeat["body"]["state_updates"])
         self.assertEqual(raw["dag"]["outputs"], {"solution": "$node.aletheia_repeat.solution"})
         self.assertTrue(validate_preset_yaml(raw_yaml)["ok"])
+
+
+API_OUTPUTS_FIXTURE = textwrap.dedent(
+    """
+    workflow: proofstack.agents.dag_workflow.DAGWorkflow
+    inputs:
+      problem: ''
+    components:
+      cfg_review:
+        system_prompt: Review rigorously.
+        user_prompt: 'Assess: {problem}'
+        model: models/anthropic/sonnet_46
+        output:
+          xml_tags: [report, verdict, answer_tex]
+          default_field: report
+        input_schema:
+          problem: string
+        output_schema:
+          report: string
+          verdict: string
+          answer_tex: string
+    dag:
+      nodes:
+        - id: review
+          kind: agent
+          agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+          name: cfg_review
+          inputs:
+            problem: $input.problem
+      outputs:
+        verdict: $node.review.verdict
+    """
+)
+
+
+class SetExecutorCoverageTests(unittest.TestCase):
+    """Regressions from PR review: executor swaps must keep outputs producible
+    and retarget every node shape that invokes the component."""
+
+    def test_switch_api_to_cli_creates_output_files_for_business_outputs(self) -> None:
+        raw_yaml = _mutate(
+            API_OUTPUTS_FIXTURE,
+            {"op": "set_executor", "name": "cfg_review", "executor": "claude_cli"},
+        )
+        cfg = _raw(raw_yaml)["components"]["cfg_review"]
+
+        # every declared output the CLI can't report via done.json now has a file
+        self.assertEqual(
+            cfg["output_files"],
+            {"report": "report.txt", "verdict": "verdict.txt", "answer_tex": "answer.tex"},
+        )
+        self.assertEqual(cfg["output_schema"]["workspace"], "string")
+        self.assertEqual(cfg["output_schema"]["status"], "string")
+
+    def test_switch_to_cli_preserves_existing_output_files_and_done_outputs(self) -> None:
+        raw = _raw(API_OUTPUTS_FIXTURE)
+        cfg = raw["components"]["cfg_review"]
+        cfg["output_files"] = {"report": "report.md"}
+        cfg["done_outputs"] = {"verdict": "summary"}
+        _op_set_executor(raw, {"executor": "codex_cli", "name": "cfg_review"})
+
+        # configured sources win; only the uncovered field gets a default file,
+        # and an explicit done_outputs keeps reporting status
+        self.assertEqual(
+            cfg["output_files"], {"report": "report.md", "answer_tex": "answer.tex"}
+        )
+        self.assertEqual(cfg["done_outputs"], {"verdict": "summary", "status": "status"})
+
+    def test_set_executor_retargets_join_or_agent_and_map_chain_steps(self) -> None:
+        raw = {
+            "components": {
+                "cfg_judge": {
+                    "prompt": "judge",
+                    "input_schema": {"source": "list"},
+                    "output_schema": {"verdict": "string"},
+                }
+            },
+            "dag": {
+                "nodes": [
+                    {
+                        "id": "pick",
+                        "kind": "join_or_agent",
+                        "agent": "proofstack.agents.configurable_prompt.ConfigurablePromptAgent",
+                        "name": "cfg_judge",
+                        "source": "$node.fan.finals",
+                    },
+                    {
+                        "id": "fan",
+                        "kind": "map_chain",
+                        "foreach": "$input.problems",
+                        "steps": [
+                            {
+                                "id": "s1",
+                                "agent": "proofstack.agents.configurable_prompt.ConfigurablePromptAgent",
+                                "name": "cfg_judge",
+                                "inputs": {},
+                            }
+                        ],
+                    },
+                ]
+            },
+        }
+        _op_set_executor(raw, {"executor": "codex_cli", "name": "cfg_judge"})
+
+        nodes = raw["dag"]["nodes"]
+        self.assertEqual(nodes[0]["agent"], CONFIGURABLE_CLI_AGENT)
+        self.assertEqual(nodes[1]["steps"][0]["agent"], CONFIGURABLE_CLI_AGENT)
 
 
 if __name__ == "__main__":

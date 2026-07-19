@@ -4216,15 +4216,65 @@ _EXECUTOR_AGENTS = {
     "human": HUMAN_AGENT,
 }
 
+# done.json fields a CLI worker reports directly (see CLIDoneRecord); every
+# other declared output must come from a file the worker writes.
+_DONE_RECORD_FIELDS = {"status", "summary", "diff_summary", "open_questions", "artifacts"}
+_KNOWN_FILE_SUFFIXES = ("tex", "md", "json", "txt", "py", "lean", "csv")
+
+
+def _default_output_filename(field: str) -> str:
+    stem, _, suffix = field.rpartition("_")
+    if stem and suffix in _KNOWN_FILE_SUFFIXES:
+        return f"{stem}.{suffix}"  # answer_tex -> answer.tex
+    return f"{field}.txt"
+
+
+def _ensure_cli_output_files(cfg: dict[str, Any], out_schema: dict[str, Any]) -> None:
+    """Map every declared output a CLI executor cannot otherwise produce to a file.
+
+    A CLI component only produces outputs from files it writes (output_files)
+    or done.json fields (done_outputs). After an executor swap the schema may
+    declare business outputs (report, verdict, ...) with neither source —
+    validation passes but downstream $node refs break at runtime.
+    """
+    files = cfg.get("output_files") if isinstance(cfg.get("output_files"), dict) else {}
+    done_cfg = cfg.get("done_outputs")
+    if isinstance(done_cfg, dict):
+        # explicit mapping: only its keys are produced; the framework needs
+        # status reported, so make sure the mapping keeps carrying it
+        done_cfg.setdefault("status", "status")
+        done_covered = set(done_cfg)
+    else:
+        # unset: ConfigurableCLIAgent auto-maps done-record-named fields
+        done_covered = _DONE_RECORD_FIELDS
+    covered = {"workspace"} | set(files) | done_covered
+    added = {
+        str(field): _default_output_filename(str(field))
+        for field in out_schema
+        if str(field) not in covered
+    }
+    if added:
+        cfg["output_files"] = {**files, **added}
+
 
 def _iter_agent_nodes(nodes: Any):
+    """Yield every dict that resolves an agent component via agent/name keys.
+
+    That is more than ``kind: agent`` nodes: join_or_agent nodes and map_chain
+    steps invoke components the same way, so an executor swap must retarget
+    them too or the component config and the node's agent class silently
+    diverge (a valid-looking but broken preset).
+    """
     if not isinstance(nodes, list):
         return
     for node in nodes:
         if not isinstance(node, dict):
             continue
-        if node.get("kind") == "agent":
+        if node.get("kind") in ("agent", "join_or_agent"):
             yield node
+        for step in node.get("steps") or ():
+            if isinstance(step, dict):
+                yield step
         body = node.get("body")
         if isinstance(body, dict):
             yield from _iter_agent_nodes(body.get("nodes"))
@@ -4371,6 +4421,7 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
         out_schema = cfg.get("output_schema")
         if isinstance(out_schema, dict):
             out_schema.setdefault("status", "string")
+            _ensure_cli_output_files(cfg, out_schema)
     elif executor == "human":
         # workspace is CLI mechanics; a human answers through the web form.
         for schema_key in ("input_schema", "output_schema"):
