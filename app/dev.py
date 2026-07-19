@@ -908,9 +908,14 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(404)
         wanted = request.args.get("task", "")
         tasks = load_pending_human_tasks(run.path)
-        task = next((t for t in tasks if t.get("response_filename") == wanted), None)
-        if task is None and tasks:
-            task = tasks[0]
+        if wanted:
+            # A stale/invalid task id must 404, not silently serve another
+            # pending task's proof under the requested filename.
+            task = next((t for t in tasks if t.get("response_filename") == wanted), None)
+            if task is None:
+                abort(404, description="unknown or already-answered human task")
+        else:
+            task = tasks[0] if tasks else None
         proof = str(((task or {}).get("inputs") or {}).get("proof") or "")
         if not proof.strip():
             abort(404, description="no proof draft on this task yet")
