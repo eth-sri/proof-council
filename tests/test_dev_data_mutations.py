@@ -1745,6 +1745,61 @@ class SetExecutorCoverageTests(unittest.TestCase):
         )
         self.assertEqual(cfg["done_outputs"], {"verdict": "summary", "status": "status"})
 
+    def test_switch_basic_io_component_keeps_its_only_output(self) -> None:
+        # Basic I/O shape: output.default_field is the ONLY declaration of the
+        # business output — no output_schema at all.
+        raw = {
+            "components": {
+                "cfg_basic": {
+                    "system_prompt": "Answer.",
+                    "user_prompt": "Q: {question}",
+                    "model": "models/anthropic/sonnet_46",
+                    "output": {"default_field": "output"},
+                    "input_schema": {"question": "string"},
+                }
+            },
+            "dag": {"nodes": []},
+        }
+        cfg = raw["components"]["cfg_basic"]
+        _op_set_executor(raw, {"executor": "codex_cli", "name": "cfg_basic"})
+
+        self.assertEqual(cfg["output_schema"]["output"], "string")
+        self.assertEqual(cfg["output_files"], {"output": "output.txt"})
+
+        _op_set_executor(raw, {"executor": "human", "name": "cfg_basic"})
+        self.assertIn("output", cfg["output_schema"])
+
+        _op_set_executor(raw, {"executor": "api", "name": "cfg_basic"})
+        self.assertEqual(cfg["output"], {"default_field": "output"})
+
+    def test_switch_mixed_cli_outputs_to_api_requests_all_fields(self) -> None:
+        # CLI component sourcing outputs from BOTH output_files and
+        # done_outputs: the API extraction spec must request every field, not
+        # just the file-backed ones.
+        raw = {
+            "components": {
+                "cfg_mixed": {
+                    "prompt": "Review and report.",
+                    "input_schema": {"solution": "string", "workspace": "string"},
+                    "output_schema": {
+                        "workspace": "string",
+                        "status": "string",
+                        "notes": "string",
+                        "verdict": "string",
+                    },
+                    "output_files": {"notes": "notes.md"},
+                    "done_outputs": {"verdict": "summary", "status": "status"},
+                }
+            },
+            "dag": {"nodes": []},
+        }
+        cfg = raw["components"]["cfg_mixed"]
+        _op_set_executor(raw, {"executor": "api", "name": "cfg_mixed"})
+
+        self.assertEqual(
+            cfg["output"], {"xml_tags": ["notes", "verdict"], "default_field": "notes"}
+        )
+
     def test_set_executor_retargets_join_or_agent_and_map_chain_steps(self) -> None:
         raw = {
             "components": {

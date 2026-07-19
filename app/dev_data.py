@@ -4359,17 +4359,60 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
     return {}  # human: prompt + schemas only
 
 
-def _api_output_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
-    """Derive the API output extraction spec from the component's output fields.
+_OUTPUT_MECHANICS_FIELDS = {"workspace", "status", "summary"}
 
-    Single text output -> the whole response is that field (default_field).
-    Several -> xml_tags per field, so parse_output can split the response.
+
+def _component_business_outputs(cfg: dict[str, Any]) -> list[str]:
+    """Every business output the component declares, whatever supplies it.
+
+    The single source of truth for executor swaps: outputs may live in
+    output_schema, the API `output` extraction spec (default_field/xml_tags/
+    xml_lists/json_*), output_files, or done_outputs — and a component may use
+    any mix (Basic I/O declares ONLY output.default_field). Deriving from one
+    source per swap direction is how outputs got silently dropped.
     """
-    mechanics = {"workspace", "status", "summary"}
-    fields = [str(f) for f in (cfg.get("output_files") or {}) if str(f) not in mechanics]
-    if not fields:
-        schema = cfg.get("output_schema") or {}
-        fields = [str(f) for f in schema if str(f) not in mechanics]
+    fields: list[str] = []
+
+    def add(name: Any) -> None:
+        text = str(name or "")
+        if text and text not in _OUTPUT_MECHANICS_FIELDS and text not in fields:
+            fields.append(text)
+
+    schema = cfg.get("output_schema")
+    if isinstance(schema, dict):
+        for key in schema:
+            add(key)
+    output = cfg.get("output")
+    if isinstance(output, dict):
+        add(output.get("default_field"))
+        for key in output.get("xml_tags") or []:
+            add(key)
+        for key in output.get("xml_lists") or {}:
+            add(key)
+        add(output.get("json_field"))
+        for key in output.get("json_tags") or {}:
+            add(key)
+    raw_files = cfg.get("output_files")
+    if isinstance(raw_files, dict):
+        for key in raw_files:
+            add(key)
+    done = cfg.get("done_outputs")
+    if isinstance(done, dict):
+        for key in done:
+            add(key)
+    return fields
+
+
+def _api_output_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """Derive the API output extraction spec from the declared output schema.
+
+    Called after _op_set_executor has backfilled output_schema with every
+    business output, so the schema is authoritative here. Single text output
+    -> the whole response is that field (default_field). Several -> xml_tags
+    per field, so parse_output can split the response.
+    """
+    schema = cfg.get("output_schema") or {}
+    fields = [str(f) for f in schema if str(f) not in _OUTPUT_MECHANICS_FIELDS]
     if not fields:
         return None
     if len(fields) == 1:
@@ -4401,10 +4444,27 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
             user = str(cfg.pop("user_prompt") or "")
             cfg["prompt"] = f"{system}\n\n{user}" if system else user
 
+    # Capture business outputs BEFORE popping executor-owned keys: the API
+    # `output` spec may be their only declaration (Basic I/O components have
+    # output.default_field and no output_schema), and popping it first would
+    # silently drop the component's outputs across the swap.
+    business_outputs = _component_business_outputs(cfg)
+
     for key in _EXECUTOR_OWNED_KEYS:
         cfg.pop(key, None)
 
     cfg.update(_executor_scaffold(executor, raw))
+
+    # Backfill the portable schema so every executor's mechanics (API parsing,
+    # CLI output_files, the human form's fields) see the same output set.
+    if business_outputs:
+        schema = cfg.get("output_schema")
+        if not isinstance(schema, dict):
+            schema = {}
+            cfg["output_schema"] = schema
+        for field in business_outputs:
+            schema.setdefault(field, "string")
+
     if executor == "api":
         output = _api_output_config(cfg)
         if output is not None:
