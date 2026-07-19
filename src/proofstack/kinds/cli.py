@@ -16,6 +16,11 @@ from proofstack.context import RunContext
 from proofstack.events import new_call_id
 from proofstack.sandbox import make_sandbox, resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
+from proofstack.subscription import (
+    DEFAULT_RECHECK_S,
+    SubscriptionPacer,
+    SubscriptionParked,
+)
 
 
 FINISH_SCRIPT = """\
@@ -147,21 +152,27 @@ class CLIAgent(Agent):
         self.tracker.add_tool_call()
         await self._emit_budget_warnings(self.tracker.check())
 
-        root = self.sandbox_root_for(inp)
-        if root is not None:
-            root.mkdir(parents=True, exist_ok=True)
-            sandbox = make_sandbox(self.SANDBOX, root=root)
-            persistent = True
-        else:
-            sandbox = make_sandbox(self.SANDBOX, root=self.workdir / "sandbox")
-            persistent = False
+        pacing_claim = await self._acquire_subscription_slot()
+
         # Track the streaming process so the finally block can terminate
         # it unconditionally on cancellation. Without this, if the
         # surrounding task is cancelled while ``_wait_for_done`` is
         # awaiting, the codex (or other CLI) child keeps running until
         # its own timeout or until the container exits.
         stream = None
+        # Sandbox creation happens INSIDE the try: if it raises, the finally
+        # must still release the pacing claim or it holds phantom headroom
+        # for every other run until its TTL expires.
+        sandbox: Sandbox | None = None
         try:
+            root = self.sandbox_root_for(inp)
+            if root is not None:
+                root.mkdir(parents=True, exist_ok=True)
+                sandbox = make_sandbox(self.SANDBOX, root=root)
+                persistent = True
+            else:
+                sandbox = make_sandbox(self.SANDBOX, root=self.workdir / "sandbox")
+                persistent = False
             if persistent:
                 runtime_dir = sandbox.root / ".pwc" / "runtime"
                 runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -263,6 +274,12 @@ class CLIAgent(Agent):
                 )
             return out
         finally:
+            if pacing_claim is not None:
+                pacer, claim_id = pacing_claim
+                try:
+                    await asyncio.shield(asyncio.to_thread(pacer.release, claim_id))
+                except (asyncio.CancelledError, Exception):
+                    pass
             # Terminate the streaming child unconditionally. If we're
             # being cancelled mid-``_wait_for_done`` the underlying
             # process is still alive; without this it can keep running
@@ -287,13 +304,130 @@ class CLIAgent(Agent):
             # Keep the sandbox dir on disk so the workdir captures artifacts.
             # teardown() still runs so subclasses can scrub per-invocation
             # secrets such as copied CLI credentials.
+            if sandbox is not None:
+                try:
+                    await self.teardown(sandbox, inp)
+                except Exception as e:
+                    await self.events.emit(
+                        "cli.teardown_error",
+                        {"type": type(e).__name__, "msg": str(e)},
+                    )
+
+    def _subscription_profile(self) -> tuple[str, str] | None:
+        """(provider, model) when this node bills a subscription window, else None.
+
+        Overridden by subclasses that know their CLI is subscription-authed
+        (e.g. ConfigurableCLIAgent with usage.type == claude_json).
+        """
+        return None
+
+    async def _emit_pacing_unavailable(self, error: Exception) -> None:
+        # The pacer is a backstop; a broken store (read-only HOME, locked
+        # volume, corrupt file) must never take the node down with it —
+        # degrade to an unpaced launch and say so.
+        await self.events.emit(
+            "pacing.unavailable",
+            {"type": type(error).__name__, "msg": str(error)},
+        )
+
+    async def _acquire_subscription_slot(self) -> tuple[SubscriptionPacer, str] | None:
+        """Wait until the account-wide subscription windows have headroom.
+
+        Returns (pacer, claim_id) to release in run()'s finally, or None when
+        pacing does not apply. Sleeps are re-decided every pass so claims
+        released by other runs/processes are picked up, are charged via
+        add_paused (a paced node must not burn the run's wallclock budget),
+        and park the run (SubscriptionParked -> resumable BudgetExhausted
+        path) rather than sleeping past the configured threshold.
+        """
+        profile = self._subscription_profile()
+        if profile is None:
+            return None
+        provider, model = profile
+        pacer = SubscriptionPacer(provider=provider)
+        try:
+            enabled, park_after_s = await asyncio.to_thread(pacer.gate_config)
+        except Exception as e:
+            await self._emit_pacing_unavailable(e)
+            return None
+        if not enabled:
+            return None
+        run_id = self.events.run_id
+        waited = 0.0
+        last_wait_emit = 0.0
+        while True:
             try:
-                await self.teardown(sandbox, inp)
-            except Exception as e:
-                await self.events.emit(
-                    "cli.teardown_error",
-                    {"type": type(e).__name__, "msg": str(e)},
+                claim_id, decision = await asyncio.to_thread(
+                    lambda: pacer.try_claim(
+                        model=model,
+                        run_id=run_id,
+                        ttl_s=float(self.SANDBOX.timeout_s) + 900.0,
+                    )
                 )
+            except Exception as e:
+                await self._emit_pacing_unavailable(e)
+                return None
+            if claim_id is not None:
+                await self.events.emit(
+                    "pacing.admit",
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "est_tokens": decision.est_tokens,
+                        "waited_s": round(waited, 1),
+                        "windows": [
+                            {
+                                "window": st.window,
+                                "usage": st.usage,
+                                "claims": st.claims,
+                                "allowed": st.allowed,
+                            }
+                            for st in decision.windows
+                        ],
+                    },
+                )
+                return (pacer, claim_id)
+            blocked = next(
+                (st for st in decision.windows if st.window == decision.blocking_window),
+                None,
+            )
+            if waited + decision.wait_s > park_after_s:
+                await self.events.emit(
+                    "pacing.parked",
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "window": decision.blocking_window,
+                        "projected_wait_s": round(waited + decision.wait_s, 1),
+                        "park_after_s": park_after_s,
+                    },
+                )
+                raise SubscriptionParked(
+                    decision.blocking_window or "unknown",
+                    decision.wait_s,
+                    float(blocked.usage + blocked.claims) if blocked else 0.0,
+                    float(blocked.allowed) if blocked else 0.0,
+                )
+            sleep_s = min(max(decision.wait_s, 5.0), DEFAULT_RECHECK_S)
+            if waited - last_wait_emit >= 600.0 or waited == 0.0:
+                last_wait_emit = waited
+                await self.events.emit(
+                    "pacing.wait",
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "window": decision.blocking_window,
+                        "wait_s": round(decision.wait_s, 1),
+                        "waited_s": round(waited, 1),
+                        "usage": blocked.usage if blocked else None,
+                        "claims": blocked.claims if blocked else None,
+                        "allowed": blocked.allowed if blocked else None,
+                        "est_tokens": decision.est_tokens,
+                    },
+                )
+            await asyncio.sleep(sleep_s)
+            self.tracker.add_paused(sleep_s)
+            waited += sleep_s
 
     async def _wait_for_done(
         self,

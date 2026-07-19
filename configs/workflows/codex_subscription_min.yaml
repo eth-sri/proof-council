@@ -11,9 +11,10 @@
 #   2. `--ignore-user-config` keeps it from reading ~/.codex/config.toml;
 #      `codex_sandbox: auto` injects `--sandbox workspace-write` on the
 #      subprocess backend, so it can write answer.tex but not roam the host.
-#   3. A pure-subscription run spends $0, and Codex usage is not token-metered
-#      here (no `usage:` block), so the guardrails are max_tool_calls,
-#      max_wallclock_s, and the per-node timeouts below.
+#   3. A pure-subscription run spends $0. Tokens ARE metered (`usage:` block
+#      with bill: false) and feed the cross-run subscription pacer; the node's
+#      session rollout is harvested for codex's own rate_limits snapshot
+#      (used %, reset time), so every node doubles as a free usage probe.
 #
 # Login once with `codex login` (ChatGPT account). A ChatGPT-account Codex
 # login supports the base GPT models but NOT the *-codex variants.
@@ -47,7 +48,9 @@ components:
       - exec
       - --ignore-user-config   # don't read ~/.codex/config.toml; auth still via CODEX_HOME
       - --skip-git-repo-check
-      - --ephemeral            # don't persist session files
+      # (no --ephemeral: the session rollout carries codex's rate_limits
+      #  snapshot; it lands in the sandboxed CODEX_HOME, is harvested for the
+      #  pacer after the run, and teardown scrubs the whole .codex-home)
       - --json
       - -m
       - "{codex_model}"
@@ -57,6 +60,9 @@ components:
       #  `--sandbox workspace-write` because codex_sandbox: auto + subprocess)
     codex_sandbox: auto        # -> workspace-write on the subprocess backend
     copy_codex_auth: true      # key-free subscription auth (no API key)
+    usage:
+      type: codex_jsonl        # meter tokens into the subscription pacer ledger
+      bill: false              # subscription run: no USD charged (max_usd: 0.0)
     soft_timeout_s: 780        # 13 min: graceful "wrap up & finish" nudge
     sandbox:
       backend: subprocess      # host, not Docker

@@ -9,11 +9,13 @@ YAML instead of requiring one Python subclass per worker role.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import shlex
 import shutil
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -28,6 +30,12 @@ from proofstack.cli_usage import (
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
+from proofstack.subscription import (
+    WINDOWS,
+    SubscriptionStore,
+    detect_rate_limit,
+    parse_codex_rollout_rate_limits,
+)
 
 
 class ConfigurableCLIAgent(CLIAgent):
@@ -198,33 +206,50 @@ class ConfigurableCLIAgent(CLIAgent):
         kind = usage_cfg.get("type")
         if kind == "claude_json":
             await self._record_claude_usage(stdout_text)
+            await self._scan_claude_rate_limit(stdout_text, stderr_text)
             return
         if kind != "codex_jsonl":
             return
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
+            await self._harvest_codex_rollout()
             return
-        cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
-        try:
-            rates = load_cost_rates(cfg_ref)
-        except (KeyError, FileNotFoundError, ValueError) as e:
-            await self.events.emit(
-                "cli.cost_lookup_failed",
-                {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
-            )
-            return
-        cost = cost_for_codex_usage(usage, **rates)
-        self.tracker.add_usd(cost)
+        cost = 0.0
+        cfg_ref = None
+        # bill: false marks a subscription run — tokens are metered but no USD
+        # is charged (add_usd would trip the max_usd: 0.0 gate those runs use).
+        if usage_cfg.get("bill", True):
+            cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
+            try:
+                rates = load_cost_rates(cfg_ref)
+            except (KeyError, FileNotFoundError, ValueError) as e:
+                await self.events.emit(
+                    "cli.cost_lookup_failed",
+                    {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
+                )
+                return
+            cost = cost_for_codex_usage(usage, **rates)
+            self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
+        if self._subscription_profile() is not None:
+            try:
+                await asyncio.to_thread(
+                    SubscriptionStore().append_usage,
+                    provider="codex",
+                    model=self._codex_model_name(),
+                    tokens=usage.input_tokens + usage.output_tokens,
+                    run_id=self.events.run_id,
+                )
+            except Exception as e:
+                await self.events.emit(
+                    "pacing.ledger_write_failed",
+                    {"type": type(e).__name__, "msg": str(e)},
+                )
+        await self._harvest_codex_rollout()
         await self.events.emit(
             "model.call",
             {
-                "model": str(
-                    self.component_config.get("model")
-                    or usage_cfg.get("model")
-                    or _model_from_cmd(self.CLI_CMD)
-                    or "codex"
-                ),
+                "model": self._codex_model_name(usage_cfg),
                 "in_tokens": usage.input_tokens,
                 "cached_in_tokens": usage.cached_input_tokens,
                 "out_tokens": usage.output_tokens,
@@ -234,6 +259,80 @@ class ConfigurableCLIAgent(CLIAgent):
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
             },
+        )
+
+    def _claude_model_name(self) -> str:
+        return str(
+            self.component_config.get("model") or _model_from_cmd(self.CLI_CMD) or "claude"
+        )
+
+    def _codex_model_name(self, usage_cfg: dict[str, Any] | None = None) -> str:
+        if not isinstance(usage_cfg, dict):
+            raw = self.component_config.get("usage")
+            usage_cfg = raw if isinstance(raw, dict) else {}
+        return str(
+            self.component_config.get("model")
+            or usage_cfg.get("model")
+            or _model_from_cmd(self.CLI_CMD)
+            or "codex"
+        )
+
+    def _subscription_profile(self) -> tuple[str, str] | None:
+        usage_cfg = self.component_config.get("usage") or {}
+        if not isinstance(usage_cfg, dict):
+            return None
+        if usage_cfg.get("type") == "claude_json":
+            return ("claude", self._claude_model_name())
+        # copy_codex_auth marks a subscription-authed codex node (a key-based
+        # API node pays USD instead and is governed by max_usd, not windows)
+        if usage_cfg.get("type") == "codex_jsonl" and self._copy_codex_auth_enabled():
+            return ("codex", self._codex_model_name(usage_cfg))
+        return None
+
+    async def _harvest_codex_rollout(self) -> None:
+        """Read rate_limits from the node's codex session rollout, if any.
+
+        Codex writes ground-truth window utilization (used_percent/resets_at)
+        into its session files under CODEX_HOME — which copy_codex_auth pins
+        inside the sandbox, and teardown scrubs. Harvesting here (before
+        teardown) turns every codex node into a free usage probe.
+        """
+        if self._subscription_profile() is None or self._active_workspace_root is None:
+            return
+        sessions = self._active_workspace_root / ".codex-home" / "sessions"
+        if not sessions.is_dir():
+            return
+
+        def _extract() -> dict[str, dict[str, float | None]]:
+            windows: dict[str, dict[str, float | None]] = {}
+            for path in sorted(sessions.rglob("rollout-*.jsonl")):
+                try:
+                    parsed = parse_codex_rollout_rate_limits(
+                        path.read_text(encoding="utf-8")
+                    )
+                except OSError:
+                    continue
+                windows.update(parsed)  # later files win
+            return windows
+
+        try:
+            windows = await asyncio.to_thread(_extract)
+            if not windows:
+                return
+            await asyncio.to_thread(
+                lambda: SubscriptionStore().record_probe(
+                    provider="codex", windows=windows, now=time.time()
+                )
+            )
+        except Exception as e:
+            await self.events.emit(
+                "pacing.calibration_write_failed",
+                {"type": type(e).__name__, "msg": str(e)},
+            )
+            return
+        await self.events.emit(
+            "pacing.probe_recorded",
+            {"provider": "codex", "windows": windows, "via": "codex_rollout"},
         )
 
     async def _record_claude_usage(self, stdout_text: str) -> None:
@@ -247,14 +346,27 @@ class ConfigurableCLIAgent(CLIAgent):
         # reads dominate an agentic loop and counting only input+output undercounts
         # ~40x. All categories are recorded below so the weighting stays visible.
         self.tracker.add_tokens(usage.metered_tokens)
+        model = self._claude_model_name()
+        # Cross-run subscription ledger: recorded unconditionally (cheap, and
+        # useful history even before pacing is enabled). Guarded so a broken
+        # store (read-only HOME) cannot suppress the model.call event below.
+        try:
+            await asyncio.to_thread(
+                SubscriptionStore().append_usage,
+                provider="claude",
+                model=model,
+                tokens=usage.metered_tokens,
+                run_id=self.events.run_id,
+            )
+        except Exception as e:
+            await self.events.emit(
+                "pacing.ledger_write_failed",
+                {"type": type(e).__name__, "msg": str(e)},
+            )
         await self.events.emit(
             "model.call",
             {
-                "model": str(
-                    self.component_config.get("model")
-                    or _model_from_cmd(self.CLI_CMD)
-                    or "claude"
-                ),
+                "model": model,
                 "in_tokens": usage.input_tokens,
                 "cache_creation_in_tokens": usage.cache_creation_input_tokens,
                 "cached_in_tokens": usage.cache_read_input_tokens,
@@ -263,6 +375,55 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cost_usd": usage.total_cost_usd,
                 "n_turns": usage.num_turns,
                 "via": "claude_exec_json",
+            },
+        )
+
+    async def _scan_claude_rate_limit(self, stdout_text: str, stderr_text: str) -> None:
+        """Calibrate window ceilings from a real subscription limit hit.
+
+        Runs AFTER the ledger append so the just-finished node's tokens are in
+        the observed total. A model-class cap (e.g. fable weekly) can be
+        misattributed to the generic window — that only over-blocks until the
+        reset, which is the safe direction for a backstop.
+        """
+        hit = detect_rate_limit((stdout_text or "") + "\n" + (stderr_text or ""))
+        if hit is None:
+            return
+        seconds, model_filter = WINDOWS[hit.window_guess]
+        store = SubscriptionStore()
+
+        def _record() -> int:
+            observed = sum(
+                e.tokens
+                for e in store.window_entries(
+                    provider="claude", seconds=seconds, model_filter=model_filter
+                )
+            )
+            store.record_rate_limit(
+                provider="claude",
+                window=hit.window_guess,
+                observed_ceiling=observed,
+                reset_at=hit.reset_at,
+            )
+            return observed
+
+        try:
+            observed = await asyncio.to_thread(_record)
+        except Exception as e:
+            await self.events.emit(
+                "pacing.calibration_write_failed",
+                {"type": type(e).__name__, "msg": str(e)},
+            )
+            return
+        await self.events.emit(
+            "pacing.rate_limit_detected",
+            {
+                "provider": "claude",
+                "model": self._claude_model_name(),
+                "window": hit.window_guess,
+                "observed_ceiling": observed,
+                "reset_at": hit.reset_at,
+                "excerpt": hit.excerpt,
             },
         )
 
