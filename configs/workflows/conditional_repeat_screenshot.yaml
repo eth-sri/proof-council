@@ -111,4 +111,5 @@ dag:
               - $state.solution
           verdict: $node.verify.verdict
   outputs:
-    solution: $state.solution
+    # the repeat node exposes its final loop state under $node.<id>.state
+    solution: $node.refine.state.solution
