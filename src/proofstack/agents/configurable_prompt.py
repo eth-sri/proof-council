@@ -205,10 +205,14 @@ def _with_format_instruction(
     if not instruction:
         return messages
     out = [dict(m) for m in messages]
-    if out and out[-1].get("role") == "user":
-        out[-1]["content"] = f"{str(out[-1]['content']).rstrip()}\n{instruction}"
-    else:
-        out.append({"role": "user", "content": instruction.lstrip("\n")})
+    # Append to the last USER message. Never add a trailing user turn after an
+    # assistant prefill (that breaks the intended prefill conversation shape);
+    # fold the instruction into the nearest preceding user turn instead.
+    for m in reversed(out):
+        if m.get("role") == "user":
+            m["content"] = f"{str(m.get('content') or '').rstrip()}\n{instruction}"
+            return out
+    out.append({"role": "user", "content": instruction.lstrip("\n")})
     return out
 
 
@@ -218,7 +222,9 @@ def _format_instruction(output_cfg: Any, existing_text: str) -> str:
     lines: list[str] = []
 
     def mentioned(tag: str) -> bool:
-        return f"<{tag}" in existing_text
+        # a complete opening/closing tag, not a prefix: `<n>` counts, `x<n`
+        # (ordinary math) and an unrelated `<n_items>` do not
+        return bool(re.search(rf"</?{re.escape(tag)}\s*>", existing_text))
 
     for tag in output_cfg.get("xml_tags") or []:
         tag = str(tag).strip()

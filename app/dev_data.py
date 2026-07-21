@@ -4132,7 +4132,7 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         cfg["input_schema"] = _parse_schema_fields(str(fields["input_schema"] or ""))
         handled_fields.add("input_schema")
     if "output_schema" in fields:
-        cfg["output_schema"] = _parse_schema_fields(str(fields["output_schema"] or ""))
+        cfg["output_schema"] = _coerce_schema_fields(fields["output_schema"])
         _prune_projections_to_schema(cfg)
         handled_fields.add("output_schema")
     if "tools" in fields:
@@ -4159,8 +4159,8 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         handled_fields.add("max_tool_calls")
 
     edits_output = any(key in fields for key in ("default_field", "xml_tags", "xml_list_field", "xml_list_tag"))
-    output = cfg.get("output")
-    if edits_output or isinstance(output, dict):
+    if edits_output:
+        output = cfg.get("output")
         if not isinstance(output, dict):
             output = {}
             cfg["output"] = output
@@ -4188,8 +4188,10 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
             handled_fields.update({"xml_list_field", "xml_list_tag"})
         # format instructions are generated at RUNTIME from the spec
         # (ConfigurablePromptAgent._with_format_instruction); baking them into
-        # the stored prompt would entangle it with API delivery mechanics
-        _sync_output_schema_with_api_spec(cfg, force=edits_output)
+        # the stored prompt would entangle it with API delivery mechanics.
+        # An explicit spec edit is authoritative — mirror it into the schema
+        # (empties included) so the two never desynchronize.
+        _sync_output_schema_with_api_spec(cfg, force=True)
 
     for key, value in fields.items():
         if key in handled_fields or str(key).startswith("__"):
@@ -4216,10 +4218,12 @@ def _prune_projections_to_schema(cfg: dict[str, Any]) -> None:
     if isinstance(done, dict):
         cfg["done_outputs"] = {k: v for k, v in done.items() if str(k) in allowed}
     if isinstance(cfg.get("output"), dict):
+        # regenerate the API bindings from the (text) schema — switchable
+        # components are delivery-neutral, so fresh tags stay self-consistent
         business = {
-            f: t for f, t in schema.items() if f not in _OUTPUT_MECHANICS_FIELDS
+            f for f in schema if f not in _OUTPUT_MECHANICS_FIELDS
         }
-        spec = _reconcile_api_spec(cfg.get("output"), business)
+        spec = _regenerated_api_spec({f: "string" for f in business})
         if spec is not None:
             cfg["output"] = spec
         else:
@@ -4248,15 +4252,12 @@ def _sync_output_schema_with_api_spec(cfg: dict[str, Any], *, force: bool = Fals
 
 
 # Component config keys owned by the executor; replaced wholesale on a swap.
-# Task identity is preserved: prompt, input_schema, tools, the canonical typed
-# output_schema — and the API `output` parse spec, whose tag names / regexes /
-# json bindings are coupled to the prompt's own wording and therefore cannot
-# be regenerated from field names without changing parse behavior. The spec
-# lies dormant on non-API executors and is reconciled against the contract
-# (pruned + extended, never rebuilt) on the way back. CLI delivery projections
-# (output_files, done_outputs) ARE executor-owned: with `contract: auto` their
-# prompt instructions are generated, so regenerating them from the contract is
-# behavior-preserving.
+# Task identity is preserved: prompt, input_schema, tools, and the canonical
+# typed output_schema. All delivery machinery is executor-owned and
+# regenerated from the schema each swap — the API `output` parse spec included:
+# switchable components have delivery-neutral prompts (enforced by
+# _switchable_or_refuse), so regenerated tag names need only be self-consistent
+# with the generated runtime instructions, not match any prompt wording.
 _EXECUTOR_OWNED_KEYS = (
     "cmd",
     "env",
@@ -4270,6 +4271,7 @@ _EXECUTOR_OWNED_KEYS = (
     "cache_enabled",
     "contract",
     "messages",
+    "output",
     "output_files",
     "done_outputs",
 )
@@ -4304,7 +4306,10 @@ def _iter_agent_nodes(nodes: Any):
     for node in nodes:
         if not isinstance(node, dict):
             continue
-        if node.get("kind") in ("agent", "join_or_agent"):
+        # kind defaults to "agent" at runtime (dag_workflow), so a node that
+        # omits kind but names a component is an agent node too — missing it
+        # here leaves that node pointed at the old agent class after a swap.
+        if node.get("kind", "agent") in ("agent", "join_or_agent"):
             yield node
         for step in node.get("steps") or ():
             if isinstance(step, dict):
@@ -4358,7 +4363,6 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
             "sandbox": {"backend": "subprocess", "timeout_s": 900},
             "env": {"HOME": "{env:HOME}"},
             "usage": {"type": "claude_json"},
-            "cache_enabled": True,
             "contract": "auto",
         }
     if executor == "codex_cli":
@@ -4380,7 +4384,6 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
             "copy_codex_auth": True,
             "soft_timeout_s": 780,
             "sandbox": {"backend": "subprocess", "timeout_s": 900},
-            "cache_enabled": True,
             "contract": "auto",
         }
         if binding:
@@ -4393,8 +4396,12 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
     return {}  # human: prompt + schemas only
 
 
-_OUTPUT_MECHANICS_FIELDS = {"workspace", "status", "summary"}
+_OUTPUT_MECHANICS_FIELDS = {"workspace", "status"}
 
+# CLI-sandbox mechanics, not business outputs: workspace is the sandbox path
+# and status is the done.json signal. `summary` is NOT here — it is a genuine
+# business output when a component declares it (deleting it silently on a swap
+# was a real bug), even though CLIDoneRecord also carries a summary field.
 # done.json fields carry known shapes (see CLIDoneRecord)
 _DONE_FIELD_TYPES: dict[str, Any] = {
     "status": "string",
@@ -4425,6 +4432,24 @@ def _is_string_type(type_spec: Any) -> bool:
     if isinstance(type_spec, str):
         return type_spec.strip().lower() in {"", "string", "str", "text"}
     return isinstance(type_spec, dict) and str(type_spec.get("type") or "") == "string"
+
+
+def _is_text_type(type_spec: Any) -> bool:
+    """A plain-text output: a string type or an all-string enum.
+
+    Executor switching is deliberately narrow — it supports only components
+    whose every output is plain text, so a swap can never change a field's
+    runtime type or need executor-specific structured (de)serialization. Any
+    richer output makes the component non-switchable (a clean refusal), which
+    is what keeps the small supported surface actually correct.
+    """
+    if _is_string_type(type_spec):
+        return True
+    if isinstance(type_spec, dict):
+        enum = type_spec.get("enum")
+        if isinstance(enum, list) and enum and all(isinstance(v, str) for v in enum):
+            return True
+    return False
 
 
 def _spec_output_contract(output: Any) -> dict[str, Any]:
@@ -4503,120 +4528,6 @@ def _absorbed_output_contract(cfg: dict[str, Any]) -> dict[str, Any]:
     return contract
 
 
-def _singular_tag(field: str) -> str:
-    # approaches -> approach, strategies -> strategy, hints -> hint; matches
-    # the per-item tag names prompts typically instruct
-    if len(field) > 3 and field.endswith("ies"):
-        return field[:-3] + "y"
-    if len(field) > 2 and any(
-        field.endswith(suffix) for suffix in ("ches", "shes", "sses", "xes", "zes")
-    ):
-        return field[:-2]
-    if len(field) > 1 and field.endswith("s") and not field.endswith("ss"):
-        return field[:-1]
-    return f"{field}_item"
-
-
-def _generated_api_bindings(fields: dict[str, Any]) -> dict[str, Any]:
-    """Fresh API parse bindings for contract fields that have none.
-
-    Array fields become xml_lists (NOT scalar tags — that silently flattens
-    lists to strings), object fields json_tags, scalars xml_tags — except a
-    single lone scalar, which stays default_field-only. No synthetic
-    default_field is ever invented: the parser has its own internal fallback,
-    and a generated `text` would be absorbed as a phantom business output on
-    the next swap.
-    """
-    lists = {f: _singular_tag(f) for f, t in fields.items() if _is_array_type(t)}
-    objects = [f for f, t in fields.items() if f not in lists and _is_object_type(t)]
-    scalars = [f for f in fields if f not in lists and f not in objects]
-    spec: dict[str, Any] = {}
-    if lists:
-        spec["xml_lists"] = lists
-    if objects:
-        spec["json_tags"] = {f: f for f in objects}
-    if len(scalars) == 1 and not lists and not objects:
-        return {"default_field": scalars[0]}
-    if scalars:
-        spec["xml_tags"] = scalars
-        spec["default_field"] = scalars[0]
-    return spec
-
-
-def _reconcile_api_spec(existing: Any, contract: dict[str, Any]) -> dict[str, Any] | None:
-    """The API parse spec for a swap to the API executor.
-
-    An existing spec is task identity — its tag names/regexes/json bindings
-    are coupled to the prompt's wording, so reusing it verbatim is the only
-    behavior-preserving choice. It is reconciled, not rebuilt: entries whose
-    fields left the contract are pruned (no resurrection), fields with no
-    binding get freshly generated ones. Only a component with no spec at all
-    gets a fully generated one.
-    """
-    if not contract:
-        return None
-    if not isinstance(existing, dict) or not existing:
-        return _generated_api_bindings(contract) or None
-
-    spec: dict[str, Any] = {}
-    covered: set[str] = set()
-
-    def keep(field: Any) -> bool:
-        text = str(field or "")
-        if text in contract:
-            covered.add(text)
-            return True
-        return False
-
-    xml_lists = {
-        str(f): str(tag) for f, tag in (existing.get("xml_lists") or {}).items() if keep(f)
-    }
-    if xml_lists:
-        spec["xml_lists"] = xml_lists
-    xml_tags = [str(f) for f in (existing.get("xml_tags") or []) if keep(f)]
-    if xml_tags:
-        spec["xml_tags"] = xml_tags
-    if isinstance(existing.get("json_tag"), str):
-        json_out = str(existing.get("json_field") or existing["json_tag"])
-        if keep(json_out):
-            spec["json_tag"] = existing["json_tag"]
-            if existing.get("json_field"):
-                spec["json_field"] = existing["json_field"]
-            for extra in ("json_default", "json_merge"):
-                if extra in existing:
-                    spec[extra] = existing[extra]
-    json_tags = {
-        str(f): str(tag) for f, tag in (existing.get("json_tags") or {}).items() if keep(f)
-    }
-    if json_tags:
-        spec["json_tags"] = json_tags
-        if isinstance(existing.get("json_defaults"), dict):
-            defaults = {
-                f: v for f, v in existing["json_defaults"].items() if str(f) in json_tags
-            }
-            if defaults:
-                spec["json_defaults"] = defaults
-    regex_fields = {
-        str(f): str(p) for f, p in (existing.get("regex_fields") or {}).items() if keep(f)
-    }
-    if regex_fields:
-        spec["regex_fields"] = regex_fields
-    default_field = existing.get("default_field")
-    if isinstance(default_field, str) and keep(default_field):
-        spec["default_field"] = default_field
-
-    missing = {f: t for f, t in contract.items() if f not in covered}
-    if missing:
-        generated = _generated_api_bindings(missing)
-        for key, value in generated.items():
-            if key in ("xml_lists", "json_tags") and key in spec:
-                spec[key] = {**spec[key], **value}
-            elif key == "xml_tags" and key in spec:
-                spec[key] = [*spec[key], *value]
-            elif key not in spec:
-                spec[key] = value
-    return spec or None
-
 
 _SWAPPABLE_AGENTS = {CONFIGURABLE_PROMPT_AGENT, CONFIGURABLE_CLI_AGENT, HUMAN_AGENT}
 
@@ -4637,16 +4548,138 @@ def _binding_literals(output: Any, prompt_text: str) -> list[str]:
     tags.update(str(t) for t in (output.get("json_tags") or {}).values())
     if isinstance(output.get("json_tag"), str):
         tags.add(output["json_tag"])
-    found = [f"<{tag}>" for tag in sorted(tags) if f"<{tag}" in prompt_text]
+    # match a COMPLETE opening/closing tag, not a prefix: `<n>`/`</n>` counts,
+    # but ordinary math like `x<n` or an unrelated `<answer_tex>` does not.
+    found = [
+        f"<{tag}>"
+        for tag in sorted(tags)
+        if re.search(rf"</?{re.escape(tag)}\s*>", prompt_text)
+    ]
     for pattern in (output.get("regex_fields") or {}).values():
         if not isinstance(pattern, str):
             continue
         # fixed literal runs of the pattern (e.g. "VERDICT:") appearing verbatim
-        for literal in re.findall(r"[A-Za-z0-9_ :\-]{4,}", pattern):
+        for literal in re.findall(r"[A-Za-z0-9_]+:", pattern):
             if literal.strip() and literal.strip() in prompt_text:
                 found.append(literal.strip())
                 break
     return found
+
+
+def _switchable_or_refuse(cfg: dict[str, Any], name: str) -> None:
+    """Raise PresetError unless this component is in the narrow swappable tier.
+
+    Executor switching is intentionally limited to what can be translated
+    soundly for a web-UI user who cannot inspect the result: plain-text
+    outputs, a delivery-neutral prompt, and no executor-specific delivery
+    machinery. Everything richer is refused with a specific reason rather
+    than silently mangled (four review rounds of silent mangling is why).
+    Components that need it can still be edited by hand or by an LLM.
+    """
+    if isinstance(cfg.get("messages"), list) and cfg["messages"]:
+        raise PresetError(
+            f"component {name!r} uses a multi-message `messages:` template, "
+            "which has no single-prompt form — not switchable; edit it by hand"
+        )
+    output_spec = cfg.get("output") if isinstance(cfg.get("output"), dict) else {}
+    if output_spec.get("json_merge"):
+        raise PresetError(
+            f"component {name!r} uses output.json_merge (dynamic output "
+            "fields) — not switchable; declare explicit outputs instead"
+        )
+    if output_spec.get("regex_fields"):
+        raise PresetError(
+            f"component {name!r} uses output.regex_fields (a hand-tuned "
+            "parser tied to its prompt) — not switchable; edit it by hand"
+        )
+    for field, spec in (cfg.get("output_files") or {}).items():
+        if "." in str(field):
+            raise PresetError(
+                f"component {name!r} has a nested output field "
+                f"({field!r}) — nested outputs are not switchable"
+            )
+        kind = str(spec.get("type") or "text") if isinstance(spec, dict) else "text"
+        if kind != "text":
+            raise PresetError(
+                f"component {name!r} collects output {field!r} as "
+                f"{kind!r} (a CLI-specific file mode) — not switchable"
+            )
+    for field in cfg.get("done_outputs") or {}:
+        if "." in str(field):
+            raise PresetError(
+                f"component {name!r} has a nested output field "
+                f"({field!r}) — nested outputs are not switchable"
+            )
+    schema = cfg.get("output_schema")
+    if isinstance(schema, dict):
+        for field in schema:
+            if "." in str(field):
+                raise PresetError(
+                    f"component {name!r} has a nested output field "
+                    f"({field!r}) — nested outputs are not switchable"
+                )
+    non_text = sorted(
+        field
+        for field, type_spec in _absorbed_output_contract(cfg).items()
+        if not _is_text_type(type_spec)
+    )
+    if non_text:
+        raise PresetError(
+            f"component {name!r} produces non-text output(s) "
+            f"({', '.join(non_text)}) — executor switching supports text "
+            "outputs only. Change the output types, or edit the node by hand"
+        )
+    literals = _binding_literals(output_spec, _component_prompt_text(cfg))
+    if literals:
+        raise PresetError(
+            f"component {name!r}'s prompt hand-embeds its output format "
+            f"({', '.join(literals[:4])}) — not switchable; make the prompt "
+            "delivery-neutral (the framework generates format instructions) "
+            "or edit the node by hand"
+        )
+    if str(cfg.get("contract") or "") != "auto":
+        prompt_text = _component_prompt_text(cfg)
+        for spec in (cfg.get("output_files") or {}).values():
+            relpath = str(spec.get("path") or "") if isinstance(spec, dict) else str(spec)
+            if len(relpath) >= 4 and "." in relpath and re.search(
+                rf"\b{re.escape(relpath)}\b", prompt_text
+            ):
+                raise PresetError(
+                    f"component {name!r}'s prompt names its delivery file "
+                    f"({relpath}) — not switchable; use contract: auto or "
+                    "edit the node by hand"
+                )
+
+
+def _infer_executor(cfg: dict[str, Any], agent_cls: str) -> str:
+    if agent_cls == CONFIGURABLE_PROMPT_AGENT:
+        return "api"
+    if agent_cls == HUMAN_AGENT:
+        return "human"
+    if agent_cls == CONFIGURABLE_CLI_AGENT:
+        cmd = cfg.get("cmd") or []
+        first = str(cmd[0]) if cmd else ""
+        if "codex" in first or cfg.get("copy_codex_auth"):
+            return "codex_cli"
+        return "claude_cli"
+    return ""
+
+
+def _regenerated_api_spec(contract: dict[str, Any]) -> dict[str, Any] | None:
+    """Fresh API parse bindings for an all-text contract.
+
+    Safe to regenerate (rather than persist) precisely because switchable
+    components have delivery-neutral prompts: the runtime format instructions
+    and the parser both derive from this spec, so the tag names only have to
+    be self-consistent, not match any wording in the prompt. All fields are
+    text (guaranteed by _switchable_or_refuse), so bindings are plain tags.
+    """
+    scalars = list(contract)
+    if not scalars:
+        return None
+    if len(scalars) == 1:
+        return {"default_field": scalars[0]}
+    return {"xml_tags": scalars, "default_field": scalars[0]}
 
 
 def _component_prompt_text(cfg: dict[str, Any]) -> str:
@@ -4696,66 +4729,17 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
             f"{', '.join(custom)} — custom nodes are immutable; executor "
             "switching applies only to configurable components"
         )
-    output_spec = cfg.get("output") if isinstance(cfg.get("output"), dict) else {}
-    if executor != "api" and output_spec:
-        # older editor versions baked generated format text into the prompt;
-        # that is mechanics, not authorship — remove before judging the prompt
-        _strip_legacy_format_block(cfg)
-        # json_merge spreads a parsed dict into outputs: the field set is not
-        # statically known, so no other executor can honor the contract.
-        if output_spec.get("json_merge"):
-            raise PresetError(
-                f"component {name!r} uses output.json_merge, whose output "
-                "fields are not statically known — it cannot be converted; "
-                "declare explicit output fields first"
-            )
-        literals = _binding_literals(output_spec, _component_prompt_text(cfg))
-        if literals:
-            raise PresetError(
-                f"component {name!r}'s prompt hand-embeds its API delivery "
-                f"format ({', '.join(literals[:4])}) — a conversion would "
-                "leave the prompt requesting a format the new executor does "
-                "not parse. Make the prompt delivery-neutral (the framework "
-                "generates format instructions) or edit the node manually"
-            )
-    # The symmetric lint for CLI-authored components: with `contract: auto`
-    # the file/finish instructions are generated, but a hand-written CLI
-    # prompt that names its delivery files would carry that file-talk into an
-    # executor that has no files.
-    if executor in ("api", "human") and str(cfg.get("contract") or "") != "auto":
-        prompt_text = _component_prompt_text(cfg)
-        raw_files = cfg.get("output_files")
-        file_literals = sorted(
-            {
-                relpath
-                for spec in (raw_files.values() if isinstance(raw_files, dict) else ())
-                for relpath in [
-                    str(spec.get("path") or "") if isinstance(spec, dict) else str(spec)
-                ]
-                if len(relpath) >= 4 and "." in relpath and relpath in prompt_text
-            }
-        )
-        if file_literals:
-            raise PresetError(
-                f"component {name!r}'s prompt hand-embeds its CLI delivery "
-                f"files ({', '.join(file_literals[:4])}) — the {executor} "
-                "executor has no files to write. Make the prompt "
-                "delivery-neutral (use contract: auto) or edit the node "
-                "manually"
-            )
-    if executor == "human":
-        structured = sorted(
-            field
-            for field, type_spec in _absorbed_output_contract(cfg).items()
-            if not _is_string_type(type_spec)
-        )
-        if structured:
-            raise PresetError(
-                f"component {name!r} declares non-text output(s) "
-                f"({', '.join(structured)}) — the human web form only "
-                "collects text fields; change the output types or keep a "
-                "model executor"
-            )
+
+    # Selecting the executor already in use is a no-op: mutating anyway would
+    # replace the model / reasoning settings with scaffold defaults.
+    if referencing and executor == _infer_executor(cfg, str(referencing[0].get("agent"))):
+        return
+
+    # older editor versions baked generated format text into the prompt; that
+    # is generated mechanics, not authorship — strip it before judging the
+    # prompt for switchability.
+    _strip_legacy_format_block(cfg)
+    _switchable_or_refuse(cfg, name)
 
     # Normalize the prompt text across executor conventions: API components use
     # system_prompt/user_prompt, CLI and human components use prompt.
@@ -4768,10 +4752,8 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
             user = str(cfg.pop("user_prompt") or "")
             cfg["prompt"] = f"{system}\n\n{user}" if system else user
 
-    # Absorb the outgoing executor's declarations into the canonical typed
-    # contract BEFORE popping owned keys: the API `output` spec seeds the
-    # schema for spec-only components (Basic I/O, the ideator), and types
-    # like xml_lists' list-ness live nowhere else on first swap.
+    # The contract is the business outputs — all plain text (guaranteed by
+    # _switchable_or_refuse). Every delivery projection is regenerated from it.
     contract = _absorbed_output_contract(cfg)
 
     for key in _EXECUTOR_OWNED_KEYS:
@@ -4780,54 +4762,37 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
     cfg.update(_executor_scaffold(executor, raw))
 
     # The canonical schema is exactly the business contract; executor
-    # mechanics (workspace/status) are added or stripped per executor below,
-    # never carried across as if they were the component's outputs.
-    if contract or isinstance(cfg.get("output_schema"), dict):
-        cfg["output_schema"] = dict(contract)
+    # mechanics (workspace/status) are added or stripped per executor below.
+    cfg["output_schema"] = {field: "string" for field in contract}
 
     if executor == "api":
         input_schema = cfg.get("input_schema")
         if isinstance(input_schema, dict):
             input_schema.pop("workspace", None)
-        # the persisted spec is task identity: reconcile it (prune fields that
-        # left the contract, generate bindings for new ones) — never rebuild,
-        # or tag names/regexes drift from what the prompt requests
-        output = _reconcile_api_spec(cfg.get("output"), contract)
+        output = _regenerated_api_spec(contract)
         if output is not None:
             cfg["output"] = output
-        else:
-            cfg.pop("output", None)
     elif executor in ("claude_cli", "codex_cli"):
         # The CLI executor reports its sandbox as a workspace output (and can
         # accept one as input) and signals completion via done.json status.
         input_schema = cfg.get("input_schema")
         if isinstance(input_schema, dict):
             input_schema.setdefault("workspace", "string")
-        out_schema = cfg.setdefault("output_schema", {})
-        out_schema.setdefault("workspace", "string")
-        out_schema.setdefault("status", "string")
-        # Regenerate the CLI projections from the contract: every business
-        # output comes from a file — any non-text type as parsed JSON so the
-        # runtime value keeps its type (lists, objects, integers, booleans) —
-        # and status from done.json. Stale entries from before a rename
-        # cannot survive because nothing old is merged in. (The dormant API
-        # `output` spec stays untouched for the trip back.)
+        out_schema = cfg["output_schema"]
+        out_schema["workspace"] = "string"
+        out_schema["status"] = "string"
+        # every business output comes from a plain text file; status from
+        # done.json. Regenerated fresh, so a renamed field leaves nothing stale.
         cfg["output_files"] = {
-            field: (
-                _default_output_filename(field)
-                if _is_string_type(type_spec)
-                else {"path": f"{field}.json", "type": "json"}
-            )
-            for field, type_spec in contract.items()
+            field: _default_output_filename(field) for field in contract
         }
         cfg["done_outputs"] = {"status": "status"}
     elif executor == "human":
-        # workspace/status are CLI mechanics; a human answers through the web
-        # form, whose fields come from output_schema — the contract alone.
-        for schema_key in ("input_schema", "output_schema"):
-            schema = cfg.get(schema_key)
-            if isinstance(schema, dict):
-                schema.pop("workspace", None)
+        # a human answers through the web form, whose fields come from
+        # output_schema — the contract alone; no CLI mechanics.
+        input_schema = cfg.get("input_schema")
+        if isinstance(input_schema, dict):
+            input_schema.pop("workspace", None)
 
     for node in _iter_agent_nodes((raw.get("dag") or {}).get("nodes")):
         if str(node.get("name") or "") == name:
@@ -6334,6 +6299,23 @@ def _parse_schema_fields(raw: str) -> dict[str, str]:
     return fields
 
 
+def _coerce_schema_fields(value: Any) -> dict[str, Any]:
+    """Parse a schema from the editor, which sends either text or an object.
+
+    The visual editor posts output_schema as a JSON object ({field: type});
+    the textarea path posts newline text. Coercing a dict with str() produced
+    a single ``_field_`` whose value was the stringified dict — silent
+    corruption that still validated.
+    """
+    if isinstance(value, dict):
+        return {
+            _clean_id(str(k)): (v if v not in (None, "") else "string")
+            for k, v in value.items()
+            if _clean_id(str(k))
+        }
+    return _parse_schema_fields(str(value or ""))
+
+
 def _parse_tools_config(raw: Any) -> list[dict[str, Any]]:
     if raw is None:
         return []
@@ -6374,14 +6356,24 @@ def _parse_tool_refs(raw: Any) -> list[str]:
 _LEGACY_FORMAT_HEADER = "Output each named result using exactly these tags:"
 
 
+# A genuine appended block is the header followed only by generated tag lines
+# (blank or `<tag>...</tag>`) to the end of the prompt. Anything else after
+# the header is authored prose and must NOT be truncated.
+_LEGACY_TAG_LINE = re.compile(r"^\s*(<\w+>\.\.\.</\w+>)?\s*$")
+
+
 def _strip_legacy_format_block(cfg: dict[str, Any]) -> None:
     for key in ("user_prompt", "prompt"):
         text = cfg.get(key)
         if not isinstance(text, str):
             continue
         idx = text.find(_LEGACY_FORMAT_HEADER)
-        if idx >= 0:
-            cfg[key] = text[:idx].rstrip() + "\n" if text[:idx].strip() else ""
+        if idx < 0:
+            continue
+        after = text[idx + len(_LEGACY_FORMAT_HEADER):]
+        if not all(_LEGACY_TAG_LINE.match(line) for line in after.splitlines()):
+            continue  # authored text follows the header — not a generated block
+        cfg[key] = text[:idx].rstrip() + "\n" if text[:idx].strip() else ""
 
 
 def _rename_node_refs(raw: Any, old_id: str, new_id: str) -> None:

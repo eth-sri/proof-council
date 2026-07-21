@@ -80,7 +80,9 @@ dag:
         solution: $node.draft.solution
         verdict: ''
       condition:
-        python: iteration == 0 or inputs.get("verdict") != "correct"
+        # the verifier's verdict is a full response whose first line is the
+        # ruling, so test a prefix, not exact equality
+        python: iteration == 0 or not inputs.get("verdict", "").strip().lower().startswith("correct")
       body:
         nodes:
           - id: verify
@@ -98,7 +100,7 @@ dag:
             when:
               inputs:
                 verdict: $node.verify.verdict
-              python: inputs.get("verdict") != "correct"
+              python: not inputs.get("verdict", "").strip().lower().startswith("correct")
             inputs:
               solution: $state.solution
               verdict: $node.verify.verdict

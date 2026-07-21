@@ -980,6 +980,23 @@ _DISPUTE_MACRO = (
 _DISPUTE_COMMENT_RE = re.compile(r"^\s*%+\s*>{2,3}\s*DISPUTE:\s*(.*)$", re.MULTILINE)
 
 
+_LATEX_SPECIALS = {
+    "\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
+    "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}", "~": r"\textasciitilde{}",
+    "^": r"\textasciicircum{}",
+}
+
+
+def _latex_escape_text(text: str) -> str:
+    """Escape LaTeX specials in plain text pulled from a dispute comment.
+
+    A comment like ``% >>> DISPUTE: confidence is only 50%`` would otherwise
+    inject a raw ``%`` that comments out the macro's closing brace and breaks
+    compilation.
+    """
+    return "".join(_LATEX_SPECIALS.get(ch, ch) for ch in text)
+
+
 def _surface_dispute_markers(text: str) -> str:
     """Turn comment-style dispute markers into visible \\dispute boxes.
 
@@ -988,7 +1005,9 @@ def _surface_dispute_markers(text: str) -> str:
     in a compiled PDF — the opposite of their purpose. Rewrite them and make
     sure the macro exists.
     """
-    replaced = _DISPUTE_COMMENT_RE.sub(lambda m: r"\dispute{" + m.group(1).strip() + "}", text)
+    replaced = _DISPUTE_COMMENT_RE.sub(
+        lambda m: r"\dispute{" + _latex_escape_text(m.group(1).strip()) + "}", text
+    )
     already_defined = re.search(
         r"\\(?:providecommand|newcommand|renewcommand|def)\s*\{?\\dispute", replaced
     )
