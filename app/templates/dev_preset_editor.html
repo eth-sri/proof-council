@@ -140,7 +140,7 @@
         let exportedPresets = {{ exported_presets | tojson }};
         let toolDefinitions = {{ tool_definitions | tojson }};
         const fieldHelp = {
-            executor: "Who runs this component: an API model, a subscription CLI (Claude or Codex), or a human. Switching keeps the prompt and inputs/outputs and swaps the executor settings (command, model, sandbox) to defaults.",
+            executor: "Run this CLI component on the Claude or the Codex subscription. Switching keeps the prompt and the entire output configuration and swaps only the command/auth/usage settings.",
             model: "Model config used for this component's API call.",
             cliModel: "Model for this node. 'Default' inherits the workflow model; pick a specific model to override just this node.",
             cliReasoningEffort: "Reasoning effort for this node: --effort for Claude, model_reasoning_effort for Codex. 'default' uses the CLI's own default.",
@@ -4863,10 +4863,11 @@
             return '';
         }
 
-        // Executor picker: the same component (prompt + inputs/outputs) can be
-        // run by an API model, a subscription CLI (Claude or Codex), or a human.
-        // Switching posts a set_executor mutation that swaps the executor-owned
-        // config (cmd/env/usage/sandbox/model/...) while keeping the task keys.
+        // Executor picker: a CLI component can run on the Claude or the Codex
+        // subscription. Switching posts a set_executor mutation that swaps the
+        // command/auth/usage scaffold while keeping the prompt and the entire
+        // output configuration. Only Claude <-> Codex is offered — general
+        // API/human translation was descoped (see feat/executor-switching).
         const executorLabels = {
             api: 'API model',
             claude_cli: 'Claude CLI (subscription)',
@@ -4888,13 +4889,15 @@
         function executorSection(node) {
             const current = executorOf(node);
             const name = node?.component_key || node?.name || '';
-            if (!current || !name) return '';
-            const opts = Object.entries(executorLabels).map(([value, label]) => `
-                <option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>
+            // Only CLI nodes are switchable (Claude <-> Codex); API/human nodes
+            // show nothing, since their switches are disabled.
+            if (!name || (current !== 'claude_cli' && current !== 'codex_cli')) return '';
+            const opts = ['claude_cli', 'codex_cli'].map((value) => `
+                <option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(executorLabels[value])}</option>
             `).join('');
             return `
                 <div class="inspector-grid">
-                    <label>${fieldLabel('Executor', fieldHelp.executor)}
+                    <label>${fieldLabel('CLI subscription', fieldHelp.executor)}
                         <select onchange="onExecutorChange('${escapeAttr(name)}', this.value, '${escapeAttr(current)}', this)">${opts}</select>
                     </label>
                 </div>

@@ -4598,6 +4598,30 @@ def _full_output_contract(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 _SWAPPABLE_AGENTS = {CONFIGURABLE_PROMPT_AGENT, CONFIGURABLE_CLI_AGENT, HUMAN_AGENT}
+_CLI_EXECUTORS = {"claude_cli", "codex_cli"}
+# Executor-owned config that differs between the two CLI flavors. The output
+# configuration is deliberately NOT here (both CLIs read outputs identically),
+# and `usage` is handled separately so its billing intent carries across.
+_CLI_SWAP_KEYS = (
+    "cmd", "env", "sandbox", "codex_sandbox", "copy_codex_auth",
+    "model", "model_reasoning_effort", "soft_timeout_s", "contract",
+)
+
+
+def _cli_usage_for(existing: Any, executor: str) -> dict[str, Any]:
+    """Carry token metering across a CLI swap, flipping only the parser type.
+
+    Preserves a subscription (bill: false) vs billed (cost_config) intent; a
+    node metered on the Claude subscription stays metered, not billed, on Codex.
+    """
+    usage = dict(existing) if isinstance(existing, dict) else {}
+    if executor == "codex_cli":
+        usage["type"] = "codex_jsonl"
+        if "cost_config" not in usage:
+            usage.setdefault("bill", False)
+    else:
+        usage["type"] = "claude_json"
+    return usage
 
 
 def _binding_literals(output: Any, prompt_text: str) -> list[str]:
@@ -4827,65 +4851,34 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
     if current == {executor}:
         return
 
-    _switchable_or_refuse(cfg, name)
+    # Only Claude<->Codex CLI switching is currently enabled. Both run the same
+    # ConfigurableCLIAgent and read outputs identically (files + done.json), so
+    # the swap only exchanges the command / auth / usage scaffold and touches
+    # none of the output-contract translation that made API/human switching a
+    # combinatorial correctness hazard (that path is disabled pending rework;
+    # the full implementation lives on the feat/executor-switching branch).
+    if executor not in _CLI_EXECUTORS or not current <= _CLI_EXECUTORS:
+        raise PresetError(
+            f"switching {name!r} to {executor!r} is disabled — only Claude "
+            "<-> Codex CLI switching is currently supported. Edit the node "
+            "by hand for other executor changes."
+        )
 
-    # Normalize the prompt text across executor conventions: API components use
-    # system_prompt/user_prompt, CLI and human components use prompt.
-    if executor == "api":
-        if cfg.get("prompt") and not cfg.get("user_prompt"):
-            cfg["user_prompt"] = str(cfg.pop("prompt"))
-    else:
-        if not cfg.get("prompt") and (cfg.get("user_prompt") or cfg.get("system_prompt")):
-            system = str(cfg.pop("system_prompt", "") or "").strip()
-            # a component with only a system prompt relies on the class default
-            # user prompt ("{problem}"); preserve that or the task is lost
-            user = str(cfg.pop("user_prompt", "") or "").strip() or "{problem}"
-            cfg["prompt"] = f"{system}\n\n{user}" if system else user
-
-    # The contract is the business outputs — all plain text (guaranteed by
-    # _switchable_or_refuse). Every delivery projection is regenerated from it.
-    contract = _absorbed_output_contract(cfg)
-
-    for key in _EXECUTOR_OWNED_KEYS:
+    # CLI -> CLI: preserve prompt, schemas, and the entire output configuration
+    # (both executors deliver outputs the same way); replace only the
+    # command/auth scaffold, and carry token metering across. Leave
+    # output/output_files/done_outputs and input_files untouched.
+    usage = _cli_usage_for(cfg.get("usage"), executor)
+    for key in _CLI_SWAP_KEYS:
         cfg.pop(key, None)
-
-    cfg.update(_executor_scaffold(executor, raw))
-
-    # The canonical schema is exactly the business contract, preserving each
-    # field's text type (a string enum keeps its choices); executor mechanics
-    # (workspace/status) are added or stripped per executor below.
-    cfg["output_schema"] = {field: (type_spec or "string") for field, type_spec in contract.items()}
-
-    if executor == "api":
-        input_schema = cfg.get("input_schema")
-        if isinstance(input_schema, dict):
-            input_schema.pop("workspace", None)
-        output = _regenerated_api_spec(contract)
-        if output is not None:
-            cfg["output"] = output
-    elif executor in ("claude_cli", "codex_cli"):
-        # The CLI executor reports its sandbox as a workspace output (and can
-        # accept one as input) and signals completion via done.json status.
-        input_schema = cfg.get("input_schema")
-        if isinstance(input_schema, dict):
-            input_schema.setdefault("workspace", "string")
-        out_schema = cfg["output_schema"]
-        out_schema["workspace"] = "string"
-        out_schema["status"] = "string"
-        # every business output comes from a distinct plain text file; status
-        # from done.json. Regenerated fresh, so a rename leaves nothing stale.
-        cfg["output_files"] = _unique_output_files(contract)
-        cfg["done_outputs"] = {"status": "status"}
-    elif executor == "human":
-        # a human answers through the web form, whose fields come from
-        # output_schema — the contract alone; no CLI mechanics.
-        input_schema = cfg.get("input_schema")
-        if isinstance(input_schema, dict):
-            input_schema.pop("workspace", None)
+    scaffold = _executor_scaffold(executor, raw)
+    scaffold.pop("usage", None)  # metering intent carried by _cli_usage_for
+    cfg.update(scaffold)
+    cfg["usage"] = usage
 
     for node in _iter_agent_nodes((raw.get("dag") or {}).get("nodes")):
         if str(node.get("name") or "") == name:
-            node["agent"] = agent_cls
+            node["agent"] = agent_cls  # both CLI executors use the same class
 
 
 def _op_update_node_inputs(raw: dict[str, Any], operation: dict[str, Any]) -> None:
