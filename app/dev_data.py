@@ -4200,32 +4200,54 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
 
 
 def _regenerate_projections_from_schema(cfg: dict[str, Any]) -> None:
-    """After an output_schema edit, rebuild the executor's delivery projection.
+    """After an output_schema edit, reconcile the executor's delivery config.
 
-    The schema is canonical. Whichever projection the component has (the API
-    parse spec, or CLI output_files) is regenerated from the schema's business
-    fields, in order: a removed field disappears from every projection, a
-    renamed one cannot resurrect, and — the point missed before — a newly
-    ADDED field gets its binding/file, instead of validating with no way to
-    produce it.
+    The schema is canonical for WHICH fields exist; the delivery config is
+    merged, not rebuilt: entries for removed fields are pruned, custom file
+    paths/specs for surviving fields are preserved untouched, and a newly
+    added field gets a default binding/file only if nothing (neither an
+    existing file nor a done_outputs mapping) already produces it —
+    regenerating wholesale clobbered hand-tuned specs and shadowed done
+    values with empty files.
     """
     schema = cfg.get("output_schema")
     schema = schema if isinstance(schema, dict) else {}
     business = [f for f in schema if f not in _OUTPUT_MECHANICS_FIELDS]
     if "output" in cfg:
-        # switchable components are delivery-neutral, so fresh tags stay
+        # API components are delivery-neutral, so fresh tags stay
         # self-consistent with the runtime instructions
         spec = _regenerated_api_spec({f: "string" for f in business})
         if spec is not None:
             cfg["output"] = spec
         else:
             cfg.pop("output", None)
-    if isinstance(cfg.get("output_files"), dict):
-        cfg["output_files"] = _unique_output_files(business)
     done = cfg.get("done_outputs")
     if isinstance(done, dict):
         allowed = set(schema) | _OUTPUT_MECHANICS_FIELDS
-        cfg["done_outputs"] = {k: v for k, v in done.items() if str(k) in allowed}
+        done = {k: v for k, v in done.items() if str(k) in allowed}
+        cfg["done_outputs"] = done
+    files = cfg.get("output_files")
+    if isinstance(files, dict):
+        kept = {k: v for k, v in files.items() if str(k).split(".", 1)[0] in schema}
+        covered = {str(k).split(".", 1)[0] for k in kept}
+        covered |= set(done or {}) if isinstance(done, dict) else set()
+        used_names = {
+            str(v.get("path") or "") if isinstance(v, dict) else str(v)
+            for v in kept.values()
+        }
+        for field in business:
+            if field in covered:
+                continue
+            name = _default_output_filename(field)
+            if name in used_names:
+                stem, _, ext = name.rpartition(".")
+                n = 2
+                while f"{stem}_{n}.{ext}" in used_names:
+                    n += 1
+                name = f"{stem}_{n}.{ext}"
+            kept[field] = name
+            used_names.add(name)
+        cfg["output_files"] = kept
 
 
 def _sync_output_schema_with_api_spec(cfg: dict[str, Any], *, force: bool = False) -> None:
@@ -4621,6 +4643,10 @@ def _cli_usage_for(existing: Any, executor: str) -> dict[str, Any]:
             usage.setdefault("bill", False)
     else:
         usage["type"] = "claude_json"
+        # codex-only metering metadata is inert for the claude parser but
+        # would silently reactivate on a later swap back — drop it
+        for codex_key in ("cost_config", "model", "bill"):
+            usage.pop(codex_key, None)
     return usage
 
 
