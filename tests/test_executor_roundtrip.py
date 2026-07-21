@@ -316,6 +316,22 @@ class RefusalTests(unittest.TestCase):
         self._refuse(cfg, "codex_cli", "api", "write")
 
 
+class OutputRenameTests(unittest.TestCase):
+    def test_rename_updates_map_chain_step_refs(self):
+        raw = {
+            "components": {"cfg": {"user_prompt": "x", "output_schema": {"old": "string"},
+                                   "output": {"default_field": "old"}}},
+            "dag": {"nodes": [
+                {"id": "fan", "kind": "map_chain", "foreach": "$input.items",
+                 "steps": [{"id": "s1", "agent": CONFIGURABLE_PROMPT_AGENT, "name": "cfg", "inputs": {}}]},
+                {"id": "join", "kind": "join_or_agent", "source": "$node.fan.finals",
+                 "inputs": {"value": "$step.s1.old"}}]}}
+        res = mutate_preset_yaml(_dump(raw),
+            {"op": "update_component", "name": "cfg", "fields": {"__rename_output_refs": {"old": "new"}}})
+        joined = yaml.safe_load(res["raw_yaml"])["dag"]["nodes"][1]["inputs"]["value"]
+        self.assertEqual(joined, "$step.s1.new")
+
+
 class RefusalFalsePositiveTests(unittest.TestCase):
     """A refusal that blocks a legitimate switch is a real defect."""
 

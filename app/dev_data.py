@@ -6499,6 +6499,12 @@ def _component_node_ids(raw: dict[str, Any], component_name: str) -> list[str]:
             node_id = str(node.get("id") or "")
             if node_id and str(node.get("name") or "") == component_name:
                 node_ids.append(node_id)
+            # map_chain steps invoke a component too, referenced as $step.<id>
+            for step in node.get("steps") or ():
+                if isinstance(step, dict):
+                    step_id = str(step.get("id") or "")
+                    if step_id and str(step.get("name") or "") == component_name:
+                        node_ids.append(step_id)
             body = node.get("body")
             if isinstance(body, dict):
                 visit(body.get("nodes"))
@@ -6509,7 +6515,7 @@ def _component_node_ids(raw: dict[str, Any], component_name: str) -> list[str]:
 
 def _rename_node_output_ref(raw: Any, node_id: str, old_field: str, new_field: str) -> None:
     pattern = re.compile(
-        rf"(\$(?:parent\.)?node\.{re.escape(node_id)}\.)"
+        rf"(\$(?:parent\.)?(?:node|step)\.{re.escape(node_id)}\.)"
         rf"{re.escape(old_field)}(?=\.|$|[^A-Za-z0-9_-])"
     )
 
