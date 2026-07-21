@@ -272,6 +272,49 @@ class RefusalTests(unittest.TestCase):
                "output": {"xml_tags": ["item"], "default_field": "item"}}
         self._refuse(cfg, "api", "codex_cli", "hand-embeds")
 
+    def test_structured_output_masked_by_text_schema_refused(self):
+        # schema says text, but the spec ALSO declares a list — must not slip
+        cfg = {"model": "m", "user_prompt": "x", "output_schema": {"answer": "string"},
+               "output": {"xml_lists": {"items": "item"}, "default_field": "answer"}}
+        self._refuse(cfg, "api", "codex_cli", "non-text")
+
+    def test_cli_constant_outputs_refused(self):
+        cfg = {"prompt": "x", "cmd": ["codex", "exec"], "contract": "auto",
+               "output_schema": {"answer": "string"}, "output_files": {"answer": "a.txt"},
+               "constant_outputs": {"approved": False}}
+        self._refuse(cfg, "codex_cli", "api", "constant_outputs")
+
+    def test_dotted_field_in_api_spec_refused(self):
+        cfg = {"model": "m", "user_prompt": "x", "output": {"default_field": "review.summary"}}
+        self._refuse(cfg, "api", "codex_cli", "nested")
+
+    def test_falsy_type_specs_refused(self):
+        for bad in ({}, None, False, []):
+            cfg = {"model": "m", "user_prompt": "x", "output_schema": {"f": bad},
+                   "output": {"default_field": "f"}}
+            with self.assertRaises(PresetError):
+                _swap(_raw_for(cfg, "api"), "codex_cli")
+
+    def test_enum_with_array_type_refused(self):
+        cfg = {"model": "m", "user_prompt": "x",
+               "output_schema": {"v": {"type": "array", "enum": ["a", "b"]}},
+               "output": {"default_field": "v"}}
+        self._refuse(cfg, "api", "codex_cli", "non-text")
+
+    def test_mixed_executor_nodes_refused(self):
+        raw = {"components": {"cfg": {"user_prompt": "x", "output": {"default_field": "a"}}},
+               "dag": {"nodes": [
+                   {"id": "p", "kind": "agent", "agent": CONFIGURABLE_PROMPT_AGENT, "name": "cfg"},
+                   {"id": "c", "kind": "agent", "agent": CONFIGURABLE_CLI_AGENT, "name": "cfg"}]}}
+        with self.assertRaisesRegex(PresetError, "different executors"):
+            _op_set_executor(raw, {"name": "cfg", "executor": "api"})
+
+    def test_contract_auto_prompt_writing_a_file_refused(self):
+        cfg = {"prompt": "Write the final answer to notes.md.", "cmd": ["codex", "exec"],
+               "contract": "auto", "output_schema": {"notes": "string"},
+               "output_files": {"notes": "notes.md"}}
+        self._refuse(cfg, "codex_cli", "api", "write")
+
 
 class RefusalFalsePositiveTests(unittest.TestCase):
     """A refusal that blocks a legitimate switch is a real defect."""
@@ -299,6 +342,81 @@ class RefusalFalsePositiveTests(unittest.TestCase):
         raw = _raw_for(cfg, "api")
         _swap(raw, "codex_cli")
         self.assertIn("prove T", raw["components"]["cfg"]["prompt"])
+
+    def test_text_file_collector_kind_allowed(self):
+        # `type: string` (and other non-special kinds) read a text file — allowed
+        cfg = {"prompt": "x", "cmd": ["codex", "exec"], "contract": "auto",
+               "output_schema": {"answer": "string"},
+               "output_files": {"answer": {"path": "answer.txt", "type": "string"}}}
+        _swap(_raw_for(cfg, "codex_cli"), "api")  # must not raise
+
+    def test_enum_choices_preserved_across_swap(self):
+        cfg = {"model": "m", "user_prompt": "x",
+               "output_schema": {"verdict": {"enum": ["yes", "no"]}}, "output": {"default_field": "verdict"}}
+        raw = _raw_for(cfg, "api")
+        _swap(raw, "codex_cli")
+        self.assertEqual(raw["components"]["cfg"]["output_schema"]["verdict"], {"enum": ["yes", "no"]})
+
+    def test_generated_cli_filenames_are_distinct(self):
+        cfg = {"model": "m", "user_prompt": "x",
+               "output_schema": {"notes": "string", "notes_txt": "string"},
+               "output": {"xml_tags": ["notes", "notes_txt"], "default_field": "notes"}}
+        raw = _raw_for(cfg, "api")
+        _swap(raw, "codex_cli")
+        files = raw["components"]["cfg"]["output_files"]
+        self.assertEqual(len(set(files.values())), len(files), files)
+
+    def test_string_form_codex_cmd_is_a_noop(self):
+        cfg = {"model": "gpt-5.6-sol", "model_reasoning_effort": "high", "prompt": "x",
+               "cmd": "codex exec --json", "copy_codex_auth": True, "contract": "auto",
+               "output_schema": {"answer": "string"}, "output_files": {"answer": "answer.txt"},
+               "done_outputs": {"status": "status"}}
+        raw = _raw_for(cfg, "codex_cli")
+        _swap(raw, "codex_cli")
+        self.assertEqual(raw["components"]["cfg"]["model"], "gpt-5.6-sol")
+        self.assertEqual(raw["components"]["cfg"]["model_reasoning_effort"], "high")
+
+    def test_reserved_output_name_refused(self):
+        for bad in ("status", "raw_text", "workspace"):
+            cfg = {"model": "m", "user_prompt": "x", "output": {"default_field": bad}}
+            with self.assertRaisesRegex(PresetError, "reserved"):
+                _swap(_raw_for(cfg, "api"), "codex_cli")
+
+    def test_component_without_any_prompt_refused(self):
+        cfg = {"model": "m", "output": {"default_field": "a"}}
+        with self.assertRaisesRegex(PresetError, "no authored prompt"):
+            _swap(_raw_for(cfg, "api"), "codex_cli")
+
+    def test_system_prompt_only_keeps_the_task_on_swap(self):
+        cfg = {"model": "m", "system_prompt": "Solve rigorously.", "output": {"default_field": "answer"}}
+        raw = _raw_for(cfg, "api")
+        _swap(raw, "codex_cli")
+        prompt = raw["components"]["cfg"]["prompt"]
+        self.assertIn("Solve rigorously.", prompt)
+        self.assertIn("{problem}", prompt)
+
+    def test_adding_a_cli_output_creates_its_file(self):
+        cfg = {"prompt": "x", "cmd": ["codex", "exec"], "contract": "auto",
+               "output_schema": {"workspace": "string", "status": "string", "answer": "string"},
+               "output_files": {"answer": "answer.txt"}, "done_outputs": {"status": "status"}}
+        res = mutate_preset_yaml(_dump(_raw_for(cfg, "codex_cli")), {"op": "update_component", "name": "cfg",
+            "fields": {"output_schema": "workspace: string\nstatus: string\nanswer: string\nnotes: string"}})
+        c = yaml.safe_load(res["raw_yaml"])["components"]["cfg"]
+        self.assertIn("notes", c["output_files"])
+
+    def test_schema_edit_binding_order_is_deterministic(self):
+        cfg = {"model": "m", "user_prompt": "x", "output_schema": {"notes": "string"},
+               "output": {"default_field": "notes"}}
+        res = mutate_preset_yaml(_dump(_raw_for(cfg, "api")), {"op": "update_component", "name": "cfg",
+            "fields": {"output_schema": "notes: string\nscore: string"}})
+        c = yaml.safe_load(res["raw_yaml"])["components"]["cfg"]
+        self.assertEqual(c["output"]["xml_tags"], ["notes", "score"])
+
+    def test_filename_as_example_under_contract_auto_allowed(self):
+        cfg = {"prompt": "For instance notes.md would be a sensible name.",
+               "cmd": ["codex", "exec"], "contract": "auto",
+               "output_schema": {"notes": "string"}, "output_files": {"notes": "notes.md"}}
+        _swap(_raw_for(cfg, "codex_cli"), "api")  # must not raise
 
 
 class RuntimeInstructionTests(unittest.TestCase):
