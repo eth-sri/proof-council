@@ -38,17 +38,20 @@ class ConfigurablePromptAgent(APICallAgent):
     def render_messages(self, inp: BaseModel):
         fields = inp.model_dump(mode="json")
         messages_cfg = self.component_config.get("messages")
+        messages = None
         if isinstance(messages_cfg, list):
-            messages = []
+            rendered = []
             for msg in messages_cfg:
                 if not isinstance(msg, dict):
                     continue
                 role = str(msg.get("role", "user"))
                 content = str(msg.get("content", "")).format(**fields)
-                messages.append({"role": role, "content": content})
-            if messages:
-                return messages
-        return super().render_messages(inp)
+                rendered.append({"role": role, "content": content})
+            if rendered:
+                messages = rendered
+        if messages is None:
+            messages = super().render_messages(inp)
+        return _with_format_instruction(messages, self.component_config.get("output"))
 
     def extra_client_kwargs(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -183,6 +186,69 @@ def _parse_json_tag(raw_text: str, tag: str, *, default: Any = None) -> Any:
         return json.loads(body)
     except json.JSONDecodeError:
         return default
+
+
+def _with_format_instruction(
+    messages: list[dict[str, Any]], output_cfg: Any
+) -> list[dict[str, Any]]:
+    """Append generated delivery-format instructions to the final user message.
+
+    The API-side analog of the CLI ``contract: auto`` tail: component prompts
+    stay delivery-neutral (describing only the task) and each executor
+    generates its own delivery instructions at runtime. Bindings the prompt
+    already mentions are skipped, so hand-written format prompts keep working
+    unchanged.
+    """
+    instruction = _format_instruction(
+        output_cfg, "\n".join(str(m.get("content") or "") for m in messages)
+    )
+    if not instruction:
+        return messages
+    out = [dict(m) for m in messages]
+    if out and out[-1].get("role") == "user":
+        out[-1]["content"] = f"{str(out[-1]['content']).rstrip()}\n{instruction}"
+    else:
+        out.append({"role": "user", "content": instruction.lstrip("\n")})
+    return out
+
+
+def _format_instruction(output_cfg: Any, existing_text: str) -> str:
+    if not isinstance(output_cfg, dict):
+        return ""
+    lines: list[str] = []
+
+    def mentioned(tag: str) -> bool:
+        return f"<{tag}" in existing_text
+
+    for tag in output_cfg.get("xml_tags") or []:
+        tag = str(tag).strip()
+        if tag and not mentioned(tag):
+            lines.append(f"- Wrap that output in <{tag}>...</{tag}>.")
+    xml_lists = output_cfg.get("xml_lists") or {}
+    if isinstance(xml_lists, dict):
+        for field, tag in xml_lists.items():
+            tag = str(tag).strip()
+            if tag and not mentioned(tag):
+                lines.append(
+                    f"- Output every item of {str(field).replace('_', ' ')} in its own "
+                    f"<{tag}>...</{tag}> tag (repeat the tag per item)."
+                )
+    json_tag = output_cfg.get("json_tag")
+    if isinstance(json_tag, str) and json_tag.strip() and not mentioned(json_tag.strip()):
+        lines.append(f"- Output the result as valid JSON inside <{json_tag.strip()}>...</{json_tag.strip()}>.")
+    json_tags = output_cfg.get("json_tags") or {}
+    if isinstance(json_tags, dict):
+        for field, tag in json_tags.items():
+            tag = str(tag).strip()
+            if tag and not mentioned(tag):
+                lines.append(
+                    f"- Output {str(field).replace('_', ' ')} as valid JSON inside <{tag}>...</{tag}>."
+                )
+    # regex_fields are hand-authored bindings whose prompts already explain the
+    # expected format; default_field needs no instruction (whole response).
+    if not lines:
+        return ""
+    return "\n\nFORMAT YOUR ANSWER:\n" + "\n".join(lines)
 
 
 __all__ = ["ConfigurablePromptAgent"]

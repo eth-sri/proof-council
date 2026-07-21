@@ -1760,7 +1760,17 @@ class SetExecutorCoverageTests(unittest.TestCase):
                     "input_schema": {"question": "string"},
                 }
             },
-            "dag": {"nodes": []},
+            "dag": {
+                "nodes": [
+                    {
+                        "id": "basic",
+                        "kind": "agent",
+                        "agent": "proofstack.agents.configurable_prompt.ConfigurablePromptAgent",
+                        "name": "cfg_basic",
+                        "inputs": {},
+                    }
+                ]
+            },
         }
         cfg = raw["components"]["cfg_basic"]
         _op_set_executor(raw, {"executor": "codex_cli", "name": "cfg_basic"})
@@ -1793,7 +1803,17 @@ class SetExecutorCoverageTests(unittest.TestCase):
                     "done_outputs": {"verdict": "summary", "status": "status"},
                 }
             },
-            "dag": {"nodes": []},
+            "dag": {
+                "nodes": [
+                    {
+                        "id": "mixed",
+                        "kind": "agent",
+                        "agent": "proofstack.agents.configurable_cli.ConfigurableCLIAgent",
+                        "name": "cfg_mixed",
+                        "inputs": {},
+                    }
+                ]
+            },
         }
         cfg = raw["components"]["cfg_mixed"]
         _op_set_executor(raw, {"executor": "api", "name": "cfg_mixed"})
