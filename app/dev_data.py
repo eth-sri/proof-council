@@ -4718,6 +4718,31 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
                 "not parse. Make the prompt delivery-neutral (the framework "
                 "generates format instructions) or edit the node manually"
             )
+    # The symmetric lint for CLI-authored components: with `contract: auto`
+    # the file/finish instructions are generated, but a hand-written CLI
+    # prompt that names its delivery files would carry that file-talk into an
+    # executor that has no files.
+    if executor in ("api", "human") and str(cfg.get("contract") or "") != "auto":
+        prompt_text = _component_prompt_text(cfg)
+        raw_files = cfg.get("output_files")
+        file_literals = sorted(
+            {
+                relpath
+                for spec in (raw_files.values() if isinstance(raw_files, dict) else ())
+                for relpath in [
+                    str(spec.get("path") or "") if isinstance(spec, dict) else str(spec)
+                ]
+                if len(relpath) >= 4 and "." in relpath and relpath in prompt_text
+            }
+        )
+        if file_literals:
+            raise PresetError(
+                f"component {name!r}'s prompt hand-embeds its CLI delivery "
+                f"files ({', '.join(file_literals[:4])}) — the {executor} "
+                "executor has no files to write. Make the prompt "
+                "delivery-neutral (use contract: auto) or edit the node "
+                "manually"
+            )
     if executor == "human":
         structured = sorted(
             field

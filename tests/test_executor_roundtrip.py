@@ -346,6 +346,23 @@ class ExecutorRefusalTests(unittest.TestCase):
         with self.assertRaisesRegex(PresetError, "delivery"):
             _swap(raw, "codex_cli")
 
+    def test_cli_prompt_naming_its_files_refuses_conversion_to_api(self) -> None:
+        home, cfg = SHAPES["cli_mixed"]
+        entangled = copy.deepcopy(cfg)
+        entangled["prompt"] = "Review the proof and write your findings to notes.md."
+        raw = _raw_for(entangled, home)
+        with self.assertRaisesRegex(PresetError, "notes.md"):
+            _swap(raw, "api")
+
+    def test_contract_auto_cli_prompt_is_not_flagged(self) -> None:
+        # with contract: auto the delivery instructions are generated, so the
+        # stored prompt is delivery-neutral by construction
+        home, cfg = SHAPES["cli_mixed"]
+        auto = copy.deepcopy(cfg)
+        auto["contract"] = "auto"
+        raw = _raw_for(auto, home)
+        _swap(raw, "api")  # must not raise
+
     def test_json_merge_refuses_conversion(self) -> None:
         home, cfg = SHAPES["json_tag_singular"]
         merged = copy.deepcopy(cfg)
