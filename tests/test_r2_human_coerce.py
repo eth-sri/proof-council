@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from app.dev import create_app  # noqa: E402
-from app.dev_data import coerce_human_response_value  # noqa: E402
+from app.dev_data import coerce_human_response_value, human_response_type_error  # noqa: E402
 from proofstack.agents.human_agent import HumanAgent  # noqa: E402
 from proofstack.context import RunContext  # noqa: E402
 
@@ -130,6 +130,72 @@ class HumanPostCoercionTests(unittest.TestCase):
                 )
             written = json.loads(response.read_text(encoding="utf-8"))
             self.assertIs(written["approved"], False)
+
+
+class TypeErrorTests(unittest.TestCase):
+    """B5: the validator flags a coerced value that doesn't match its type."""
+
+    def test_matches_pass(self) -> None:
+        self.assertIsNone(human_response_type_error([1], "array"))
+        self.assertIsNone(human_response_type_error({"k": 1}, "object"))
+        self.assertIsNone(human_response_type_error(True, "bool"))
+        self.assertIsNone(human_response_type_error(3, "integer"))
+        self.assertIsNone(human_response_type_error(0.5, "number"))
+        self.assertIsNone(human_response_type_error("anything", "string"))
+
+    def test_mismatches_flagged(self) -> None:
+        # a malformed structured value stays a raw string -> flagged
+        self.assertIsNotNone(human_response_type_error('["x"]', "object"))
+        self.assertIsNotNone(human_response_type_error("nope", "array"))
+        self.assertIsNotNone(human_response_type_error("maybe", "bool"))
+        self.assertIsNotNone(human_response_type_error("1.5", "integer"))
+        # a bool must not satisfy a numeric field
+        self.assertIsNotNone(human_response_type_error(True, "integer"))
+
+
+class HumanPostRejectionTests(unittest.TestCase):
+    """B5 end-to-end: a malformed structured answer is rejected, task pending."""
+
+    def _setup(self, td: str, schema: dict):
+        root = Path(td)
+        run_dir = root / "run"
+        inbox = run_dir / "human_inbox"
+        inbox.mkdir(parents=True)
+        ctx = RunContext.create(
+            run_id="run", root_workdir=root, flat=True,
+            component_configs={"human": {"output_schema": schema}},
+        )
+        declared = HumanAgent(ctx, name="human")._output_fields()
+        task_path = run_dir / "task.json"
+        task_path.write_text(json.dumps({"output_fields": declared}), encoding="utf-8")
+        response = inbox / "task.response.json"
+        (run_dir / "run-metadata.json").write_text(json.dumps({"status": "running"}), encoding="utf-8")
+        (run_dir / "events.jsonl").write_text(
+            json.dumps({"kind": "human.waiting", "payload": {
+                "task_path": str(task_path), "response_path": str(response)}}) + "\n",
+            encoding="utf-8",
+        )
+        return root, response
+
+    def test_valid_object_is_stored_as_dict(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root, response = self._setup(td, {"data": "object"})
+            app = create_app(runs_roots=(root,))
+            with app.test_client() as client:
+                r = client.post("/run/run/human", data={
+                    "response_filename": "task.response.json", "f_data": '{"k": 1}'})
+            self.assertEqual(r.status_code, 302)
+            self.assertEqual(json.loads(response.read_text())["data"], {"k": 1})
+
+    def test_malformed_object_is_rejected_and_task_stays_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root, response = self._setup(td, {"data": "object"})
+            app = create_app(runs_roots=(root,))
+            with app.test_client() as client:
+                r = client.post("/run/run/human", data={
+                    "response_filename": "task.response.json", "f_data": '["not", "an", "object"]'})
+            self.assertEqual(r.status_code, 400)
+            self.assertFalse(response.exists())  # nothing written -> still pending
 
 
 if __name__ == "__main__":

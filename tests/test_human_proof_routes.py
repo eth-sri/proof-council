@@ -96,12 +96,12 @@ class HumanSubmitCoercionTests(unittest.TestCase):
         )
         return inbox / "t.response.json"
 
-    def test_declared_types_are_parsed_bad_json_left_verbatim(self) -> None:
+    def test_declared_types_are_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             response_file = self._setup(
                 root,
-                {"items": "array", "meta": "object", "note": "string", "bad": "array"},
+                {"items": "array", "meta": "object", "note": "string"},
             )
             app = create_app(runs_roots=(root,))
             with app.test_client() as client:
@@ -112,7 +112,6 @@ class HumanSubmitCoercionTests(unittest.TestCase):
                         "f_items": "[1, 2, 3]",
                         "f_meta": '{"a": 1}',
                         "f_note": "just text",
-                        "f_bad": "not json",
                     },
                 )
             self.assertEqual(resp.status_code, 302)
@@ -120,8 +119,22 @@ class HumanSubmitCoercionTests(unittest.TestCase):
             self.assertEqual(written["items"], [1, 2, 3])
             self.assertEqual(written["meta"], {"a": 1})
             self.assertEqual(written["note"], "just text")
-            # declared array but not valid JSON -> untouched for validation to flag
-            self.assertEqual(written["bad"], "not json")
+
+    def test_malformed_structured_field_is_rejected(self) -> None:
+        # a declared array that isn't valid JSON is rejected (B5): the Outputs
+        # model would silently accept a raw string, so the route refuses it and
+        # leaves the task pending rather than writing a malformed response.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            response_file = self._setup(root, {"bad": "array"})
+            app = create_app(runs_roots=(root,))
+            with app.test_client() as client:
+                resp = client.post(
+                    "/run/cr/human",
+                    data={"response_filename": "t.response.json", "f_bad": "not json"},
+                )
+            self.assertEqual(resp.status_code, 400)
+            self.assertFalse(response_file.exists())
 
 
 if __name__ == "__main__":

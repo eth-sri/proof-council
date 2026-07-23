@@ -909,6 +909,31 @@ def coerce_human_response_value(raw: str, declared_type: Any) -> Any:
     return parsed
 
 
+def human_response_type_error(value: Any, declared_type: Any) -> str | None:
+    """Message if a coerced value doesn't match a structured/numeric declared
+    type, else None. Strings, ``json`` and unknown types always pass.
+
+    ``coerce_human_response_value`` leaves a malformed structured value as its
+    raw string; without this check the human node's permissive (extra-allow)
+    Outputs model accepts it and a downstream node reads a str where it expects
+    a list/dict/number (B5). The caller rejects on a non-None message so the
+    human task stays pending for a corrected answer.
+    """
+    t = str(declared_type or "string").strip().lower()
+    if t in {"array"}:
+        return None if isinstance(value, list) else "must be a JSON array"
+    if t in {"object"}:
+        return None if isinstance(value, dict) else "must be a JSON object"
+    if t in {"bool", "boolean"}:
+        return None if isinstance(value, bool) else "must be true or false"
+    if t in {"int", "integer"}:
+        return None if (isinstance(value, int) and not isinstance(value, bool)) else "must be an integer"
+    if t in {"number", "float"}:
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return None if ok else "must be a number"
+    return None
+
+
 def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
     """Human-in-the-loop tasks awaiting a response in this run.
 

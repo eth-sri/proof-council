@@ -62,6 +62,7 @@ from app.dev_data import (
     load_event_tree,
     load_monitor_summaries,
     coerce_human_response_value,
+    human_response_type_error,
     load_pending_human_tasks,
     load_execution_graph,
     mutate_preset_yaml,
@@ -829,6 +830,13 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             if key.startswith("f_"):
                 field = key[2:]
                 values[field] = coerce_human_response_value(value, declared.get(field))
+        # Reject a malformed structured/numeric answer rather than writing a raw
+        # string the permissive Outputs model would silently accept (B5); the
+        # task stays pending so the human can correct it.
+        for field, val in values.items():
+            err = human_response_type_error(val, declared.get(field))
+            if err:
+                abort(400, description=f"field {field!r} {err}")
         values.setdefault("status", "done")
         inbox.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
