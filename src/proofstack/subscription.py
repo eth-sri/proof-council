@@ -105,12 +105,28 @@ def _provider_calibration(settings: dict[str, Any], provider: str) -> dict[str, 
     if not isinstance(calibration, dict):
         return {}
     scoped = calibration.get(provider)
-    if isinstance(scoped, dict):
-        return scoped
+    scoped = scoped if isinstance(scoped, dict) else None
     # pre-namespacing files stored claude windows at the top level
-    if provider == "claude" and any(k in WINDOWS for k in calibration):
-        return calibration
-    return {}
+    legacy = (
+        {k: v for k, v in calibration.items() if k in WINDOWS and isinstance(v, dict)}
+        if provider == "claude"
+        else {}
+    )
+    if not legacy:
+        return scoped or {}
+    # merge the legacy top-level entries BENEATH the scoped ones (scoped fields
+    # win per window) so creating the provider namespace — e.g. persisting a
+    # single probe reset — doesn't shadow a legacy ceiling or active block (F2)
+    merged: dict[str, Any] = {k: dict(v) for k, v in legacy.items()}
+    for window, val in (scoped or {}).items():
+        if isinstance(val, dict):
+            base = merged.get(window)
+            base = dict(base) if isinstance(base, dict) else {}
+            base.update(val)
+            merged[window] = base
+        else:
+            merged[window] = val
+    return merged
 
 PROBE_TIMEOUT_S = 60.0
 # claude usage-API keys -> our window ids (null-valued keys are skipped)
@@ -882,13 +898,20 @@ def detect_rate_limit(text: str, *, now: float | None = None) -> RateLimitHit | 
         # the window label often sits just outside the matched span (e.g.
         # "Weekly usage limit reached|<epoch>" — the first pattern captures
         # from "usage" on, dropping the "Weekly" prefix), so read the label
-        # off the surrounding text, not only m.group(0) (B3). An explicit
-        # label wins over the reset-delta guess, which can misread a soon
-        # weekly reset as five_hour.
+        # off the surrounding text, not only m.group(0) (B3). A label INSIDE
+        # the matched signal is authoritative; only an unlabeled match consults
+        # the surrounding excerpt, so unrelated "weekly" prose near a
+        # "5-hour limit reached" can't flip it (F3). An explicit label wins
+        # over the reset-delta guess, which can misread a soon weekly reset.
         start = max(0, m.start() - 40)
         excerpt = text[start : m.end() + 40]
+        matched = m.group(0).lower()
         context = excerpt.lower()
-        if "weekly" in context:
+        if "weekly" in matched:
+            window_guess = "weekly"
+        elif "5-hour" in matched or "5 hour" in matched:
+            window_guess = "five_hour"
+        elif "weekly" in context:
             window_guess = "weekly"
         elif "5-hour" in context or "5 hour" in context:
             window_guess = "five_hour"
@@ -1048,21 +1071,8 @@ class SubscriptionPacer:
             probe = provider_probes.get(window)
             probe = probe if isinstance(probe, dict) else None
 
-            # The provider window is a discrete block, not a rolling one. A probe
-            # reset time bounds that block: entries before it belong to a prior,
-            # already-reset block. That boundary must survive past its own reset
-            # (a stale probe) so pre-reset usage can't resurrect (B3) — even
-            # though the probe's *utilization* goes stale once the block rolls.
-            # The DURABLE block boundary (written by record_probe/record_rate_limit
-            # from any explicit reset, and never erased by a reset-less
-            # observation) bounds the discrete block: entries before it belong to
-            # a prior, already-reset block. It is kept separate from the probe
-            # *sample* so a reset-less probe can't drop the boundary (A2), and a
-            # stale boundary can't discard a fresh probe (B2).
-            cal_reset = cal.get("reset_at")
-            block_boundary = float(cal_reset) if cal_reset else None
             # probe *utilization* freshness keys off the PROBE's OWN reset and
-            # timestamp only — never the boundary above.
+            # timestamp only — never the block boundary below.
             probe_resets_at = None
             if probe is not None:
                 pr = probe.get("resets_at")
@@ -1078,6 +1088,19 @@ class SubscriptionPacer:
             )
             probe_stale = probe_expired or no_reset_stale
             active_probe = None if probe_stale else probe
+
+            # The provider window is a discrete block, not a rolling one. The
+            # DURABLE block boundary (written by record_probe/record_rate_limit
+            # from any explicit reset, never erased by a reset-less observation)
+            # bounds it: ledger entries before it belong to a prior, already-reset
+            # block. It is kept separate from the probe *sample* so a reset-less
+            # probe can't drop the boundary (A2) and a stale boundary can't
+            # discard a fresh probe (B2). Pre-delta stores persisted the reset
+            # only in probes.json, so fall back to the probe's own reset when no
+            # durable boundary exists yet (F1 upgrade bridge) — a boundary source,
+            # independent of the sample's staleness above.
+            cal_reset = cal.get("reset_at")
+            block_boundary = float(cal_reset) if cal_reset else probe_resets_at
             if block_boundary is None:
                 block_start = None
             elif block_boundary > now:
