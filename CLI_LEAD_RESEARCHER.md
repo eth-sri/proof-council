@@ -213,15 +213,65 @@ headers are updated with anything new the round taught you.
 
 ---
 
+## Claude subagents: the third leg
+
+The two frontier models in this workflow have partially complementary
+strengths: the browser consultant is a thorough worker — long
+calculations, exhaustive case analysis, meticulous refereeing — while
+Claude (this session and its subagents) tends to be stronger at
+ideation, research taste, and synthesis. **Do not delegate all thinking
+to the browser rounds.** Subagents are dollar-free, human-latency-free,
+parallel, and tool-using; use them deliberately:
+
+- **Ideation councils before each packet wave.** Spawn 3–5 parallel
+  subagents with deliberately distinct lenses ("attack via coupling",
+  "attack via a Lyapunov/drift argument", "hunt for the obstruction",
+  "construct the counterexample"). Curate the best routes into the
+  packets' *planted ideas*. The full pipeline is:
+  *subagents ideate → packet plants → consultant grinds → machine
+  checks arbitrate → lead verifies and integrates.*
+- **Packet red-teaming.** Before dispatching a hard packet, one
+  subagent pass: what is underspecified, what will a stateless reader
+  misread, is the planted idea the strongest available? Round yield is
+  the scarcest commodity (each round costs human minutes); this is
+  cheap insurance on it.
+- **Derivation subagents.** Well-scoped creative derivations (exact
+  special cases, identity families) run well as subagents with the
+  standing requirement that every result comes back machine-validated.
+- **Adversarial audits and synthesis passes.** Refute-first audit
+  subagents on anything imported or self-derived; and after several
+  rounds return, a synthesis subagent hunting for cross-round
+  connections and consistency checks the lead might miss.
+- **Literature.** Retrieval and full-text digestion, returning
+  distilled claim-level summaries (this also protects the lead
+  session's context).
+
+**Cross-family triangulation.** Same-family review shares blind spots.
+For load-bearing results, order the verification stack: machine checks
+(model-agnostic ground truth) > cross-family review (consultant
+refereeing Claude's proofs, or Claude refereeing the consultant's) >
+same-family subagent audit — and use all three. This is an epistemic
+argument for the two-model workflow independent of its economics.
+
+Keep in the lead session (do not delegate): global research state,
+routing, budget, final verification sign-off, and the deliverable's
+voice. Note subagents consume subscription capacity — heavy fan-out is
+cheap but not unlimited.
+
 ## Tool routing and cost policy
 
-| Task | Route | Cost |
+Three currencies: dollars (API), human minutes (browser rounds,
+relays), subscription capacity (this session, subagents, codex). The
+table says which each task spends.
+
+| Task | Route | Currency |
 |---|---|---|
-| Planning, proofs, integration, verification, writing | this session (+ subagents for parallel derivations/audits) | subscription |
+| Planning, proofs, integration, verification sign-off, writing | this session | subscription |
+| Ideation councils, packet red-team, derivations, audits, synthesis, literature | Fable subagents (parallel) | subscription |
 | Mechanical numerics, solvers, plotting infrastructure | codex CLI (if available) or this session | subscription |
-| Deep single-shot reasoning / proof attempts | **browser packet (default)** | free |
+| Deep single-shot grinding: long calculations, case analysis, meticulous referee passes, proof pushes on a set target ladder | **browser packet (default)** | human minutes |
 | Analysis needing a code-interpreter tool loop | API reasoning call via `mathagents.api_client.APIClient` | $ |
-| Prescreen / formal referee pass | API call (`scripts/prescreen_problem.py` or one-off) | $ |
+| Prescreen / formal cross-family referee pass | API call (`scripts/prescreen_problem.py` or one-off) | $ |
 
 Known failure modes to design around:
 - **Long API reasoning calls may be killed server-side at ~60 minutes**
@@ -300,3 +350,7 @@ second opinion at round zero.
     off at all times.
 12. The human's minutes are the scarcest resource: make every harness
     request self-contained, batched, and worth it.
+13. Route by task shape, not model reputation: subagents ideate and
+    audit, the consultant grinds and referees, machine checks
+    arbitrate — and every load-bearing result gets cross-family
+    triangulation.
