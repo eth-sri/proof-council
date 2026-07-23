@@ -190,51 +190,6 @@ class RefusalTests(unittest.TestCase):
         self.assertEqual(raw["dag"]["nodes"][0]["agent"], CONFIGURABLE_CLI_AGENT)
 
 
-class SchemaEditProjectionTests(unittest.TestCase):
-    """Ordinary output_schema edits must MERGE the delivery config: preserve
-    custom file specs, honor done_outputs coverage, prune removed fields, and
-    only add defaults for genuinely new, uncovered fields."""
-
-    def _cfg(self):
-        return {
-            "cmd": ["claude", "-p"], "contract": "auto",
-            "prompt": "Review.",
-            "input_schema": {"solution": "string", "workspace": "string"},
-            "output_schema": {"workspace": "string", "status": "string",
-                              "summary": "string", "answer_tex": "string", "notes": "string"},
-            "output_files": {
-                "answer_tex": {"path": "deliverables/final-answer.tex", "type": "text", "default": "NO ANSWER"},
-                "notes": {"path": "scratch/reviewer-notes.md", "type": "text", "default": "NO NOTES"},
-            },
-            "done_outputs": {"status": "status", "summary": "summary"},
-        }
-
-    def test_adding_a_field_preserves_custom_specs_and_done_coverage(self):
-        raw = _raw_for(self._cfg())
-        res = mutate_preset_yaml(_dump(raw), {"op": "update_component", "name": "cfg",
-            "fields": {"output_schema":
-                "workspace: string\nstatus: string\nsummary: string\n"
-                "answer_tex: string\nnotes: string\ncritique: string"}})
-        files = yaml.safe_load(res["raw_yaml"])["components"]["cfg"]["output_files"]
-        # custom dict specs untouched
-        self.assertEqual(files["answer_tex"]["path"], "deliverables/final-answer.tex")
-        self.assertEqual(files["notes"]["default"], "NO NOTES")
-        # done-supplied summary must NOT get a shadowing file
-        self.assertNotIn("summary", files)
-        # only the genuinely new field gets a default file
-        self.assertEqual(files["critique"], "critique.txt")
-
-    def test_removing_a_field_prunes_only_that_field(self):
-        raw = _raw_for(self._cfg())
-        res = mutate_preset_yaml(_dump(raw), {"op": "update_component", "name": "cfg",
-            "fields": {"output_schema":
-                "workspace: string\nstatus: string\nsummary: string\nanswer_tex: string"}})
-        cfg = yaml.safe_load(res["raw_yaml"])["components"]["cfg"]
-        self.assertNotIn("notes", cfg["output_files"])
-        self.assertEqual(cfg["output_files"]["answer_tex"]["path"], "deliverables/final-answer.tex")
-        self.assertEqual(cfg["done_outputs"], {"status": "status", "summary": "summary"})
-
-
 class UsageCarryTests(unittest.TestCase):
     def test_codex_metadata_dropped_on_swap_to_claude(self):
         cfg = _claude_cli_cfg()

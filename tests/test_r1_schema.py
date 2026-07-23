@@ -16,23 +16,23 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from app.dev_data import (  # noqa: E402
+    _rename_component_output_refs,
     mutate_preset_yaml,
     validate_preset_yaml,
 )
-from proofstack.agents.configurable_prompt import ConfigurablePromptAgent  # noqa: E402
-
-
-def _mutate(raw_yaml: str, operation: dict[str, Any]) -> str:
-    result = mutate_preset_yaml(raw_yaml, operation)
-    assert result["ok"], result["errors"]
-    return result["raw_yaml"]
 
 
 def _component(raw_yaml: str, name: str) -> dict[str, Any]:
     return yaml.safe_load(raw_yaml)["components"][name]
 
 
-# --- P-A3: structured API output spec survives an output_schema edit ----------
+# The UI output_schema-editing feature (schema-only projection/reconciliation)
+# was dropped: no real editor affordance posts a bare output_schema, and the
+# projection helper was a recurring source of silent corruption. These tests pin
+# the replacement contract — a bare schema change is refused, the CLI file editor
+# (which bundles output_files) still works — plus the two residual fixes that
+# outlived the feature: B8 (output-path validation) and A5 (scoped rename).
+
 
 API_STRUCTURED_FIXTURE = textwrap.dedent(
     """
@@ -71,172 +71,22 @@ API_STRUCTURED_FIXTURE = textwrap.dedent(
 )
 
 
-class SchemaProjectionA3Tests(unittest.TestCase):
-    def _edit_dropping_note(self) -> dict[str, Any]:
-        # Re-edit the schema (dropping `note`), keeping the two structured fields.
-        raw = _mutate(
-            API_STRUCTURED_FIXTURE,
-            {
-                "op": "update_component",
-                "name": "judge",
-                "fields": {"output_schema": {"decision": "object", "items": "array"}},
-            },
-        )
-        self.assertEqual(validate_preset_yaml(raw)["errors"], [])
-        return _component(raw, "judge")
-
-    def test_structured_bindings_survive(self) -> None:
-        cfg = self._edit_dropping_note()
-        output = cfg["output"]
-        # The json/array parse bindings are preserved, not flattened to string tags.
-        self.assertEqual(output.get("json_tags"), {"decision": "decision"})
-        self.assertEqual(output.get("xml_lists"), {"items": "item"})
-        # decision/items must NOT appear as plain xml_tags (that was the bug).
-        self.assertNotIn("decision", output.get("xml_tags") or [])
-        self.assertNotIn("items", output.get("xml_tags") or [])
-
-    def test_removed_field_pruned_from_spec(self) -> None:
-        cfg = self._edit_dropping_note()
-        output = cfg["output"]
-        self.assertNotIn("note", output.get("xml_tags") or [])
-        self.assertNotEqual(output.get("default_field"), "note")
-        self.assertNotIn("note", cfg["output_schema"])
-
-    def test_runtime_parses_object_and_array(self) -> None:
-        cfg = self._edit_dropping_note()
-        agent = ConfigurablePromptAgent.__new__(ConfigurablePromptAgent)
-        agent.component_config = cfg
-        raw_resp = (
-            '<decision>{"verdict": "accept", "score": 9}</decision>\n'
-            "<item>a</item>\n<item>b</item>"
-        )
-        data = agent.parse_output(raw_resp, None).model_dump()
-        self.assertIsInstance(data.get("decision"), dict)
-        self.assertEqual(data["decision"], {"verdict": "accept", "score": 9})
-        self.assertIsInstance(data.get("items"), list)
-        self.assertEqual(data["items"], ["a", "b"])
-
-
-# --- P-B2: done-only CLI component gets a synthesized file for new fields ------
-
-CLI_DONE_ONLY_FIXTURE = textwrap.dedent(
+CLI_FIXTURE_TEMPLATE = textwrap.dedent(
     """
     workflow: proofstack.agents.dag_workflow.DAGWorkflow
     inputs:
       problem: ''
     components:
       solver:
-        contract: auto
         cmd: [claude, -p]
         prompt: solve {problem}
         input_schema:
           problem: string
-          workspace: string
         output_schema:
-          workspace: string
-          status: string
-        done_outputs:
-          status: status
-    dag:
-      nodes:
-        - id: solve
-          kind: agent
-          agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
-          name: solver
-          inputs:
-            problem: $input.problem
-      outputs:
-        status: $node.solve.status
-    """
-)
-
-API_NO_FILES_FIXTURE = textwrap.dedent(
-    """
-    workflow: proofstack.agents.dag_workflow.DAGWorkflow
-    inputs:
-      problem: ''
-    components:
-      judge:
-        model: models/openai/gpt-54
-        prompt: judge {problem}
-        output_schema:
-          verdict: string
-        output:
-          xml_tags: [verdict]
-          default_field: verdict
-    dag:
-      nodes:
-        - id: j
-          kind: agent
-          agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
-          name: judge
-          inputs:
-            problem: $input.problem
-      outputs:
-        verdict: $node.j.verdict
-    """
-)
-
-
-class SchemaProjectionB2Tests(unittest.TestCase):
-    def test_new_field_synthesizes_output_file(self) -> None:
-        raw = _mutate(
-            CLI_DONE_ONLY_FIXTURE,
-            {
-                "op": "update_component",
-                "name": "solver",
-                "fields": {
-                    "output_schema": {
-                        "workspace": "string",
-                        "status": "string",
-                        "answer_tex": "string",
-                    }
-                },
-            },
-        )
-        self.assertEqual(validate_preset_yaml(raw)["errors"], [])
-        cfg = _component(raw, "solver")
-        files = cfg.get("output_files")
-        self.assertIsInstance(files, dict)
-        # The genuinely-new field gets a delivery file so the model is told to write it.
-        self.assertIn("answer_tex", files)
-        # A done_outputs-supplied field is not shadowed by a synthetic empty file.
-        self.assertNotIn("status", files)
-
-    def test_api_component_never_grows_output_files(self) -> None:
-        raw = _mutate(
-            API_NO_FILES_FIXTURE,
-            {
-                "op": "update_component",
-                "name": "judge",
-                "fields": {"output_schema": {"verdict": "string", "reason": "string"}},
-            },
-        )
-        cfg = _component(raw, "judge")
-        self.assertNotIn("output_files", cfg)
-
-
-# --- P-B4: collision check normalizes paths (./notes.txt == notes.txt) --------
-
-CLI_CUSTOM_PATH_FIXTURE = textwrap.dedent(
-    """
-    workflow: proofstack.agents.dag_workflow.DAGWorkflow
-    inputs:
-      problem: ''
-    components:
-      solver:
-        contract: auto
-        cmd: [claude, -p]
-        prompt: solve {problem}
-        input_schema:
-          problem: string
-          workspace: string
-        output_schema:
-          workspace: string
           draft: string
         output_files:
           draft:
-            path: ./notes.txt
+            path: PATH_HERE
             type: text
     dag:
       nodes:
@@ -251,38 +101,159 @@ CLI_CUSTOM_PATH_FIXTURE = textwrap.dedent(
     """
 )
 
+CLI_FIXTURE = CLI_FIXTURE_TEMPLATE.replace("PATH_HERE", "notes.txt")
 
-class SchemaProjectionB4Tests(unittest.TestCase):
-    @staticmethod
-    def _norm(spec: Any) -> str:
-        raw = spec.get("path") if isinstance(spec, dict) else spec
-        return Path(str(raw)).as_posix()
 
-    def test_new_field_avoids_normalized_collision(self) -> None:
-        raw = _mutate(
-            CLI_CUSTOM_PATH_FIXTURE,
+class OutputSchemaEditRefusedTests(unittest.TestCase):
+    def test_bare_business_schema_change_is_refused(self) -> None:
+        result = mutate_preset_yaml(
+            API_STRUCTURED_FIXTURE,
             {
                 "op": "update_component",
-                "name": "solver",
+                "name": "judge",
+                "fields": {"output_schema": {"decision": "object", "items": "array"}},
+            },
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("not supported in the editor" in e for e in result["errors"]),
+            result["errors"],
+        )
+        # refusal is atomic: the document is left untouched
+        self.assertEqual(
+            _component(result["raw_yaml"], "judge")["output_schema"],
+            {"decision": "object", "items": "array", "note": "string"},
+        )
+
+    def test_unchanged_schema_is_allowed(self) -> None:
+        # re-submitting the same business schema is a no-op, not a refusal
+        result = mutate_preset_yaml(
+            API_STRUCTURED_FIXTURE,
+            {
+                "op": "update_component",
+                "name": "judge",
                 "fields": {
                     "output_schema": {
-                        "workspace": "string",
-                        "draft": "string",
-                        "notes": "string",
+                        "decision": "object",
+                        "items": "array",
+                        "note": "string",
                     }
                 },
             },
         )
-        self.assertEqual(validate_preset_yaml(raw)["errors"], [])
-        files = _component(raw, "solver")["output_files"]
-        # ./notes.txt and notes.txt are one physical file, so `notes` must dodge it.
-        self.assertEqual(self._norm(files["draft"]), "notes.txt")
-        self.assertEqual(self._norm(files["notes"]), "notes_2.txt")
-        physical = {self._norm(spec) for spec in files.values()}
-        self.assertEqual(len(physical), len(files))
+        self.assertTrue(result["ok"], result["errors"])
+
+    def test_cli_file_edit_bundling_output_files_is_allowed(self) -> None:
+        # the CLI file editor always posts output_files alongside output_schema;
+        # that legitimate flow must pass through, not hit the refusal.
+        result = mutate_preset_yaml(
+            CLI_FIXTURE,
+            {
+                "op": "update_component",
+                "name": "solver",
+                "fields": {
+                    "output_schema": {"draft": "string", "notes": "string"},
+                    "output_files": {
+                        "draft": {"path": "notes.txt", "type": "text"},
+                        "notes": "notes_2.txt",
+                    },
+                },
+            },
+        )
+        self.assertTrue(result["ok"], result["errors"])
+        cfg = _component(result["raw_yaml"], "solver")
+        self.assertIn("notes", cfg["output_files"])
+        self.assertIn("notes", cfg["output_schema"])
+
+
+class OutputPathValidationB8Tests(unittest.TestCase):
+    def test_absolute_and_escaping_paths_rejected(self) -> None:
+        for bad in ("/tmp/notes.txt", "../notes.txt", "../../etc/passwd"):
+            raw = CLI_FIXTURE_TEMPLATE.replace("PATH_HERE", bad)
+            report = validate_preset_yaml(raw)
+            self.assertFalse(report["ok"], bad)
+            self.assertTrue(
+                any("relative path inside the workspace" in e for e in report["errors"]),
+                (bad, report["errors"]),
+            )
+
+    def test_relative_path_has_no_path_error(self) -> None:
+        report = validate_preset_yaml(CLI_FIXTURE)
+        self.assertEqual(
+            [e for e in report["errors"] if "workspace" in e],
+            [],
+        )
+
+
+class ScopedRenameA5Tests(unittest.TestCase):
+    def test_rename_does_not_corrupt_sibling_repeat_scope(self) -> None:
+        # Two repeat bodies each own a node id `worker`; renaming component a's
+        # output must not touch component b's independent scope.
+        raw = {
+            "dag": {
+                "nodes": [
+                    {
+                        "id": "loopA",
+                        "body": {
+                            "nodes": [
+                                {"id": "worker", "name": "a"},
+                                {"id": "cA", "prompt": "$node.worker.old"},
+                            ]
+                        },
+                    },
+                    {
+                        "id": "loopB",
+                        "body": {
+                            "nodes": [
+                                {"id": "worker", "name": "b"},
+                                {"id": "cB", "prompt": "$node.worker.old"},
+                            ]
+                        },
+                    },
+                ]
+            }
+        }
+        _rename_component_output_refs(raw, "a", {"old": "new"})
+        self.assertEqual(
+            raw["dag"]["nodes"][0]["body"]["nodes"][1]["prompt"], "$node.worker.new"
+        )
+        self.assertEqual(
+            raw["dag"]["nodes"][1]["body"]["nodes"][1]["prompt"], "$node.worker.old"
+        )
+
+    def test_rename_updates_same_scope_outputs_and_parent_ref(self) -> None:
+        # The legit case still works: a top-level rename updates this scope's
+        # outputs AND the $parent.node form reaching down into a repeat body.
+        raw = {
+            "dag": {
+                "nodes": [
+                    {"id": "lit", "name": "a"},
+                    {
+                        "id": "loop",
+                        "body": {
+                            "nodes": [
+                                {
+                                    "id": "verify",
+                                    "name": "b",
+                                    "inputs": {"x": "$parent.node.lit.old"},
+                                }
+                            ]
+                        },
+                    },
+                ],
+                "outputs": {"final": "$node.lit.old"},
+            }
+        }
+        _rename_component_output_refs(raw, "a", {"old": "new"})
+        self.assertEqual(raw["dag"]["outputs"]["final"], "$node.lit.new")
+        self.assertEqual(
+            raw["dag"]["nodes"][1]["body"]["nodes"][0]["inputs"]["x"],
+            "$parent.node.lit.new",
+        )
 
 
 # --- P-B3: editor JS keeps type/default when a CLI output path is renamed -----
+# (The CLI file editor is retained; only the bare-schema projection was dropped.)
 
 EDITOR_HTML = ROOT / "app" / "templates" / "dev_preset_editor.html"
 

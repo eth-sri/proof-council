@@ -2672,9 +2672,37 @@ def _preset_validation_errors(raw: dict[str, Any]) -> list[str]:
             if not isinstance(name, str) or not isinstance(cfg, dict):
                 errors.append("each component config must map a string name to a mapping")
                 break
+        errors.extend(_output_path_errors(components))
 
     if workflow_cls is not None and not hasattr(workflow_cls, "Inputs"):
         errors.append(f"workflow {workflow_cls.__name__} does not declare Inputs")
+    return errors
+
+
+def _output_path_errors(components: dict[str, Any]) -> list[str]:
+    """Reject output_files paths the runtime collector would refuse.
+
+    ConfigurableCLIAgent (`_safe_relpath`) raises on an absolute or escaping
+    (``..``) workspace path at collect time; catch it here so a bad path fails
+    at edit/validate time instead of mid-run.
+    """
+    errors: list[str] = []
+    for name, cfg in components.items():
+        if not isinstance(cfg, dict):
+            continue
+        files = cfg.get("output_files")
+        if not isinstance(files, dict):
+            continue
+        for field, spec in files.items():
+            raw_path = spec.get("path") if isinstance(spec, dict) else spec
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            path = Path(raw_path)
+            if path.is_absolute() or any(part == ".." for part in path.parts):
+                errors.append(
+                    f"component {name!r} output_files[{field!r}] must be a relative "
+                    f"path inside the workspace: {raw_path!r}"
+                )
     return errors
 
 
@@ -4132,8 +4160,22 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         cfg["input_schema"] = _parse_schema_fields(str(fields["input_schema"] or ""))
         handled_fields.add("input_schema")
     if "output_schema" in fields:
-        cfg["output_schema"] = _coerce_schema_fields(fields["output_schema"])
-        _regenerate_projections_from_schema(cfg)
+        new_schema = _coerce_schema_fields(fields["output_schema"])
+        # No real editor affordance posts a bare output_schema: the CLI file
+        # editor always bundles an explicit output_files map, and the API output
+        # editor edits the parse spec directly. The projection helper that used to
+        # synthesize output/output_files from a schema-only edit was a recurring
+        # source of silent corruption, so refuse that path rather than guess.
+        if "output_files" not in fields and _output_schema_business_changed(cfg, new_schema):
+            raise PresetError(
+                f"component {name!r}: editing output_schema is not supported in "
+                "the editor — edit the node by hand"
+            )
+        cfg["output_schema"] = new_schema
+        done = cfg.get("done_outputs")
+        if isinstance(done, dict):
+            allowed = set(new_schema) | _OUTPUT_MECHANICS_FIELDS
+            cfg["done_outputs"] = {k: v for k, v in done.items() if str(k) in allowed}
         handled_fields.add("output_schema")
     if "tools" in fields:
         tools = _parse_tools_config(fields.get("tools"))
@@ -4199,66 +4241,21 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         cfg[str(key)] = value
 
 
-def _regenerate_projections_from_schema(cfg: dict[str, Any]) -> None:
-    """After an output_schema edit, reconcile the executor's delivery config.
+def _output_schema_business_changed(cfg: dict[str, Any], new_schema: dict[str, Any]) -> bool:
+    """True if the non-mechanics output fields (names or types) changed.
 
-    The schema is canonical for WHICH fields exist; the delivery config is
-    merged, not rebuilt: entries for removed fields are pruned, custom file
-    paths/specs for surviving fields are preserved untouched, and a newly
-    added field gets a default binding/file only if nothing (neither an
-    existing file nor a done_outputs mapping) already produces it —
-    regenerating wholesale clobbered hand-tuned specs and shadowed done
-    values with empty files.
+    Guards the editor's output_schema edit: a bare schema change (add/remove/
+    retype of a business field) that isn't paired with an explicit output_files
+    map has no sound projection and is refused, so the editor never silently
+    corrupts the delivery config.
     """
-    schema = cfg.get("output_schema")
-    schema = schema if isinstance(schema, dict) else {}
-    business = [f for f in schema if f not in _OUTPUT_MECHANICS_FIELDS]
-    if "output" in cfg:
-        contract = {f: schema[f] for f in business}
-        if business and not all(_is_text_type(t) for t in contract.values()):
-            # structured outputs: reconcile the existing parse spec so each
-            # surviving field keeps its binding (a json/array parse is never
-            # flattened to a plain string tag) and removed fields are pruned
-            spec = _reconciled_api_spec(cfg.get("output"), contract)
-        else:
-            # all-text (switchable): fresh tags stay self-consistent with the
-            # runtime instructions
-            spec = _regenerated_api_spec({f: "string" for f in business})
-        if spec is not None:
-            cfg["output"] = spec
-        else:
-            cfg.pop("output", None)
-    done = cfg.get("done_outputs")
-    if isinstance(done, dict):
-        allowed = set(schema) | _OUTPUT_MECHANICS_FIELDS
-        done = {k: v for k, v in done.items() if str(k) in allowed}
-        cfg["done_outputs"] = done
-    files = cfg.get("output_files")
-    # A CLI component with done_outputs but no output_files map still needs a
-    # delivery file synthesized for a genuinely-new field; only CLI components
-    # (they have a cmd, not an API `output` spec) ever grow an output_files map.
-    if isinstance(files, dict) or (cfg.get("cmd") is not None and "output" not in cfg):
-        files = files if isinstance(files, dict) else {}
-        kept = {k: v for k, v in files.items() if str(k).split(".", 1)[0] in schema}
-        covered = {str(k).split(".", 1)[0] for k in kept}
-        covered |= set(done or {}) if isinstance(done, dict) else set()
-        used_names = {
-            _norm_output_path(str(v.get("path") or "") if isinstance(v, dict) else str(v))
-            for v in kept.values()
-        }
-        for field in business:
-            if field in covered:
-                continue
-            name = _default_output_filename(field)
-            if _norm_output_path(name) in used_names:
-                stem, _, ext = name.rpartition(".")
-                n = 2
-                while _norm_output_path(f"{stem}_{n}.{ext}") in used_names:
-                    n += 1
-                name = f"{stem}_{n}.{ext}"
-            kept[field] = name
-            used_names.add(_norm_output_path(name))
-        cfg["output_files"] = kept
+    old_schema = cfg.get("output_schema")
+    old_schema = old_schema if isinstance(old_schema, dict) else {}
+
+    def business(schema: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in schema.items() if k not in _OUTPUT_MECHANICS_FIELDS}
+
+    return business(old_schema) != business(new_schema)
 
 
 def _sync_output_schema_with_api_spec(cfg: dict[str, Any], *, force: bool = False) -> None:
@@ -4322,22 +4319,6 @@ def _default_output_filename(field: str) -> str:
     if stem and suffix in _KNOWN_FILE_SUFFIXES:
         return f"{stem}.{suffix}"  # answer_tex -> answer.tex
     return f"{field}.txt"
-
-
-def _norm_output_path(raw: str) -> str:
-    """Normalize a workspace-relative output path the way the runtime does.
-
-    Mirrors configurable_cli._safe_relpath so the editor's collision check sees
-    what the collector will: ``./notes.txt`` and ``notes.txt`` are one file. An
-    absolute/escaping path is left as-is (it is rejected at validation).
-    """
-    try:
-        path = Path(raw)
-        if path.is_absolute() or any(part == ".." for part in path.parts):
-            return raw
-        return path.as_posix()
-    except (TypeError, ValueError):
-        return raw
 
 
 def _iter_agent_nodes(nodes: Any):
@@ -4835,88 +4816,6 @@ def _infer_executor(cfg: dict[str, Any], agent_cls: str) -> str:
         # the swap guard refuse rather than overwrite the user's command
         return ""
     return ""
-
-
-def _regenerated_api_spec(contract: dict[str, Any]) -> dict[str, Any] | None:
-    """Fresh API parse bindings for an all-text contract.
-
-    Safe to regenerate (rather than persist) precisely because switchable
-    components have delivery-neutral prompts: the runtime format instructions
-    and the parser both derive from this spec, so the tag names only have to
-    be self-consistent, not match any wording in the prompt. All fields are
-    text (guaranteed by _switchable_or_refuse), so bindings are plain tags.
-    """
-    scalars = list(contract)
-    if not scalars:
-        return None
-    if len(scalars) == 1:
-        return {"default_field": scalars[0]}
-    return {"xml_tags": scalars, "default_field": scalars[0]}
-
-
-def _reconciled_api_spec(
-    old: Any, contract: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Prune/extend an existing API parse spec to match an edited schema.
-
-    Used instead of a wholesale regenerate when the schema carries a non-text
-    field: surviving fields keep their current binding (a json/array parse is
-    not flattened to a string tag), fields dropped from the schema are pruned,
-    and a genuinely-new field gets a plain tag when text or a json_tag when
-    structured.
-    """
-    spec = copy.deepcopy(old) if isinstance(old, dict) else {}
-    survivors = set(contract)
-
-    for key in ("xml_lists", "json_tags", "regex_fields"):
-        m = spec.get(key)
-        if isinstance(m, dict):
-            m = {k: v for k, v in m.items() if str(k) in survivors}
-            if m:
-                spec[key] = m
-            else:
-                spec.pop(key, None)
-    tags = spec.get("xml_tags")
-    if isinstance(tags, list):
-        tags = [t for t in tags if str(t) in survivors]
-        if tags:
-            spec["xml_tags"] = tags
-        else:
-            spec.pop("xml_tags", None)
-    if isinstance(spec.get("json_tag"), str):
-        json_name = spec.get("json_field") or spec["json_tag"]
-    elif isinstance(spec.get("json_field"), str):
-        json_name = spec["json_field"]
-    else:
-        json_name = None
-    if json_name is not None and str(json_name) not in survivors:
-        spec.pop("json_tag", None)
-        spec.pop("json_field", None)
-    default = spec.get("default_field")
-    if isinstance(default, str) and default not in survivors:
-        spec.pop("default_field", None)
-
-    covered = set(_spec_output_contract(spec))
-    for field, type_spec in contract.items():
-        if field in covered:
-            continue
-        if _is_text_type(type_spec):
-            tags = spec.get("xml_tags")
-            tags = tags if isinstance(tags, list) else []
-            tags.append(field)
-            spec["xml_tags"] = tags
-        else:
-            jt = spec.get("json_tags")
-            jt = jt if isinstance(jt, dict) else {}
-            jt[field] = field
-            spec["json_tags"] = jt
-        covered.add(field)
-
-    if not covered:
-        return None
-    if not isinstance(spec.get("default_field"), str) or spec["default_field"] not in covered:
-        spec["default_field"] = next(f for f in contract if f in covered)
-    return spec
 
 
 def _component_prompt_text(cfg: dict[str, Any]) -> str:
@@ -6608,57 +6507,93 @@ def _rename_component_output_refs(raw: dict[str, Any], component_name: str, rena
     }
     if not clean_renames:
         return
-    for node_id in _component_node_ids(raw, component_name):
-        for old_field, new_field in clean_renames.items():
-            _rename_node_output_ref(raw, node_id, old_field, new_field)
+    _rename_output_refs_in_scope(_editable_dag(raw), component_name, clean_renames)
 
 
-def _component_node_ids(raw: dict[str, Any], component_name: str) -> list[str]:
-    node_ids: list[str] = []
+def _rename_output_refs_in_scope(
+    scope: dict[str, Any], component_name: str, renames: dict[str, str]
+) -> None:
+    """Rewrite a component's output-field refs one DAG scope at a time.
 
-    def visit(nodes: Any) -> None:
-        if not isinstance(nodes, list):
-            return
-        for node in nodes:
-            if not isinstance(node, dict):
-                continue
-            node_id = str(node.get("id") or "")
-            if node_id and str(node.get("name") or "") == component_name:
-                node_ids.append(node_id)
-            # map_chain steps invoke a component too, referenced as $step.<id>
-            for step in node.get("steps") or ():
-                if isinstance(step, dict):
-                    step_id = str(step.get("id") or "")
-                    if step_id and str(step.get("name") or "") == component_name:
-                        node_ids.append(step_id)
-            body = node.get("body")
-            if isinstance(body, dict):
-                visit(body.get("nodes"))
+    A ``$node.<id>.<field>`` ref is scope-local and a ``$parent.node.<id>.<field>``
+    ref reaches exactly one scope up, so each rename is applied per scope: the
+    local form here (this scope's nodes and outputs), and the parent form in the
+    direct child repeat bodies. Scoping this way stops a rename from corrupting a
+    sibling repeat body that happens to reuse the same node id.
+    """
+    nodes = scope.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    child_bodies = [
+        node["body"]
+        for node in nodes
+        if isinstance(node, dict) and isinstance(node.get("body"), dict)
+    ]
+    local_ids = [
+        str(node["id"])
+        for node in nodes
+        if isinstance(node, dict)
+        and node.get("id")
+        and str(node.get("name") or "") == component_name
+    ]
+    # map_chain steps invoke a component too, referenced as $step.<id>
+    step_ids = [
+        str(step["id"])
+        for node in nodes
+        if isinstance(node, dict)
+        for step in (node.get("steps") or ())
+        if isinstance(step, dict)
+        and step.get("id")
+        and str(step.get("name") or "") == component_name
+    ]
+    for old_field, new_field in renames.items():
+        for node_id in local_ids:
+            _sub_output_ref(
+                scope, _output_ref_pattern("node", node_id, old_field), new_field, child_bodies
+            )
+            for body in child_bodies:
+                grandchildren = [
+                    n["body"]
+                    for n in (body.get("nodes") or [])
+                    if isinstance(n, dict) and isinstance(n.get("body"), dict)
+                ]
+                _sub_output_ref(
+                    body,
+                    _output_ref_pattern("parent.node", node_id, old_field),
+                    new_field,
+                    grandchildren,
+                )
+        for step_id in step_ids:
+            _sub_output_ref(
+                scope, _output_ref_pattern("step", step_id, old_field), new_field, child_bodies
+            )
 
-    visit(_editable_dag(raw).get("nodes"))
-    return node_ids
+    for body in child_bodies:
+        _rename_output_refs_in_scope(body, component_name, renames)
 
 
-def _rename_node_output_ref(raw: Any, node_id: str, old_field: str, new_field: str) -> None:
-    pattern = re.compile(
-        rf"(\$(?:parent\.)?(?:node|step)\.{re.escape(node_id)}\.)"
+def _output_ref_pattern(kind: str, node_id: str, old_field: str) -> "re.Pattern[str]":
+    prefix = kind.replace(".", r"\.")
+    return re.compile(
+        rf"(\${prefix}\.{re.escape(node_id)}\.)"
         rf"{re.escape(old_field)}(?=\.|$|[^A-Za-z0-9_-])"
     )
 
-    def replace(value: Any) -> Any:
-        if isinstance(value, str):
-            return pattern.sub(rf"\g<1>{new_field}", value)
-        if isinstance(value, list):
-            for i, item in enumerate(value):
-                value[i] = replace(item)
-            return value
-        if isinstance(value, dict):
-            for key, item in list(value.items()):
-                value[key] = replace(item)
-            return value
-        return value
 
-    replace(raw)
+def _sub_output_ref(obj: Any, pattern: "re.Pattern[str]", new_field: str, skip: list[Any]) -> Any:
+    if any(obj is s for s in skip):
+        return obj
+    if isinstance(obj, str):
+        return pattern.sub(rf"\g<1>{new_field}", obj)
+    if isinstance(obj, list):
+        for i, item in enumerate(obj):
+            obj[i] = _sub_output_ref(item, pattern, new_field, skip)
+        return obj
+    if isinstance(obj, dict):
+        for key, item in list(obj.items()):
+            obj[key] = _sub_output_ref(item, pattern, new_field, skip)
+        return obj
+    return obj
 
 
 def _remove_component_if_unused(raw: dict[str, Any], name: str) -> None:
