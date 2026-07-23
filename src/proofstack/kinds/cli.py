@@ -160,6 +160,10 @@ class CLIAgent(Agent):
         # awaiting, the codex (or other CLI) child keeps running until
         # its own timeout or until the container exits.
         stream = None
+        # Set once the normal record_cli_usage below has been reached, so the
+        # finally knows whether it still owes a partial-usage metering (see the
+        # cancellation note in the finally block).
+        usage_recorded = False
         # Sandbox creation happens INSIDE the try: if it raises, the finally
         # must still release the pacing claim or it holds phantom headroom
         # for every other run until its TTL expires.
@@ -249,6 +253,9 @@ class CLIAgent(Agent):
                 wrap_up_path=wrap_up_path,
                 soft_timeout_s=soft_timeout_s,
             )
+            # Taking responsibility for metering here; the finally's fallback
+            # only fires when we never reached this point (cancel/error earlier).
+            usage_recorded = True
             try:
                 await self.record_cli_usage(stream.stdout, stream.stderr, done)
             except Exception as e:
@@ -274,22 +281,39 @@ class CLIAgent(Agent):
                 )
             return out
         finally:
-            if pacing_claim is not None:
-                pacer, claim_id = pacing_claim
-                try:
-                    await asyncio.shield(asyncio.to_thread(pacer.release, claim_id))
-                except (asyncio.CancelledError, Exception):
-                    pass
             # Terminate the streaming child unconditionally. If we're
             # being cancelled mid-``_wait_for_done`` the underlying
             # process is still alive; without this it can keep running
             # past the parent's cleanup and into container shutdown.
             # ``asyncio.shield`` keeps the terminate sequence from
             # being interrupted by the same cancellation that brought
-            # us here.
+            # us here. Done BEFORE the claim release below so the transcript
+            # is complete when we meter partial usage.
             if stream is not None:
                 try:
                     await asyncio.shield(stream.terminate())
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # If we were cancelled (or errored) before the normal
+            # record_cli_usage above, the CLI may already have spent real
+            # tokens. Meter them now — BEFORE releasing the pacing claim — or
+            # the pacer loses that usage and over-admits the next run. Shielded
+            # so the same cancellation can't skip it too.
+            if stream is not None and not usage_recorded:
+                try:
+                    await asyncio.shield(
+                        self.record_cli_usage(
+                            stream.stdout,
+                            stream.stderr,
+                            CLIDoneRecord(status="partial", summary="(cancelled mid-run)"),
+                        )
+                    )
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if pacing_claim is not None:
+                pacer, claim_id = pacing_claim
+                try:
+                    await asyncio.shield(asyncio.to_thread(pacer.release, claim_id))
                 except (asyncio.CancelledError, Exception):
                     pass
             try:
