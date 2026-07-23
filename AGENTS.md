@@ -144,3 +144,7 @@ reference for the workflow runtime and should prevent spelunking through
    reusable component guidance; required before creating or editing
    workflow preset YAML.
 3. **`README.md`** — how to install + run today.
+
+For the human-harnessed research mode (Claude Code as lead researcher
+on an open problem, with browser-run consultations), read
+**`CLI_LEAD_RESEARCHER.md`** instead of the workflow docs.
