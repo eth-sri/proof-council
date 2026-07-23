@@ -311,10 +311,18 @@ class CLIAgent(Agent):
             # produced a record, so meter the partial usage the CLI may have
             # spent. Shielded so the same cancellation can't skip it too.
             if meter_task is not None:
-                try:
-                    await asyncio.shield(meter_task)
-                except (asyncio.CancelledError, Exception):
-                    pass
+                # Drain the retained metering to completion even under REPEATED
+                # cancellation: a second cancel while awaiting would otherwise
+                # abandon the still-running task, and event-loop shutdown then
+                # cancels it and the metering is lost (B6). The task is shielded,
+                # so re-awaiting resumes it; the loop exits once it is done.
+                while not meter_task.done():
+                    try:
+                        await asyncio.shield(meter_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
             elif stream is not None and not usage_recorded:
                 try:
                     await asyncio.shield(
