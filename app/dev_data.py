@@ -811,10 +811,13 @@ def _status_from_problem_statuses(statuses: list[Any]) -> str | None:
         return "running"
     if "stopped" in normalized:
         return "stopped"
-    if "parked" in normalized:
-        return "parked"
+    # a genuine crash outranks a resumable parked sibling: surfacing the failure
+    # matters more than offering Resume, and the parked child is independently
+    # resumable via its own run (B6)
     if "error" in normalized:
         return "error"
+    if "parked" in normalized:
+        return "parked"
     if all(status == "finished" for status in normalized):
         return "finished"
     return None

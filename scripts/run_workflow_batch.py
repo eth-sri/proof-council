@@ -188,11 +188,19 @@ async def amain() -> int:
             return code
 
     codes = await asyncio.gather(*(run_one(problem) for problem in problems))
-    meta["status"] = "ok" if all(code == 0 for code in codes) else "error"
+    # Mirror the child tri-state at the parent: a real crash is an error, but a
+    # batch whose only non-ok children parked (exit 2) is itself parked and
+    # resumable — collapsing it to error/exit-1 hid that and refused Resume (B5).
+    if all(code == 0 for code in codes):
+        meta["status"] = "ok"
+    elif any(code not in (0, 2) for code in codes):
+        meta["status"] = "error"
+    else:
+        meta["status"] = "parked"
     meta["finished_at"] = _now()
     manifest["finished_at"] = meta["finished_at"]
     _write_metadata(metadata_path, meta)
-    return 0 if meta["status"] == "ok" else 1
+    return {"ok": 0, "parked": 2}.get(meta["status"], 1)
 
 
 def main() -> int:
