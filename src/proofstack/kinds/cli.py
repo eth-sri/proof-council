@@ -430,7 +430,7 @@ class CLIAgent(Agent):
                     decision.blocking_window or "unknown",
                     decision.wait_s,
                     float(blocked.usage + blocked.claims) if blocked else 0.0,
-                    float(blocked.allowed) if blocked else 0.0,
+                    float(blocked.allowed) if blocked and blocked.allowed is not None else 0.0,
                 )
             sleep_s = min(max(decision.wait_s, 5.0), DEFAULT_RECHECK_S)
             if waited - last_wait_emit >= 600.0 or waited == 0.0:

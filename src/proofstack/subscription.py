@@ -180,6 +180,18 @@ def _park_after_s(settings: dict[str, Any]) -> float:
         return DEFAULT_PARK_AFTER_S
 
 
+def _block_until(reset_at: float | None, now: float) -> float:
+    """When a limit is detected, produce a block even with no known reset.
+
+    A real limit hit (or a ~100%-utilization probe) always means "no headroom
+    right now". If the provider gave a reset time we block until then; otherwise
+    we block for one recheck interval so a re-probe or a re-hit refreshes it,
+    instead of admitting straight back into the exhausted window (A9). A block
+    already in the past is cleared later, at read time in _window_statuses.
+    """
+    return float(reset_at) if reset_at else now + DEFAULT_RECHECK_S
+
+
 def _probe_ttl_s(settings: dict[str, Any]) -> float:
     try:
         return max(30.0, float(settings.get("probe_ttl_s") or 600))
@@ -217,6 +229,38 @@ def _filter_window(
     )
 
 
+def _entries_in_block(
+    entries: list[LedgerEntry],
+    *,
+    provider: str,
+    seconds: float,
+    model_filter: str | None,
+    block_start: float | None,
+    now: float,
+) -> list[LedgerEntry]:
+    """Ledger entries counting against a window: the rolling window, further
+    trimmed to the current discrete provider block when its start is known."""
+    win = _filter_window(
+        entries, provider=provider, seconds=seconds, model_filter=model_filter, now=now
+    )
+    if block_start is not None:
+        win = [e for e in win if e.ts >= block_start]
+    return win
+
+
+def _relevant_claims(
+    claims: dict[str, Any], *, provider: str, model_filter: str | None, now: float
+) -> Iterator[dict[str, Any]]:
+    for c in claims.values():
+        if (
+            isinstance(c, dict)
+            and float(c.get("expires_at") or 0) > now
+            and c.get("provider") == provider
+            and (model_filter is None or model_filter in str(c.get("model") or "").lower())
+        ):
+            yield c
+
+
 def _claims_sum(
     claims: dict[str, Any],
     *,
@@ -226,12 +270,24 @@ def _claims_sum(
 ) -> int:
     return sum(
         int(c.get("est_tokens") or 0)
-        for c in claims.values()
-        if isinstance(c, dict)
-        and float(c.get("expires_at") or 0) > now
-        and c.get("provider") == provider
-        and (model_filter is None or model_filter in str(c.get("model") or "").lower())
+        for c in _relevant_claims(claims, provider=provider, model_filter=model_filter, now=now)
     )
+
+
+def _soonest_claim_expiry(
+    claims: dict[str, Any], *, provider: str, model_filter: str | None, now: float
+) -> float | None:
+    """Earliest expiry among live claims counted against this window, or None.
+
+    Claims expiring release the headroom they reserve, so no own-spend wait
+    should ever project past the soonest expiry — otherwise a 30-second claim
+    forces an hours-long park (A11).
+    """
+    expiries = [
+        float(c.get("expires_at") or 0)
+        for c in _relevant_claims(claims, provider=provider, model_filter=model_filter, now=now)
+    ]
+    return min(expiries) if expiries else None
 
 
 def _iso_to_epoch(raw: Any) -> float | None:
@@ -621,10 +677,10 @@ class SubscriptionStore:
                             )
                             calibration[window] = cal
                             settings_changed = True
-                if pct >= 99.5 and resets_at:
+                if pct >= 99.5:
                     cal = calibration.get(window)
                     cal = cal if isinstance(cal, dict) else {}
-                    cal.update({"blocked_until": resets_at, "ts": now})
+                    cal.update({"blocked_until": _block_until(resets_at, now), "ts": now})
                     calibration[window] = cal
                     settings_changed = True
                 provider_probes[window] = {
@@ -743,7 +799,8 @@ class SubscriptionStore:
             best = max(int(prior.get("observed_ceiling") or 0), int(observed_ceiling))
             scoped[window] = {
                 "observed_ceiling": best,
-                "blocked_until": reset_at,
+                # a detected limit always blocks, even with no reset epoch (A9)
+                "blocked_until": _block_until(reset_at, now),
                 "ts": now,
             }
             self._write_settings(settings)
@@ -815,7 +872,7 @@ class WindowStatus:
     model_filter: str | None
     ceiling: int  # 0 when unknown (probe-only window, e.g. codex without seeds)
     ceiling_source: str  # manual | calibrated | seed | probe-only
-    allowed: int
+    allowed: int | None  # None = no own-spend cap (probe-only); 0 = hard block (0% cap)
     usage: int
     claims: int
     blocked_until: float | None
@@ -824,6 +881,9 @@ class WindowStatus:
     resets_at: float | None = None
     account_cap_pct: float | None = None
     own_since_probe: int = 0
+    # discrete-block boundary: ledger entries before it belong to a previous,
+    # already-reset provider block and must not count (None = pure rolling window)
+    block_start: float | None = None
 
 
 @dataclass
@@ -944,10 +1004,25 @@ class SubscriptionPacer:
             cal = calibration.get(window) if isinstance(calibration.get(window), dict) else {}
             probe = provider_probes.get(window)
             probe = probe if isinstance(probe, dict) else None
+
+            # The provider window is a discrete block, not a rolling one. A probe
+            # reset time bounds that block: entries before it belong to a prior,
+            # already-reset block. That boundary must survive past its own reset
+            # (a stale probe) so pre-reset usage can't resurrect (B3) — even
+            # though the probe's *utilization* goes stale once the block rolls.
+            raw_resets_at = None
             if probe is not None:
-                probe_reset = probe.get("resets_at")
-                if probe_reset and float(probe_reset) <= now:
-                    probe = None  # the probed block has ended; its utilization reset
+                pr = probe.get("resets_at")
+                raw_resets_at = float(pr) if pr else None
+            probe_stale = raw_resets_at is not None and raw_resets_at <= now
+            active_probe = None if probe_stale else probe
+            if raw_resets_at is None:
+                block_start = None
+            elif raw_resets_at > now:
+                block_start = raw_resets_at - seconds  # start of the current block
+            else:
+                block_start = raw_resets_at  # a new block began at the reset
+
             manual = manual_ceilings.get(window)
             observed = int(cal.get("observed_ceiling") or 0)
             if manual:
@@ -957,7 +1032,7 @@ class SubscriptionPacer:
                 ceiling, source = observed, "calibrated"
             elif window in seeds:
                 ceiling, source = int(seeds[window]), "seed"
-            elif probe is not None:
+            elif active_probe is not None:
                 # no token ceiling yet, but the provider reports utilization %
                 ceiling, source = 0, "probe-only"
             else:
@@ -966,26 +1041,23 @@ class SubscriptionPacer:
                 pct = float(cap_pct.get(window, 100))
             except (TypeError, ValueError):
                 pct = 100.0
-            allowed = int(ceiling * max(0.0, min(100.0, pct)) / 100.0)
+            # None = no own-spend cap (probe-only: the account gate governs it);
+            # 0 = a real 0% cap that must hard-block, not silently admit (A8)
+            allowed = None if ceiling <= 0 else int(ceiling * max(0.0, min(100.0, pct)) / 100.0)
             blocked_until = cal.get("blocked_until")
             blocked_until = float(blocked_until) if blocked_until else None
             if blocked_until is not None and blocked_until <= now:
                 blocked_until = None
-            resets_at = probe.get("resets_at") if probe else None
-            resets_at = float(resets_at) if resets_at else None
-            window_entries = _filter_window(
+            resets_at = raw_resets_at if (raw_resets_at is not None and raw_resets_at > now) else None
+            window_entries = _entries_in_block(
                 entries,
                 provider=self.provider,
                 seconds=seconds,
                 model_filter=model_filter,
+                block_start=block_start,
                 now=now,
             )
-            if resets_at is not None and resets_at > now:
-                # the provider window is a discrete block, not rolling: only
-                # own spend since the block started counts against it
-                block_start = resets_at - seconds
-                window_entries = [e for e in window_entries if e.ts >= block_start]
-            probe_ts = float(probe.get("ts") or 0) if probe else None
+            probe_ts = float(active_probe.get("ts") or 0) if active_probe else None
             try:
                 acct_cap = float(account_cap_pct.get(window, 90))
             except (TypeError, ValueError):
@@ -1003,13 +1075,14 @@ class SubscriptionPacer:
                         claims, provider=self.provider, model_filter=model_filter, now=now
                     ),
                     blocked_until=blocked_until,
-                    probe_pct=float(probe.get("used_pct")) if probe and probe.get("used_pct") is not None else None,
+                    probe_pct=float(active_probe.get("used_pct")) if active_probe and active_probe.get("used_pct") is not None else None,
                     probe_ts=probe_ts,
                     resets_at=resets_at,
                     account_cap_pct=acct_cap,
                     own_since_probe=sum(
                         e.tokens for e in window_entries if probe_ts and e.ts >= probe_ts
                     ),
+                    block_start=block_start,
                 )
             )
         return statuses
@@ -1070,33 +1143,44 @@ class SubscriptionPacer:
             account_wait = self._account_gate_wait(st, est, ttl_s, now)
             if account_wait is not None:
                 window_wait = max(window_wait or 0.0, account_wait)
-            # own-spend cap; skipped for probe-only windows (no token ceiling)
-            # and untouched windows (zero usage and claims must never stall)
-            if (
-                window_wait is None
-                and st.allowed > 0
-                and st.usage + st.claims > 0
-                and st.usage + st.claims + est > st.allowed
-            ):
-                deficit = st.usage + st.claims + est - st.allowed
-                window_entries = _filter_window(
-                    entries,
-                    provider=self.provider,
-                    seconds=st.seconds,
-                    model_filter=st.model_filter,
-                    now=now,
-                )
-                cum = 0
-                window_wait = DEFAULT_RECHECK_S  # claims may free up before ledger ages out
-                for e in window_entries:
-                    cum += e.tokens
-                    if cum >= deficit:
-                        window_wait = max(0.0, e.ts + st.seconds - now)
-                        break
-                # a discrete provider reset frees all own-spend at once, so never
-                # wait past it for the rolling ledger entry to age out
-                if st.resets_at is not None and st.resets_at > now:
-                    window_wait = min(window_wait, st.resets_at - now)
+            # own-spend cap. allowed is None only for probe-only windows (no
+            # token ceiling) — those are governed by the account gate above.
+            if window_wait is None and st.allowed is not None:
+                if st.allowed <= 0:
+                    # a real 0% cap hard-closes the window; the untouched-window
+                    # rule must not rescue it. Re-check so raising the cap (a
+                    # live settings edit) admits without a restart (A8).
+                    window_wait = DEFAULT_RECHECK_S
+                elif st.usage + st.claims > 0 and st.usage + st.claims + est > st.allowed:
+                    # untouched windows (zero usage and claims) never stall: an
+                    # estimate alone must not deadlock a fresh window.
+                    deficit = st.usage + st.claims + est - st.allowed
+                    window_entries = _entries_in_block(
+                        entries,
+                        provider=self.provider,
+                        seconds=st.seconds,
+                        model_filter=st.model_filter,
+                        block_start=st.block_start,
+                        now=now,
+                    )
+                    cum = 0
+                    window_wait = DEFAULT_RECHECK_S  # claims may free up before ledger ages out
+                    for e in window_entries:
+                        cum += e.tokens
+                        if cum >= deficit:
+                            window_wait = max(0.0, e.ts + st.seconds - now)
+                            break
+                    # bound the wait by the soonest event that can free headroom:
+                    # a claim expiring (A11) or a discrete provider reset that
+                    # frees all own-spend at once (A5/B3). Never project past
+                    # either into a needless hours-long park.
+                    claim_expiry = _soonest_claim_expiry(
+                        claims, provider=self.provider, model_filter=st.model_filter, now=now
+                    )
+                    if claim_expiry is not None:
+                        window_wait = min(window_wait, max(0.0, claim_expiry - now))
+                    if st.resets_at is not None and st.resets_at > now:
+                        window_wait = min(window_wait, st.resets_at - now)
             if window_wait is None:
                 continue
             if blocking is None or window_wait > wait_s:
@@ -1181,7 +1265,12 @@ class SubscriptionPacer:
                 "last_error": meta.get("last_error"),
             },
             "windows": [
-                {**asdict(st), "headroom": max(0, st.allowed - st.usage - st.claims)}
+                {
+                    **asdict(st),
+                    "headroom": None
+                    if st.allowed is None
+                    else max(0, st.allowed - st.usage - st.claims),
+                }
                 for st in statuses
             ],
         }
