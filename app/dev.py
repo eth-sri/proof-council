@@ -61,6 +61,7 @@ from app.dev_data import (
     load_call_detail,
     load_event_tree,
     load_monitor_summaries,
+    coerce_human_response_value,
     load_pending_human_tasks,
     load_execution_graph,
     mutate_preset_yaml,
@@ -816,10 +817,18 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         target = (inbox / filename).resolve()
         if target.parent != inbox:
             abort(400, description="response path escapes inbox")
+        # The declared output types drive coercion: a field declared array/object
+        # must be parsed from its submitted string, not stored verbatim.
+        declared: dict[str, Any] = {}
+        for task in load_pending_human_tasks(run.path):
+            if task.get("response_filename") == filename:
+                declared = task.get("output_fields") or {}
+                break
         values: dict[str, Any] = {}
         for key, value in request.form.items():
             if key.startswith("f_"):
-                values[key[2:]] = value
+                field = key[2:]
+                values[field] = coerce_human_response_value(value, declared.get(field))
         values.setdefault("status", "done")
         inbox.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")

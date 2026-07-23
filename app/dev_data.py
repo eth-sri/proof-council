@@ -852,6 +852,29 @@ def find_run(roots: Iterable[Path], run_id: str) -> RunInfo | None:
     return None
 
 
+def coerce_human_response_value(raw: str, declared_type: Any) -> Any:
+    """Coerce a form-submitted string to the field's declared output type.
+
+    A human node whose output field is declared ``array``/``object`` must not
+    receive a raw string — the resumed downstream node then chokes on a str
+    where it expects a list/dict. Parse those (and generic ``json``) via JSON;
+    if the value does not parse to the declared shape, leave it verbatim so the
+    normal output validation surfaces it rather than this silently mangling it.
+    """
+    t = str(declared_type or "string").strip().lower()
+    if t not in {"array", "object", "json"}:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    if t == "array" and not isinstance(parsed, list):
+        return raw
+    if t == "object" and not isinstance(parsed, dict):
+        return raw
+    return parsed
+
+
 def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
     """Human-in-the-loop tasks awaiting a response in this run.
 

@@ -65,5 +65,64 @@ class HumanProofRouteTests(unittest.TestCase):
                 self.assertIn("PROOF-ALPHA", first.get_data(as_text=True))
 
 
+class HumanSubmitCoercionTests(unittest.TestCase):
+    """A10: the submit route coerces a field to its declared output type, so an
+    array/object field is not handed to the resumed node as a raw string."""
+
+    def _setup(self, root: Path, output_fields: dict) -> Path:
+        run_dir = root / "cr"
+        inbox = run_dir / "human_inbox"
+        inbox.mkdir(parents=True)
+        (run_dir / "run-metadata.json").write_text(
+            json.dumps({"status": "running", "display_name": "cr"}), encoding="utf-8"
+        )
+        task_path = run_dir / "t.task.json"
+        task_path.write_text(
+            json.dumps({"prompt": "p", "output_fields": output_fields}), encoding="utf-8"
+        )
+        (run_dir / "events.jsonl").write_text(
+            json.dumps(
+                {
+                    "kind": "human.waiting",
+                    "agent": "t",
+                    "payload": {
+                        "response_path": str(inbox / "t.response.json"),
+                        "task_path": str(task_path),
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return inbox / "t.response.json"
+
+    def test_declared_types_are_parsed_bad_json_left_verbatim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            response_file = self._setup(
+                root,
+                {"items": "array", "meta": "object", "note": "string", "bad": "array"},
+            )
+            app = create_app(runs_roots=(root,))
+            with app.test_client() as client:
+                resp = client.post(
+                    "/run/cr/human",
+                    data={
+                        "response_filename": "t.response.json",
+                        "f_items": "[1, 2, 3]",
+                        "f_meta": '{"a": 1}',
+                        "f_note": "just text",
+                        "f_bad": "not json",
+                    },
+                )
+            self.assertEqual(resp.status_code, 302)
+            written = json.loads(response_file.read_text(encoding="utf-8"))
+            self.assertEqual(written["items"], [1, 2, 3])
+            self.assertEqual(written["meta"], {"a": 1})
+            self.assertEqual(written["note"], "just text")
+            # declared array but not valid JSON -> untouched for validation to flag
+            self.assertEqual(written["bad"], "not json")
+
+
 if __name__ == "__main__":
     unittest.main()
