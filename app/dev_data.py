@@ -4808,9 +4808,10 @@ def _infer_executor(cfg: dict[str, Any], agent_cls: str) -> str:
         if isinstance(cmd, str):
             cmd = cmd.split()
         first = str(cmd[0]) if cmd else ""
-        if "codex" in first or cfg.get("copy_codex_auth"):
+        base = first.rsplit("/", 1)[-1]
+        if base == "codex" or cfg.get("copy_codex_auth"):
             return "codex_cli"
-        if "claude" in first:
+        if base == "claude":
             return "claude_cli"
         # a genuinely custom command is neither CLI executor; returning "" makes
         # the swap guard refuse rather than overwrite the user's command

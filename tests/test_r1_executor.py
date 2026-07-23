@@ -100,6 +100,40 @@ class EB1CustomCommandTests(unittest.TestCase):
         self.assertEqual(raw["dag"]["nodes"][0]["agent"], CONFIGURABLE_CLI_AGENT)
 
 
+class B7BasenameInferenceTests(unittest.TestCase):
+    """_infer_executor keys on the executable *basename*, not a substring, so a
+    command like ``notcodex`` or ``acme-codex-wrapper`` is not mislabelled (and
+    then destructively overwritten by a swap)."""
+
+    def test_real_tools_infer_by_basename(self) -> None:
+        self.assertEqual(
+            _infer_executor({"cmd": ["codex", "exec"]}, CONFIGURABLE_CLI_AGENT),
+            "codex_cli",
+        )
+        self.assertEqual(
+            _infer_executor({"cmd": ["/usr/local/bin/codex"]}, CONFIGURABLE_CLI_AGENT),
+            "codex_cli",
+        )
+        self.assertEqual(
+            _infer_executor({"cmd": ["claude", "-p"]}, CONFIGURABLE_CLI_AGENT),
+            "claude_cli",
+        )
+
+    def test_substring_lookalikes_are_not_mislabelled(self) -> None:
+        for cmd in (["notcodex", "run"], ["acme-codex-wrapper"], ["claudelike-tool"]):
+            self.assertEqual(
+                _infer_executor({"cmd": cmd}, CONFIGURABLE_CLI_AGENT), "", cmd
+            )
+
+    def test_copy_codex_auth_still_forces_codex_regardless_of_basename(self) -> None:
+        self.assertEqual(
+            _infer_executor(
+                {"cmd": ["mytool"], "copy_codex_auth": True}, CONFIGURABLE_CLI_AGENT
+            ),
+            "codex_cli",
+        )
+
+
 class EB5ClassAliasTests(unittest.TestCase):
     """A node using the ``class:`` alias is a first-class configurable node and
     must swap like an ``agent:`` node."""
