@@ -629,13 +629,20 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
         # process died after a child finished/was stopped but before it recorded
         # the result, the parent is stuck "running" or mislabelled "error" (a
         # stopped child exits non-zero, which the batch records as a failure).
-        # Children are ground truth. We override a stale terminal status only when
-        # the children show the run is actually still going ("running") or was
-        # deliberately stopped ("stopped") — never to fabricate a finish.
+        # Children are ground truth. We override a stale terminal status when the
+        # children show the run is still going ("running"), was deliberately
+        # stopped ("stopped"), parked, or is fully done. A derived "finished"
+        # requires EVERY listed child to be finished (a died batch leaves some
+        # queued/running), so it can safely retire a stale "error" left by a
+        # resumed/parked child — e.g. a legacy batch whose parked child was
+        # resumed to completion (B4).
         derived = _status_from_problem_statuses(
             [p.get("status") for p in info.problems.values() if isinstance(p, dict)]
         )
-        if derived and (info.status not in ("finished", "error") or derived in ("running", "stopped", "parked")):
+        if derived and (
+            info.status not in ("finished", "error")
+            or derived in ("running", "stopped", "parked", "finished")
+        ):
             info.status = derived
             if derived in ("finished", "error"):
                 info.process_dead = False  # resolved, not a phantom
