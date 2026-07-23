@@ -801,6 +801,11 @@ class SubscriptionStore:
                 "observed_ceiling": best,
                 # a detected limit always blocks, even with no reset epoch (A9)
                 "blocked_until": _block_until(reset_at, now),
+                # keep the raw reset epoch: it bounds the discrete block so that,
+                # once the block lapses, pre-reset usage is excluded rather than
+                # re-blocking the fresh window (A2 — the CLI sibling of B3's
+                # probe-sourced boundary)
+                "reset_at": reset_at,
                 "ts": now,
             }
             self._write_settings(settings)
@@ -996,6 +1001,7 @@ class SubscriptionPacer:
         calibration = _provider_calibration(settings, self.provider)
         provider_probes = probes.get(self.provider) or {}
         model_l = (model or "").lower()
+        ttl_s = _probe_ttl_s(settings)
 
         statuses: list[WindowStatus] = []
         for window, (seconds, model_filter) in WINDOWS.items():
@@ -1014,7 +1020,22 @@ class SubscriptionPacer:
             if probe is not None:
                 pr = probe.get("resets_at")
                 raw_resets_at = float(pr) if pr else None
-            probe_stale = raw_resets_at is not None and raw_resets_at <= now
+            # a CLI-detected limit (record_rate_limit) carries the same kind of
+            # reset boundary as a probe; honour the later of the two so a 429's
+            # block also survives past its reset to exclude pre-reset usage (A2)
+            cal_reset = cal.get("reset_at")
+            if cal_reset:
+                cal_reset = float(cal_reset)
+                raw_resets_at = cal_reset if raw_resets_at is None else max(raw_resets_at, cal_reset)
+            probe_ts_val = float(probe.get("ts") or 0) if probe is not None else 0.0
+            # a saturated probe with no reset epoch can't be refreshed for codex
+            # (which only re-probes by harvesting a rollout AFTER a node runs);
+            # once it ages past its TTL, drop its utilization so one node may run
+            # and re-harvest, instead of parking the provider forever (A3/B1)
+            no_reset_stale = (
+                raw_resets_at is None and probe_ts_val > 0 and (now - probe_ts_val) > ttl_s
+            )
+            probe_stale = (raw_resets_at is not None and raw_resets_at <= now) or no_reset_stale
             active_probe = None if probe_stale else probe
             if raw_resets_at is None:
                 block_start = None
@@ -1142,6 +1163,15 @@ class SubscriptionPacer:
                 window_wait = max(0.0, st.blocked_until - now)
             account_wait = self._account_gate_wait(st, est, ttl_s, now)
             if account_wait is not None:
+                # a short-lived claim inflates the account drift too, so bound
+                # the account wait by the soonest claim expiry — else a 30s claim
+                # projects to the hours-away provider reset (A4, the account-gate
+                # sibling of the own-spend A11 bound below)
+                claim_expiry = _soonest_claim_expiry(
+                    claims, provider=self.provider, model_filter=st.model_filter, now=now
+                )
+                if claim_expiry is not None:
+                    account_wait = min(account_wait, max(0.0, claim_expiry - now))
                 window_wait = max(window_wait or 0.0, account_wait)
             # own-spend cap. allowed is None only for probe-only windows (no
             # token ceiling) — those are governed by the account gate above.
