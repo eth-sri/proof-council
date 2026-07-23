@@ -175,9 +175,12 @@ async def amain() -> int:
                     start_new_session=True,
                 )
                 code = await proc.wait()
+            # Exit 2 == the child parked on a subscription window (resumable),
+            # not a crash — keep it distinct so the dashboard offers Resume.
+            child_status = "ok" if code == 0 else "parked" if code == 2 else "error"
             await update_problem(
                 problem_id,
-                status="ok" if code == 0 else "error",
+                status=child_status,
                 finished_at=_now(),
                 returncode=code,
                 log=f"logs/{log_path.name}",

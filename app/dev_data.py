@@ -635,7 +635,7 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
         derived = _status_from_problem_statuses(
             [p.get("status") for p in info.problems.values() if isinstance(p, dict)]
         )
-        if derived and (info.status not in ("finished", "error") or derived in ("running", "stopped")):
+        if derived and (info.status not in ("finished", "error") or derived in ("running", "stopped", "parked")):
             info.status = derived
             if derived in ("finished", "error"):
                 info.process_dead = False  # resolved, not a phantom
@@ -792,6 +792,8 @@ def _normalize_run_status(value: Any) -> str | None:
         return "finished"
     if raw in {"error", "failed", "failure"}:
         return "error"
+    if raw in {"parked"}:
+        return "parked"
     if raw in {"stopped", "paused", "cancelled", "canceled"}:
         return "stopped"
     if raw in {"running", "starting", "started", "queued", "pending"}:
@@ -809,6 +811,8 @@ def _status_from_problem_statuses(statuses: list[Any]) -> str | None:
         return "running"
     if "stopped" in normalized:
         return "stopped"
+    if "parked" in normalized:
+        return "parked"
     if "error" in normalized:
         return "error"
     if all(status == "finished" for status in normalized):

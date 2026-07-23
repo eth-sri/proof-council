@@ -40,7 +40,7 @@ load_dotenv_file(REPO_ROOT / ".env")
 from proofstack import BudgetSpec, RunContext  # noqa: E402
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, RunMonitor  # noqa: E402
 from proofstack.registry import load_preset  # noqa: E402
-from proofstack.subscription import RESUME_ENV_ALLOWLIST  # noqa: E402
+from proofstack.subscription import RESUME_ENV_ALLOWLIST, SubscriptionParked  # noqa: E402
 
 
 def _argparser() -> argparse.ArgumentParser:
@@ -525,6 +525,28 @@ async def amain() -> int:
 
     try:
         out = await wf(**built_inputs)
+    except SubscriptionParked as e:
+        # A pacing park is a resumable pause, not a crash. Record a distinct
+        # non-error status so the dashboard offers Resume (and doesn't paint it
+        # red) instead of treating it as a terminal failure.
+        await ctx.events.emit(
+            "run.end",
+            {"status": "parked", "type": type(e).__name__, "msg": str(e)},
+        )
+        await _drain_monitor(ctx)
+        ctx.write_metadata(
+            _run_metadata(
+                ctx,
+                {
+                    "status": "parked",
+                    "display_name": args.run_name,
+                    "error": f"{type(e).__name__}: {e}",
+                },
+            )
+        )
+        print(f"run parked (resumable): {e}", file=sys.stderr)
+        _clear_run_pid(ctx.root_workdir)
+        return 2
     except Exception as e:
         await ctx.events.emit(
             "run.end",
