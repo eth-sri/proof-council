@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import time
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -38,6 +39,18 @@ from proofstack.subscription import (
 )
 
 
+# A single ConfigurableCLIAgent instance is reused across concurrent map_chain
+# items (DAGWorkflow._agent_for caches one object per node.step key). These three
+# values are genuinely per-invocation — the command built from THIS item's inputs,
+# the sandbox root for THIS call, whether THIS call copied codex auth — so they
+# must not live on ``self`` or one item clobbers another mid-run. They ride
+# per-call ContextVars instead, exactly as ``workdir`` does (each item runs in its
+# own asyncio task, which copies the context, so the vars are naturally isolated).
+_CALL_CLI_CMD: ContextVar[list[str] | None] = ContextVar("cli_call_cmd", default=None)
+_CALL_WS_ROOT: ContextVar[Path | None] = ContextVar("cli_call_ws_root", default=None)
+_CALL_COPIED_AUTH: ContextVar[bool] = ContextVar("cli_call_copied_auth", default=False)
+
+
 class ConfigurableCLIAgent(CLIAgent):
     """Generic CLI component configured through ``components:`` YAML."""
 
@@ -58,8 +71,34 @@ class ConfigurableCLIAgent(CLIAgent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._raw_cmd = self.component_config.get("cmd") or []
-        self._copied_codex_auth = False
-        self._active_workspace_root: Path | None = None
+
+    # Per-invocation state backed by ContextVars (see module note above) so a
+    # shared instance under concurrent map_chain items can't cross-contaminate.
+    # Exposed as properties named like the old attributes so base-class reads
+    # (``self.CLI_CMD``) and callers/tests keep working unchanged.
+    @property
+    def CLI_CMD(self) -> list[str]:  # type: ignore[override]
+        return _CALL_CLI_CMD.get() or []
+
+    @CLI_CMD.setter
+    def CLI_CMD(self, value: list[str]) -> None:
+        _CALL_CLI_CMD.set(list(value))
+
+    @property
+    def _active_workspace_root(self) -> Path | None:
+        return _CALL_WS_ROOT.get()
+
+    @_active_workspace_root.setter
+    def _active_workspace_root(self, value: Path | None) -> None:
+        _CALL_WS_ROOT.set(value)
+
+    @property
+    def _copied_codex_auth(self) -> bool:
+        return _CALL_COPIED_AUTH.get()
+
+    @_copied_codex_auth.setter
+    def _copied_codex_auth(self, value: bool) -> None:
+        _CALL_COPIED_AUTH.set(value)
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
         self.CLI_CMD = self._command_for(inp)
