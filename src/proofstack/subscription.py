@@ -677,6 +677,15 @@ class SubscriptionStore:
                             )
                             calibration[window] = cal
                             settings_changed = True
+                if resets_at:
+                    # persist the probe's reset as the DURABLE block boundary, so
+                    # a later reset-less probe can't erase it and resurrect
+                    # pre-reset usage (A2). Only an explicit reset updates it.
+                    cal = calibration.get(window)
+                    cal = cal if isinstance(cal, dict) else {}
+                    cal["reset_at"] = float(resets_at)
+                    calibration[window] = cal
+                    settings_changed = True
                 if pct >= 99.5:
                     cal = calibration.get(window)
                     cal = cal if isinstance(cal, dict) else {}
@@ -797,15 +806,34 @@ class SubscriptionStore:
             # observed usage at the moment of a real limit hit is a lower bound
             # on the true ceiling; keep the largest ever seen
             best = max(int(prior.get("observed_ceiling") or 0), int(observed_ceiling))
+            # A no-epoch hit must not erase the durable boundary from an earlier
+            # hit or probe: keep the prior reset (past OR future) so pre-reset
+            # usage stays excluded (B1/A1). A past boundary simply stops
+            # over-blocking; a future one keeps the window shut.
+            boundary = reset_at
+            if boundary is None:
+                prior_reset = prior.get("reset_at")
+                if prior_reset:
+                    boundary = float(prior_reset)
+            if reset_at is not None:
+                # explicit reset this hit: block until it, stored verbatim
+                blocked_until = _block_until(reset_at, now)
+            elif boundary is not None and boundary > now:
+                # no epoch, but a still-future boundary remains: keep the window
+                # shut until it rather than cutting the block short (B1)
+                blocked_until = boundary
+            else:
+                # no epoch and no future boundary: block one recheck interval so
+                # a re-probe / re-hit refreshes it (A9)
+                blocked_until = now + DEFAULT_RECHECK_S
             scoped[window] = {
                 "observed_ceiling": best,
-                # a detected limit always blocks, even with no reset epoch (A9)
-                "blocked_until": _block_until(reset_at, now),
-                # keep the raw reset epoch: it bounds the discrete block so that,
-                # once the block lapses, pre-reset usage is excluded rather than
+                "blocked_until": blocked_until,
+                # the durable reset epoch bounds the discrete block so that, once
+                # the block lapses, pre-reset usage is excluded rather than
                 # re-blocking the fresh window (A2 — the CLI sibling of B3's
                 # probe-sourced boundary)
-                "reset_at": reset_at,
+                "reset_at": boundary,
                 "ts": now,
             }
             self._write_settings(settings)
@@ -1016,33 +1044,37 @@ class SubscriptionPacer:
             # already-reset block. That boundary must survive past its own reset
             # (a stale probe) so pre-reset usage can't resurrect (B3) — even
             # though the probe's *utilization* goes stale once the block rolls.
-            raw_resets_at = None
+            # The DURABLE block boundary (written by record_probe/record_rate_limit
+            # from any explicit reset, and never erased by a reset-less
+            # observation) bounds the discrete block: entries before it belong to
+            # a prior, already-reset block. It is kept separate from the probe
+            # *sample* so a reset-less probe can't drop the boundary (A2), and a
+            # stale boundary can't discard a fresh probe (B2).
+            cal_reset = cal.get("reset_at")
+            block_boundary = float(cal_reset) if cal_reset else None
+            # probe *utilization* freshness keys off the PROBE's OWN reset and
+            # timestamp only — never the boundary above.
+            probe_resets_at = None
             if probe is not None:
                 pr = probe.get("resets_at")
-                raw_resets_at = float(pr) if pr else None
-            # a CLI-detected limit (record_rate_limit) carries the same kind of
-            # reset boundary as a probe; honour the later of the two so a 429's
-            # block also survives past its reset to exclude pre-reset usage (A2)
-            cal_reset = cal.get("reset_at")
-            if cal_reset:
-                cal_reset = float(cal_reset)
-                raw_resets_at = cal_reset if raw_resets_at is None else max(raw_resets_at, cal_reset)
+                probe_resets_at = float(pr) if pr else None
             probe_ts_val = float(probe.get("ts") or 0) if probe is not None else 0.0
+            probe_expired = probe_resets_at is not None and probe_resets_at <= now
             # a saturated probe with no reset epoch can't be refreshed for codex
             # (which only re-probes by harvesting a rollout AFTER a node runs);
             # once it ages past its TTL, drop its utilization so one node may run
             # and re-harvest, instead of parking the provider forever (A3/B1)
             no_reset_stale = (
-                raw_resets_at is None and probe_ts_val > 0 and (now - probe_ts_val) > ttl_s
+                probe_resets_at is None and probe_ts_val > 0 and (now - probe_ts_val) > ttl_s
             )
-            probe_stale = (raw_resets_at is not None and raw_resets_at <= now) or no_reset_stale
+            probe_stale = probe_expired or no_reset_stale
             active_probe = None if probe_stale else probe
-            if raw_resets_at is None:
+            if block_boundary is None:
                 block_start = None
-            elif raw_resets_at > now:
-                block_start = raw_resets_at - seconds  # start of the current block
+            elif block_boundary > now:
+                block_start = block_boundary - seconds  # start of the current block
             else:
-                block_start = raw_resets_at  # a new block began at the reset
+                block_start = block_boundary  # a new block began at the reset
 
             manual = manual_ceilings.get(window)
             observed = int(cal.get("observed_ceiling") or 0)
@@ -1069,7 +1101,7 @@ class SubscriptionPacer:
             blocked_until = float(blocked_until) if blocked_until else None
             if blocked_until is not None and blocked_until <= now:
                 blocked_until = None
-            resets_at = raw_resets_at if (raw_resets_at is not None and raw_resets_at > now) else None
+            resets_at = block_boundary if (block_boundary is not None and block_boundary > now) else None
             window_entries = _entries_in_block(
                 entries,
                 provider=self.provider,

@@ -440,17 +440,24 @@ class ConfigurableCLIAgent(CLIAgent):
         store = SubscriptionStore()
 
         def _record() -> int:
-            window_entries = store.window_entries(
-                provider="claude", seconds=seconds, model_filter=model_filter
-            )
             # the provider window is a discrete block: usage booked before this
             # block began (hit.reset_at - seconds) belongs to the prior, already
             # reset block and must not inflate the observed ceiling — an inflated
-            # ceiling later UNDER-blocks the fresh window (A1)
+            # ceiling later UNDER-blocks the fresh window (A1). With no reset we
+            # can't attribute rolling usage to this block at all, so don't
+            # calibrate a discrete ceiling from it; still record the block.
             if hit.reset_at:
                 block_start = hit.reset_at - seconds
-                window_entries = [e for e in window_entries if e.ts >= block_start]
-            observed = sum(e.tokens for e in window_entries)
+                window_entries = [
+                    e
+                    for e in store.window_entries(
+                        provider="claude", seconds=seconds, model_filter=model_filter
+                    )
+                    if e.ts >= block_start
+                ]
+                observed = sum(e.tokens for e in window_entries)
+            else:
+                observed = 0
             store.record_rate_limit(
                 provider="claude",
                 window=hit.window_guess,
