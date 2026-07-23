@@ -164,6 +164,10 @@ class CLIAgent(Agent):
         # finally knows whether it still owes a partial-usage metering (see the
         # cancellation note in the finally block).
         usage_recorded = False
+        # The retained metering task once the run produced a done record. The
+        # finally awaits THIS task rather than re-running metering, so a cancel
+        # landing mid-metering neither loses it nor double-counts it (A7).
+        meter_task: asyncio.Task | None = None
         # Sandbox creation happens INSIDE the try: if it raises, the finally
         # must still release the pacing claim or it holds phantom headroom
         # for every other run until its TTL expires.
@@ -253,12 +257,17 @@ class CLIAgent(Agent):
                 wrap_up_path=wrap_up_path,
                 soft_timeout_s=soft_timeout_s,
             )
-            # Taking responsibility for metering here; the finally's fallback
-            # only fires when we never reached this point (cancel/error earlier).
+            # Meter as a retained, shielded task. A cancellation landing while
+            # record_cli_usage runs must not skip it (that loses a detected
+            # rate limit); the finally awaits this exact task instead of
+            # re-running metering, so the ledger is never double-counted (A7).
+            meter_task = asyncio.ensure_future(
+                self.record_cli_usage(stream.stdout, stream.stderr, done)
+            )
             usage_recorded = True
             try:
-                await self.record_cli_usage(stream.stdout, stream.stderr, done)
-            except Exception as e:
+                await asyncio.shield(meter_task)
+            except Exception as e:  # a real failure; cancellation propagates
                 await self.events.emit(
                     "cli.usage_record_failed",
                     {"type": type(e).__name__, "msg": str(e)},
@@ -294,12 +303,19 @@ class CLIAgent(Agent):
                     await asyncio.shield(stream.terminate())
                 except (asyncio.CancelledError, Exception):
                     pass
-            # If we were cancelled (or errored) before the normal
-            # record_cli_usage above, the CLI may already have spent real
-            # tokens. Meter them now — BEFORE releasing the pacing claim — or
-            # the pacer loses that usage and over-admits the next run. Shielded
-            # so the same cancellation can't skip it too.
-            if stream is not None and not usage_recorded:
+            # Meter BEFORE releasing the pacing claim, exactly once, even under
+            # cancellation — else the pacer loses real spend and over-admits the
+            # next run. If the run reached a done record, metering was already
+            # dispatched as meter_task; await that same task (no re-run, no
+            # double count). Otherwise we were cancelled/errored before the run
+            # produced a record, so meter the partial usage the CLI may have
+            # spent. Shielded so the same cancellation can't skip it too.
+            if meter_task is not None:
+                try:
+                    await asyncio.shield(meter_task)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            elif stream is not None and not usage_recorded:
                 try:
                     await asyncio.shield(
                         self.record_cli_usage(
