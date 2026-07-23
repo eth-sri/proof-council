@@ -890,8 +890,14 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
     events_path = run_path / "events.jsonl"
     if not events_path.exists():
         return []
+    # Track each response path's lifecycle IN ORDER so the latest event wins: a
+    # human.waiting that lands AFTER a human.submitted/timeout — a genuine re-ask
+    # on the same stable path (e.g. a loop revisiting the node) — must reopen the
+    # task rather than stay suppressed forever by the earlier resolution. ``pending``
+    # is an insertion-ordered set of currently-open paths; a dropped valid response
+    # file still short-circuits listing below (that answer is in flight).
     waiting: dict[str, dict[str, Any]] = {}
-    resolved: set[str] = set()
+    pending: dict[str, None] = {}
     try:
         with events_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -911,16 +917,16 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                 kind = e.get("kind")
                 if kind == "human.waiting":
                     waiting[response_path] = {**payload, "agent": e.get("agent")}
+                    pending[response_path] = None
                 elif kind in ("human.submitted", "human.timeout"):
-                    resolved.add(response_path)
+                    pending.pop(response_path, None)
     except OSError:
         return []
 
     inbox = run_path / "human_inbox"
     tasks: list[dict[str, Any]] = []
-    for response_path, payload in waiting.items():
-        if response_path in resolved:
-            continue
+    for response_path in pending:
+        payload = waiting[response_path]
         filename = Path(response_path).name
         response_error = ""
         response_file = inbox / filename
