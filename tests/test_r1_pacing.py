@@ -179,6 +179,30 @@ class AnswerFreeScanTests(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit.reset_at, float(reset))
 
+    def test_phrase_inside_successful_result_is_ignored(self) -> None:
+        # A7=B4: the terminal result/success envelope repeats the final answer;
+        # a rate-limit phrase merely quoted there must not calibrate a limit.
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "The paper quotes 'usage limit reached' verbatim.",
+            }
+        )
+        self.assertIsNone(self._scan(stdout))
+
+    def test_phrase_inside_error_result_is_still_detected(self) -> None:
+        # An error result may carry a genuine limit signal — keep scanning it.
+        stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "result": "usage limit reached",
+            }
+        )
+        self.assertIsNotNone(self._scan(stdout))
+
 
 def _claude_component(cmd: list[str]) -> dict:
     return {

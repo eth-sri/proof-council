@@ -764,9 +764,11 @@ def _answer_free_stdout(stdout_text: str) -> str:
     """Stdout with the model's own conversational turns removed.
 
     stream-json emits one envelope per line; ``assistant``/``user`` lines carry
-    the model's answer text, which must not be scanned for a rate-limit phrase
-    the candidate may merely quote. Non-JSON lines (a real limit prints one) and
-    all other envelopes are kept.
+    the model's answer text, and the terminal ``result``/``subtype: success``
+    envelope repeats that final answer — neither must be scanned for a rate-limit
+    phrase the candidate may merely quote. Non-JSON lines (a real limit prints
+    one) and error ``result`` envelopes (which may report a genuine limit) are
+    kept.
     """
     kept: list[str] = []
     for line in (stdout_text or "").splitlines():
@@ -777,8 +779,12 @@ def _answer_free_stdout(stdout_text: str) -> str:
             except (ValueError, TypeError):
                 kept.append(line)
                 continue
-            if isinstance(obj, dict) and obj.get("type") in {"assistant", "user"}:
-                continue
+            if isinstance(obj, dict):
+                otype = obj.get("type")
+                if otype in {"assistant", "user"}:
+                    continue
+                if otype == "result" and obj.get("subtype") == "success":
+                    continue
         kept.append(line)
     return "\n".join(kept)
 
