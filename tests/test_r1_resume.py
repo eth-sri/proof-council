@@ -245,6 +245,63 @@ class DashboardResumeReinjectsPacingTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 302)
         self.assertEqual(captured["env"].get("PROOFCOUNCIL_PACING"), "off")
 
+    def test_resume_route_ignores_non_allowlisted_env(self) -> None:
+        # B1: a hand-edited resume.json must not inject arbitrary environment on
+        # resume — only the same keys the writer is allowed to persist survive.
+        dev = _load_module("app_dev_b1", "app/dev.py")
+
+        captured: dict = {}
+
+        class FakePopen:
+            def __init__(self, cmd, cwd=None, env=None, **kw):
+                captured["env"] = env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "myrun"
+            run_dir.mkdir()
+            (run_dir / "run-metadata.json").write_text(
+                json.dumps({"status": "stopped", "preset": "author_critic"}),
+                encoding="utf-8",
+            )
+            (run_dir / "resume.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "myrun",
+                        "argv": [
+                            "scripts/run_workflow.py",
+                            "--workflow",
+                            "author_critic",
+                            "--run-id",
+                            "myrun",
+                            "--output",
+                            str(root),
+                        ],
+                        "env": {
+                            "PROOFCOUNCIL_PACING": "off",
+                            "EVIL_INJECTED": "1",
+                            "LD_PRELOAD": "/tmp/evil.so",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(dev.subprocess, "Popen", FakePopen), mock.patch.dict(
+                "os.environ", {}, clear=False
+            ):
+                import os
+
+                os.environ.pop("PROOFCOUNCIL_PACING", None)
+                os.environ.pop("LD_PRELOAD", None)
+                app = dev.create_app(runs_roots=(root,))
+                resp = app.test_client().post("/run/myrun/resume")
+
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(captured["env"].get("PROOFCOUNCIL_PACING"), "off")
+        self.assertIsNone(captured["env"].get("EVIL_INJECTED"))
+        self.assertIsNone(captured["env"].get("LD_PRELOAD"))
+
 
 class BatchMetadataPacingTests(unittest.TestCase):
     def test_batch_metadata_records_pacing(self) -> None:

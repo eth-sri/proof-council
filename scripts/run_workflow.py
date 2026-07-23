@@ -40,6 +40,7 @@ load_dotenv_file(REPO_ROOT / ".env")
 from proofstack import BudgetSpec, RunContext  # noqa: E402
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, RunMonitor  # noqa: E402
 from proofstack.registry import load_preset  # noqa: E402
+from proofstack.subscription import RESUME_ENV_ALLOWLIST  # noqa: E402
 
 
 def _argparser() -> argparse.ArgumentParser:
@@ -343,7 +344,7 @@ def _write_resume_spec(
     # fresh env and would otherwise fall back to the global setting.
     env = {
         k: v
-        for k in ("PROOFCOUNCIL_PACING",)
+        for k in RESUME_ENV_ALLOWLIST
         if (v := os.environ.get(k)) is not None
     }
     try:

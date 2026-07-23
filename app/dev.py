@@ -37,7 +37,7 @@ if str(_REPO_ROOT) not in sys.path:
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, url_for
 from mathagents.config_loader import load_solver_config
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, normalize_monitor_model_spec
-from proofstack.subscription import PLAN_SEEDS, SubscriptionPacer
+from proofstack.subscription import PLAN_SEEDS, RESUME_ENV_ALLOWLIST, SubscriptionPacer
 
 from app.dev_data import (
     clear_stopped_marker,
@@ -852,7 +852,15 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         # the original launch recorded — a fresh env would revert to the global.
         spec_env = spec.get("env")
         if isinstance(spec_env, dict):
-            env.update({str(k): str(v) for k, v in spec_env.items()})
+            # Only re-inject the keys the writer is allowed to persist; a
+            # hand-edited resume.json must not inject arbitrary environment.
+            env.update(
+                {
+                    str(k): str(v)
+                    for k, v in spec_env.items()
+                    if str(k) in RESUME_ENV_ALLOWLIST
+                }
+            )
         log_path = run.path / "dashboard-resume.log"
         with log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(

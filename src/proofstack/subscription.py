@@ -156,6 +156,13 @@ def subscription_home() -> Path:
     return Path.home() / ".proofcouncil"
 
 
+# Env keys a run may persist into resume.json and have re-injected on resume.
+# Both the writer (run_workflow._write_resume_spec) and the reader (the
+# dashboard's resume route) filter on this so a hand-edited resume.json cannot
+# inject arbitrary environment into the relaunched process.
+RESUME_ENV_ALLOWLIST: tuple[str, ...] = ("PROOFCOUNCIL_PACING",)
+
+
 def pacing_env_override() -> str | None:
     raw = (os.environ.get("PROOFCOUNCIL_PACING") or "").strip().lower()
     if raw in {"on", "off"}:
