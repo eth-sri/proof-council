@@ -35,7 +35,13 @@ def fetch(url_or_id: str) -> dict:
         endpoint,
         headers={
             "Accept": "application/json",
-            "User-Agent": "proofcouncil-share-reader/0.1",
+            # Cloudflare serves a challenge to non-browser UAs (2026-07-23)
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://chatgpt.com/share/{m.group(1)}",
         },
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
