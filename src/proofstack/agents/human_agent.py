@@ -160,7 +160,15 @@ class HumanAgent(Agent):
             for key, spec in schema.items():
                 if key == "workspace":
                     continue
-                fields[str(key)] = spec if isinstance(spec, str) else "string"
+                if isinstance(spec, str):
+                    fields[str(key)] = spec
+                elif isinstance(spec, dict) and isinstance(spec.get("type"), str):
+                    # JSON-schema form ({type: array}); keep the declared type so
+                    # the form-post coercion can rebuild it instead of flattening
+                    # every structured field to a raw string
+                    fields[str(key)] = spec["type"]
+                else:
+                    fields[str(key)] = "string"
         if not fields:
             fields = {"response": "string"}
         return fields

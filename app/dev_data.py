@@ -862,13 +862,33 @@ def find_run(roots: Iterable[Path], run_id: str) -> RunInfo | None:
 def coerce_human_response_value(raw: str, declared_type: Any) -> Any:
     """Coerce a form-submitted string to the field's declared output type.
 
-    A human node whose output field is declared ``array``/``object`` must not
-    receive a raw string — the resumed downstream node then chokes on a str
-    where it expects a list/dict. Parse those (and generic ``json``) via JSON;
-    if the value does not parse to the declared shape, leave it verbatim so the
-    normal output validation surfaces it rather than this silently mangling it.
+    A human node whose output field is declared as anything other than a string
+    must not receive a raw string — the resumed downstream node then chokes on a
+    str where it expects a list/dict, or reads a truthy ``"false"`` where it
+    expects a bool. Coerce the declared shape; if the value does not parse to
+    that shape, leave it verbatim so the normal output validation surfaces it
+    rather than this silently mangling it.
     """
     t = str(declared_type or "string").strip().lower()
+    if t in {"bool", "boolean"}:
+        v = raw.strip().lower()
+        if v in {"true", "1", "yes", "on"}:
+            return True
+        if v in {"false", "0", "no", "off", ""}:
+            return False
+        return raw
+    if t in {"int", "integer", "number", "float"}:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+        # json parses true/false to bool, and bool is an int subclass in Python;
+        # a numeric field must not silently accept a boolean
+        if isinstance(parsed, bool):
+            return raw
+        if t in {"int", "integer"}:
+            return parsed if isinstance(parsed, int) else raw
+        return parsed if isinstance(parsed, (int, float)) else raw
     if t not in {"array", "object", "json"}:
         return raw
     try:
