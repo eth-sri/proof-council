@@ -416,9 +416,10 @@ class CLIAgent(Agent):
                 await self._emit_pacing_unavailable(e)
                 return None
             if claim_id is not None:
-                await self.events.emit(
-                    "pacing.admit",
-                    {
+                try:
+                    await self.events.emit(
+                        "pacing.admit",
+                        {
                         "provider": provider,
                         "model": model,
                         "est_tokens": decision.est_tokens,
@@ -432,8 +433,17 @@ class CLIAgent(Agent):
                             }
                             for st in decision.windows
                         ],
-                    },
-                )
+                        },
+                    )
+                except asyncio.CancelledError:
+                    # cancelled after try_claim registered the claim but before
+                    # run() takes ownership of it in its finally: release it so
+                    # it doesn't hold phantom headroom until its TTL (B7)
+                    try:
+                        await asyncio.shield(asyncio.to_thread(pacer.release, claim_id))
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raise
                 return (pacer, claim_id)
             blocked = next(
                 (st for st in decision.windows if st.window == decision.blocking_window),

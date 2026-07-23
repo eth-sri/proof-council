@@ -879,18 +879,27 @@ def detect_rate_limit(text: str, *, now: float | None = None) -> RateLimitHit | 
                 reset_at /= 1000.0
             if reset_at <= now or reset_at > now + 32 * 86400:
                 reset_at = None  # implausible; keep the hit, drop the reset
-        lowered = m.group(0).lower()
-        if "weekly" in lowered:
+        # the window label often sits just outside the matched span (e.g.
+        # "Weekly usage limit reached|<epoch>" — the first pattern captures
+        # from "usage" on, dropping the "Weekly" prefix), so read the label
+        # off the surrounding text, not only m.group(0) (B3). An explicit
+        # label wins over the reset-delta guess, which can misread a soon
+        # weekly reset as five_hour.
+        start = max(0, m.start() - 40)
+        excerpt = text[start : m.end() + 40]
+        context = excerpt.lower()
+        if "weekly" in context:
             window_guess = "weekly"
+        elif "5-hour" in context or "5 hour" in context:
+            window_guess = "five_hour"
         elif reset_at is not None:
             window_guess = "five_hour" if reset_at - now <= FIVE_HOURS_S * 1.1 else "weekly"
         else:
             window_guess = "five_hour"
-        start = max(0, m.start() - 40)
         return RateLimitHit(
             reset_at=reset_at,
             window_guess=window_guess,
-            excerpt=text[start : m.end() + 40].strip()[:200],
+            excerpt=excerpt.strip()[:200],
         )
     return None
 
