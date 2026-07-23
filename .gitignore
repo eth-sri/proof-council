@@ -22,4 +22,8 @@ smoke/secrets.env
 # and ``smoke/output_container``).
 smoke/output/
 smoke/output_container/
-smoke/output_*
+smoke/output_*# CLI lead-researcher mode: research content is confidential by default
+research/
+# Root-level secrets file (smoke/secrets.env is ignored above; the root
+# variant used by CLI_LEAD_RESEARCHER.md must not be tracked either)
+secrets.env
