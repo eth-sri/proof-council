@@ -848,6 +848,11 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         # not as the stopped run it was a moment ago.
         clear_stopped_marker(run.path)
         env = _dashboard_subprocess_env()
+        # Re-inject the run's own env overrides (e.g. PROOFCOUNCIL_PACING) that
+        # the original launch recorded — a fresh env would revert to the global.
+        spec_env = spec.get("env")
+        if isinstance(spec_env, dict):
+            env.update({str(k): str(v) for k, v in spec_env.items()})
         log_path = run.path / "dashboard-resume.log"
         with log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(

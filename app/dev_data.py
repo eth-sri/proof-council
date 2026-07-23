@@ -4214,9 +4214,16 @@ def _regenerate_projections_from_schema(cfg: dict[str, Any]) -> None:
     schema = schema if isinstance(schema, dict) else {}
     business = [f for f in schema if f not in _OUTPUT_MECHANICS_FIELDS]
     if "output" in cfg:
-        # API components are delivery-neutral, so fresh tags stay
-        # self-consistent with the runtime instructions
-        spec = _regenerated_api_spec({f: "string" for f in business})
+        contract = {f: schema[f] for f in business}
+        if business and not all(_is_text_type(t) for t in contract.values()):
+            # structured outputs: reconcile the existing parse spec so each
+            # surviving field keeps its binding (a json/array parse is never
+            # flattened to a plain string tag) and removed fields are pruned
+            spec = _reconciled_api_spec(cfg.get("output"), contract)
+        else:
+            # all-text (switchable): fresh tags stay self-consistent with the
+            # runtime instructions
+            spec = _regenerated_api_spec({f: "string" for f in business})
         if spec is not None:
             cfg["output"] = spec
         else:
@@ -4227,26 +4234,30 @@ def _regenerate_projections_from_schema(cfg: dict[str, Any]) -> None:
         done = {k: v for k, v in done.items() if str(k) in allowed}
         cfg["done_outputs"] = done
     files = cfg.get("output_files")
-    if isinstance(files, dict):
+    # A CLI component with done_outputs but no output_files map still needs a
+    # delivery file synthesized for a genuinely-new field; only CLI components
+    # (they have a cmd, not an API `output` spec) ever grow an output_files map.
+    if isinstance(files, dict) or (cfg.get("cmd") is not None and "output" not in cfg):
+        files = files if isinstance(files, dict) else {}
         kept = {k: v for k, v in files.items() if str(k).split(".", 1)[0] in schema}
         covered = {str(k).split(".", 1)[0] for k in kept}
         covered |= set(done or {}) if isinstance(done, dict) else set()
         used_names = {
-            str(v.get("path") or "") if isinstance(v, dict) else str(v)
+            _norm_output_path(str(v.get("path") or "") if isinstance(v, dict) else str(v))
             for v in kept.values()
         }
         for field in business:
             if field in covered:
                 continue
             name = _default_output_filename(field)
-            if name in used_names:
+            if _norm_output_path(name) in used_names:
                 stem, _, ext = name.rpartition(".")
                 n = 2
-                while f"{stem}_{n}.{ext}" in used_names:
+                while _norm_output_path(f"{stem}_{n}.{ext}") in used_names:
                     n += 1
                 name = f"{stem}_{n}.{ext}"
             kept[field] = name
-            used_names.add(name)
+            used_names.add(_norm_output_path(name))
         cfg["output_files"] = kept
 
 
@@ -4311,6 +4322,22 @@ def _default_output_filename(field: str) -> str:
     if stem and suffix in _KNOWN_FILE_SUFFIXES:
         return f"{stem}.{suffix}"  # answer_tex -> answer.tex
     return f"{field}.txt"
+
+
+def _norm_output_path(raw: str) -> str:
+    """Normalize a workspace-relative output path the way the runtime does.
+
+    Mirrors configurable_cli._safe_relpath so the editor's collision check sees
+    what the collector will: ``./notes.txt`` and ``notes.txt`` are one file. An
+    absolute/escaping path is left as-is (it is rejected at validation).
+    """
+    try:
+        path = Path(raw)
+        if path.is_absolute() or any(part == ".." for part in path.parts):
+            return raw
+        return path.as_posix()
+    except (TypeError, ValueError):
+        return raw
 
 
 def _iter_agent_nodes(nodes: Any):
@@ -4394,7 +4421,6 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
             "exec",
             "--ignore-user-config",
             "--skip-git-repo-check",
-            "--ephemeral",
             "--json",
         ]
         scaffold: dict[str, Any] = {
@@ -4782,6 +4808,15 @@ def _unique_output_files(fields: Any) -> dict[str, str]:
     return out
 
 
+def _node_agent_class(node: dict[str, Any]) -> str:
+    """The agent class a node resolves, honoring the ``class:`` alias.
+
+    The runtime accepts ``agent:`` or ``class:`` (dag_workflow._agent_for), so
+    the editor must read both or a valid ``class:`` node looks custom-coded.
+    """
+    return str(node.get("agent") or node.get("class") or "")
+
+
 def _infer_executor(cfg: dict[str, Any], agent_cls: str) -> str:
     if agent_cls == CONFIGURABLE_PROMPT_AGENT:
         return "api"
@@ -4794,7 +4829,11 @@ def _infer_executor(cfg: dict[str, Any], agent_cls: str) -> str:
         first = str(cmd[0]) if cmd else ""
         if "codex" in first or cfg.get("copy_codex_auth"):
             return "codex_cli"
-        return "claude_cli"
+        if "claude" in first:
+            return "claude_cli"
+        # a genuinely custom command is neither CLI executor; returning "" makes
+        # the swap guard refuse rather than overwrite the user's command
+        return ""
     return ""
 
 
@@ -4813,6 +4852,71 @@ def _regenerated_api_spec(contract: dict[str, Any]) -> dict[str, Any] | None:
     if len(scalars) == 1:
         return {"default_field": scalars[0]}
     return {"xml_tags": scalars, "default_field": scalars[0]}
+
+
+def _reconciled_api_spec(
+    old: Any, contract: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Prune/extend an existing API parse spec to match an edited schema.
+
+    Used instead of a wholesale regenerate when the schema carries a non-text
+    field: surviving fields keep their current binding (a json/array parse is
+    not flattened to a string tag), fields dropped from the schema are pruned,
+    and a genuinely-new field gets a plain tag when text or a json_tag when
+    structured.
+    """
+    spec = copy.deepcopy(old) if isinstance(old, dict) else {}
+    survivors = set(contract)
+
+    for key in ("xml_lists", "json_tags", "regex_fields"):
+        m = spec.get(key)
+        if isinstance(m, dict):
+            m = {k: v for k, v in m.items() if str(k) in survivors}
+            if m:
+                spec[key] = m
+            else:
+                spec.pop(key, None)
+    tags = spec.get("xml_tags")
+    if isinstance(tags, list):
+        tags = [t for t in tags if str(t) in survivors]
+        if tags:
+            spec["xml_tags"] = tags
+        else:
+            spec.pop("xml_tags", None)
+    if isinstance(spec.get("json_tag"), str):
+        json_name = spec.get("json_field") or spec["json_tag"]
+    elif isinstance(spec.get("json_field"), str):
+        json_name = spec["json_field"]
+    else:
+        json_name = None
+    if json_name is not None and str(json_name) not in survivors:
+        spec.pop("json_tag", None)
+        spec.pop("json_field", None)
+    default = spec.get("default_field")
+    if isinstance(default, str) and default not in survivors:
+        spec.pop("default_field", None)
+
+    covered = set(_spec_output_contract(spec))
+    for field, type_spec in contract.items():
+        if field in covered:
+            continue
+        if _is_text_type(type_spec):
+            tags = spec.get("xml_tags")
+            tags = tags if isinstance(tags, list) else []
+            tags.append(field)
+            spec["xml_tags"] = tags
+        else:
+            jt = spec.get("json_tags")
+            jt = jt if isinstance(jt, dict) else {}
+            jt[field] = field
+            spec["json_tags"] = jt
+        covered.add(field)
+
+    if not covered:
+        return None
+    if not isinstance(spec.get("default_field"), str) or spec["default_field"] not in covered:
+        spec["default_field"] = next(f for f in contract if f in covered)
+    return spec
 
 
 def _component_prompt_text(cfg: dict[str, Any]) -> str:
@@ -4851,9 +4955,9 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
         )
     custom = sorted(
         {
-            str(node.get("agent"))
+            _node_agent_class(node)
             for node in referencing
-            if str(node.get("agent") or "") not in _SWAPPABLE_AGENTS
+            if _node_agent_class(node) not in _SWAPPABLE_AGENTS
         }
     )
     if custom:
@@ -4865,7 +4969,7 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
 
     # A component wired to nodes of different executors is already in an
     # ambiguous state; a swap would resolve it order-dependently.
-    current = {_infer_executor(cfg, str(node.get("agent"))) for node in referencing}
+    current = {_infer_executor(cfg, _node_agent_class(node)) for node in referencing}
     if len(current) > 1:
         raise PresetError(
             f"component {name!r} is run by nodes on different executors "
@@ -4904,7 +5008,10 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
 
     for node in _iter_agent_nodes((raw.get("dag") or {}).get("nodes")):
         if str(node.get("name") or "") == name:
-            node["agent"] = agent_cls  # both CLI executors use the same class
+            # write back to whichever alias the node already uses so a `class:`
+            # node isn't left with a stale `class` beside a fresh `agent`
+            key = "class" if "class" in node and "agent" not in node else "agent"
+            node[key] = agent_cls  # both CLI executors use the same class
 
 
 def _op_update_node_inputs(raw: dict[str, Any], operation: dict[str, Any]) -> None:
@@ -6171,7 +6278,7 @@ def _cli_component_template() -> dict[str, Any]:
             "sandbox": {"timeout_s": 900, "backend": "docker", "docker_no_new_privileges": False},
             "output_schema": {"workspace": "string", "status": "string", "summary": "string"},
             "done_outputs": {"status": "status", "summary": "summary"},
-            "usage": {"type": "codex_jsonl", "model": "gpt-5.4-mini", "cost_config": "models/openai/gpt-54-mini"},
+            "usage": {"type": "codex_jsonl", "model": "gpt-5.4-mini", "cost_config": "models/openai/gpt-54-mini", "bill": False},
         }
     )
     return cfg

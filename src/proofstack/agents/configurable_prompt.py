@@ -39,6 +39,7 @@ class ConfigurablePromptAgent(APICallAgent):
         fields = inp.model_dump(mode="json")
         messages_cfg = self.component_config.get("messages")
         messages = None
+        template_text = ""
         if isinstance(messages_cfg, list):
             rendered = []
             for msg in messages_cfg:
@@ -49,9 +50,19 @@ class ConfigurablePromptAgent(APICallAgent):
                 rendered.append({"role": role, "content": content})
             if rendered:
                 messages = rendered
+                template_text = "\n".join(
+                    str(msg.get("content") or "")
+                    for msg in messages_cfg
+                    if isinstance(msg, dict)
+                )
         if messages is None:
             messages = super().render_messages(inp)
-        return _with_format_instruction(messages, self.component_config.get("output"))
+            template_text = "\n".join(
+                str(t) for t in (self.SYSTEM_PROMPT, self.USER_PROMPT) if t
+            )
+        return _with_format_instruction(
+            messages, self.component_config.get("output"), template_text
+        )
 
     def extra_client_kwargs(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -189,19 +200,19 @@ def _parse_json_tag(raw_text: str, tag: str, *, default: Any = None) -> Any:
 
 
 def _with_format_instruction(
-    messages: list[dict[str, Any]], output_cfg: Any
+    messages: list[dict[str, Any]], output_cfg: Any, template_text: str = ""
 ) -> list[dict[str, Any]]:
     """Append generated delivery-format instructions to the final user message.
 
     The API-side analog of the CLI ``contract: auto`` tail: component prompts
     stay delivery-neutral (describing only the task) and each executor
-    generates its own delivery instructions at runtime. Bindings the prompt
-    already mentions are skipped, so hand-written format prompts keep working
-    unchanged.
+    generates its own delivery instructions at runtime. Bindings the authored
+    prompt template already mentions are skipped, so hand-written format prompts
+    keep working unchanged. Only the template is consulted, never the rendered
+    user input — an output tag echoed in a candidate answer must not suppress
+    that field's instruction.
     """
-    instruction = _format_instruction(
-        output_cfg, "\n".join(str(m.get("content") or "") for m in messages)
-    )
+    instruction = _format_instruction(output_cfg, template_text)
     if not instruction:
         return messages
     out = [dict(m) for m in messages]

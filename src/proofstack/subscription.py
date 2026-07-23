@@ -411,7 +411,7 @@ class SubscriptionStore:
         if not isinstance(raw, dict):
             return merged
         for key, value in raw.items():
-            if key in ("cap_pct", "ceilings", "calibration") and isinstance(value, dict):
+            if key in ("cap_pct", "ceilings", "calibration", "account_cap_pct") and isinstance(value, dict):
                 merged[key] = {**merged.get(key, {}), **value}
             else:
                 merged[key] = value
@@ -423,7 +423,7 @@ class SubscriptionStore:
             for key, value in updates.items():
                 if key not in DEFAULT_SETTINGS:
                     continue
-                if key in ("cap_pct", "ceilings") and isinstance(value, dict):
+                if key in ("cap_pct", "ceilings", "account_cap_pct") and isinstance(value, dict):
                     # merge per window; an explicit null deletes the override
                     merged = {**settings.get(key, {}), **value}
                     settings[key] = {k: v for k, v in merged.items() if v is not None}
@@ -1024,6 +1024,12 @@ class SubscriptionPacer:
         if st.ceiling > 0:
             drift_pct = 100.0 * drift_tokens / st.ceiling
         else:
+            # probe-only window: a fresh probe already at the cap must block any
+            # pending spend, since we have no ceiling to convert drift to percent
+            if drift_tokens > 0 and st.probe_pct >= st.account_cap_pct:
+                if st.resets_at is not None and st.resets_at > now:
+                    return st.resets_at - now
+                return DEFAULT_RECHECK_S
             stale = st.probe_ts is None or (now - st.probe_ts) > ttl_s * 1.5
             drift_pct = 10.0 if stale else 0.0
         if st.probe_pct + drift_pct <= st.account_cap_pct:
@@ -1080,6 +1086,10 @@ class SubscriptionPacer:
                     if cum >= deficit:
                         window_wait = max(0.0, e.ts + st.seconds - now)
                         break
+                # a discrete provider reset frees all own-spend at once, so never
+                # wait past it for the rolling ledger entry to age out
+                if st.resets_at is not None and st.resets_at > now:
+                    window_wait = min(window_wait, st.resets_at - now)
             if window_wait is None:
                 continue
             if blocking is None or window_wait > wait_s:

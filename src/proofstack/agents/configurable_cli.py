@@ -218,7 +218,9 @@ class ConfigurableCLIAgent(CLIAgent):
         cfg_ref = None
         # bill: false marks a subscription run — tokens are metered but no USD
         # is charged (add_usd would trip the max_usd: 0.0 gate those runs use).
-        if usage_cfg.get("bill", True):
+        # copy_codex_auth is subscription auth by itself, so it is never billed
+        # even when a template forgets bill: false.
+        if usage_cfg.get("bill", True) and not self._copy_codex_auth_enabled():
             cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
             try:
                 rates = load_cost_rates(cfg_ref)
@@ -385,8 +387,12 @@ class ConfigurableCLIAgent(CLIAgent):
         the observed total. A model-class cap (e.g. fable weekly) can be
         misattributed to the generic window — that only over-blocks until the
         reset, which is the safe direction for a backstop.
+
+        The model's own answer is excluded: a real limit prints as a plain line
+        or a non-assistant envelope, so scanning the assistant text too would
+        misread a candidate that merely quotes the limit phrase as a real hit.
         """
-        hit = detect_rate_limit((stdout_text or "") + "\n" + (stderr_text or ""))
+        hit = detect_rate_limit(_answer_free_stdout(stdout_text) + "\n" + (stderr_text or ""))
         if hit is None:
             return
         seconds, model_filter = WINDOWS[hit.window_guess]
@@ -750,6 +756,29 @@ def _has_codex_sandbox_flag(cmd: list[str]) -> bool:
         part in {"--dangerously-bypass-approvals-and-sandbox", "--sandbox"}
         for part in cmd
     )
+
+
+def _answer_free_stdout(stdout_text: str) -> str:
+    """Stdout with the model's own conversational turns removed.
+
+    stream-json emits one envelope per line; ``assistant``/``user`` lines carry
+    the model's answer text, which must not be scanned for a rate-limit phrase
+    the candidate may merely quote. Non-JSON lines (a real limit prints one) and
+    all other envelopes are kept.
+    """
+    kept: list[str] = []
+    for line in (stdout_text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            try:
+                obj = json.loads(stripped)
+            except (ValueError, TypeError):
+                kept.append(line)
+                continue
+            if isinstance(obj, dict) and obj.get("type") in {"assistant", "user"}:
+                continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _safe_relpath(raw: str) -> str:

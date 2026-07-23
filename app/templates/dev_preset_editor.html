@@ -5939,8 +5939,9 @@
         }
 
         function cliOutputSchemaForRow(row, path) {
-            const originalPath = String(row.dataset.originalOutputPath || '').trim();
-            if (originalPath === path && row.dataset.originalOutputSchema) {
+            // The declared type is path-independent, so a saved row keeps it when
+            // only its path is renamed (keying on originalPath dropped type:path).
+            if (row.dataset.originalOutputSchema) {
                 try {
                     return JSON.parse(row.dataset.originalOutputSchema);
                 } catch {
@@ -5955,11 +5956,15 @@
         }
 
         function cliOutputSpecForRow(row, path) {
-            const originalPath = String(row.dataset.originalOutputPath || '').trim();
-            if (originalPath === path && row.dataset.originalOutputSpec) {
+            // Carry the renamed path into the saved spec so its type/default
+            // survive (keying on originalPath collapsed the dict to a bare path,
+            // flipping the collector from path-return to file-contents).
+            if (row.dataset.originalOutputSpec) {
                 try {
                     const spec = JSON.parse(row.dataset.originalOutputSpec);
-                    if (spec && typeof spec === 'object' && !Array.isArray(spec)) return spec;
+                    if (spec && typeof spec === 'object' && !Array.isArray(spec)) {
+                        return { ...spec, path };
+                    }
                 } catch {
                     return path;
                 }

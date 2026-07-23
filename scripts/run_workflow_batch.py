@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +118,7 @@ async def amain() -> int:
         "started_by": "dashboard",
         "preset": args.workflow,
         "monitor": {"enabled": bool(args.monitor), "model": args.monitor_model if args.monitor else None},
+        "pacing": os.environ.get("PROOFCOUNCIL_PACING") or "default",
         "started_at": manifest["started_at"],
         "manifest": manifest,
     }

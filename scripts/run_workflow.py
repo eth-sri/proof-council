@@ -339,9 +339,18 @@ def _write_resume_spec(
         argv += ["--budget-usd", str(args.budget_usd)]
     if args.monitor:
         argv += ["--monitor", "--monitor-model", args.monitor_model]
+    # Pacing is env-only, so persist the run's override here — resume rebuilds a
+    # fresh env and would otherwise fall back to the global setting.
+    env = {
+        k: v
+        for k in ("PROOFCOUNCIL_PACING",)
+        if (v := os.environ.get(k)) is not None
+    }
     try:
         (run_dir / "resume.json").write_text(
-            json.dumps({"run_id": run_id, "argv": argv}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"run_id": run_id, "argv": argv, "env": env}, ensure_ascii=False, indent=2
+            ),
             encoding="utf-8",
         )
     except OSError:
