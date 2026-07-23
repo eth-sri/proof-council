@@ -1,5 +1,14 @@
 """Cross-run subscription window accounting and pacing.
 
+EXPERIMENTAL — the PACER (admission control: ``SubscriptionPacer.decide`` /
+``_window_statuses`` / ``record_rate_limit`` / ``record_probe``) is DISABLED BY
+DEFAULT (settings ``"enabled": False``) and is NOT production-ready. Focused
+review found recurring correctness defects in its discrete-block / calibration
+model; see ``docs/pacer-rework.md`` for the open findings and the planned
+structural rework. Do not rely on it in production until that lands. The usage
+LEDGER in this module (``SubscriptionStore.append_usage`` / ``window_entries``,
+used by metering) is stable and unaffected by the pacer's state.
+
 Subscription (CLI) runs are limited by the provider's rolling account-wide
 windows (Anthropic: 5-hour + weekly + model-class weeklies), not by USD. A
 per-run BudgetTracker structurally cannot see those, so this module keeps a
@@ -27,6 +36,7 @@ import os
 import re
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -978,6 +988,17 @@ class SubscriptionPacer:
             return False, DEFAULT_PARK_AFTER_S
         settings = self.store.load_settings()
         enabled = True if override == "on" else bool(settings.get("enabled"))
+        if enabled:
+            # the pacer is carved out of the council-infra PR as experimental;
+            # anyone turning it on gets one loud warning per process (see
+            # docs/pacer-rework.md for the open correctness defects)
+            warnings.warn(
+                "subscription pacing is EXPERIMENTAL and unreviewed: it has known "
+                "admission-control defects (see docs/pacer-rework.md) and must not "
+                "be relied on in production",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return enabled, _park_after_s(settings)
 
     def enabled(self) -> bool:
