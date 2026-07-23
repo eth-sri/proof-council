@@ -29,8 +29,11 @@ _CODEX_STDOUT = json.dumps(
 ) + "\n"
 
 
-def _meter(cfg: dict) -> tuple[float, int]:
-    """Run the metering path for a codex node and return (usd, tokens)."""
+def _meter(cfg: dict, copied: bool = False) -> tuple[float, int]:
+    """Run the metering path for a codex node and return (usd, tokens).
+
+    ``copied`` mirrors what ``setup()`` leaves behind: whether codex subscription
+    auth was actually copied into the sandbox (only then is the run un-billed)."""
     with tempfile.TemporaryDirectory() as td:
         ctx = RunContext.create(
             run_id="t",
@@ -40,14 +43,15 @@ def _meter(cfg: dict) -> tuple[float, int]:
         )
         agent = ConfigurableCLIAgent(ctx, name="cfg_x")
         agent._active_workspace_root = Path(td)
+        agent._copied_codex_auth = copied
         asyncio.run(agent.record_cli_usage(_CODEX_STDOUT, "", CLIDoneRecord()))
         return agent.tracker.counters.usd, agent.tracker.counters.tokens
 
 
 class R1BillingTests(unittest.TestCase):
     def test_subscription_node_without_explicit_bill_meters_tokens_but_no_usd(self) -> None:
-        # copy_codex_auth == subscription auth: USD must stay zero even when the
-        # usage dict forgets `bill: false`. Tokens are still metered.
+        # copy_codex_auth actually copied == subscription auth: USD must stay zero
+        # even when the usage dict forgets `bill: false`. Tokens are still metered.
         cfg = {
             "copy_codex_auth": True,
             "usage": {
@@ -56,8 +60,24 @@ class R1BillingTests(unittest.TestCase):
                 "cost_config": "models/openai/gpt-54-mini",
             },
         }
-        usd, tokens = _meter(cfg)
+        usd, tokens = _meter(cfg, copied=True)
         self.assertEqual(usd, 0.0)
+        self.assertEqual(tokens, 1500)
+
+    def test_copy_codex_auth_flag_but_auth_not_copied_still_bills(self) -> None:
+        # B2: copy_codex_auth: true but no host auth.json to copy -> the run fell
+        # back to a billable key. Billing must key on whether auth was ACTUALLY
+        # copied (_copied_codex_auth), not the config flag, or a key run goes free.
+        cfg = {
+            "copy_codex_auth": True,
+            "usage": {
+                "type": "codex_jsonl",
+                "model": "gpt-5.4-mini",
+                "cost_config": "models/openai/gpt-54-mini",
+            },
+        }
+        usd, tokens = _meter(cfg, copied=False)
+        self.assertGreater(usd, 0.0)
         self.assertEqual(tokens, 1500)
 
     def test_key_based_billed_node_still_charges_usd(self) -> None:

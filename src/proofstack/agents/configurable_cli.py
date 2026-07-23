@@ -218,9 +218,11 @@ class ConfigurableCLIAgent(CLIAgent):
         cfg_ref = None
         # bill: false marks a subscription run — tokens are metered but no USD
         # is charged (add_usd would trip the max_usd: 0.0 gate those runs use).
-        # copy_codex_auth is subscription auth by itself, so it is never billed
-        # even when a template forgets bill: false.
-        if usage_cfg.get("bill", True) and not self._copy_codex_auth_enabled():
+        # A node that ACTUALLY copied codex subscription auth is never billed even
+        # when a template forgets bill: false. Gate on _copied_codex_auth (the
+        # runtime fact), not the config flag: copy_codex_auth: true with no host
+        # auth.json copies nothing, so that run fell back to a billable key.
+        if usage_cfg.get("bill", True) and not self._copied_codex_auth:
             cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
             try:
                 rates = load_cost_rates(cfg_ref)
