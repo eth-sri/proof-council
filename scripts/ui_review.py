@@ -1,6 +1,6 @@
 """Drive the dashboard headlessly and screenshot key UI states for review.
 
-Usage: uv run python scripts/ui_review.py [--port 5002]
+Usage: uv run python scripts/ui_review.py [--port 5005] [--probe]
 
 Writes PNGs to outputs/ui_review/ (gitignored). Read-only: it loads pages but
 does not save settings or launch runs.
@@ -18,7 +18,12 @@ OUT_DIR = REPO_ROOT / "outputs" / "ui_review"
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=5002)
+    parser.add_argument("--port", type=int, default=5005)
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Fail on HTTP errors or uncaught browser-page exceptions.",
+    )
     args = parser.parse_args()
     base = f"http://127.0.0.1:{args.port}"
 
@@ -33,19 +38,49 @@ def main() -> int:
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(viewport={"width": 1440, "height": 1400})
-        page.goto(f"{base}/run-agent", wait_until="networkidle")
-        page.wait_for_timeout(500)
-        shot(page, "run_agent_full")
+        try:
+            page = browser.new_page(viewport={"width": 1440, "height": 1400})
+            page_errors: list[str] = []
+            page.on("pageerror", lambda error: page_errors.append(str(error)))
 
-        page.goto(f"{base}/runs", wait_until="networkidle")
-        page.wait_for_timeout(300)
-        shot(page, "runs_list")
-        browser.close()
+            def visit(path: str, *, settle_ms: int = 300) -> None:
+                response = page.goto(f"{base}{path}", wait_until="networkidle")
+                if args.probe and (response is None or not response.ok):
+                    status = response.status if response is not None else "no response"
+                    raise RuntimeError(f"{path} returned {status}")
+                page.wait_for_timeout(settle_ms)
+
+            visit("/run-agent", settle_ms=500)
+            shot(page, "run_agent_full")
+
+            visit("/runs")
+            shot(page, "runs_list")
+
+            visit("/presets")
+            shot(page, "presets_list")
+            editor_links = page.locator("a.agent-link")
+            editor_count = editor_links.count()
+            if args.probe and editor_count == 0:
+                raise RuntimeError("/presets did not expose an agent editor link")
+            if editor_count:
+                editor_link = editor_links.first
+                href = editor_link.get_attribute("href")
+                if args.probe and not href:
+                    raise RuntimeError("agent editor link has no href")
+                if href:
+                    visit(href, settle_ms=700)
+                    shot(page, "preset_editor")
+
+            if args.probe and page_errors:
+                raise RuntimeError("browser page error(s): " + "; ".join(page_errors))
+        finally:
+            browser.close()
 
     print("screenshots:")
     for s in shots:
         print(f"  {s}")
+    if args.probe:
+        print("probe: ok")
     return 0
 
 

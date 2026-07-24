@@ -5,12 +5,10 @@
 # a single node drives the headless `claude` CLI, which solves the problem and
 # writes answer.tex. Two things make the subscription path work:
 #   1. The subprocess sandbox pins HOME to the sandbox root by default, so a
-#      coding CLI can't read or modify your real home — but that also hides the
-#      subscription login. Setting HOME: "{env:HOME}" points it back at your
-#      real home so `claude` finds the logged-in subscription. The worker can
-#      still only WRITE files (via the Write tool) and run the single `finish`
-#      command (--allowedTools Bash(finish:*)); every other shell command is
-#      auto-denied in headless mode.
+#      coding CLI can't find the subscription login. Setting HOME: "{env:HOME}"
+#      exposes the login to the CLI itself, while --safe-mode ignores user
+#      customizations and --tools Write removes all read/shell tools from the
+#      model. The worker can only create the requested files in its workspace.
 #   2. `--output-format stream-json` reports token usage per turn, so even a
 #      timed-out call is metered against max_tokens. A pure-subscription run
 #      spends $0 — the real limit is the token window, not USD.
@@ -44,20 +42,24 @@ components:
       - "{claude_model}"
       - --permission-mode
       - acceptEdits         # auto-approve file writes (so it can create answer.tex)
-      - --allowedTools
-      - Bash(finish:*)      # the ONLY shell command it may run is `finish`
-    soft_timeout_s: 780     # 13 min: graceful "wrap up & finish" nudge
+      - --safe-mode         # ignore user hooks, plugins, instructions, and MCP config
+      - --strict-mcp-config # do not load MCP servers from the real home
+      - --no-session-persistence
+      - --tools
+      - Write               # no Read, Bash, web, subagent, or other model tools
+    soft_timeout_s: 780     # 13 min: graceful completion nudge
     sandbox:
       backend: subprocess   # host, not Docker
       timeout_s: 900        # 15 min: hard kill ceiling for this call
+      provider_keys: []     # do not let an API key override subscription login
     env:
       HOME: "{env:HOME}"    # point at real home so the CLI finds the subscription login
     usage:
       type: claude_json     # meter full token throughput (incl. cache) vs max_tokens
-    # Delivery mechanics are auto-appended: with `contract: auto` the framework
-    # tells the model which files to write (from output_files) and how to signal
-    # completion (the `finish` command), so the prompt describes only the task.
+    # Delivery mechanics are auto-appended: the model writes output files plus a
+    # done.json completion record using the Write tool, with no shell access.
     contract: auto
+    completion_signal: file
     prompt: |
       You are a research mathematician. Solve the problem below with a complete,
       rigorous proof, written as a self-contained LaTeX document.

@@ -33,6 +33,7 @@ from proofstack.registry import (
     list_presets,
     load_preset,
 )
+from proofstack.transient_auth import remove_codex_auth_for_run
 
 DEFAULT_TOOL_ROOT = CONFIGS_ROOT / "tools"
 WORKFLOW_OUTPUT_NODE_ID = "__workflow_outputs"
@@ -559,6 +560,7 @@ def _apply_process_liveness(info: RunInfo) -> None:
     pid = read_run_pid(info.path)
     if pid is not None and not _pid_alive(pid):
         info.process_dead = True
+        _scrub_transient_credentials(info.path)
 
 
 def _apply_stopped_marker(info: RunInfo) -> None:
@@ -1150,6 +1152,44 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+_TRANSIENT_CREDENTIAL_DIR_NAMES = frozenset(
+    {".codex-home", ".compute_codex_home"}
+)
+
+
+def _scrub_transient_credentials(run_path: Path) -> int:
+    """Remove known transient credential directories below a retained run.
+
+    Current configurable subscription nodes keep auth in a deterministic
+    per-run location outside the run tree; older nodes and the compute worker
+    used directories below the run. Symlinks are unlinked, never followed.
+    """
+    if run_path.is_symlink():
+        return 0
+    removed = 0
+    if remove_codex_auth_for_run(run_path):
+        removed += 1
+    if not run_path.is_dir():
+        return removed
+    for root, dirnames, _filenames in os.walk(
+        run_path, topdown=True, followlinks=False
+    ):
+        for name in tuple(dirnames):
+            if name not in _TRANSIENT_CREDENTIAL_DIR_NAMES:
+                continue
+            dirnames.remove(name)
+            target = Path(root) / name
+            try:
+                if target.is_symlink():
+                    target.unlink()
+                else:
+                    shutil.rmtree(target)
+            except OSError:
+                continue
+            removed += 1
+    return removed
+
+
 def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
     """Terminate a run's process group (the worker plus its sandbox CLIs).
 
@@ -1160,14 +1200,28 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
     the caller still marks the run stopped so Resume appears.
     """
     pid = read_run_pid(run_path)
-    if pid is None or not _pid_alive(pid):
-        return {"signalled": False, "pid": pid}
+    if pid is None:
+        return {
+            "signalled": False,
+            "pid": pid,
+            "credentials_scrubbed": _scrub_transient_credentials(run_path),
+        }
+    if not _pid_alive(pid):
+        return {
+            "signalled": False,
+            "pid": pid,
+            "credentials_scrubbed": _scrub_transient_credentials(run_path),
+        }
     # Only signal the GROUP if this PID is genuinely its own group leader, else
     # killpg would hit an unrelated group; otherwise signal just the process.
     try:
         use_group = os.getpgid(pid) == pid
     except ProcessLookupError:
-        return {"signalled": False, "pid": pid}
+        return {
+            "signalled": False,
+            "pid": pid,
+            "credentials_scrubbed": _scrub_transient_credentials(run_path),
+        }
 
     def send(sig: int) -> None:
         if use_group:
@@ -1177,8 +1231,14 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
 
     try:
         send(signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return {"signalled": False, "pid": pid}
+    except ProcessLookupError:
+        return {
+            "signalled": False,
+            "pid": pid,
+            "credentials_scrubbed": _scrub_transient_credentials(run_path),
+        }
+    except PermissionError:
+        return {"signalled": False, "pid": pid, "credentials_scrubbed": 0}
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline and _pid_alive(pid):
         time.sleep(0.1)
@@ -1191,7 +1251,11 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
         (run_path / "run.pid").unlink()
     except OSError:
         pass
-    return {"signalled": True, "pid": pid}
+    return {
+        "signalled": True,
+        "pid": pid,
+        "credentials_scrubbed": _scrub_transient_credentials(run_path),
+    }
 
 
 def run_process_alive(run_path: Path) -> bool:
@@ -4386,6 +4450,7 @@ _EXECUTOR_OWNED_KEYS = (
     "soft_timeout_s",
     "cache_enabled",
     "contract",
+    "completion_signal",
     "messages",
     "output",
     "output_files",
@@ -4472,14 +4537,22 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
                 model_arg,
                 "--permission-mode",
                 "acceptEdits",
-                "--allowedTools",
-                "Bash(finish:*)",
+                "--safe-mode",
+                "--strict-mcp-config",
+                "--no-session-persistence",
+                "--tools",
+                "Write",
             ],
             "soft_timeout_s": 780,
-            "sandbox": {"backend": "subprocess", "timeout_s": 900},
+            "sandbox": {
+                "backend": "subprocess",
+                "timeout_s": 900,
+                "provider_keys": [],
+            },
             "env": {"HOME": "{env:HOME}"},
             "usage": {"type": "claude_json"},
             "contract": "auto",
+            "completion_signal": "file",
         }
     if executor == "codex_cli":
         binding = (
@@ -4498,7 +4571,11 @@ def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict
             "codex_sandbox": "auto",
             "copy_codex_auth": True,
             "soft_timeout_s": 780,
-            "sandbox": {"backend": "subprocess", "timeout_s": 900},
+            "sandbox": {
+                "backend": "subprocess",
+                "timeout_s": 900,
+                "provider_keys": [],
+            },
             "contract": "auto",
         }
         if binding:
@@ -4722,6 +4799,7 @@ _CLI_EXECUTORS = {"claude_cli", "codex_cli"}
 _CLI_SWAP_KEYS = (
     "cmd", "env", "sandbox", "codex_sandbox", "copy_codex_auth",
     "model", "model_reasoning_effort", "soft_timeout_s", "contract",
+    "completion_signal",
 )
 
 
@@ -4896,7 +4974,7 @@ def _infer_executor(cfg: dict[str, Any], agent_cls: str) -> str:
         if isinstance(cmd, str):
             cmd = cmd.split()
         first = str(cmd[0]) if cmd else ""
-        base = first.rsplit("/", 1)[-1]
+        base = re.split(r"[\\/]", first)[-1]
         if base == "codex" or cfg.get("copy_codex_auth"):
             return "codex_cli"
         if base == "claude":
@@ -4970,11 +5048,11 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
         return
 
     # Only Claude<->Codex CLI switching is currently enabled. Both run the same
-    # ConfigurableCLIAgent and read outputs identically (files + done.json), so
-    # the swap only exchanges the command / auth / usage scaffold and touches
-    # none of the output-contract translation that made API/human switching a
-    # combinatorial correctness hazard (that path is disabled pending rework;
-    # the full implementation lives on the feat/executor-switching branch).
+    # ConfigurableCLIAgent and deliver outputs identically (files + done.json),
+    # so the swap only exchanges the command / auth / usage scaffold. The
+    # restricted Claude executor cannot consume workspace file inputs, which is
+    # refused explicitly below. API/human switching remains disabled pending
+    # rework; its old implementation lives on feat/executor-switching.
     if executor not in _CLI_EXECUTORS or not current <= _CLI_EXECUTORS:
         raise PresetError(
             f"switching {name!r} to {executor!r} is disabled — only Claude "
@@ -4982,10 +5060,22 @@ def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
             "by hand for other executor changes."
         )
 
+    if executor == "claude_cli":
+        file_inputs = [
+            key for key in ("input_files", "bootstrap_files") if cfg.get(key)
+        ]
+        if file_inputs:
+            raise PresetError(
+                f"component {name!r} uses {', '.join(file_inputs)}, but the "
+                "restricted Claude subscription executor is write-only and "
+                "cannot consume workspace files. Move the required content "
+                "into prompt inputs, or edit the node by hand."
+            )
+
     # CLI -> CLI: preserve prompt, schemas, and the entire output configuration
     # (both executors deliver outputs the same way); replace only the
     # command/auth scaffold, and carry token metering across. Leave
-    # output/output_files/done_outputs and input_files untouched.
+    # output/output_files/done_outputs and any supported input_files untouched.
     usage = _cli_usage_for(cfg.get("usage"), executor)
     for key in _CLI_SWAP_KEYS:
         cfg.pop(key, None)
@@ -6263,7 +6353,12 @@ def _cli_component_template() -> dict[str, Any]:
             "model_reasoning_effort": "low",
             "prompt": "Complete this CLI task. Write any requested files in the workspace.",
             "input_schema": {},
-            "sandbox": {"timeout_s": 900, "backend": "docker", "docker_no_new_privileges": False},
+            "sandbox": {
+                "timeout_s": 900,
+                "backend": "docker",
+                "docker_no_new_privileges": False,
+                "provider_keys": [],
+            },
             "output_schema": {"workspace": "string", "status": "string", "summary": "string"},
             "done_outputs": {"status": "status", "summary": "summary"},
             "usage": {"type": "codex_jsonl", "model": "gpt-5.4-mini", "cost_config": "models/openai/gpt-54-mini", "bill": False},

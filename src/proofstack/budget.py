@@ -178,11 +178,12 @@ class BudgetTracker:
                 ("wallclock_s", node.counters.wallclock_s(), node.spec.max_wallclock_s),
                 ("tool_calls", node.counters.tool_calls, node.spec.max_tool_calls),
             ):
-                if limit is None or limit <= 0:
+                if limit is None or limit < 0:
                     continue
-                if used >= limit and not allow_overrun:
+                exhausted = used > 0 if limit == 0 else used >= limit
+                if exhausted and not allow_overrun:
                     raise BudgetExhausted(node.scope, kind, float(limit), float(used))
-                if used >= 0.9 * limit and not node.warned.get(kind):
+                if limit > 0 and used >= 0.9 * limit and not node.warned.get(kind):
                     node.warned[kind] = True
                     warnings.append((node.scope, kind, float(used), float(limit)))
         return warnings

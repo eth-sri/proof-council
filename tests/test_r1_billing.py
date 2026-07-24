@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from proofstack.agents.configurable_cli import ConfigurableCLIAgent  # noqa: E402
+from proofstack.budget import BudgetExhausted, BudgetSpec, BudgetTracker  # noqa: E402
 from proofstack.context import RunContext  # noqa: E402
 from proofstack.kinds.cli import CLIDoneRecord  # noqa: E402
 from app.dev_data import _cli_component_template  # noqa: E402
@@ -94,14 +95,28 @@ class R1BillingTests(unittest.TestCase):
         self.assertGreater(usd, 0.0)
         self.assertEqual(tokens, 1500)
 
-    def test_editor_add_node_template_carries_bill_false(self) -> None:
+    def test_bill_false_never_masks_missing_subscription_auth(self) -> None:
         cfg = _cli_component_template()
         self.assertTrue(cfg.get("copy_codex_auth"))
         self.assertEqual(cfg["usage"].get("bill"), False)
-        # And end-to-end: the editor template itself must not charge USD.
-        usd, tokens = _meter(cfg)
-        self.assertEqual(usd, 0.0)
+        self.assertEqual(cfg["sandbox"].get("provider_keys"), [])
+
+        # The declaration is not authoritative: without observed copied auth,
+        # metering must account for a possible paid-key run.
+        usd, tokens = _meter(cfg, copied=False)
+        self.assertGreater(usd, 0.0)
         self.assertEqual(tokens, 1500)
+
+        # With observed subscription auth, the same template remains unbilled.
+        subscription_usd, _ = _meter(cfg, copied=True)
+        self.assertEqual(subscription_usd, 0.0)
+
+    def test_zero_usd_budget_is_a_hard_zero_after_spend(self) -> None:
+        tracker = BudgetTracker(scope="run", spec=BudgetSpec(max_usd=0.0))
+        self.assertEqual(tracker.check(), [])
+        tracker.add_usd(0.01)
+        with self.assertRaises(BudgetExhausted):
+            tracker.check()
 
 
 if __name__ == "__main__":

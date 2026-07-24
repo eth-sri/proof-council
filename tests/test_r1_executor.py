@@ -115,6 +115,12 @@ class B7BasenameInferenceTests(unittest.TestCase):
             "codex_cli",
         )
         self.assertEqual(
+            _infer_executor(
+                {"cmd": [r"C:\tools\codex", "exec"]}, CONFIGURABLE_CLI_AGENT
+            ),
+            "codex_cli",
+        )
+        self.assertEqual(
             _infer_executor({"cmd": ["claude", "-p"]}, CONFIGURABLE_CLI_AGENT),
             "claude_cli",
         )

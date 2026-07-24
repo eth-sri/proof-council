@@ -44,4 +44,5 @@ testpaths = ["tests"]
 [dependency-groups]
 dev = [
     "playwright>=1.61.0",
+    "pytest>=8.3.0",
 ]

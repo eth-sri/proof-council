@@ -4875,13 +4875,22 @@
             human: 'Human',
         };
 
+        function cliExecutorFromConfig(cfg) {
+            if (cfg?.copy_codex_auth) return 'codex_cli';
+            const executable = String(cliCommandParts(cfg?.cmd)[0] || '').split(/[\\/]/).pop();
+            if (executable === 'codex') return 'codex_cli';
+            if (executable === 'claude') return 'claude_cli';
+            return '';
+        }
+
         function executorOf(node) {
-            if (node?.agent === humanAgent) return 'human';
-            if (node?.agent === configurablePromptAgent) return 'api';
-            if (node?.agent === configurableCliAgent) {
+            const agentClass = node?.agent || node?.class || '';
+            if (agentClass === humanAgent) return 'human';
+            if (agentClass === configurablePromptAgent) return 'api';
+            if (agentClass === configurableCliAgent) {
                 const name = node.component_key || node.name || '';
                 const cfg = node.component_config || componentConfigs[name] || {};
-                return cliCommandParts(cfg.cmd)[0] === 'codex' ? 'codex_cli' : 'claude_cli';
+                return cliExecutorFromConfig(cfg);
             }
             return '';
         }
@@ -4941,8 +4950,10 @@
             const override = String(cfg.model || '').trim();
             const bound = cliModelFromCmd(cfg.cmd);
             const boundIsBinding = /^\{[A-Za-z_][\w]*\}$/.test(bound);
-            const isCodex = cliCommandParts(cfg.cmd).includes('codex');
-            const known = isCodex ? ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['claude-fable-5', 'opus', 'sonnet', 'haiku'];
+            const executor = cliExecutorFromConfig(cfg);
+            const known = executor === 'codex_cli'
+                ? ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini']
+                : (executor === 'claude_cli' ? ['claude-fable-5', 'opus', 'sonnet', 'haiku'] : []);
             const isCustom = override !== '' && !known.includes(override);
             const defaultLabel = boundIsBinding
                 ? `Workflow default (${bound})`

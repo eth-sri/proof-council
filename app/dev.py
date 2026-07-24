@@ -718,11 +718,17 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description="response path escapes inbox")
         # The declared output types drive coercion: a field declared array/object
         # must be parsed from its submitted string, not stored verbatim.
-        declared: dict[str, Any] = {}
-        for task in load_pending_human_tasks(run.path):
-            if task.get("response_filename") == filename:
-                declared = task.get("output_fields") or {}
-                break
+        task = next(
+            (
+                item
+                for item in load_pending_human_tasks(run.path)
+                if item.get("response_filename") == filename
+            ),
+            None,
+        )
+        if task is None:
+            abort(409, description="unknown or already-answered human task")
+        declared = task.get("output_fields") or {}
         values: dict[str, Any] = {}
         for key, value in request.form.items():
             if key.startswith("f_"):
@@ -737,7 +743,15 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 abort(400, description=f"field {field!r} {err}")
         values.setdefault("status", "done")
         inbox.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(values, ensure_ascii=False)
+        if task.get("response_error"):
+            target.write_text(payload, encoding="utf-8")
+        else:
+            try:
+                with target.open("x", encoding="utf-8") as f:
+                    f.write(payload)
+            except FileExistsError:
+                abort(409, description="human task was already answered")
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/resume", methods=["POST"])

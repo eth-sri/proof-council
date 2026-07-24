@@ -4,7 +4,10 @@
 # Usage: scripts/ui_review.sh [PORT] [--probe]
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"   # uv lives here on fresh installs
-PORT="${1:-5002}"
-shift $(( $# > 0 ? 1 : 0 ))
+PORT=5005
+if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    PORT="$1"
+    shift
+fi
 cd "$(dirname "$0")/.."
 exec uv run python scripts/ui_review.py --port "$PORT" "$@"

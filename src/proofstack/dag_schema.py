@@ -565,6 +565,11 @@ def _schema_for_state_update(value: Any) -> dict[str, Any]:
     if isinstance(value, list):
         return {"type": "array", "items": {}}
     if isinstance(value, dict):
+        candidates = value.get("coalesce")
+        if isinstance(candidates, list) and candidates:
+            schemas = [_schema_for_state_update(candidate) for candidate in candidates]
+            types = {_schema_type(schema) for schema in schemas}
+            return schemas[0] if len(types) == 1 else {"type": "any"}
         return {"type": "object"}
     if isinstance(value, str):
         match = re.fullmatch(r"\$node\.[A-Za-z_][A-Za-z0-9_-]*(?:\.([A-Za-z0-9_.-]+))?", value)

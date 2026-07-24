@@ -15,7 +15,10 @@ import os
 import re
 import shlex
 import shutil
+import tempfile
+import weakref
 from contextvars import ContextVar
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -30,18 +33,28 @@ from proofstack.cli_usage import (
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
+from proofstack.transient_auth import (
+    create_codex_auth_parent,
+    remove_codex_auth_parent,
+)
 
 
 # A single ConfigurableCLIAgent instance is reused across concurrent map_chain
-# items (DAGWorkflow._agent_for caches one object per node.step key). These three
-# values are genuinely per-invocation — the command built from THIS item's inputs,
-# the sandbox root for THIS call, whether THIS call copied codex auth — so they
-# must not live on ``self`` or one item clobbers another mid-run. They ride
-# per-call ContextVars instead, exactly as ``workdir`` does (each item runs in its
-# own asyncio task, which copies the context, so the vars are naturally isolated).
+# items (DAGWorkflow._agent_for caches one object per node.step key). These values
+# are genuinely per-invocation — the command built from THIS item's inputs, the
+# sandbox root, completion record and temporary auth home for THIS call, and
+# whether THIS call copied codex auth — so they must not live on ``self`` or one
+# item clobbers another mid-run. They ride per-call ContextVars instead, exactly
+# as ``workdir`` does (each item runs in its own asyncio task, which copies the
+# context, so the vars are naturally isolated).
 _CALL_CLI_CMD: ContextVar[list[str] | None] = ContextVar("cli_call_cmd", default=None)
 _CALL_WS_ROOT: ContextVar[Path | None] = ContextVar("cli_call_ws_root", default=None)
+_CALL_DONE_PATH: ContextVar[Path | None] = ContextVar("cli_call_done_path", default=None)
 _CALL_COPIED_AUTH: ContextVar[bool] = ContextVar("cli_call_copied_auth", default=False)
+_CALL_CODEX_HOME: ContextVar[tuple[Path, str] | None] = ContextVar(
+    "cli_call_codex_home", default=None
+)
+_CODEX_AUTH_CONTAINER_ROOT = "/proofstack-codex-home"
 
 
 class ConfigurableCLIAgent(CLIAgent):
@@ -64,6 +77,65 @@ class ConfigurableCLIAgent(CLIAgent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._raw_cmd = self.component_config.get("cmd") or []
+        completion_signal = str(
+            self.component_config.get("completion_signal") or "finish"
+        ).strip().lower()
+        if completion_signal not in {"finish", "file", "exit"}:
+            raise ValueError(
+                "component completion_signal must be 'finish', 'file', or 'exit'"
+            )
+
+        sandbox_spec = self.SANDBOX
+        blocked_keys = self._subscription_api_key_envs()
+        blocked_env = set(blocked_keys)
+        if self._copy_codex_auth_enabled():
+            blocked_env.add("CODEX_HOME")
+        if blocked_env:
+            # A subscription node must not silently fall back to paid API auth,
+            # or redirect CODEX_HOME away from the verified temporary login,
+            # regardless of which SandboxSpec environment channel supplied it.
+            sandbox_spec = replace(
+                sandbox_spec,
+                env_allowlist=tuple(
+                    key
+                    for key in sandbox_spec.env_allowlist
+                    if str(key).upper() not in blocked_env
+                ),
+                extra_env={
+                    key: value
+                    for key, value in sandbox_spec.extra_env.items()
+                    if str(key).upper() not in blocked_env
+                },
+                provider_keys=tuple(
+                    key
+                    for key in sandbox_spec.provider_keys
+                    if str(key).upper() not in blocked_env
+                ),
+            )
+
+        self._codex_auth_parent: Path | None = None
+        self._codex_auth_finalizer: weakref.finalize | None = None
+        if self._copy_codex_auth_enabled():
+            # Credentials never live below the retained run directory. Docker
+            # receives this private temp parent as a narrow bind mount; the
+            # subprocess backend uses the host path directly.
+            parent = create_codex_auth_parent(self.ctx.root_workdir)
+            self._codex_auth_parent = parent
+            self._codex_auth_finalizer = weakref.finalize(
+                self,
+                remove_codex_auth_parent,
+                parent,
+                self.ctx.root_workdir,
+            )
+            sandbox_spec = replace(
+                sandbox_spec,
+                docker_extra_args=(
+                    *sandbox_spec.docker_extra_args,
+                    "-v",
+                    f"{parent}:{_CODEX_AUTH_CONTAINER_ROOT}",
+                ),
+            )
+        self.SANDBOX = sandbox_spec
 
     # Per-invocation state backed by ContextVars (see module note above) so a
     # shared instance under concurrent map_chain items can't cross-contaminate.
@@ -86,12 +158,28 @@ class ConfigurableCLIAgent(CLIAgent):
         _CALL_WS_ROOT.set(value)
 
     @property
+    def _completion_record_path(self) -> Path | None:
+        return _CALL_DONE_PATH.get()
+
+    @_completion_record_path.setter
+    def _completion_record_path(self, value: Path | None) -> None:
+        _CALL_DONE_PATH.set(value)
+
+    @property
     def _copied_codex_auth(self) -> bool:
         return _CALL_COPIED_AUTH.get()
 
     @_copied_codex_auth.setter
     def _copied_codex_auth(self, value: bool) -> None:
         _CALL_COPIED_AUTH.set(value)
+
+    @property
+    def _codex_home(self) -> tuple[Path, str] | None:
+        return _CALL_CODEX_HOME.get()
+
+    @_codex_home.setter
+    def _codex_home(self, value: tuple[Path, str] | None) -> None:
+        _CALL_CODEX_HOME.set(value)
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
         self.CLI_CMD = self._command_for(inp)
@@ -113,26 +201,74 @@ class ConfigurableCLIAgent(CLIAgent):
 
     async def setup(self, sandbox: Sandbox, inp: BaseModel) -> None:
         self._active_workspace_root = sandbox.root
+        persistent = self.sandbox_root_for(inp) is not None
+        self._completion_record_path = sandbox.root / (
+            ".pwc/runtime/done.json" if persistent else "done.json"
+        )
         fields = self._fields(inp, workspace=sandbox.root)
 
         await self._write_file_group(sandbox, fields, "bootstrap_files", overwrite_default=False)
         await self._write_file_group(sandbox, fields, "input_files", overwrite_default=True)
 
         if self._copy_codex_auth_enabled():
-            (sandbox.root / ".codex-home").mkdir(parents=True, exist_ok=True)
+            self._copied_codex_auth = False
+            self._codex_home = None
             host_auth = Path.home() / ".codex" / "auth.json"
-            if host_auth.exists():
-                await sandbox.write_file(".codex-home/auth.json", host_auth.read_text(encoding="utf-8"))
-                try:
-                    (sandbox.root / ".codex-home" / "auth.json").chmod(0o600)
-                except OSError:
-                    pass
-                self._copied_codex_auth = True
+            if not host_auth.is_file():
+                raise RuntimeError(
+                    "Codex subscription authentication is unavailable: "
+                    f"{host_auth} does not exist. Run `codex login` first."
+                )
+            try:
+                auth_text = host_auth.read_text(encoding="utf-8")
+                auth_data = json.loads(auth_text)
+            except OSError as e:
+                raise RuntimeError(
+                    f"could not read Codex subscription authentication from {host_auth}: {e}"
+                ) from e
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"Codex authentication at {host_auth} is not valid JSON. "
+                    "Run `codex login` again."
+                ) from e
+            auth_mode = (
+                str(auth_data.get("auth_mode") or "").lower()
+                if isinstance(auth_data, dict)
+                else ""
+            )
+            api_key = auth_data.get("OPENAI_API_KEY") if isinstance(auth_data, dict) else None
+            if auth_mode != "chatgpt" or (isinstance(api_key, str) and api_key.strip()):
+                raise RuntimeError(
+                    "Codex subscription authentication is unavailable: "
+                    f"{host_auth} is not a ChatGPT login. Run `codex login` "
+                    "with a ChatGPT subscription."
+                )
+            auth_home, auth_home_env = self._new_codex_home(sandbox)
+            auth_path = auth_home / "auth.json"
+            self._codex_home = (auth_home, auth_home_env)
+            try:
+                auth_path.write_text(auth_text, encoding="utf-8")
+            except OSError as e:
+                raise RuntimeError(
+                    f"could not copy Codex subscription authentication from {host_auth}: {e}"
+                ) from e
+            try:
+                auth_path.chmod(0o600)
+            except OSError:
+                pass
+            self._copied_codex_auth = True
 
     async def teardown(self, sandbox: Sandbox, inp: BaseModel) -> None:
         if self._copy_codex_auth_enabled():
+            state = self._codex_home
+            if state is not None:
+                shutil.rmtree(state[0], ignore_errors=True)
+            self._codex_home = None
+            # Remove credentials left by pre-hardening runs that reused a
+            # persistent workspace.
             shutil.rmtree(sandbox.root / ".codex-home", ignore_errors=True)
             self._copied_codex_auth = False
+        self._completion_record_path = None
 
     def cli_input(self, inp: BaseModel) -> str:
         fields = self._fields(inp, workspace=self._active_workspace_root)
@@ -146,7 +282,7 @@ class ConfigurableCLIAgent(CLIAgent):
 
     def _contract_tail(self) -> str:
         # With `contract: auto` the component prompt describes only the task;
-        # the delivery mechanics (which files to write, the finish handshake)
+        # the delivery mechanics (which files to write and how to complete)
         # are generated here from output_files/done_outputs. This keeps prompts
         # free of executor boilerplate so the same component text can be run by
         # a different backend (API model, human) whose adapter supplies its own
@@ -166,17 +302,40 @@ class ConfigurableCLIAgent(CLIAgent):
             for field, relpath in files:
                 lines.append(f"   - {relpath}  (your {field.replace('_', ' ')})")
             step += 1
-        lines.append(
-            f"{step}. When everything is written, signal completion by running exactly"
-        )
-        lines.append("   this shell command:")
-        lines.append(f"   finish '{self._finish_payload_example()}'")
+        completion_signal = str(
+            self.component_config.get("completion_signal") or "finish"
+        ).strip().lower()
+        if completion_signal == "file":
+            record_path = self._completion_record_path or Path("done.json")
+            root = self._active_workspace_root
+            if root is not None:
+                try:
+                    record_path = record_path.relative_to(root)
+                except ValueError:
+                    pass
+            lines.append(
+                f"{step}. Write this completion record as valid JSON to "
+                f"{record_path.as_posix()}:"
+            )
+            lines.append(f"   {self._finish_payload_example()}")
+            lines.append("   Replace every placeholder with the actual result.")
+        elif completion_signal == "exit":
+            lines.append(
+                f"{step}. When everything is written, return a concise final response "
+                "and exit normally."
+            )
+        else:
+            lines.append(
+                f"{step}. When everything is written, signal completion by running exactly"
+            )
+            lines.append("   this shell command:")
+            lines.append(f"   finish '{self._finish_payload_example()}'")
         lines.append("Work autonomously; do not ask questions.")
         return "\n".join(lines) + "\n"
 
-    # placeholders for each done.json field a component may request; the finish
-    # example must ask for every configured field or the model never supplies
-    # it and done_outputs silently receives the CLIDoneRecord default
+    # Placeholders for each done.json field a component may request. The
+    # completion example must ask for every configured field or the model never
+    # supplies it and done_outputs silently receives the CLIDoneRecord default.
     _DONE_FIELD_PLACEHOLDERS: ClassVar[dict[str, Any]] = {
         "status": "done",
         "summary": "<one line: what you did>",
@@ -210,8 +369,13 @@ class ConfigurableCLIAgent(CLIAgent):
         if isinstance(raw_env, dict):
             for key, value in raw_env.items():
                 env[str(key)] = _format_template(str(value), fields)
+        for key in self._subscription_api_key_envs():
+            env.pop(key, None)
         if self._copy_codex_auth_enabled():
-            env.setdefault("CODEX_HOME", str(sandbox.root / ".codex-home"))
+            state = self._codex_home
+            if state is None:
+                raise RuntimeError("Codex authentication was not prepared before process spawn")
+            env["CODEX_HOME"] = state[1]
         return env
 
     async def collect(
@@ -246,13 +410,9 @@ class ConfigurableCLIAgent(CLIAgent):
             return
         cost = 0.0
         cfg_ref = None
-        # bill: false marks a subscription run — tokens are metered but no USD
-        # is charged (add_usd would trip the max_usd: 0.0 gate those runs use).
-        # A node that ACTUALLY copied codex subscription auth is never billed even
-        # when a template forgets bill: false. Gate on _copied_codex_auth (the
-        # runtime fact), not the config flag: copy_codex_auth: true with no host
-        # auth.json copies nothing, so that run fell back to a billable key.
-        if usage_cfg.get("bill", True) and not self._copied_codex_auth:
+        # Only observed copied subscription auth suppresses USD accounting.
+        # A declarative bill:false flag must never hide a paid-key fallback.
+        if not self._copied_codex_auth:
             cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
             try:
                 rates = load_cost_rates(cfg_ref)
@@ -371,6 +531,35 @@ class ConfigurableCLIAgent(CLIAgent):
 
     def _copy_codex_auth_enabled(self) -> bool:
         return bool(self.component_config.get("copy_codex_auth"))
+
+    def _subscription_api_key_envs(self) -> set[str]:
+        keys: set[str] = set()
+        if self._copy_codex_auth_enabled():
+            keys.add("OPENAI_API_KEY")
+        usage = self.component_config.get("usage")
+        if isinstance(usage, dict) and usage.get("type") == "claude_json":
+            keys.add("ANTHROPIC_API_KEY")
+        return keys
+
+    def _new_codex_home(self, sandbox: Sandbox) -> tuple[Path, str]:
+        parent = self._codex_auth_parent
+        if parent is None:
+            raise RuntimeError("Codex authentication temp directory is unavailable")
+        parent.mkdir(parents=True, exist_ok=True)
+        try:
+            parent.chmod(0o700)
+        except OSError:
+            pass
+        host_home = Path(tempfile.mkdtemp(prefix="call-", dir=parent)).resolve()
+        try:
+            host_home.chmod(0o700)
+        except OSError:
+            pass
+        if resolve_backend(sandbox.spec) == "docker":
+            env_home = f"{_CODEX_AUTH_CONTAINER_ROOT}/{host_home.name}"
+        else:
+            env_home = str(host_home)
+        return host_home, env_home
 
     async def _write_file_group(
         self,

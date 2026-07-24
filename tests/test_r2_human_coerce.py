@@ -197,6 +197,51 @@ class HumanPostRejectionTests(unittest.TestCase):
             self.assertEqual(r.status_code, 400)
             self.assertFalse(response.exists())  # nothing written -> still pending
 
+    def test_duplicate_submit_is_rejected_without_overwriting_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root, response = self._setup(td, {"data": "object"})
+            app = create_app(runs_roots=(root,))
+            with app.test_client() as client:
+                first = client.post(
+                    "/run/run/human",
+                    data={
+                        "response_filename": "task.response.json",
+                        "f_data": '{"accepted": true}',
+                    },
+                )
+                duplicate = client.post(
+                    "/run/run/human",
+                    data={
+                        "response_filename": "task.response.json",
+                        "f_data": '{"overwrite": true}',
+                    },
+                )
+
+            self.assertEqual(first.status_code, 302)
+            self.assertEqual(duplicate.status_code, 409)
+            self.assertEqual(
+                json.loads(response.read_text(encoding="utf-8"))["data"],
+                {"accepted": True},
+            )
+
+    def test_unknown_response_filename_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root, _ = self._setup(td, {"data": "object"})
+            app = create_app(runs_roots=(root,))
+            with app.test_client() as client:
+                response = client.post(
+                    "/run/run/human",
+                    data={
+                        "response_filename": "other.response.json",
+                        "f_data": '{"accepted": true}',
+                    },
+                )
+
+            self.assertEqual(response.status_code, 409)
+            self.assertFalse(
+                (root / "run" / "human_inbox" / "other.response.json").exists()
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

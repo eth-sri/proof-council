@@ -95,7 +95,9 @@ permission prompts every time), prefer the wrapper scripts:
   running dashboard headlessly (Playwright) and screenshots the key states to
   `outputs/ui_review/`; Read the PNGs and fix what you see BEFORE handing UI
   changes to the user. The dashboard caches templates (no --debug), so restart
-  it first when templates changed, or the screenshots show stale copy.
+  it first when templates changed, or the screenshots show stale copy. On a
+  fresh checkout, install the browser once with
+  `uv run playwright install chromium`.
 
 Do **not** hand-write monitoring loops (`for i in $(seq …); do … curl … done`)
 or multi-tool status bundles inline — those control-flow shell blobs cannot be

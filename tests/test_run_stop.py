@@ -13,10 +13,15 @@ sys.path.insert(0, str(ROOT))
 from app.dev import create_app  # noqa: E402
 from app.dev_data import (  # noqa: E402
     _read_run_info,
+    _scrub_transient_credentials,
     read_run_pid,
     run_process_alive,
     stop_run_process,
     write_stopped_marker,
+)
+from proofstack.transient_auth import (  # noqa: E402
+    codex_auth_run_root,
+    create_codex_auth_parent,
 )
 
 
@@ -57,6 +62,113 @@ class StopRunProcessTests(unittest.TestCase):
             (run_dir / "run.pid").write_text("2147480000", encoding="utf-8")
             result = stop_run_process(run_dir)
             self.assertFalse(result["signalled"])
+
+    def test_stop_scrubs_transient_credential_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            legacy_auth = run_dir / "agents" / "solver" / "sandbox" / ".codex-home"
+            compute_auth = run_dir / ".compute_codex_home" / "round-1"
+            legacy_auth.mkdir(parents=True)
+            compute_auth.mkdir(parents=True)
+            (legacy_auth / "auth.json").write_text("secret", encoding="utf-8")
+            (compute_auth / "auth.json").write_text("secret", encoding="utf-8")
+            external_auth = create_codex_auth_parent(run_dir)
+            (external_auth / "auth.json").write_text("secret", encoding="utf-8")
+
+            proc = _spawn_group_leader()
+            pid = proc.pid
+            self.addCleanup(proc.wait)
+            self.addCleanup(lambda: self._reap(pid))
+            (run_dir / "run.pid").write_text(str(pid), encoding="utf-8")
+
+            result = stop_run_process(run_dir, grace_s=2.0)
+
+            self.assertTrue(result["signalled"])
+            self.assertEqual(result["credentials_scrubbed"], 3)
+            self.assertFalse(legacy_auth.exists())
+            self.assertFalse((run_dir / ".compute_codex_home").exists())
+            self.assertFalse(codex_auth_run_root(run_dir).exists())
+
+    def test_dead_run_detection_scrubs_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "events.jsonl").write_text(
+                '{"kind": "run.start", "payload": {}}\n', encoding="utf-8"
+            )
+            (run_dir / "run.pid").write_text("2147480000", encoding="utf-8")
+            auth_dir = run_dir / "agents" / "solver" / "sandbox" / ".codex-home"
+            auth_dir.mkdir(parents=True)
+            (auth_dir / "auth.json").write_text("secret", encoding="utf-8")
+            external_auth = create_codex_auth_parent(run_dir)
+            (external_auth / "auth.json").write_text("secret", encoding="utf-8")
+
+            info = _read_run_info(run_dir)
+
+            self.assertTrue(info.process_dead)
+            self.assertFalse(auth_dir.exists())
+            self.assertFalse(codex_auth_run_root(run_dir).exists())
+
+    def test_credential_scrub_does_not_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            outside = root / "outside"
+            run_dir.mkdir()
+            outside.mkdir()
+            marker = outside / "keep.txt"
+            marker.write_text("keep", encoding="utf-8")
+            link = run_dir / ".codex-home"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            removed = _scrub_transient_credentials(run_dir)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(link.exists())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_external_credential_scrub_does_not_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            outside = root / "outside"
+            run_dir.mkdir()
+            outside.mkdir()
+            marker = outside / "keep.txt"
+            marker.write_text("keep", encoding="utf-8")
+            auth_root = codex_auth_run_root(run_dir)
+            auth_root.parent.mkdir(mode=0o700, exist_ok=True)
+            try:
+                auth_root.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            removed = _scrub_transient_credentials(run_dir)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(auth_root.exists())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
+    def test_credential_scrub_does_not_follow_symlinked_run_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside_auth = outside / ".codex-home"
+            outside_auth.mkdir(parents=True)
+            marker = outside_auth / "keep.txt"
+            marker.write_text("keep", encoding="utf-8")
+            run_link = root / "linked-run"
+            try:
+                run_link.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks unavailable: {exc}")
+
+            removed = _scrub_transient_credentials(run_link)
+
+            self.assertEqual(removed, 0)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
 
     def test_stopped_marker_makes_status_nonterminal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

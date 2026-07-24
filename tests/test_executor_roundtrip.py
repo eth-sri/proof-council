@@ -40,15 +40,27 @@ from app.dev_data import (  # noqa: E402
 
 def _claude_cli_cfg() -> dict[str, Any]:
     return {
-        "cmd": ["claude", "-p", "--model", "{claude_model}", "--permission-mode", "acceptEdits"],
+        "cmd": [
+            "claude",
+            "-p",
+            "--model",
+            "{claude_model}",
+            "--permission-mode",
+            "acceptEdits",
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--tools",
+            "Write",
+        ],
         "env": {"HOME": "{env:HOME}"},
         "usage": {"type": "claude_json"},
         "contract": "auto",
+        "completion_signal": "file",
         "soft_timeout_s": 780,
-        "sandbox": {"backend": "subprocess", "timeout_s": 900},
+        "sandbox": {"backend": "subprocess", "timeout_s": 900, "provider_keys": []},
         "prompt": "Solve the problem: {problem}",
         "input_schema": {"problem": "string", "workspace": "string"},
-        "input_files": {"context.txt": {"from_input": "context"}},
         "output_schema": {"workspace": "string", "status": "string",
                           "answer_tex": "string", "notes": "string"},
         "output_files": {"answer_tex": {"path": "answer.tex", "type": "text"},
@@ -88,6 +100,7 @@ class CliSwitchTests(unittest.TestCase):
         self.assertIs(cfg["copy_codex_auth"], True)
         self.assertEqual(cfg["usage"]["type"], "codex_jsonl")
         self.assertNotIn("env", cfg)  # codex auth travels via CODEX_HOME
+        self.assertNotIn("completion_signal", cfg)
         # task + every output binding untouched
         for key in _PRESERVED:
             self.assertEqual(cfg.get(key), before.get(key), key)
@@ -103,7 +116,23 @@ class CliSwitchTests(unittest.TestCase):
         self.assertEqual(cfg["cmd"][0], "claude")
         self.assertEqual(cfg["usage"]["type"], "claude_json")
         self.assertNotIn("copy_codex_auth", cfg)
+        self.assertEqual(cfg["completion_signal"], "file")
+        self.assertEqual(cfg["cmd"][cfg["cmd"].index("--tools") + 1], "Write")
+        self.assertIn("--safe-mode", cfg["cmd"])
+        self.assertNotIn("--allowedTools", cfg["cmd"])
         self.assertEqual(cfg["output_files"], outputs_mid)
+
+    def test_claude_to_codex_preserves_file_inputs(self) -> None:
+        cfg = _claude_cli_cfg()
+        cfg["input_files"] = {"context.txt": {"from_input": "context"}}
+        raw = _raw_for(cfg)
+
+        _swap(raw, "codex_cli")
+
+        self.assertEqual(
+            raw["components"]["cfg"]["input_files"],
+            {"context.txt": {"from_input": "context"}},
+        )
 
     def test_round_trip_preserves_task_and_outputs(self) -> None:
         raw = _raw_for(_claude_cli_cfg())
@@ -188,6 +217,23 @@ class RefusalTests(unittest.TestCase):
                "dag": {"nodes": [{"id": "n", "agent": CONFIGURABLE_CLI_AGENT, "name": "cfg"}]}}
         _swap(raw, "codex_cli")  # implicit kind still counts as an agent node
         self.assertEqual(raw["dag"]["nodes"][0]["agent"], CONFIGURABLE_CLI_AGENT)
+
+    def test_codex_to_claude_refuses_workspace_file_inputs(self):
+        for key in ("input_files", "bootstrap_files"):
+            with self.subTest(key=key):
+                cfg = _claude_cli_cfg()
+                cfg.update(
+                    {
+                        "cmd": ["codex", "exec", "--json"],
+                        "copy_codex_auth": True,
+                        key: {"context.txt": {"from_input": "context"}},
+                    }
+                )
+                cfg.pop("env", None)
+                raw = _raw_for(cfg)
+
+                with self.assertRaisesRegex(PresetError, "write-only"):
+                    _swap(raw, "claude_cli")
 
 
 class UsageCarryTests(unittest.TestCase):

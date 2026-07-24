@@ -471,13 +471,15 @@ class DevDataMutationTests(unittest.TestCase):
         components:
           cfg_hint:
             cmd: [claude, -p, --output-format, stream-json, --verbose, --model, sonnet,
-                  --permission-mode, acceptEdits, --allowedTools, 'Bash(finish:*)']
+                  --permission-mode, acceptEdits, --safe-mode, --strict-mcp-config,
+                  --no-session-persistence, --tools, Write]
             soft_timeout_s: 780
-            sandbox: {backend: subprocess, timeout_s: 900}
+            sandbox: {backend: subprocess, timeout_s: 900, provider_keys: []}
             env: {HOME: '{env:HOME}'}
             usage: {type: claude_json}
             cache_enabled: true
             contract: auto
+            completion_signal: file
             prompt: |
               You are the specialist.
 
@@ -576,6 +578,12 @@ class DevDataMutationTests(unittest.TestCase):
         claude_cfg = _raw(back)["components"]["cfg_hint"]
         idx = claude_cfg["cmd"].index("--model")
         self.assertEqual(claude_cfg["cmd"][idx + 1], "{base_model}")
+        self.assertEqual(claude_cfg["completion_signal"], "file")
+        self.assertEqual(
+            claude_cfg["cmd"][claude_cfg["cmd"].index("--tools") + 1],
+            "Write",
+        )
+        self.assertNotIn("--allowedTools", claude_cfg["cmd"])
 
     def test_set_executor_falls_back_to_literal_model_without_knobs(self) -> None:
         as_claude = _mutate(
@@ -587,6 +595,8 @@ class DevDataMutationTests(unittest.TestCase):
         )
         cfg = _raw(as_claude)["components"]["cfg_hint"]
         self.assertEqual(cfg["cmd"][cfg["cmd"].index("--model") + 1], "sonnet")
+        self.assertEqual(cfg["completion_signal"], "file")
+        self.assertIn("--safe-mode", cfg["cmd"])
 
     def test_rename_cli_file_output_updates_existing_refs(self) -> None:
         raw_yaml = _mutate(
