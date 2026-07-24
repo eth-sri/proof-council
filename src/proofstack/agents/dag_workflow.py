@@ -18,8 +18,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from proofstack.agent import Agent
-from proofstack.budget import BudgetExhausted, allow_budget_overrun
-from proofstack.subscription import SubscriptionParked
+from proofstack.budget import BudgetExhausted, SubscriptionParked, allow_budget_overrun
 
 
 class DAGConfigError(ValueError):

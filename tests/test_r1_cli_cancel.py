@@ -1,6 +1,5 @@
 """R1-A2: cancelling a CLI node mid-run must still meter the partial usage the
-CLI already spent, BEFORE the pacing claim is released. Otherwise the subscription
-pacer loses those tokens and over-admits the next run.
+CLI already spent, so the run's token/cost accounting doesn't lose it.
 
 The normal metering happens at ``record_cli_usage`` (kinds/cli.py, right after
 ``_wait_for_done``). A cancellation lands inside ``_wait_for_done`` and skips it,

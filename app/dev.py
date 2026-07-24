@@ -37,7 +37,7 @@ if str(_REPO_ROOT) not in sys.path:
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file, url_for
 from mathagents.config_loader import load_solver_config
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, normalize_monitor_model_spec
-from proofstack.subscription import PLAN_SEEDS, RESUME_ENV_ALLOWLIST, SubscriptionPacer
+from proofstack.budget import RESUME_ENV_ALLOWLIST
 
 from app.dev_data import (
     clear_stopped_marker,
@@ -260,20 +260,6 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             }
         return jsonify(payload)
 
-    def _pacing_providers_for_preset(preset) -> list[str]:
-        providers: set[str] = set()
-        for cfg in (preset.component_configs or {}).values():
-            if not isinstance(cfg, dict):
-                continue
-            usage = cfg.get("usage")
-            if not isinstance(usage, dict):
-                continue
-            if usage.get("type") == "claude_json":
-                providers.add("claude")
-            elif usage.get("type") == "codex_jsonl" and cfg.get("copy_codex_auth"):
-                providers.add("codex")
-        return sorted(providers)
-
     @app.route("/run-agent")
     def run_agent():
         presets = [p for p in discover_presets() if not p.error]
@@ -281,7 +267,6 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             "dev_run_agent.html",
             presets=presets,
             preset_inputs={p.name: p.inputs for p in presets},
-            pacing_providers={p.name: _pacing_providers_for_preset(p) for p in presets},
             preset_signature=presets_registry_version(),
             problems=_discover_problem_files(),
             monitor_model_options=_monitor_model_options(),
@@ -322,11 +307,6 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             if clean_key and clean_value:
                 env[clean_key] = clean_value
 
-        # Per-run subscription pacing override; "" follows the global setting.
-        pacing = str(payload.get("pacing") or "").strip().lower()
-        if pacing in {"on", "off"}:
-            env["PROOFCOUNCIL_PACING"] = pacing
-
         missing = [
             req["env"]
             for req in _api_key_requirements_for_preset(preset_name, env=env)
@@ -360,7 +340,6 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                     "started_by": "dashboard",
                     "preset": preset_name,
                     "monitor": {"enabled": monitor_enabled, "model": monitor_model if monitor_enabled else None},
-                    "pacing": pacing or "default",
                     "started_at": datetime.now().isoformat(timespec="seconds"),
                     "manifest": {
                         "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -433,87 +412,6 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             return jsonify({"ok": False, "errors": ["Problem statement is required."]}), 400
         problem = _save_problem_text(str(payload.get("id") or ""), text)
         return jsonify({"ok": True, "problem": problem})
-
-    def _subscription_payload() -> dict[str, Any]:
-        claude = SubscriptionPacer()
-        codex = SubscriptionPacer(claude.store, provider="codex")
-        return {
-            "ok": True,
-            "status": claude.status(),
-            "codex_status": codex.status(),
-            "settings": claude.store.load_settings(),
-            "plans": sorted(PLAN_SEEDS),
-        }
-
-    @app.route("/subscription/status")
-    def subscription_status():
-        return jsonify(_subscription_payload())
-
-    @app.route("/subscription/probe", methods=["POST"])
-    def subscription_probe():
-        SubscriptionPacer().ensure_fresh_probe(force=True)
-        return jsonify(_subscription_payload())
-
-    def _window_pct_map(raw: Any, name: str, errors: list[str]) -> dict[str, float]:
-        out: dict[str, float] = {}
-        if not isinstance(raw, dict):
-            errors.append(f"{name} must be a mapping of window -> percent.")
-            return out
-        for window, pct in raw.items():
-            try:
-                out[str(window)] = min(100.0, max(0.0, float(pct)))
-            except (TypeError, ValueError):
-                errors.append(f"{name}.{window} must be a number.")
-        return out
-
-    @app.route("/subscription/settings", methods=["POST"])
-    def subscription_settings():
-        payload = request.get_json(silent=True) or {}
-        errors: list[str] = []
-        updates: dict[str, Any] = {}
-        if "enabled" in payload:
-            updates["enabled"] = bool(payload.get("enabled"))
-        if "plan" in payload:
-            plan = str(payload.get("plan") or "").strip()
-            if plan not in PLAN_SEEDS:
-                errors.append(f"Unknown plan '{plan}'.")
-            else:
-                updates["plan"] = plan
-        for key in ("cap_pct", "account_cap_pct"):
-            if key in payload:
-                updates[key] = _window_pct_map(payload.get(key), key, errors)
-        if "usage_probe_cmd" in payload:
-            cmd = str(payload.get("usage_probe_cmd") or "").strip()
-            updates["usage_probe_cmd"] = cmd or None
-        if "ceilings" in payload:
-            raw = payload.get("ceilings")
-            if not isinstance(raw, dict):
-                errors.append("ceilings must be a mapping of window -> tokens.")
-            else:
-                ceilings: dict[str, int | None] = {}
-                for window, tokens in raw.items():
-                    if tokens in (None, ""):
-                        ceilings[str(window)] = None  # clear a manual override
-                        continue
-                    try:
-                        ceilings[str(window)] = max(1, int(tokens))
-                    except (TypeError, ValueError):
-                        errors.append(f"ceilings.{window} must be a token count.")
-                updates["ceilings"] = ceilings
-        for key in ("park_after_s", "node_estimate_tokens", "probe_ttl_s"):
-            if key in payload:
-                raw_value = payload.get(key)
-                if raw_value in (None, ""):
-                    updates[key] = None
-                    continue
-                try:
-                    updates[key] = max(0, int(float(raw_value)))
-                except (TypeError, ValueError):
-                    errors.append(f"{key} must be a number.")
-        if errors:
-            return jsonify({"ok": False, "errors": errors}), 400
-        SubscriptionPacer().store.save_settings(updates)
-        return jsonify(_subscription_payload())
 
     @app.route("/agents/new")
     def new_agent():
@@ -865,12 +763,11 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         # not as the stopped run it was a moment ago.
         clear_stopped_marker(run.path)
         env = _dashboard_subprocess_env()
-        # Re-inject the run's own env overrides (e.g. PROOFCOUNCIL_PACING) that
-        # the original launch recorded — a fresh env would revert to the global.
         spec_env = spec.get("env")
         if isinstance(spec_env, dict):
-            # Only re-inject the keys the writer is allowed to persist; a
-            # hand-edited resume.json must not inject arbitrary environment.
+            # Only re-inject the keys the writer is allowed to persist
+            # (RESUME_ENV_ALLOWLIST, currently empty); a hand-edited resume.json
+            # must not inject arbitrary environment.
             env.update(
                 {
                     str(k): str(v)

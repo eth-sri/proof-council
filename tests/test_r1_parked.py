@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
-from proofstack.subscription import SubscriptionParked  # noqa: E402
+from proofstack.budget import SubscriptionParked  # noqa: E402
 from app.dev_data import _normalize_run_status  # noqa: E402
 from app.dev import _TERMINAL_RUN_STATUSES, create_app  # noqa: E402
 
@@ -121,7 +121,7 @@ class DashboardParkedRunTests(unittest.TestCase):
                 body = resp.get_data(as_text=True)
         self.assertEqual(resp.status_code, 200)
         self.assertIn("Resume run", body)
-        self.assertIn("parked on a subscription usage window", body)
+        self.assertIn("parked (paused in a resumable state)", body)
 
     def test_runs_list_uses_parked_pill(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -57,24 +57,6 @@ The agent editor has many features, including:
 
 Saved problems live in `problems/`. Run artifacts are written under `outputs/` by default.
 
-### Subscription Pacing
-
-Long runs on a Claude subscription (the `claude` CLI, no API key) are limited by
-the account's rolling windows (5-hour / weekly / model-class weeklies), not by
-USD. The **Subscription pacing** panel on the Run Agent page lets you cap what
-share of each window ProofCouncil may use; paced runs launch nodes while there
-is headroom, wait for the window to roll over when there is not, and park
-themselves (resumable) rather than sleeping past a configurable threshold.
-Window ceilings are seeded from your plan tier and self-calibrate from real
-usage: an optional **usage probe command** (any script printing the provider's
-usage JSON) feeds ground-truth utilization percentages, enabling a second,
-account-level gate — runs won't launch nodes into a window that outside usage
-has already filled past your threshold. Codex nodes self-probe: each run's
-session rollout carries the account's rate-limit snapshot. Ceilings also
-recalibrate from probe deltas and from any real limit hit. Cross-run
-accounting lives in `~/.proofcouncil/` (override with `PROOFCOUNCIL_HOME`); a
-per-run override is available at launch (`PROOFCOUNCIL_PACING=on|off`).
-
 ## Run From The CLI
 
 Use the CLI when you want a scriptable single-problem run.

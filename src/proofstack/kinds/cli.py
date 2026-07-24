@@ -16,11 +16,6 @@ from proofstack.context import RunContext
 from proofstack.events import new_call_id
 from proofstack.sandbox import make_sandbox, resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
-from proofstack.subscription import (
-    DEFAULT_RECHECK_S,
-    SubscriptionPacer,
-    SubscriptionParked,
-)
 
 
 FINISH_SCRIPT = """\
@@ -152,8 +147,6 @@ class CLIAgent(Agent):
         self.tracker.add_tool_call()
         await self._emit_budget_warnings(self.tracker.check())
 
-        pacing_claim = await self._acquire_subscription_slot()
-
         # Track the streaming process so the finally block can terminate
         # it unconditionally on cancellation. Without this, if the
         # surrounding task is cancelled while ``_wait_for_done`` is
@@ -168,9 +161,6 @@ class CLIAgent(Agent):
         # finally awaits THIS task rather than re-running metering, so a cancel
         # landing mid-metering neither loses it nor double-counts it (A7).
         meter_task: asyncio.Task | None = None
-        # Sandbox creation happens INSIDE the try: if it raises, the finally
-        # must still release the pacing claim or it holds phantom headroom
-        # for every other run until its TTL expires.
         sandbox: Sandbox | None = None
         try:
             root = self.sandbox_root_for(inp)
@@ -296,20 +286,19 @@ class CLIAgent(Agent):
             # past the parent's cleanup and into container shutdown.
             # ``asyncio.shield`` keeps the terminate sequence from
             # being interrupted by the same cancellation that brought
-            # us here. Done BEFORE the claim release below so the transcript
-            # is complete when we meter partial usage.
+            # us here. Done before metering so the transcript is complete
+            # when we meter partial usage.
             if stream is not None:
                 try:
                     await asyncio.shield(stream.terminate())
                 except (asyncio.CancelledError, Exception):
                     pass
-            # Meter BEFORE releasing the pacing claim, exactly once, even under
-            # cancellation — else the pacer loses real spend and over-admits the
-            # next run. If the run reached a done record, metering was already
-            # dispatched as meter_task; await that same task (no re-run, no
-            # double count). Otherwise we were cancelled/errored before the run
-            # produced a record, so meter the partial usage the CLI may have
-            # spent. Shielded so the same cancellation can't skip it too.
+            # Meter exactly once, even under cancellation — else the run loses
+            # real token/cost accounting. If the run reached a done record,
+            # metering was already dispatched as meter_task; await that same task
+            # (no re-run, no double count). Otherwise we were cancelled/errored
+            # before the run produced a record, so meter the partial usage the
+            # CLI may have spent. Shielded so the same cancellation can't skip it.
             if meter_task is not None:
                 # Drain the retained metering to completion even under REPEATED
                 # cancellation: a second cancel while awaiting would otherwise
@@ -334,12 +323,6 @@ class CLIAgent(Agent):
                     )
                 except (asyncio.CancelledError, Exception):
                     pass
-            if pacing_claim is not None:
-                pacer, claim_id = pacing_claim
-                try:
-                    await asyncio.shield(asyncio.to_thread(pacer.release, claim_id))
-                except (asyncio.CancelledError, Exception):
-                    pass
             try:
                 stdout_text = stream.stdout if stream is not None else ""
                 stderr_text = stream.stderr if stream is not None else ""
@@ -360,132 +343,6 @@ class CLIAgent(Agent):
                         "cli.teardown_error",
                         {"type": type(e).__name__, "msg": str(e)},
                     )
-
-    def _subscription_profile(self) -> tuple[str, str] | None:
-        """(provider, model) when this node bills a subscription window, else None.
-
-        Overridden by subclasses that know their CLI is subscription-authed
-        (e.g. ConfigurableCLIAgent with usage.type == claude_json).
-        """
-        return None
-
-    async def _emit_pacing_unavailable(self, error: Exception) -> None:
-        # The pacer is a backstop; a broken store (read-only HOME, locked
-        # volume, corrupt file) must never take the node down with it —
-        # degrade to an unpaced launch and say so.
-        await self.events.emit(
-            "pacing.unavailable",
-            {"type": type(error).__name__, "msg": str(error)},
-        )
-
-    async def _acquire_subscription_slot(self) -> tuple[SubscriptionPacer, str] | None:
-        """Wait until the account-wide subscription windows have headroom.
-
-        Returns (pacer, claim_id) to release in run()'s finally, or None when
-        pacing does not apply. Sleeps are re-decided every pass so claims
-        released by other runs/processes are picked up, are charged via
-        add_paused (a paced node must not burn the run's wallclock budget),
-        and park the run (SubscriptionParked -> resumable BudgetExhausted
-        path) rather than sleeping past the configured threshold.
-        """
-        profile = self._subscription_profile()
-        if profile is None:
-            return None
-        provider, model = profile
-        pacer = SubscriptionPacer(provider=provider)
-        try:
-            enabled, park_after_s = await asyncio.to_thread(pacer.gate_config)
-        except Exception as e:
-            await self._emit_pacing_unavailable(e)
-            return None
-        if not enabled:
-            return None
-        run_id = self.events.run_id
-        waited = 0.0
-        last_wait_emit = 0.0
-        while True:
-            try:
-                claim_id, decision = await asyncio.to_thread(
-                    lambda: pacer.try_claim(
-                        model=model,
-                        run_id=run_id,
-                        ttl_s=float(self.SANDBOX.timeout_s) + 900.0,
-                    )
-                )
-            except Exception as e:
-                await self._emit_pacing_unavailable(e)
-                return None
-            if claim_id is not None:
-                try:
-                    await self.events.emit(
-                        "pacing.admit",
-                        {
-                        "provider": provider,
-                        "model": model,
-                        "est_tokens": decision.est_tokens,
-                        "waited_s": round(waited, 1),
-                        "windows": [
-                            {
-                                "window": st.window,
-                                "usage": st.usage,
-                                "claims": st.claims,
-                                "allowed": st.allowed,
-                            }
-                            for st in decision.windows
-                        ],
-                        },
-                    )
-                except asyncio.CancelledError:
-                    # cancelled after try_claim registered the claim but before
-                    # run() takes ownership of it in its finally: release it so
-                    # it doesn't hold phantom headroom until its TTL (B7)
-                    try:
-                        await asyncio.shield(asyncio.to_thread(pacer.release, claim_id))
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    raise
-                return (pacer, claim_id)
-            blocked = next(
-                (st for st in decision.windows if st.window == decision.blocking_window),
-                None,
-            )
-            if waited + decision.wait_s > park_after_s:
-                await self.events.emit(
-                    "pacing.parked",
-                    {
-                        "provider": provider,
-                        "model": model,
-                        "window": decision.blocking_window,
-                        "projected_wait_s": round(waited + decision.wait_s, 1),
-                        "park_after_s": park_after_s,
-                    },
-                )
-                raise SubscriptionParked(
-                    decision.blocking_window or "unknown",
-                    decision.wait_s,
-                    float(blocked.usage + blocked.claims) if blocked else 0.0,
-                    float(blocked.allowed) if blocked and blocked.allowed is not None else 0.0,
-                )
-            sleep_s = min(max(decision.wait_s, 5.0), DEFAULT_RECHECK_S)
-            if waited - last_wait_emit >= 600.0 or waited == 0.0:
-                last_wait_emit = waited
-                await self.events.emit(
-                    "pacing.wait",
-                    {
-                        "provider": provider,
-                        "model": model,
-                        "window": decision.blocking_window,
-                        "wait_s": round(decision.wait_s, 1),
-                        "waited_s": round(waited, 1),
-                        "usage": blocked.usage if blocked else None,
-                        "claims": blocked.claims if blocked else None,
-                        "allowed": blocked.allowed if blocked else None,
-                        "est_tokens": decision.est_tokens,
-                    },
-                )
-            await asyncio.sleep(sleep_s)
-            self.tracker.add_paused(sleep_s)
-            waited += sleep_s
 
     async def _wait_for_done(
         self,

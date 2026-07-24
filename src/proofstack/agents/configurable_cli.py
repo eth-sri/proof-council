@@ -15,7 +15,6 @@ import os
 import re
 import shlex
 import shutil
-import time
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, ClassVar
@@ -31,12 +30,6 @@ from proofstack.cli_usage import (
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
-from proofstack.subscription import (
-    WINDOWS,
-    SubscriptionStore,
-    detect_rate_limit,
-    parse_codex_rollout_rate_limits,
-)
 
 
 # A single ConfigurableCLIAgent instance is reused across concurrent map_chain
@@ -245,13 +238,11 @@ class ConfigurableCLIAgent(CLIAgent):
         kind = usage_cfg.get("type")
         if kind == "claude_json":
             await self._record_claude_usage(stdout_text)
-            await self._scan_claude_rate_limit(stdout_text, stderr_text)
             return
         if kind != "codex_jsonl":
             return
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
-            await self._harvest_codex_rollout()
             return
         cost = 0.0
         cfg_ref = None
@@ -274,21 +265,6 @@ class ConfigurableCLIAgent(CLIAgent):
             cost = cost_for_codex_usage(usage, **rates)
             self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
-        if self._subscription_profile() is not None:
-            try:
-                await asyncio.to_thread(
-                    SubscriptionStore().append_usage,
-                    provider="codex",
-                    model=self._codex_model_name(),
-                    tokens=usage.input_tokens + usage.output_tokens,
-                    run_id=self.events.run_id,
-                )
-            except Exception as e:
-                await self.events.emit(
-                    "pacing.ledger_write_failed",
-                    {"type": type(e).__name__, "msg": str(e)},
-                )
-        await self._harvest_codex_rollout()
         await self.events.emit(
             "model.call",
             {
@@ -320,64 +296,6 @@ class ConfigurableCLIAgent(CLIAgent):
             or "codex"
         )
 
-    def _subscription_profile(self) -> tuple[str, str] | None:
-        usage_cfg = self.component_config.get("usage") or {}
-        if not isinstance(usage_cfg, dict):
-            return None
-        if usage_cfg.get("type") == "claude_json":
-            return ("claude", self._claude_model_name())
-        # copy_codex_auth marks a subscription-authed codex node (a key-based
-        # API node pays USD instead and is governed by max_usd, not windows)
-        if usage_cfg.get("type") == "codex_jsonl" and self._copy_codex_auth_enabled():
-            return ("codex", self._codex_model_name(usage_cfg))
-        return None
-
-    async def _harvest_codex_rollout(self) -> None:
-        """Read rate_limits from the node's codex session rollout, if any.
-
-        Codex writes ground-truth window utilization (used_percent/resets_at)
-        into its session files under CODEX_HOME — which copy_codex_auth pins
-        inside the sandbox, and teardown scrubs. Harvesting here (before
-        teardown) turns every codex node into a free usage probe.
-        """
-        if self._subscription_profile() is None or self._active_workspace_root is None:
-            return
-        sessions = self._active_workspace_root / ".codex-home" / "sessions"
-        if not sessions.is_dir():
-            return
-
-        def _extract() -> dict[str, dict[str, float | None]]:
-            windows: dict[str, dict[str, float | None]] = {}
-            for path in sorted(sessions.rglob("rollout-*.jsonl")):
-                try:
-                    parsed = parse_codex_rollout_rate_limits(
-                        path.read_text(encoding="utf-8")
-                    )
-                except OSError:
-                    continue
-                windows.update(parsed)  # later files win
-            return windows
-
-        try:
-            windows = await asyncio.to_thread(_extract)
-            if not windows:
-                return
-            await asyncio.to_thread(
-                lambda: SubscriptionStore().record_probe(
-                    provider="codex", windows=windows, now=time.time()
-                )
-            )
-        except Exception as e:
-            await self.events.emit(
-                "pacing.calibration_write_failed",
-                {"type": type(e).__name__, "msg": str(e)},
-            )
-            return
-        await self.events.emit(
-            "pacing.probe_recorded",
-            {"provider": "codex", "windows": windows, "via": "codex_rollout"},
-        )
-
     async def _record_claude_usage(self, stdout_text: str) -> None:
         usage = parse_claude_json(stdout_text)
         if not usage.found:
@@ -390,22 +308,6 @@ class ConfigurableCLIAgent(CLIAgent):
         # ~40x. All categories are recorded below so the weighting stays visible.
         self.tracker.add_tokens(usage.metered_tokens)
         model = self._claude_model_name()
-        # Cross-run subscription ledger: recorded unconditionally (cheap, and
-        # useful history even before pacing is enabled). Guarded so a broken
-        # store (read-only HOME) cannot suppress the model.call event below.
-        try:
-            await asyncio.to_thread(
-                SubscriptionStore().append_usage,
-                provider="claude",
-                model=model,
-                tokens=usage.metered_tokens,
-                run_id=self.events.run_id,
-            )
-        except Exception as e:
-            await self.events.emit(
-                "pacing.ledger_write_failed",
-                {"type": type(e).__name__, "msg": str(e)},
-            )
         await self.events.emit(
             "model.call",
             {
@@ -418,71 +320,6 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cost_usd": usage.total_cost_usd,
                 "n_turns": usage.num_turns,
                 "via": "claude_exec_json",
-            },
-        )
-
-    async def _scan_claude_rate_limit(self, stdout_text: str, stderr_text: str) -> None:
-        """Calibrate window ceilings from a real subscription limit hit.
-
-        Runs AFTER the ledger append so the just-finished node's tokens are in
-        the observed total. A model-class cap (e.g. fable weekly) can be
-        misattributed to the generic window — that only over-blocks until the
-        reset, which is the safe direction for a backstop.
-
-        The model's own answer is excluded: a real limit prints as a plain line
-        or a non-assistant envelope, so scanning the assistant text too would
-        misread a candidate that merely quotes the limit phrase as a real hit.
-        """
-        hit = detect_rate_limit(_answer_free_stdout(stdout_text) + "\n" + (stderr_text or ""))
-        if hit is None:
-            return
-        seconds, model_filter = WINDOWS[hit.window_guess]
-        store = SubscriptionStore()
-
-        def _record() -> int:
-            # the provider window is a discrete block: usage booked before this
-            # block began (hit.reset_at - seconds) belongs to the prior, already
-            # reset block and must not inflate the observed ceiling — an inflated
-            # ceiling later UNDER-blocks the fresh window (A1). With no reset we
-            # can't attribute rolling usage to this block at all, so don't
-            # calibrate a discrete ceiling from it; still record the block.
-            if hit.reset_at:
-                block_start = hit.reset_at - seconds
-                window_entries = [
-                    e
-                    for e in store.window_entries(
-                        provider="claude", seconds=seconds, model_filter=model_filter
-                    )
-                    if e.ts >= block_start
-                ]
-                observed = sum(e.tokens for e in window_entries)
-            else:
-                observed = 0
-            store.record_rate_limit(
-                provider="claude",
-                window=hit.window_guess,
-                observed_ceiling=observed,
-                reset_at=hit.reset_at,
-            )
-            return observed
-
-        try:
-            observed = await asyncio.to_thread(_record)
-        except Exception as e:
-            await self.events.emit(
-                "pacing.calibration_write_failed",
-                {"type": type(e).__name__, "msg": str(e)},
-            )
-            return
-        await self.events.emit(
-            "pacing.rate_limit_detected",
-            {
-                "provider": "claude",
-                "model": self._claude_model_name(),
-                "window": hit.window_guess,
-                "observed_ceiling": observed,
-                "reset_at": hit.reset_at,
-                "excerpt": hit.excerpt,
             },
         )
 
@@ -809,35 +646,6 @@ def _has_codex_sandbox_flag(cmd: list[str]) -> bool:
         part in {"--dangerously-bypass-approvals-and-sandbox", "--sandbox"}
         for part in cmd
     )
-
-
-def _answer_free_stdout(stdout_text: str) -> str:
-    """Stdout with the model's own conversational turns removed.
-
-    stream-json emits one envelope per line; ``assistant``/``user`` lines carry
-    the model's answer text, and the terminal ``result``/``subtype: success``
-    envelope repeats that final answer — neither must be scanned for a rate-limit
-    phrase the candidate may merely quote. Non-JSON lines (a real limit prints
-    one) and error ``result`` envelopes (which may report a genuine limit) are
-    kept.
-    """
-    kept: list[str] = []
-    for line in (stdout_text or "").splitlines():
-        stripped = line.strip()
-        if stripped:
-            try:
-                obj = json.loads(stripped)
-            except (ValueError, TypeError):
-                kept.append(line)
-                continue
-            if isinstance(obj, dict):
-                otype = obj.get("type")
-                if otype in {"assistant", "user"}:
-                    continue
-                if otype == "result" and obj.get("subtype") == "success":
-                    continue
-        kept.append(line)
-    return "\n".join(kept)
 
 
 def _safe_relpath(raw: str) -> str:

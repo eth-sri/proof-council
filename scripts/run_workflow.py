@@ -40,7 +40,7 @@ load_dotenv_file(REPO_ROOT / ".env")
 from proofstack import BudgetSpec, RunContext  # noqa: E402
 from proofstack.monitor import DEFAULT_MONITOR_MODEL, RunMonitor  # noqa: E402
 from proofstack.registry import load_preset  # noqa: E402
-from proofstack.subscription import RESUME_ENV_ALLOWLIST, SubscriptionParked  # noqa: E402
+from proofstack.budget import RESUME_ENV_ALLOWLIST, SubscriptionParked  # noqa: E402
 
 
 def _argparser() -> argparse.ArgumentParser:
@@ -340,8 +340,8 @@ def _write_resume_spec(
         argv += ["--budget-usd", str(args.budget_usd)]
     if args.monitor:
         argv += ["--monitor", "--monitor-model", args.monitor_model]
-    # Pacing is env-only, so persist the run's override here — resume rebuilds a
-    # fresh env and would otherwise fall back to the global setting.
+    # Persist only allow-listed env (currently empty) so resume rebuilds the same
+    # environment without carrying arbitrary vars across.
     env = {
         k: v
         for k in RESUME_ENV_ALLOWLIST
@@ -526,9 +526,9 @@ async def amain() -> int:
     try:
         out = await wf(**built_inputs)
     except SubscriptionParked as e:
-        # A pacing park is a resumable pause, not a crash. Record a distinct
-        # non-error status so the dashboard offers Resume (and doesn't paint it
-        # red) instead of treating it as a terminal failure.
+        # A park is a resumable pause, not a crash. Record a distinct non-error
+        # status so the dashboard offers Resume (and doesn't paint it red)
+        # instead of treating it as a terminal failure.
         await ctx.events.emit(
             "run.end",
             {"status": "parked", "type": type(e).__name__, "msg": str(e)},
