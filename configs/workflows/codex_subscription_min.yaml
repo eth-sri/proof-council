@@ -11,9 +11,10 @@
 #   2. `--ignore-user-config` keeps it from reading ~/.codex/config.toml;
 #      `codex_sandbox: auto` injects `--sandbox workspace-write` on the
 #      subprocess backend, so it can write answer.tex but not roam the host.
-#   3. A pure-subscription run spends $0, and Codex usage is not token-metered
-#      here (no `usage:` block), so the guardrails are max_tool_calls,
-#      max_wallclock_s, and the per-node timeouts below.
+#   3. A pure-subscription run spends $0. Tokens ARE metered (`usage:` block
+#      with bill: false) and feed the cross-run subscription pacer; the node's
+#      session rollout is harvested for codex's own rate_limits snapshot
+#      (used %, reset time), so every node doubles as a free usage probe.
 #
 # Login once with `codex login` (ChatGPT account). A ChatGPT-account Codex
 # login supports the base GPT models but NOT the *-codex variants.
@@ -31,11 +32,13 @@ budget:
 
 inputs:
   problem: ''
-  # Verified working on a ChatGPT-account login: gpt-5.5 (top), gpt-5.4,
-  # gpt-5.4-mini (cheap test). Rejected: gpt-5, *-codex, *-mini on the 5/5.5
-  # lines, o3, o4-mini.
-  codex_model: gpt-5.5
-  codex_effort: high     # high (serious) | medium | low | minimal (cheap test)
+  # Verified working on a ChatGPT-account login: gpt-5.6-sol (top; needs codex
+  # CLI >= 0.144 — older CLIs reject it with "requires a newer version of
+  # Codex"), gpt-5.5, gpt-5.4, gpt-5.4-mini (cheap test). Rejected: gpt-5,
+  # *-codex, *-mini on the 5/5.5 lines, o3, o4-mini.
+  codex_model: gpt-5.6-sol
+  codex_effort: high     # high (serious) | medium | low | minimal (cheap test);
+                         # gpt-5.6-sol also accepts xhigh and max (both verified)
 
 components:
   codex_solver:
@@ -45,7 +48,9 @@ components:
       - exec
       - --ignore-user-config   # don't read ~/.codex/config.toml; auth still via CODEX_HOME
       - --skip-git-repo-check
-      - --ephemeral            # don't persist session files
+      # (no --ephemeral: the session rollout carries codex's rate_limits
+      #  snapshot; it lands in the sandboxed CODEX_HOME, is harvested for the
+      #  pacer after the run, and teardown scrubs the whole .codex-home)
       - --json
       - -m
       - "{codex_model}"
@@ -55,23 +60,23 @@ components:
       #  `--sandbox workspace-write` because codex_sandbox: auto + subprocess)
     codex_sandbox: auto        # -> workspace-write on the subprocess backend
     copy_codex_auth: true      # key-free subscription auth (no API key)
+    usage:
+      type: codex_jsonl        # meter tokens into the subscription pacer ledger
+      bill: false              # subscription run: no USD charged (max_usd: 0.0)
     soft_timeout_s: 780        # 13 min: graceful "wrap up & finish" nudge
     sandbox:
       backend: subprocess      # host, not Docker
       timeout_s: 900           # 15 min: hard kill ceiling for this call
+    # Delivery mechanics are auto-appended: with `contract: auto` the framework
+    # tells the model which files to write (from output_files) and how to signal
+    # completion (the `finish` command), so the prompt describes only the task.
+    contract: auto
     prompt: |
       You are a research mathematician. Solve the problem below with a complete,
-      rigorous proof.
+      rigorous proof, written as a self-contained LaTeX document.
 
       Problem:
       {problem}
-
-      Instructions:
-      1. Write your full solution as a self-contained LaTeX document to a file
-         named  answer.tex  in the current directory.
-      2. When you are finished, run this exact shell command to signal completion:
-           finish '{"status":"done","summary":"proof written to answer.tex"}'
-      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       workspace: string

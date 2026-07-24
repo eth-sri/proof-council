@@ -629,13 +629,20 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
         # process died after a child finished/was stopped but before it recorded
         # the result, the parent is stuck "running" or mislabelled "error" (a
         # stopped child exits non-zero, which the batch records as a failure).
-        # Children are ground truth. We override a stale terminal status only when
-        # the children show the run is actually still going ("running") or was
-        # deliberately stopped ("stopped") — never to fabricate a finish.
+        # Children are ground truth. We override a stale terminal status when the
+        # children show the run is still going ("running"), was deliberately
+        # stopped ("stopped"), parked, or is fully done. A derived "finished"
+        # requires EVERY listed child to be finished (a died batch leaves some
+        # queued/running), so it can safely retire a stale "error" left by a
+        # resumed/parked child — e.g. a legacy batch whose parked child was
+        # resumed to completion (B4).
         derived = _status_from_problem_statuses(
             [p.get("status") for p in info.problems.values() if isinstance(p, dict)]
         )
-        if derived and (info.status not in ("finished", "error") or derived in ("running", "stopped")):
+        if derived and (
+            info.status not in ("finished", "error")
+            or derived in ("running", "stopped", "parked", "finished")
+        ):
             info.status = derived
             if derived in ("finished", "error"):
                 info.process_dead = False  # resolved, not a phantom
@@ -792,6 +799,8 @@ def _normalize_run_status(value: Any) -> str | None:
         return "finished"
     if raw in {"error", "failed", "failure"}:
         return "error"
+    if raw in {"parked"}:
+        return "parked"
     if raw in {"stopped", "paused", "cancelled", "canceled"}:
         return "stopped"
     if raw in {"running", "starting", "started", "queued", "pending"}:
@@ -809,8 +818,13 @@ def _status_from_problem_statuses(statuses: list[Any]) -> str | None:
         return "running"
     if "stopped" in normalized:
         return "stopped"
+    # a genuine crash outranks a resumable parked sibling: surfacing the failure
+    # matters more than offering Resume, and the parked child is independently
+    # resumable via its own run (B6)
     if "error" in normalized:
         return "error"
+    if "parked" in normalized:
+        return "parked"
     if all(status == "finished" for status in normalized):
         return "finished"
     return None
@@ -852,6 +866,74 @@ def find_run(roots: Iterable[Path], run_id: str) -> RunInfo | None:
     return None
 
 
+def coerce_human_response_value(raw: str, declared_type: Any) -> Any:
+    """Coerce a form-submitted string to the field's declared output type.
+
+    A human node whose output field is declared as anything other than a string
+    must not receive a raw string — the resumed downstream node then chokes on a
+    str where it expects a list/dict, or reads a truthy ``"false"`` where it
+    expects a bool. Coerce the declared shape; if the value does not parse to
+    that shape, leave it verbatim so the normal output validation surfaces it
+    rather than this silently mangling it.
+    """
+    t = str(declared_type or "string").strip().lower()
+    if t in {"bool", "boolean"}:
+        v = raw.strip().lower()
+        if v in {"true", "1", "yes", "on"}:
+            return True
+        if v in {"false", "0", "no", "off", ""}:
+            return False
+        return raw
+    if t in {"int", "integer", "number", "float"}:
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return raw
+        # json parses true/false to bool, and bool is an int subclass in Python;
+        # a numeric field must not silently accept a boolean
+        if isinstance(parsed, bool):
+            return raw
+        if t in {"int", "integer"}:
+            return parsed if isinstance(parsed, int) else raw
+        return parsed if isinstance(parsed, (int, float)) else raw
+    if t not in {"array", "object", "json"}:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    if t == "array" and not isinstance(parsed, list):
+        return raw
+    if t == "object" and not isinstance(parsed, dict):
+        return raw
+    return parsed
+
+
+def human_response_type_error(value: Any, declared_type: Any) -> str | None:
+    """Message if a coerced value doesn't match a structured/numeric declared
+    type, else None. Strings, ``json`` and unknown types always pass.
+
+    ``coerce_human_response_value`` leaves a malformed structured value as its
+    raw string; without this check the human node's permissive (extra-allow)
+    Outputs model accepts it and a downstream node reads a str where it expects
+    a list/dict/number (B5). The caller rejects on a non-None message so the
+    human task stays pending for a corrected answer.
+    """
+    t = str(declared_type or "string").strip().lower()
+    if t in {"array"}:
+        return None if isinstance(value, list) else "must be a JSON array"
+    if t in {"object"}:
+        return None if isinstance(value, dict) else "must be a JSON object"
+    if t in {"bool", "boolean"}:
+        return None if isinstance(value, bool) else "must be true or false"
+    if t in {"int", "integer"}:
+        return None if (isinstance(value, int) and not isinstance(value, bool)) else "must be an integer"
+    if t in {"number", "float"}:
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        return None if ok else "must be a number"
+    return None
+
+
 def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
     """Human-in-the-loop tasks awaiting a response in this run.
 
@@ -863,8 +945,14 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
     events_path = run_path / "events.jsonl"
     if not events_path.exists():
         return []
+    # Track each response path's lifecycle IN ORDER so the latest event wins: a
+    # human.waiting that lands AFTER a human.submitted/timeout — a genuine re-ask
+    # on the same stable path (e.g. a loop revisiting the node) — must reopen the
+    # task rather than stay suppressed forever by the earlier resolution. ``pending``
+    # is an insertion-ordered set of currently-open paths; a dropped valid response
+    # file still short-circuits listing below (that answer is in flight).
     waiting: dict[str, dict[str, Any]] = {}
-    resolved: set[str] = set()
+    pending: dict[str, None] = {}
     try:
         with events_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -884,16 +972,16 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                 kind = e.get("kind")
                 if kind == "human.waiting":
                     waiting[response_path] = {**payload, "agent": e.get("agent")}
+                    pending[response_path] = None
                 elif kind in ("human.submitted", "human.timeout"):
-                    resolved.add(response_path)
+                    pending.pop(response_path, None)
     except OSError:
         return []
 
     inbox = run_path / "human_inbox"
     tasks: list[dict[str, Any]] = []
-    for response_path, payload in waiting.items():
-        if response_path in resolved:
-            continue
+    for response_path in pending:
+        payload = waiting[response_path]
         filename = Path(response_path).name
         response_error = ""
         response_file = inbox / filename
@@ -2507,6 +2595,7 @@ def safe_blob_path(run_path: Path, ref: str) -> Path:
 
 CONFIGURABLE_PROMPT_AGENT = "proofstack.agents.configurable_prompt.ConfigurablePromptAgent"
 CONFIGURABLE_CLI_AGENT = "proofstack.agents.configurable_cli.ConfigurableCLIAgent"
+HUMAN_AGENT = "proofstack.agents.human_agent.HumanAgent"
 DEFAULT_MODEL_ROOT = CONFIGS_ROOT / "models"
 
 
@@ -2671,9 +2760,37 @@ def _preset_validation_errors(raw: dict[str, Any]) -> list[str]:
             if not isinstance(name, str) or not isinstance(cfg, dict):
                 errors.append("each component config must map a string name to a mapping")
                 break
+        errors.extend(_output_path_errors(components))
 
     if workflow_cls is not None and not hasattr(workflow_cls, "Inputs"):
         errors.append(f"workflow {workflow_cls.__name__} does not declare Inputs")
+    return errors
+
+
+def _output_path_errors(components: dict[str, Any]) -> list[str]:
+    """Reject output_files paths the runtime collector would refuse.
+
+    ConfigurableCLIAgent (`_safe_relpath`) raises on an absolute or escaping
+    (``..``) workspace path at collect time; catch it here so a bad path fails
+    at edit/validate time instead of mid-run.
+    """
+    errors: list[str] = []
+    for name, cfg in components.items():
+        if not isinstance(cfg, dict):
+            continue
+        files = cfg.get("output_files")
+        if not isinstance(files, dict):
+            continue
+        for field, spec in files.items():
+            raw_path = spec.get("path") if isinstance(spec, dict) else spec
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            path = Path(raw_path)
+            if path.is_absolute() or any(part == ".." for part in path.parts):
+                errors.append(
+                    f"component {name!r} output_files[{field!r}] must be a relative "
+                    f"path inside the workspace: {raw_path!r}"
+                )
     return errors
 
 
@@ -2926,6 +3043,8 @@ def mutate_preset_yaml(raw_yaml: str, operation: dict[str, Any]) -> dict[str, An
             _op_update_node(raw, operation)
         elif op == "update_component":
             _op_update_component(raw, operation)
+        elif op == "set_executor":
+            _op_set_executor(raw, operation)
         elif op == "update_node_inputs":
             _op_update_node_inputs(raw, operation)
         elif op == "update_node_outputs":
@@ -4128,6 +4247,24 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
     if "input_schema" in fields:
         cfg["input_schema"] = _parse_schema_fields(str(fields["input_schema"] or ""))
         handled_fields.add("input_schema")
+    if "output_schema" in fields:
+        new_schema = _coerce_schema_fields(fields["output_schema"])
+        # No real editor affordance posts a bare output_schema: the CLI file
+        # editor always bundles an explicit output_files map, and the API output
+        # editor edits the parse spec directly. The projection helper that used to
+        # synthesize output/output_files from a schema-only edit was a recurring
+        # source of silent corruption, so refuse that path rather than guess.
+        if "output_files" not in fields and _output_schema_business_changed(cfg, new_schema):
+            raise PresetError(
+                f"component {name!r}: editing output_schema is not supported in "
+                "the editor — edit the node by hand"
+            )
+        cfg["output_schema"] = new_schema
+        done = cfg.get("done_outputs")
+        if isinstance(done, dict):
+            allowed = set(new_schema) | _OUTPUT_MECHANICS_FIELDS
+            cfg["done_outputs"] = {k: v for k, v in done.items() if str(k) in allowed}
+        handled_fields.add("output_schema")
     if "tools" in fields:
         tools = _parse_tools_config(fields.get("tools"))
         if tools:
@@ -4152,8 +4289,8 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
         handled_fields.add("max_tool_calls")
 
     edits_output = any(key in fields for key in ("default_field", "xml_tags", "xml_list_field", "xml_list_tag"))
-    output = cfg.get("output")
-    if edits_output or isinstance(output, dict):
+    if edits_output:
+        output = cfg.get("output")
         if not isinstance(output, dict):
             output = {}
             cfg["output"] = output
@@ -4179,12 +4316,690 @@ def _op_update_component(raw: dict[str, Any], operation: dict[str, Any]) -> None
             else:
                 output.pop("xml_lists", None)
             handled_fields.update({"xml_list_field", "xml_list_tag"})
-        _ensure_multi_output_prompt_instruction(cfg, output)
+        # format instructions are generated at RUNTIME from the spec
+        # (ConfigurablePromptAgent._with_format_instruction); baking them into
+        # the stored prompt would entangle it with API delivery mechanics.
+        # An explicit spec edit is authoritative — mirror it into the schema
+        # (empties included) so the two never desynchronize.
+        _sync_output_schema_with_api_spec(cfg, force=True)
 
     for key, value in fields.items():
         if key in handled_fields or str(key).startswith("__"):
             continue
         cfg[str(key)] = value
+
+
+def _output_schema_business_changed(cfg: dict[str, Any], new_schema: dict[str, Any]) -> bool:
+    """True if the non-mechanics output fields (names or types) changed.
+
+    Guards the editor's output_schema edit: a bare schema change (add/remove/
+    retype of a business field) that isn't paired with an explicit output_files
+    map has no sound projection and is refused, so the editor never silently
+    corrupts the delivery config.
+    """
+    old_schema = cfg.get("output_schema")
+    old_schema = old_schema if isinstance(old_schema, dict) else {}
+
+    def business(schema: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in schema.items() if k not in _OUTPUT_MECHANICS_FIELDS}
+
+    return business(old_schema) != business(new_schema)
+
+
+def _sync_output_schema_with_api_spec(cfg: dict[str, Any], *, force: bool = False) -> None:
+    """Keep the canonical output_schema in step with API output-spec edits.
+
+    The spec is what the API executor actually parses, so a rename/removal
+    there must reach the schema too — otherwise the next executor swap
+    resurrects the old field from the stale schema entry (renaming `output`
+    to `answer` used to produce both output.txt and answer.txt). ``force``
+    marks an explicit spec edit: then even an emptied spec is mirrored (an
+    empty schema), instead of leaving the last field behind.
+    """
+    spec_contract = _spec_output_contract(cfg.get("output"))
+    if not spec_contract and not force:
+        return
+    schema = cfg.get("output_schema")
+    schema = schema if isinstance(schema, dict) else {}
+    # names come from the edited spec; richer types already declared survive
+    cfg["output_schema"] = {
+        field: schema.get(field, type_spec) for field, type_spec in spec_contract.items()
+    }
+
+
+# Component config keys owned by the executor; replaced wholesale on a swap.
+# Task identity is preserved: prompt, input_schema, tools, and the canonical
+# typed output_schema. All delivery machinery is executor-owned and
+# regenerated from the schema each swap — the API `output` parse spec included:
+# switchable components have delivery-neutral prompts (enforced by
+# _switchable_or_refuse), so regenerated tag names need only be self-consistent
+# with the generated runtime instructions, not match any prompt wording.
+_EXECUTOR_OWNED_KEYS = (
+    "cmd",
+    "env",
+    "usage",
+    "sandbox",
+    "codex_sandbox",
+    "copy_codex_auth",
+    "model",
+    "model_reasoning_effort",
+    "soft_timeout_s",
+    "cache_enabled",
+    "contract",
+    "messages",
+    "output",
+    "output_files",
+    "done_outputs",
+)
+
+_EXECUTOR_AGENTS = {
+    "api": CONFIGURABLE_PROMPT_AGENT,
+    "claude_cli": CONFIGURABLE_CLI_AGENT,
+    "codex_cli": CONFIGURABLE_CLI_AGENT,
+    "human": HUMAN_AGENT,
+}
+
+_KNOWN_FILE_SUFFIXES = ("tex", "md", "json", "txt", "py", "lean", "csv")
+
+
+def _default_output_filename(field: str) -> str:
+    stem, _, suffix = field.rpartition("_")
+    if stem and suffix in _KNOWN_FILE_SUFFIXES:
+        return f"{stem}.{suffix}"  # answer_tex -> answer.tex
+    return f"{field}.txt"
+
+
+def _iter_agent_nodes(nodes: Any):
+    """Yield every dict that resolves an agent component via agent/name keys.
+
+    That is more than ``kind: agent`` nodes: join_or_agent nodes and map_chain
+    steps invoke components the same way, so an executor swap must retarget
+    them too or the component config and the node's agent class silently
+    diverge (a valid-looking but broken preset).
+    """
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        # kind defaults to "agent" at runtime (dag_workflow), so a node that
+        # omits kind but names a component is an agent node too — missing it
+        # here leaves that node pointed at the old agent class after a swap.
+        if node.get("kind", "agent") in ("agent", "join_or_agent"):
+            yield node
+        for step in node.get("steps") or ():
+            if isinstance(step, dict):
+                yield step
+        body = node.get("body")
+        if isinstance(body, dict):
+            yield from _iter_agent_nodes(body.get("nodes"))
+
+
+def _workflow_model_binding(raw: dict[str, Any], knobs: tuple[str, ...]) -> str | None:
+    """Return a '{knob}' cmd binding for the first declared workflow model knob.
+
+    Knob names are flavor-specific (claude_model/base_model vs codex_model/
+    gpt_model) — reusing a binding across CLI flavors would feed one provider's
+    model names to the other, so callers pass only their own flavor's knobs.
+    """
+    inputs = raw.get("inputs")
+    if isinstance(inputs, dict):
+        for knob in knobs:
+            if knob in inputs:
+                return "{" + knob + "}"
+    return None
+
+
+def _executor_scaffold(executor: str, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Executor-owned config defaults for a component.
+
+    The single source of truth for what each executor's plumbing looks like —
+    used by both set_executor and the add-node CLI template so the two cannot
+    drift. CLI models bind to a declared workflow knob when `raw` is given.
+    """
+    if executor == "claude_cli":
+        model_arg = (
+            _workflow_model_binding(raw, ("claude_model", "base_model")) if raw else None
+        ) or "sonnet"
+        return {
+            "cmd": [
+                "claude",
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                model_arg,
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Bash(finish:*)",
+            ],
+            "soft_timeout_s": 780,
+            "sandbox": {"backend": "subprocess", "timeout_s": 900},
+            "env": {"HOME": "{env:HOME}"},
+            "usage": {"type": "claude_json"},
+            "contract": "auto",
+        }
+    if executor == "codex_cli":
+        binding = (
+            _workflow_model_binding(raw, ("codex_model", "gpt_model")) if raw else None
+        )
+        cmd = [
+            "codex",
+            "exec",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--json",
+        ]
+        scaffold: dict[str, Any] = {
+            "cmd": cmd,
+            "model_reasoning_effort": "medium",
+            "codex_sandbox": "auto",
+            "copy_codex_auth": True,
+            "soft_timeout_s": 780,
+            "sandbox": {"backend": "subprocess", "timeout_s": 900},
+            "contract": "auto",
+        }
+        if binding:
+            cmd += ["-m", binding]
+        else:
+            scaffold["model"] = "gpt-5.4-mini"
+        return scaffold
+    if executor == "api":
+        return {"model": "models/anthropic/sonnet_46"}
+    return {}  # human: prompt + schemas only
+
+
+_OUTPUT_MECHANICS_FIELDS = {"workspace", "status"}
+
+# CLI-sandbox mechanics, not business outputs: workspace is the sandbox path
+# and status is the done.json signal. `summary` is NOT here — it is a genuine
+# business output when a component declares it (deleting it silently on a swap
+# was a real bug), even though CLIDoneRecord also carries a summary field.
+# done.json fields carry known shapes (see CLIDoneRecord)
+_DONE_FIELD_TYPES: dict[str, Any] = {
+    "status": "string",
+    "summary": "string",
+    "diff_summary": "string",
+    "open_questions": {"type": "array", "items": {"type": "string"}},
+    "artifacts": {"type": "array", "items": {"type": "object"}},
+}
+
+_ARRAY_TYPE = {"type": "array", "items": {"type": "string"}}
+
+
+def _is_array_type(type_spec: Any) -> bool:
+    if isinstance(type_spec, str):
+        return type_spec.strip().lower() in {"array", "list"}
+    return isinstance(type_spec, dict) and str(type_spec.get("type") or "") == "array"
+
+
+def _is_object_type(type_spec: Any) -> bool:
+    if isinstance(type_spec, str):
+        return type_spec.strip().lower() in {"object", "dict", "any"}
+    return isinstance(type_spec, dict) and (
+        not type_spec or str(type_spec.get("type") or "") == "object"
+    )
+
+
+def _is_string_type(type_spec: Any) -> bool:
+    if isinstance(type_spec, str):
+        return type_spec.strip().lower() in {"", "string", "str", "text"}
+    return isinstance(type_spec, dict) and str(type_spec.get("type") or "") == "string"
+
+
+def _is_text_type(type_spec: Any) -> bool:
+    """A plain-text output: a string type or an all-string enum.
+
+    Executor switching is deliberately narrow — it supports only components
+    whose every output is plain text, so a swap can never change a field's
+    runtime type or need executor-specific structured (de)serialization. Any
+    richer output makes the component non-switchable (a clean refusal), which
+    is what keeps the small supported surface actually correct.
+    """
+    if isinstance(type_spec, str):
+        return type_spec.strip().lower() in {"string", "str", "text"}
+    if isinstance(type_spec, dict):
+        declared = str(type_spec.get("type") or "").strip().lower()
+        if declared and declared != "string":
+            return False  # e.g. {"type": "array", "enum": [...]} is not text
+        enum = type_spec.get("enum")
+        if isinstance(enum, list) and enum and all(isinstance(v, str) for v in enum):
+            return True
+        return declared == "string"
+    return False
+
+
+def _spec_output_contract(output: Any) -> dict[str, Any]:
+    """Business outputs (with types) declared by an API `output` parse spec.
+
+    Typing mirrors dag_schema._configured_prompt_outputs; the singular
+    json_tag form names its output via json_field, defaulting to the tag.
+    """
+    contract: dict[str, Any] = {}
+    if not isinstance(output, dict):
+        return contract
+
+    def add(name: Any, type_spec: Any) -> None:
+        text = str(name or "")
+        if text and text not in _OUTPUT_MECHANICS_FIELDS and text not in contract:
+            contract[text] = type_spec
+
+    for key in output.get("xml_lists") or {}:
+        add(key, _ARRAY_TYPE)
+    for key in output.get("xml_tags") or []:
+        add(key, "string")
+    if isinstance(output.get("json_tag"), str):
+        add(output.get("json_field") or output["json_tag"], "object")
+    elif isinstance(output.get("json_field"), str):
+        add(output["json_field"], "object")
+    json_tags = output.get("json_tags")
+    if isinstance(json_tags, dict):
+        for key in json_tags:
+            add(key, "object")
+    regex_fields = output.get("regex_fields")
+    if isinstance(regex_fields, dict):
+        for key in regex_fields:
+            add(key, "string")
+    add(output.get("default_field"), "string")
+    return contract
+
+
+def _absorbed_output_contract(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The component's business outputs with their TYPES.
+
+    output_schema is the canonical, typed declaration. The API `output` spec
+    contributes only when the schema declares no business outputs — that seeds
+    the schema for spec-only components (Basic I/O, the ideator) on their
+    first swap. Once a schema exists it is authoritative: deleting a field
+    from it must stick, so the dormant spec is deliberately NOT re-read (that
+    was the renamed-outputs-resurrect bug). CLI projections (output_files,
+    done_outputs) likewise only fill gaps for legacy hand-written configs.
+    """
+    contract: dict[str, Any] = {}
+
+    def add(name: Any, type_spec: Any) -> None:
+        text = str(name or "")
+        if text and text not in _OUTPUT_MECHANICS_FIELDS and text not in contract:
+            contract[text] = type_spec
+
+    schema = cfg.get("output_schema")
+    if isinstance(schema, dict):
+        for key, type_spec in schema.items():
+            add(key, type_spec if type_spec else "string")
+    if not contract:
+        for key, type_spec in _spec_output_contract(cfg.get("output")).items():
+            add(key, type_spec)
+    raw_files = cfg.get("output_files")
+    if isinstance(raw_files, dict):
+        for key, spec in raw_files.items():
+            kind = str(spec.get("type") or "text") if isinstance(spec, dict) else "text"
+            add(str(key).split(".", 1)[0], "object" if kind == "json" else "string")
+    done = cfg.get("done_outputs")
+    if isinstance(done, dict):
+        for key, spec in done.items():
+            source = str(spec.get("field") if isinstance(spec, dict) else spec)
+            type_spec = _DONE_FIELD_TYPES.get(source, "string")
+            if isinstance(spec, dict) and spec.get("join"):
+                type_spec = "string"
+            add(key, type_spec)
+    return contract
+
+
+# CLI output_files collector modes that read something other than a text file;
+# no other executor can reproduce them, so a component using one is not
+# switchable.
+_CLI_STRUCTURED_FILE_KINDS = {"path", "exists", "listing", "int", "float", "json"}
+
+
+def _spec_declared_names(output: Any) -> set[str]:
+    """Every field name an API `output` spec declares, mechanics included."""
+    if not isinstance(output, dict):
+        return set()
+    names: set[str] = set()
+    names.update(str(f) for f in output.get("xml_lists") or {})
+    names.update(str(f) for f in output.get("xml_tags") or [])
+    names.update(str(f) for f in output.get("json_tags") or {})
+    names.update(str(f) for f in output.get("regex_fields") or {})
+    if isinstance(output.get("json_field"), str):
+        names.add(output["json_field"])
+    if isinstance(output.get("json_tag"), str):
+        names.add(str(output.get("json_field") or output["json_tag"]))
+    if isinstance(output.get("default_field"), str):
+        names.add(output["default_field"])
+    return names
+
+
+def _full_output_contract(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Every business output from EVERY source, with types, for the swap gate.
+
+    Unlike _absorbed_output_contract (schema-authoritative, used for the
+    transformation), this never lets one source mask another: a structured
+    field declared only in the API spec, a CLI file, done_outputs, or
+    constant_outputs is visible here, so the gate can refuse it instead of
+    silently dropping it. Falsy/unknown type specs are kept as-is (not
+    coerced to string) so the non-text check refuses them.
+    """
+    contract: dict[str, Any] = {}
+
+    def add(name: Any, type_spec: Any) -> None:
+        text = str(name or "")
+        if text and text not in _OUTPUT_MECHANICS_FIELDS and text not in contract:
+            contract[text] = type_spec
+
+    schema = cfg.get("output_schema")
+    if isinstance(schema, dict):
+        for key, type_spec in schema.items():
+            add(key, type_spec)
+    for key, type_spec in _spec_output_contract(cfg.get("output")).items():
+        add(key, type_spec)
+    raw_files = cfg.get("output_files")
+    if isinstance(raw_files, dict):
+        for key, spec in raw_files.items():
+            kind = str(spec.get("type") or "text").lower() if isinstance(spec, dict) else "text"
+            add(str(key), "object" if kind == "json" else "string")
+    done = cfg.get("done_outputs")
+    if isinstance(done, dict):
+        for key, spec in done.items():
+            source = str(spec.get("field") if isinstance(spec, dict) else spec)
+            type_spec = _DONE_FIELD_TYPES.get(source, "string")
+            if isinstance(spec, dict) and spec.get("join"):
+                type_spec = "string"
+            add(key, type_spec)
+    constants = cfg.get("constant_outputs")
+    if isinstance(constants, dict):
+        for key, value in constants.items():
+            add(key, "string" if isinstance(value, str) else "object")
+    return contract
+
+
+_SWAPPABLE_AGENTS = {CONFIGURABLE_PROMPT_AGENT, CONFIGURABLE_CLI_AGENT, HUMAN_AGENT}
+_CLI_EXECUTORS = {"claude_cli", "codex_cli"}
+# Executor-owned config that differs between the two CLI flavors. The output
+# configuration is deliberately NOT here (both CLIs read outputs identically),
+# and `usage` is handled separately so its billing intent carries across.
+_CLI_SWAP_KEYS = (
+    "cmd", "env", "sandbox", "codex_sandbox", "copy_codex_auth",
+    "model", "model_reasoning_effort", "soft_timeout_s", "contract",
+)
+
+
+def _cli_usage_for(existing: Any, executor: str) -> dict[str, Any]:
+    """Carry token metering across a CLI swap, flipping only the parser type.
+
+    Preserves a subscription (bill: false) vs billed (cost_config) intent; a
+    node metered on the Claude subscription stays metered, not billed, on Codex.
+    """
+    usage = dict(existing) if isinstance(existing, dict) else {}
+    if executor == "codex_cli":
+        usage["type"] = "codex_jsonl"
+        if "cost_config" not in usage:
+            usage.setdefault("bill", False)
+    else:
+        usage["type"] = "claude_json"
+        # codex-only metering metadata is inert for the claude parser but
+        # would silently reactivate on a later swap back — drop it
+        for codex_key in ("cost_config", "model", "bill"):
+            usage.pop(codex_key, None)
+    return usage
+
+
+def _binding_literals(output: Any, prompt_text: str) -> list[str]:
+    """Delivery-format literals from the API spec that the prompt hand-embeds.
+
+    A prompt that mentions its own tags ("emit each strategy in an <approach>
+    tag") entangles task description with API delivery mechanics; no config
+    transformation can convert such a node soundly. This is a lint, not a
+    proof — prose descriptions without the literal strings will pass.
+    """
+    if not isinstance(output, dict) or not prompt_text:
+        return []
+    tags: set[str] = set()
+    tags.update(str(t) for t in (output.get("xml_tags") or []))
+    tags.update(str(t) for t in (output.get("xml_lists") or {}).values())
+    tags.update(str(t) for t in (output.get("json_tags") or {}).values())
+    if isinstance(output.get("json_tag"), str):
+        tags.add(output["json_tag"])
+    # match a COMPLETE opening/closing tag, not a prefix: `<n>`/`</n>` counts,
+    # but ordinary math like `x<n` or an unrelated `<answer_tex>` does not.
+    found = [
+        f"<{tag}>"
+        for tag in sorted(tags)
+        if re.search(rf"</?{re.escape(tag)}\s*>", prompt_text)
+    ]
+    for pattern in (output.get("regex_fields") or {}).values():
+        if not isinstance(pattern, str):
+            continue
+        # fixed literal runs of the pattern (e.g. "VERDICT:") appearing verbatim
+        for literal in re.findall(r"[A-Za-z0-9_]+:", pattern):
+            if literal.strip() and literal.strip() in prompt_text:
+                found.append(literal.strip())
+                break
+    return found
+
+
+def _switchable_or_refuse(cfg: dict[str, Any], name: str) -> None:
+    """Raise PresetError unless this component is in the narrow swappable tier.
+
+    Executor switching is intentionally limited to what can be translated
+    soundly for a web-UI user who cannot inspect the result: plain-text
+    outputs, a delivery-neutral prompt, and no executor-specific delivery
+    machinery. Everything richer is refused with a specific reason rather
+    than silently mangled (four review rounds of silent mangling is why).
+    Components that need it can still be edited by hand or by an LLM.
+    """
+    def refuse(reason: str) -> None:
+        raise PresetError(f"component {name!r} {reason} — not switchable; edit the node by hand")
+
+    if isinstance(cfg.get("messages"), list) and cfg["messages"]:
+        refuse("uses a multi-message `messages:` template with no single-prompt form")
+    if not any(str(cfg.get(k) or "").strip() for k in ("prompt", "user_prompt", "system_prompt")):
+        # a component with no authored prompt relies on a class default that
+        # does not translate across executors
+        refuse("has no authored prompt to carry across executors")
+    if cfg.get("constant_outputs"):
+        refuse("declares constant_outputs, which only a CLI node injects")
+    output_spec = cfg.get("output") if isinstance(cfg.get("output"), dict) else {}
+    # raw_text is the API parser's own field, and workspace/status are CLI
+    # sandbox mechanics — a business output cannot use those names
+    reserved = ({"raw_text"} | _OUTPUT_MECHANICS_FIELDS) & _spec_declared_names(output_spec)
+    if "raw_text" in (cfg.get("output_schema") or {}):
+        reserved.add("raw_text")
+    if reserved:
+        refuse(f"declares reserved output name(s) ({', '.join(sorted(reserved))})")
+    if output_spec.get("json_merge"):
+        refuse("uses output.json_merge (its output fields are not statically known)")
+    if output_spec.get("regex_fields"):
+        refuse("uses output.regex_fields (a hand-tuned parser tied to its prompt)")
+
+    # One contract across EVERY output source (schema, the API spec, files,
+    # done_outputs) — checking only the schema-authoritative view let a
+    # structured field declared solely in the spec/files slip through and get
+    # dropped. A nested (dotted) field, or any non-text type from any source,
+    # refuses.
+    contract = _full_output_contract(cfg)
+    dotted = sorted(f for f in contract if "." in f)
+    if dotted:
+        refuse(f"has nested output field(s) ({', '.join(dotted)})")
+    for field, spec in (cfg.get("output_files") or {}).items():
+        kind = str(spec.get("type") or "text").lower() if isinstance(spec, dict) else "text"
+        if kind in _CLI_STRUCTURED_FILE_KINDS:
+            refuse(f"collects output {field!r} as {kind!r} (a CLI-specific file mode)")
+    non_text = sorted(f for f, t in contract.items() if not _is_text_type(t))
+    if non_text:
+        raise PresetError(
+            f"component {name!r} produces non-text output(s) "
+            f"({', '.join(non_text)}) — executor switching supports text "
+            "outputs only. Change the output types, or edit the node by hand"
+        )
+
+    prompt_text = _component_prompt_text(cfg)
+    literals = _binding_literals(output_spec, prompt_text)
+    if literals:
+        raise PresetError(
+            f"component {name!r}'s prompt hand-embeds its output format "
+            f"({', '.join(literals[:4])}) — not switchable; make the prompt "
+            "delivery-neutral (the framework generates format instructions) "
+            "or edit the node by hand"
+        )
+    # A prompt that IMPERATIVELY names a delivery file ("write ... to notes.md")
+    # entangles the task with CLI delivery even under contract: auto; a bare
+    # mention as an example does not.
+    for spec in (cfg.get("output_files") or {}).values():
+        relpath = str(spec.get("path") or "") if isinstance(spec, dict) else str(spec)
+        if len(relpath) >= 4 and "." in relpath and re.search(
+            rf"\b(?:write|writing|save|saving|store|output|emit|create|put)\b[^.]{{0,40}}\b{re.escape(relpath)}\b",
+            prompt_text,
+            re.IGNORECASE,
+        ):
+            refuse(f"'s prompt tells the model to write its delivery file ({relpath})")
+
+
+def _unique_output_files(fields: Any) -> dict[str, str]:
+    """One DISTINCT text filename per output.
+
+    Two fields whose default names collide (e.g. `notes` and `notes_txt` both
+    -> notes.txt) would read/write the same file, so disambiguate on collision.
+    """
+    used: set[str] = set()
+    out: dict[str, str] = {}
+    for field in fields:
+        name = _default_output_filename(field)
+        if name in used:
+            stem, _, ext = name.rpartition(".")
+            n = 2
+            while f"{stem}_{n}.{ext}" in used:
+                n += 1
+            name = f"{stem}_{n}.{ext}"
+        used.add(name)
+        out[field] = name
+    return out
+
+
+def _node_agent_class(node: dict[str, Any]) -> str:
+    """The agent class a node resolves, honoring the ``class:`` alias.
+
+    The runtime accepts ``agent:`` or ``class:`` (dag_workflow._agent_for), so
+    the editor must read both or a valid ``class:`` node looks custom-coded.
+    """
+    return str(node.get("agent") or node.get("class") or "")
+
+
+def _infer_executor(cfg: dict[str, Any], agent_cls: str) -> str:
+    if agent_cls == CONFIGURABLE_PROMPT_AGENT:
+        return "api"
+    if agent_cls == HUMAN_AGENT:
+        return "human"
+    if agent_cls == CONFIGURABLE_CLI_AGENT:
+        cmd = cfg.get("cmd") or []
+        if isinstance(cmd, str):
+            cmd = cmd.split()
+        first = str(cmd[0]) if cmd else ""
+        base = first.rsplit("/", 1)[-1]
+        if base == "codex" or cfg.get("copy_codex_auth"):
+            return "codex_cli"
+        if base == "claude":
+            return "claude_cli"
+        # a genuinely custom command is neither CLI executor; returning "" makes
+        # the swap guard refuse rather than overwrite the user's command
+        return ""
+    return ""
+
+
+def _component_prompt_text(cfg: dict[str, Any]) -> str:
+    return "\n".join(
+        str(cfg.get(key) or "") for key in ("prompt", "system_prompt", "user_prompt")
+    )
+
+
+def _op_set_executor(raw: dict[str, Any], operation: dict[str, Any]) -> None:
+    executor = str(operation.get("executor") or "")
+    agent_cls = _EXECUTOR_AGENTS.get(executor)
+    if agent_cls is None:
+        raise PresetError(f"unknown executor: {executor!r}")
+    name = str(operation.get("name") or "")
+    if not name:
+        raise PresetError("set_executor requires a component name")
+    components = _components(raw)
+    cfg = components.get(name)
+    if not isinstance(cfg, dict):
+        raise PresetError(f"unknown component: {name!r}")
+
+    # --- refusal guards: never knowingly mangle -------------------------------
+    # Custom-coded nodes are immutable: executor switching is only meaningful
+    # for components run by the configurable agent classes. A component with
+    # no referencing node is config for custom Python code (e.g. the First
+    # Proof engine's model overrides), not a swappable task.
+    referencing = [
+        node
+        for node in _iter_agent_nodes((raw.get("dag") or {}).get("nodes"))
+        if str(node.get("name") or "") == name
+    ]
+    if not referencing:
+        raise PresetError(
+            f"component {name!r} is not used by any swappable node — it likely "
+            "configures a custom-coded agent, which has no executor to switch"
+        )
+    custom = sorted(
+        {
+            _node_agent_class(node)
+            for node in referencing
+            if _node_agent_class(node) not in _SWAPPABLE_AGENTS
+        }
+    )
+    if custom:
+        raise PresetError(
+            f"component {name!r} is run by custom-coded agent(s) "
+            f"{', '.join(custom)} — custom nodes are immutable; executor "
+            "switching applies only to configurable components"
+        )
+
+    # A component wired to nodes of different executors is already in an
+    # ambiguous state; a swap would resolve it order-dependently.
+    current = {_infer_executor(cfg, _node_agent_class(node)) for node in referencing}
+    if len(current) > 1:
+        raise PresetError(
+            f"component {name!r} is run by nodes on different executors "
+            f"({', '.join(sorted(current))}) — split it into separate "
+            "components before switching"
+        )
+    # Selecting the executor already in use is a no-op: mutating anyway would
+    # replace the model / reasoning settings with scaffold defaults.
+    if current == {executor}:
+        return
+
+    # Only Claude<->Codex CLI switching is currently enabled. Both run the same
+    # ConfigurableCLIAgent and read outputs identically (files + done.json), so
+    # the swap only exchanges the command / auth / usage scaffold and touches
+    # none of the output-contract translation that made API/human switching a
+    # combinatorial correctness hazard (that path is disabled pending rework;
+    # the full implementation lives on the feat/executor-switching branch).
+    if executor not in _CLI_EXECUTORS or not current <= _CLI_EXECUTORS:
+        raise PresetError(
+            f"switching {name!r} to {executor!r} is disabled — only Claude "
+            "<-> Codex CLI switching is currently supported. Edit the node "
+            "by hand for other executor changes."
+        )
+
+    # CLI -> CLI: preserve prompt, schemas, and the entire output configuration
+    # (both executors deliver outputs the same way); replace only the
+    # command/auth scaffold, and carry token metering across. Leave
+    # output/output_files/done_outputs and input_files untouched.
+    usage = _cli_usage_for(cfg.get("usage"), executor)
+    for key in _CLI_SWAP_KEYS:
+        cfg.pop(key, None)
+    scaffold = _executor_scaffold(executor, raw)
+    scaffold.pop("usage", None)  # metering intent carried by _cli_usage_for
+    cfg.update(scaffold)
+    cfg["usage"] = usage
+
+    for node in _iter_agent_nodes((raw.get("dag") or {}).get("nodes")):
+        if str(node.get("name") or "") == name:
+            # write back to whichever alias the node already uses so a `class:`
+            # node isn't left with a stale `class` beside a fresh `agent`
+            key = "class" if "class" in node and "agent" not in node else "agent"
+            node[key] = agent_cls  # both CLI executors use the same class
 
 
 def _op_update_node_inputs(raw: dict[str, Any], operation: dict[str, Any]) -> None:
@@ -5435,29 +6250,26 @@ def _import_class(path: str) -> type:
 
 
 def _cli_component_template() -> dict[str, Any]:
-    return {
-        "cmd": [
-            "codex",
-            "exec",
-            "--ignore-user-config",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--json",
-        ],
-        "model": "gpt-5.4-mini",
-        "model_reasoning_effort": "low",
-        "codex_sandbox": "auto",
-        "copy_codex_auth": True,
-        "prompt": (
-            "Complete this CLI task. Write any requested files in the workspace. "
-            "When finished, run: finish '{\"status\":\"done\",\"summary\":\"completed\"}'"
-        ),
-        "input_schema": {},
-        "sandbox": {"timeout_s": 900, "backend": "docker", "docker_no_new_privileges": False},
-        "output_schema": {"workspace": "string", "status": "string", "summary": "string"},
-        "done_outputs": {"status": "status", "summary": "summary"},
-        "usage": {"type": "codex_jsonl", "model": "gpt-5.4-mini", "cost_config": "models/openai/gpt-54-mini"},
-    }
+    # Built on the shared codex executor scaffold (see _executor_scaffold) so
+    # editor-created CLI nodes and executor switches cannot drift apart. The
+    # add-node specifics layered on top: a Docker sandbox (safer default for
+    # arbitrary tasks), metered usage, and a starter prompt + schemas. The
+    # scaffold's `contract: auto` supplies the finish/delivery mechanics, so
+    # the starter prompt describes only the task.
+    cfg = _executor_scaffold("codex_cli")
+    cfg.update(
+        {
+            "model": "gpt-5.4-mini",
+            "model_reasoning_effort": "low",
+            "prompt": "Complete this CLI task. Write any requested files in the workspace.",
+            "input_schema": {},
+            "sandbox": {"timeout_s": 900, "backend": "docker", "docker_no_new_privileges": False},
+            "output_schema": {"workspace": "string", "status": "string", "summary": "string"},
+            "done_outputs": {"status": "status", "summary": "summary"},
+            "usage": {"type": "codex_jsonl", "model": "gpt-5.4-mini", "cost_config": "models/openai/gpt-54-mini", "bill": False},
+        }
+    )
+    return cfg
 
 
 def _latex_cli_component_template() -> dict[str, Any]:
@@ -5526,11 +6338,14 @@ def _prompt_component_template(template: str) -> dict[str, Any]:
             "output": {"default_field": "output"},
         }
     if template == "ideator":
+        # Delivery-neutral prompt: the <approach> tag instruction is GENERATED
+        # from the output spec (_ensure_multi_output_prompt_instruction), so
+        # the component stays executor-swappable (tier 1).
         return {
             "model": "models/openai/gpt-54-mini",
             "system_prompt": (
-                "You are an expert mathematician. Given a problem, propose distinct "
-                "proof strategies. Emit each strategy in its own <approach> tag."
+                "You are an expert mathematician. Given a problem, propose "
+                "distinct proof strategies."
             ),
             "user_prompt": "Problem:\n\n{problem}\n\nSuggest exactly {n} distinct approaches.",
             "input_schema": {"problem": "string", "n": "integer"},
@@ -5542,7 +6357,7 @@ def _prompt_component_template(template: str) -> dict[str, Any]:
             "system_prompt": (
                 "You are the emergency fallback for a mathematical proof workflow. "
                 "Use the partial work available and return the best complete proof "
-                "you can. Emit only a LaTeX body inside <solution>...</solution>."
+                "you can, as a LaTeX body only."
             ),
             "user_prompt": (
                 "Problem:\n{problem}\n\n"
@@ -5564,7 +6379,7 @@ def _prompt_component_template(template: str) -> dict[str, Any]:
             "model": "models/openai/gpt-54-mini",
             "system_prompt": (
                 "You are improving a mathematical proof inside a bounded loop. "
-                "Return the updated proof body inside <solution>...</solution>."
+                "Return the updated proof body as LaTeX."
             ),
             "user_prompt": (
                 "Problem:\n{problem}\n\n"
@@ -5687,6 +6502,23 @@ def _parse_schema_fields(raw: str) -> dict[str, str]:
     return fields
 
 
+def _coerce_schema_fields(value: Any) -> dict[str, Any]:
+    """Parse a schema from the editor, which sends either text or an object.
+
+    The visual editor posts output_schema as a JSON object ({field: type});
+    the textarea path posts newline text. Coercing a dict with str() produced
+    a single ``_field_`` whose value was the stringified dict — silent
+    corruption that still validated.
+    """
+    if isinstance(value, dict):
+        return {
+            _clean_id(str(k)): (v if v not in (None, "") else "string")
+            for k, v in value.items()
+            if _clean_id(str(k))
+        }
+    return _parse_schema_fields(str(value or ""))
+
+
 def _parse_tools_config(raw: Any) -> list[dict[str, Any]]:
     if raw is None:
         return []
@@ -5718,28 +6550,6 @@ def _parse_tool_refs(raw: Any) -> list[str]:
             refs.append(ref)
             seen.add(ref)
     return refs
-
-
-def _ensure_multi_output_prompt_instruction(cfg: dict[str, Any], output: dict[str, Any]) -> None:
-    tags = [str(tag).strip() for tag in (output.get("xml_tags") or []) if str(tag).strip()]
-    if len(tags) <= 1:
-        return
-    prompt_text = f"{cfg.get('system_prompt') or ''}\n{cfg.get('user_prompt') or ''}"
-    missing = [
-        tag
-        for tag in tags
-        if f"<{tag}>" not in prompt_text or f"</{tag}>" not in prompt_text
-    ]
-    if not missing:
-        return
-    lines = [
-        "",
-        "",
-        "Output each named result using exactly these tags:",
-        *[f"<{tag}>...</{tag}>" for tag in missing],
-    ]
-    instruction = "\n".join(lines)
-    cfg["user_prompt"] = f"{str(cfg.get('user_prompt') or '').rstrip()}{instruction}"
 
 
 def _rename_node_refs(raw: Any, old_id: str, new_id: str) -> None:
@@ -5786,51 +6596,93 @@ def _rename_component_output_refs(raw: dict[str, Any], component_name: str, rena
     }
     if not clean_renames:
         return
-    for node_id in _component_node_ids(raw, component_name):
-        for old_field, new_field in clean_renames.items():
-            _rename_node_output_ref(raw, node_id, old_field, new_field)
+    _rename_output_refs_in_scope(_editable_dag(raw), component_name, clean_renames)
 
 
-def _component_node_ids(raw: dict[str, Any], component_name: str) -> list[str]:
-    node_ids: list[str] = []
+def _rename_output_refs_in_scope(
+    scope: dict[str, Any], component_name: str, renames: dict[str, str]
+) -> None:
+    """Rewrite a component's output-field refs one DAG scope at a time.
 
-    def visit(nodes: Any) -> None:
-        if not isinstance(nodes, list):
-            return
-        for node in nodes:
-            if not isinstance(node, dict):
-                continue
-            node_id = str(node.get("id") or "")
-            if node_id and str(node.get("name") or "") == component_name:
-                node_ids.append(node_id)
-            body = node.get("body")
-            if isinstance(body, dict):
-                visit(body.get("nodes"))
+    A ``$node.<id>.<field>`` ref is scope-local and a ``$parent.node.<id>.<field>``
+    ref reaches exactly one scope up, so each rename is applied per scope: the
+    local form here (this scope's nodes and outputs), and the parent form in the
+    direct child repeat bodies. Scoping this way stops a rename from corrupting a
+    sibling repeat body that happens to reuse the same node id.
+    """
+    nodes = scope.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    child_bodies = [
+        node["body"]
+        for node in nodes
+        if isinstance(node, dict) and isinstance(node.get("body"), dict)
+    ]
+    local_ids = [
+        str(node["id"])
+        for node in nodes
+        if isinstance(node, dict)
+        and node.get("id")
+        and str(node.get("name") or "") == component_name
+    ]
+    # map_chain steps invoke a component too, referenced as $step.<id>
+    step_ids = [
+        str(step["id"])
+        for node in nodes
+        if isinstance(node, dict)
+        for step in (node.get("steps") or ())
+        if isinstance(step, dict)
+        and step.get("id")
+        and str(step.get("name") or "") == component_name
+    ]
+    for old_field, new_field in renames.items():
+        for node_id in local_ids:
+            _sub_output_ref(
+                scope, _output_ref_pattern("node", node_id, old_field), new_field, child_bodies
+            )
+            for body in child_bodies:
+                grandchildren = [
+                    n["body"]
+                    for n in (body.get("nodes") or [])
+                    if isinstance(n, dict) and isinstance(n.get("body"), dict)
+                ]
+                _sub_output_ref(
+                    body,
+                    _output_ref_pattern("parent.node", node_id, old_field),
+                    new_field,
+                    grandchildren,
+                )
+        for step_id in step_ids:
+            _sub_output_ref(
+                scope, _output_ref_pattern("step", step_id, old_field), new_field, child_bodies
+            )
 
-    visit(_editable_dag(raw).get("nodes"))
-    return node_ids
+    for body in child_bodies:
+        _rename_output_refs_in_scope(body, component_name, renames)
 
 
-def _rename_node_output_ref(raw: Any, node_id: str, old_field: str, new_field: str) -> None:
-    pattern = re.compile(
-        rf"(\$(?:parent\.)?node\.{re.escape(node_id)}\.)"
+def _output_ref_pattern(kind: str, node_id: str, old_field: str) -> "re.Pattern[str]":
+    prefix = kind.replace(".", r"\.")
+    return re.compile(
+        rf"(\${prefix}\.{re.escape(node_id)}\.)"
         rf"{re.escape(old_field)}(?=\.|$|[^A-Za-z0-9_-])"
     )
 
-    def replace(value: Any) -> Any:
-        if isinstance(value, str):
-            return pattern.sub(rf"\g<1>{new_field}", value)
-        if isinstance(value, list):
-            for i, item in enumerate(value):
-                value[i] = replace(item)
-            return value
-        if isinstance(value, dict):
-            for key, item in list(value.items()):
-                value[key] = replace(item)
-            return value
-        return value
 
-    replace(raw)
+def _sub_output_ref(obj: Any, pattern: "re.Pattern[str]", new_field: str, skip: list[Any]) -> Any:
+    if any(obj is s for s in skip):
+        return obj
+    if isinstance(obj, str):
+        return pattern.sub(rf"\g<1>{new_field}", obj)
+    if isinstance(obj, list):
+        for i, item in enumerate(obj):
+            obj[i] = _sub_output_ref(item, pattern, new_field, skip)
+        return obj
+    if isinstance(obj, dict):
+        for key, item in list(obj.items()):
+            obj[key] = _sub_output_ref(item, pattern, new_field, skip)
+        return obj
+    return obj
 
 
 def _remove_component_if_unused(raw: dict[str, Any], name: str) -> None:

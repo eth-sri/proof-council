@@ -58,6 +58,41 @@ class BudgetExhausted(Exception):
         )
 
 
+class SubscriptionParked(BudgetExhausted):
+    """A run was paused in a resumable state (rather than failed).
+
+    Subclasses BudgetExhausted so cooperative budget plumbing (agent.error
+    events, node-level accounting) applies, but DAGWorkflow re-raises it
+    instead of running the budget fallback: a park must surface as a resumable
+    error, not a salvaged terminal answer.
+    """
+
+    def __init__(self, window: str, wait_s: float, used: float, allowed: float):
+        self.window = window
+        self.wait_s = wait_s
+        self.scope = "subscription"
+        self.limit_kind = f"window:{window}"
+        self.limit = float(allowed)
+        self.used = float(used)
+        # Not BudgetExhausted.__init__: its "used >= limit" phrasing is false
+        # for parks triggered by a reset time rather than our own cap.
+        Exception.__init__(
+            self,
+            f"subscription window '{window}' has no headroom "
+            f"(used+claims={used:.0f} of allowed={allowed:.0f}); projected wait "
+            f"{wait_s / 3600.0:.1f}h exceeds the park threshold — run parked, "
+            f"resume it after the window resets",
+        )
+
+
+# Env keys a run may persist into resume.json and have re-injected on resume.
+# Both the writer (run_workflow._write_resume_spec) and the reader (the
+# dashboard's resume route) filter on this so a hand-edited resume.json cannot
+# inject arbitrary environment into the relaunched process. Empty now that the
+# pacing override it once carried is gone; the filter mechanism is retained.
+RESUME_ENV_ALLOWLIST: tuple[str, ...] = ()
+
+
 class BudgetSpec(BaseModel):
     """Per-scope limits. ``None`` means "no limit on this dimension"."""
 

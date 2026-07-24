@@ -81,13 +81,15 @@ class HumanAgent(Agent):
 
         inbox = self.ctx.root_workdir / "human_inbox"
         inbox.mkdir(parents=True, exist_ok=True)
-        stem = f"{self.name}__{self.workdir.name}"
+        # Key the inbox on the resume-stable cache key, not the random per-call
+        # workdir.name: a resume re-executes with a fresh workdir, so a name
+        # derived from it would poll a brand-new file and orphan an answer
+        # submitted while the run was stopped. For the same reason we do not
+        # clear a pre-existing response — it is the durable answer for this exact
+        # node + inputs and must be consumed on resume.
+        stem = f"{self.name}__{self._cache_key(inp)[:16]}"
         task_path = inbox / f"{stem}.task.json"
         response_path = inbox / f"{stem}.response.json"
-        try:
-            response_path.unlink()
-        except FileNotFoundError:
-            pass
 
         task = {
             "agent": self.name,
@@ -158,7 +160,15 @@ class HumanAgent(Agent):
             for key, spec in schema.items():
                 if key == "workspace":
                     continue
-                fields[str(key)] = spec if isinstance(spec, str) else "string"
+                if isinstance(spec, str):
+                    fields[str(key)] = spec
+                elif isinstance(spec, dict) and isinstance(spec.get("type"), str):
+                    # JSON-schema form ({type: array}); keep the declared type so
+                    # the form-post coercion can rebuild it instead of flattening
+                    # every structured field to a raw string
+                    fields[str(key)] = spec["type"]
+                else:
+                    fields[str(key)] = "string"
         if not fields:
             fields = {"response": "string"}
         return fields

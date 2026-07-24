@@ -40,16 +40,46 @@ def _batch_module():
 
 
 class RunDiscoveryTests(unittest.TestCase):
-    def test_ascii_fallback_makes_text_compilable(self) -> None:
-        from app.dev import _ascii_fallback
+    def test_dispute_comments_become_visible_boxes_on_download(self) -> None:
+        # Comment-style dispute markers vanish in a compiled PDF; the download
+        # wrapper must rewrite them as \dispute boxes and define the macro.
+        from app.dev import _wrap_latex_body
 
-        out = _ascii_fallback("note — the bound deg(H') ≥ deg(H) for x ∈ S, λ > 0 ✗")
-        self.assertTrue(out.isascii())  # pdflatex-safe
-        self.assertIn("--", out)  # em dash
-        self.assertIn(">=", out)  # >=
-        self.assertIn(" in ", out)  # in
-        self.assertIn("lambda", out)
-        self.assertIn("?", out)  # unmapped glyph degrades gracefully
+        doc = (
+            "\\documentclass{article}\n"
+            "\\begin{document}\n"
+            "Claim.\n"
+            "% >>> DISPUTE: critic says the reduction is circular\n"
+            "Proof sketch.\n"
+            "\\end{document}\n"
+        )
+        out = _wrap_latex_body(doc)
+        self.assertIn("\\dispute{critic says the reduction is circular}", out)
+        self.assertIn("\\providecommand{\\dispute}", out)
+        self.assertNotIn("% >>> DISPUTE", out)
+        # The macro is injected into the preamble, not after \begin{document}.
+        self.assertLess(out.find("\\providecommand{\\dispute}"), out.find("\\begin{document}"))
+
+    def test_wrap_latex_body_respects_existing_dispute_macro(self) -> None:
+        from app.dev import _wrap_latex_body
+
+        doc = (
+            "\\documentclass{article}\n"
+            "\\newcommand{\\dispute}[1]{\\textbf{#1}}\n"
+            "\\begin{document}\n"
+            "\\dispute{already handled}\n"
+            "\\end{document}\n"
+        )
+        out = _wrap_latex_body(doc)
+        self.assertNotIn("\\providecommand{\\dispute}", out)  # no clash with \newcommand
+
+    def test_wrap_latex_body_wraps_bare_bodies_with_dispute_support(self) -> None:
+        from app.dev import _wrap_latex_body
+
+        out = _wrap_latex_body("A body.\n% >>> DISPUTE: open point\nMore text.")
+        self.assertTrue(out.startswith("\\documentclass"))
+        self.assertIn("\\dispute{open point}", out)
+        self.assertIn("\\providecommand{\\dispute}", out)
 
     def test_resolve_output_refs_inflates_blobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -147,21 +147,30 @@ class CLIAgent(Agent):
         self.tracker.add_tool_call()
         await self._emit_budget_warnings(self.tracker.check())
 
-        root = self.sandbox_root_for(inp)
-        if root is not None:
-            root.mkdir(parents=True, exist_ok=True)
-            sandbox = make_sandbox(self.SANDBOX, root=root)
-            persistent = True
-        else:
-            sandbox = make_sandbox(self.SANDBOX, root=self.workdir / "sandbox")
-            persistent = False
         # Track the streaming process so the finally block can terminate
         # it unconditionally on cancellation. Without this, if the
         # surrounding task is cancelled while ``_wait_for_done`` is
         # awaiting, the codex (or other CLI) child keeps running until
         # its own timeout or until the container exits.
         stream = None
+        # Set once the normal record_cli_usage below has been reached, so the
+        # finally knows whether it still owes a partial-usage metering (see the
+        # cancellation note in the finally block).
+        usage_recorded = False
+        # The retained metering task once the run produced a done record. The
+        # finally awaits THIS task rather than re-running metering, so a cancel
+        # landing mid-metering neither loses it nor double-counts it (A7).
+        meter_task: asyncio.Task | None = None
+        sandbox: Sandbox | None = None
         try:
+            root = self.sandbox_root_for(inp)
+            if root is not None:
+                root.mkdir(parents=True, exist_ok=True)
+                sandbox = make_sandbox(self.SANDBOX, root=root)
+                persistent = True
+            else:
+                sandbox = make_sandbox(self.SANDBOX, root=self.workdir / "sandbox")
+                persistent = False
             if persistent:
                 runtime_dir = sandbox.root / ".pwc" / "runtime"
                 runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -238,9 +247,17 @@ class CLIAgent(Agent):
                 wrap_up_path=wrap_up_path,
                 soft_timeout_s=soft_timeout_s,
             )
+            # Meter as a retained, shielded task. A cancellation landing while
+            # record_cli_usage runs must not skip it (that loses a detected
+            # rate limit); the finally awaits this exact task instead of
+            # re-running metering, so the ledger is never double-counted (A7).
+            meter_task = asyncio.ensure_future(
+                self.record_cli_usage(stream.stdout, stream.stderr, done)
+            )
+            usage_recorded = True
             try:
-                await self.record_cli_usage(stream.stdout, stream.stderr, done)
-            except Exception as e:
+                await asyncio.shield(meter_task)
+            except Exception as e:  # a real failure; cancellation propagates
                 await self.events.emit(
                     "cli.usage_record_failed",
                     {"type": type(e).__name__, "msg": str(e)},
@@ -269,10 +286,41 @@ class CLIAgent(Agent):
             # past the parent's cleanup and into container shutdown.
             # ``asyncio.shield`` keeps the terminate sequence from
             # being interrupted by the same cancellation that brought
-            # us here.
+            # us here. Done before metering so the transcript is complete
+            # when we meter partial usage.
             if stream is not None:
                 try:
                     await asyncio.shield(stream.terminate())
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # Meter exactly once, even under cancellation — else the run loses
+            # real token/cost accounting. If the run reached a done record,
+            # metering was already dispatched as meter_task; await that same task
+            # (no re-run, no double count). Otherwise we were cancelled/errored
+            # before the run produced a record, so meter the partial usage the
+            # CLI may have spent. Shielded so the same cancellation can't skip it.
+            if meter_task is not None:
+                # Drain the retained metering to completion even under REPEATED
+                # cancellation: a second cancel while awaiting would otherwise
+                # abandon the still-running task, and event-loop shutdown then
+                # cancels it and the metering is lost (B6). The task is shielded,
+                # so re-awaiting resumes it; the loop exits once it is done.
+                while not meter_task.done():
+                    try:
+                        await asyncio.shield(meter_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+            elif stream is not None and not usage_recorded:
+                try:
+                    await asyncio.shield(
+                        self.record_cli_usage(
+                            stream.stdout,
+                            stream.stderr,
+                            CLIDoneRecord(status="partial", summary="(cancelled mid-run)"),
+                        )
+                    )
                 except (asyncio.CancelledError, Exception):
                     pass
             try:
@@ -287,13 +335,14 @@ class CLIAgent(Agent):
             # Keep the sandbox dir on disk so the workdir captures artifacts.
             # teardown() still runs so subclasses can scrub per-invocation
             # secrets such as copied CLI credentials.
-            try:
-                await self.teardown(sandbox, inp)
-            except Exception as e:
-                await self.events.emit(
-                    "cli.teardown_error",
-                    {"type": type(e).__name__, "msg": str(e)},
-                )
+            if sandbox is not None:
+                try:
+                    await self.teardown(sandbox, inp)
+                except Exception as e:
+                    await self.events.emit(
+                        "cli.teardown_error",
+                        {"type": type(e).__name__, "msg": str(e)},
+                    )
 
     async def _wait_for_done(
         self,

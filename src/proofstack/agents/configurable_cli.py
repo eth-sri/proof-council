@@ -9,11 +9,13 @@ YAML instead of requiring one Python subclass per worker role.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import shlex
 import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -28,6 +30,18 @@ from proofstack.cli_usage import (
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
+
+
+# A single ConfigurableCLIAgent instance is reused across concurrent map_chain
+# items (DAGWorkflow._agent_for caches one object per node.step key). These three
+# values are genuinely per-invocation — the command built from THIS item's inputs,
+# the sandbox root for THIS call, whether THIS call copied codex auth — so they
+# must not live on ``self`` or one item clobbers another mid-run. They ride
+# per-call ContextVars instead, exactly as ``workdir`` does (each item runs in its
+# own asyncio task, which copies the context, so the vars are naturally isolated).
+_CALL_CLI_CMD: ContextVar[list[str] | None] = ContextVar("cli_call_cmd", default=None)
+_CALL_WS_ROOT: ContextVar[Path | None] = ContextVar("cli_call_ws_root", default=None)
+_CALL_COPIED_AUTH: ContextVar[bool] = ContextVar("cli_call_copied_auth", default=False)
 
 
 class ConfigurableCLIAgent(CLIAgent):
@@ -50,8 +64,34 @@ class ConfigurableCLIAgent(CLIAgent):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._raw_cmd = self.component_config.get("cmd") or []
-        self._copied_codex_auth = False
-        self._active_workspace_root: Path | None = None
+
+    # Per-invocation state backed by ContextVars (see module note above) so a
+    # shared instance under concurrent map_chain items can't cross-contaminate.
+    # Exposed as properties named like the old attributes so base-class reads
+    # (``self.CLI_CMD``) and callers/tests keep working unchanged.
+    @property
+    def CLI_CMD(self) -> list[str]:  # type: ignore[override]
+        return _CALL_CLI_CMD.get() or []
+
+    @CLI_CMD.setter
+    def CLI_CMD(self, value: list[str]) -> None:
+        _CALL_CLI_CMD.set(list(value))
+
+    @property
+    def _active_workspace_root(self) -> Path | None:
+        return _CALL_WS_ROOT.get()
+
+    @_active_workspace_root.setter
+    def _active_workspace_root(self, value: Path | None) -> None:
+        _CALL_WS_ROOT.set(value)
+
+    @property
+    def _copied_codex_auth(self) -> bool:
+        return _CALL_COPIED_AUTH.get()
+
+    @_copied_codex_auth.setter
+    def _copied_codex_auth(self, value: bool) -> None:
+        _CALL_COPIED_AUTH.set(value)
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
         self.CLI_CMD = self._command_for(inp)
@@ -98,9 +138,70 @@ class ConfigurableCLIAgent(CLIAgent):
         fields = self._fields(inp, workspace=self._active_workspace_root)
         raw = self.component_config.get("prompt") or ""
         text = _format_template(str(raw), fields)
+        if self.component_config.get("contract") == "auto":
+            text = text.rstrip("\n") + "\n" + self._contract_tail()
         if self.component_config.get("append_prompt_newline", True) and not text.endswith("\n"):
             text += "\n"
         return text
+
+    def _contract_tail(self) -> str:
+        # With `contract: auto` the component prompt describes only the task;
+        # the delivery mechanics (which files to write, the finish handshake)
+        # are generated here from output_files/done_outputs. This keeps prompts
+        # free of executor boilerplate so the same component text can be run by
+        # a different backend (API model, human) whose adapter supplies its own
+        # delivery contract.
+        lines = ["", "----", "HOW TO DELIVER YOUR OUTPUT:"]
+        files: list[tuple[str, str]] = []
+        raw = self.component_config.get("output_files") or {}
+        if isinstance(raw, dict):
+            for field, spec in raw.items():
+                relpath, kind, _default = _output_file_spec(spec)
+                if kind in {"path", "exists", "listing"} or not relpath:
+                    continue
+                files.append((str(field), relpath))
+        step = 1
+        if files:
+            lines.append(f"{step}. Write these file(s) in the current working directory:")
+            for field, relpath in files:
+                lines.append(f"   - {relpath}  (your {field.replace('_', ' ')})")
+            step += 1
+        lines.append(
+            f"{step}. When everything is written, signal completion by running exactly"
+        )
+        lines.append("   this shell command:")
+        lines.append(f"   finish '{self._finish_payload_example()}'")
+        lines.append("Work autonomously; do not ask questions.")
+        return "\n".join(lines) + "\n"
+
+    # placeholders for each done.json field a component may request; the finish
+    # example must ask for every configured field or the model never supplies
+    # it and done_outputs silently receives the CLIDoneRecord default
+    _DONE_FIELD_PLACEHOLDERS: ClassVar[dict[str, Any]] = {
+        "status": "done",
+        "summary": "<one line: what you did>",
+        "diff_summary": "<short summary of what changed>",
+        "open_questions": ["<an unresolved question, if any>"],
+        "artifacts": [{"path": "<relative file path>", "note": "<what it is>"}],
+    }
+
+    def _finish_payload_example(self) -> str:
+        raw_done = self.component_config.get("done_outputs")
+        if isinstance(raw_done, dict):
+            wanted = {
+                str(spec.get("field") if isinstance(spec, dict) else spec)
+                for spec in raw_done.values()
+            }
+        else:
+            # mirror _done_outputs' auto-derivation from declared output fields
+            wanted = _configured_output_fields(self.component_config)
+        payload = {
+            field: placeholder
+            for field, placeholder in self._DONE_FIELD_PLACEHOLDERS.items()
+            if field in ("status", "summary") or field in wanted
+        }
+        # compact separators: keeps the long-standing finish-example format
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def extra_env(self, sandbox: Sandbox, inp: BaseModel) -> dict[str, str]:
         fields = self._fields(inp, workspace=sandbox.root)
@@ -143,27 +244,31 @@ class ConfigurableCLIAgent(CLIAgent):
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
             return
-        cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
-        try:
-            rates = load_cost_rates(cfg_ref)
-        except (KeyError, FileNotFoundError, ValueError) as e:
-            await self.events.emit(
-                "cli.cost_lookup_failed",
-                {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
-            )
-            return
-        cost = cost_for_codex_usage(usage, **rates)
-        self.tracker.add_usd(cost)
+        cost = 0.0
+        cfg_ref = None
+        # bill: false marks a subscription run — tokens are metered but no USD
+        # is charged (add_usd would trip the max_usd: 0.0 gate those runs use).
+        # A node that ACTUALLY copied codex subscription auth is never billed even
+        # when a template forgets bill: false. Gate on _copied_codex_auth (the
+        # runtime fact), not the config flag: copy_codex_auth: true with no host
+        # auth.json copies nothing, so that run fell back to a billable key.
+        if usage_cfg.get("bill", True) and not self._copied_codex_auth:
+            cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
+            try:
+                rates = load_cost_rates(cfg_ref)
+            except (KeyError, FileNotFoundError, ValueError) as e:
+                await self.events.emit(
+                    "cli.cost_lookup_failed",
+                    {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
+                )
+                return
+            cost = cost_for_codex_usage(usage, **rates)
+            self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
         await self.events.emit(
             "model.call",
             {
-                "model": str(
-                    self.component_config.get("model")
-                    or usage_cfg.get("model")
-                    or _model_from_cmd(self.CLI_CMD)
-                    or "codex"
-                ),
+                "model": self._codex_model_name(usage_cfg),
                 "in_tokens": usage.input_tokens,
                 "cached_in_tokens": usage.cached_input_tokens,
                 "out_tokens": usage.output_tokens,
@@ -173,6 +278,22 @@ class ConfigurableCLIAgent(CLIAgent):
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
             },
+        )
+
+    def _claude_model_name(self) -> str:
+        return str(
+            self.component_config.get("model") or _model_from_cmd(self.CLI_CMD) or "claude"
+        )
+
+    def _codex_model_name(self, usage_cfg: dict[str, Any] | None = None) -> str:
+        if not isinstance(usage_cfg, dict):
+            raw = self.component_config.get("usage")
+            usage_cfg = raw if isinstance(raw, dict) else {}
+        return str(
+            self.component_config.get("model")
+            or usage_cfg.get("model")
+            or _model_from_cmd(self.CLI_CMD)
+            or "codex"
         )
 
     async def _record_claude_usage(self, stdout_text: str) -> None:
@@ -186,14 +307,11 @@ class ConfigurableCLIAgent(CLIAgent):
         # reads dominate an agentic loop and counting only input+output undercounts
         # ~40x. All categories are recorded below so the weighting stays visible.
         self.tracker.add_tokens(usage.metered_tokens)
+        model = self._claude_model_name()
         await self.events.emit(
             "model.call",
             {
-                "model": str(
-                    self.component_config.get("model")
-                    or _model_from_cmd(self.CLI_CMD)
-                    or "claude"
-                ),
+                "model": model,
                 "in_tokens": usage.input_tokens,
                 "cache_creation_in_tokens": usage.cache_creation_input_tokens,
                 "cached_in_tokens": usage.cache_read_input_tokens,
@@ -221,6 +339,9 @@ class ConfigurableCLIAgent(CLIAgent):
             model = str(self.component_config.get("model") or "").strip()
             if model:
                 cmd = _with_claude_model(cmd, model)
+            reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
+            if reasoning_effort and _is_claude_cmd(cmd):
+                cmd = _with_claude_effort(cmd, reasoning_effort)
         if self.component_config.get("prompt") and _is_codex_exec_cmd(cmd) and _codex_prompt_arg_index(cmd) is None:
             cmd = [*cmd, "-"]
         codex_sandbox = str(self.component_config.get("codex_sandbox") or "").strip()
@@ -387,6 +508,27 @@ def _with_claude_model(cmd: list[str], model: str) -> list[str]:
             out[i] = f"--model={model}"
             return out
     return [*out, "--model", model]
+
+
+def _is_claude_cmd(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "claude"
+
+
+def _with_claude_effort(cmd: list[str], effort: str) -> list[str]:
+    """Set the claude CLI reasoning effort (``--effort low|medium|high|xhigh|max``).
+    The shared editor vocabulary includes codex's ``minimal``, which claude does
+    not accept — map it to ``low``."""
+    if effort == "minimal":
+        effort = "low"
+    out = list(cmd)
+    for i, part in enumerate(out):
+        if part == "--effort" and i + 1 < len(out):
+            out[i + 1] = effort
+            return out
+        if part.startswith("--effort="):
+            out[i] = f"--effort={effort}"
+            return out
+    return [*out, "--effort", effort]
 
 
 def _without_codex_model(cmd: list[str]) -> list[str]:

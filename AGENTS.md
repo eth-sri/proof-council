@@ -91,6 +91,11 @@ permission prompts every time), prefer the wrapper scripts:
   ok/errors/warnings. Use this instead of `uv run python -c "…validate…"`; inline
   `python -c` always requires manual approval (anti-bypass guard), a wrapper script
   does not.
+- **Review the dashboard UI:** `scripts/ui_review.sh [PORT] [--probe]` — drives the
+  running dashboard headlessly (Playwright) and screenshots the key states to
+  `outputs/ui_review/`; Read the PNGs and fix what you see BEFORE handing UI
+  changes to the user. The dashboard caches templates (no --debug), so restart
+  it first when templates changed, or the screenshots show stale copy.
 
 Do **not** hand-write monitoring loops (`for i in $(seq …); do … curl … done`)
 or multi-tool status bundles inline — those control-flow shell blobs cannot be

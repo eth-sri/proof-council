@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from app.dev_data import (  # noqa: E402
+    CONFIGURABLE_CLI_AGENT,
+    _op_set_executor,
     discover_exported_presets,
     discover_presets,
     mutate_preset_yaml,
@@ -456,6 +458,135 @@ class DevDataMutationTests(unittest.TestCase):
         self.assertIs(cfg["copy_codex_auth"], True)
         self.assertIs(cfg["sandbox"]["docker_no_new_privileges"], False)
         self.assertEqual(cfg["usage"]["type"], "codex_jsonl")
+        # Built on the shared executor scaffold: delivery mechanics are
+        # auto-appended, so the starter prompt must not hand-write them.
+        self.assertEqual(cfg["contract"], "auto")
+        self.assertNotIn("finish", cfg["prompt"])
+
+    EXECUTOR_FIXTURE = textwrap.dedent(
+        """
+        workflow: proofstack.agents.dag_workflow.DAGWorkflow
+        inputs:
+          problem: ''
+        components:
+          cfg_hint:
+            cmd: [claude, -p, --output-format, stream-json, --verbose, --model, sonnet,
+                  --permission-mode, acceptEdits, --allowedTools, 'Bash(finish:*)']
+            soft_timeout_s: 780
+            sandbox: {backend: subprocess, timeout_s: 900}
+            env: {HOME: '{env:HOME}'}
+            usage: {type: claude_json}
+            cache_enabled: true
+            contract: auto
+            prompt: |
+              You are the specialist.
+
+              Problem:
+              {problem}
+            input_schema:
+              problem: string
+              workspace: string
+            output_schema:
+              workspace: string
+              hint: string
+              status: string
+            output_files:
+              hint: hint.txt
+            done_outputs:
+              status: status
+        dag:
+          nodes:
+            - id: rounds
+              kind: repeat
+              max_iterations: 2
+              condition: {python: 'iteration < max_iterations'}
+              initial_state: {memory: ''}
+              body:
+                nodes:
+                  - id: hint
+                    kind: agent
+                    agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+                    name: cfg_hint
+                    inputs:
+                      problem: $input.problem
+                state_updates:
+                  memory: $node.hint.hint
+          outputs:
+            memory: $state.memory
+        """
+    )
+
+    def test_set_executor_swaps_cli_component_to_codex(self) -> None:
+        raw_yaml = _mutate(
+            self.EXECUTOR_FIXTURE,
+            {"op": "set_executor", "name": "cfg_hint", "executor": "codex_cli"},
+        )
+        raw = _raw(raw_yaml)
+        cfg = raw["components"]["cfg_hint"]
+
+        self.assertEqual(cfg["cmd"][:2], ["codex", "exec"])
+        self.assertIs(cfg["copy_codex_auth"], True)
+        self.assertEqual(cfg["contract"], "auto")
+        self.assertNotIn("env", cfg)   # codex auth travels via CODEX_HOME, not HOME
+        self.assertEqual(cfg["usage"]["type"], "codex_jsonl")  # metering carried across
+        # Task identity and output config survive the swap.
+        self.assertIn("You are the specialist.", cfg["prompt"])
+        self.assertEqual(cfg["output_files"], {"hint": "hint.txt"})
+        node = raw["dag"]["nodes"][0]["body"]["nodes"][0]
+        self.assertEqual(
+            node["agent"], "proofstack.agents.configurable_cli.ConfigurableCLIAgent"
+        )
+
+    def test_set_executor_to_human_is_disabled(self) -> None:
+        res = mutate_preset_yaml(
+            self.EXECUTOR_FIXTURE,
+            {"op": "set_executor", "name": "cfg_hint", "executor": "human"},
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("disabled", " ".join(res["errors"]))
+
+    def test_set_executor_to_api_is_disabled(self) -> None:
+        # only Claude <-> Codex CLI switching is enabled
+        res = mutate_preset_yaml(
+            self.EXECUTOR_FIXTURE,
+            {"op": "set_executor", "name": "cfg_hint", "executor": "api"},
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("disabled", " ".join(res["errors"]))
+
+    def test_set_executor_binds_model_to_declared_workflow_knob(self) -> None:
+        # A tiered preset declares model knobs; scaffolds must bind to them so a
+        # dropdown round-trip does not silently pin a node to a literal model.
+        fixture = self.EXECUTOR_FIXTURE.replace(
+            "inputs:\n  problem: ''",
+            "inputs:\n  problem: ''\n  base_model: sonnet\n  gpt_model: gpt-5.4-mini",
+        )
+
+        as_codex = _mutate(
+            fixture, {"op": "set_executor", "name": "cfg_hint", "executor": "codex_cli"}
+        )
+        codex_cfg = _raw(as_codex)["components"]["cfg_hint"]
+        self.assertIn("-m", codex_cfg["cmd"])
+        self.assertEqual(codex_cfg["cmd"][codex_cfg["cmd"].index("-m") + 1], "{gpt_model}")
+        self.assertNotIn("model", codex_cfg)
+
+        back = _mutate(
+            as_codex, {"op": "set_executor", "name": "cfg_hint", "executor": "claude_cli"}
+        )
+        claude_cfg = _raw(back)["components"]["cfg_hint"]
+        idx = claude_cfg["cmd"].index("--model")
+        self.assertEqual(claude_cfg["cmd"][idx + 1], "{base_model}")
+
+    def test_set_executor_falls_back_to_literal_model_without_knobs(self) -> None:
+        as_claude = _mutate(
+            _mutate(
+                self.EXECUTOR_FIXTURE,
+                {"op": "set_executor", "name": "cfg_hint", "executor": "codex_cli"},
+            ),
+            {"op": "set_executor", "name": "cfg_hint", "executor": "claude_cli"},
+        )
+        cfg = _raw(as_claude)["components"]["cfg_hint"]
+        self.assertEqual(cfg["cmd"][cfg["cmd"].index("--model") + 1], "sonnet")
 
     def test_rename_cli_file_output_updates_existing_refs(self) -> None:
         raw_yaml = _mutate(
@@ -1511,6 +1642,96 @@ class DevDataMutationTests(unittest.TestCase):
         self.assertNotIn("done", repeat["body"]["state_updates"])
         self.assertEqual(raw["dag"]["outputs"], {"solution": "$node.aletheia_repeat.solution"})
         self.assertTrue(validate_preset_yaml(raw_yaml)["ok"])
+
+
+API_OUTPUTS_FIXTURE = textwrap.dedent(
+    """
+    workflow: proofstack.agents.dag_workflow.DAGWorkflow
+    inputs:
+      problem: ''
+    components:
+      cfg_review:
+        system_prompt: Review rigorously.
+        user_prompt: 'Assess: {problem}'
+        model: models/anthropic/sonnet_46
+        output:
+          xml_tags: [report, verdict, answer_tex]
+          default_field: report
+        input_schema:
+          problem: string
+        output_schema:
+          report: string
+          verdict: string
+          answer_tex: string
+    dag:
+      nodes:
+        - id: review
+          kind: agent
+          agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+          name: cfg_review
+          inputs:
+            problem: $input.problem
+      outputs:
+        verdict: $node.review.verdict
+    """
+)
+
+
+class SetExecutorCoverageTests(unittest.TestCase):
+    """Executor switching is Claude <-> Codex CLI only; every node shape that
+    invokes the component is retargeted, and its output config is preserved."""
+
+    def test_cli_swap_preserves_the_full_output_config(self) -> None:
+        raw = {
+            "components": {
+                "cfg_review": {
+                    "cmd": ["claude", "-p"], "contract": "auto",
+                    "prompt": "Review and report.",
+                    "input_schema": {"solution": "string", "workspace": "string"},
+                    "output_schema": {"workspace": "string", "status": "string",
+                                      "report": "string", "answer_tex": "string"},
+                    "output_files": {"report": "report.md",
+                                     "answer_tex": {"path": "answer.tex", "type": "text"}},
+                    "done_outputs": {"verdict": "summary", "status": "status"},
+                }
+            },
+            "dag": {"nodes": [{"id": "n", "kind": "agent",
+                              "agent": CONFIGURABLE_CLI_AGENT, "name": "cfg_review"}]},
+        }
+        cfg = raw["components"]["cfg_review"]
+        before = {k: cfg[k] for k in ("output_schema", "output_files", "done_outputs")}
+        _op_set_executor(raw, {"executor": "codex_cli", "name": "cfg_review"})
+
+        # custom filenames, collector kinds and done mappings are untouched
+        for key, val in before.items():
+            self.assertEqual(cfg[key], val, key)
+        self.assertEqual(cfg["cmd"][:2], ["codex", "exec"])
+
+    def test_set_executor_retargets_join_or_agent_and_map_chain_steps(self) -> None:
+        raw = {
+            "components": {
+                "cfg_judge": {
+                    "cmd": ["claude", "-p"], "contract": "auto", "prompt": "judge",
+                    "input_schema": {"source": "list", "workspace": "string"},
+                    "output_schema": {"workspace": "string", "status": "string", "verdict": "string"},
+                    "output_files": {"verdict": "verdict.txt"},
+                    "done_outputs": {"status": "status"},
+                }
+            },
+            "dag": {
+                "nodes": [
+                    {"id": "pick", "kind": "join_or_agent", "agent": CONFIGURABLE_CLI_AGENT,
+                     "name": "cfg_judge", "source": "$node.fan.finals"},
+                    {"id": "fan", "kind": "map_chain", "foreach": "$input.problems",
+                     "steps": [{"id": "s1", "agent": CONFIGURABLE_CLI_AGENT,
+                                "name": "cfg_judge", "inputs": {}}]},
+                ]
+            },
+        }
+        _op_set_executor(raw, {"executor": "codex_cli", "name": "cfg_judge"})
+        nodes = raw["dag"]["nodes"]
+        self.assertEqual(nodes[0]["agent"], CONFIGURABLE_CLI_AGENT)
+        self.assertEqual(nodes[1]["steps"][0]["agent"], CONFIGURABLE_CLI_AGENT)
 
 
 if __name__ == "__main__":

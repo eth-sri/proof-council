@@ -131,6 +131,7 @@
         let currentAgentLabel = {{ preset.label | tojson }};
         const configurablePromptAgent = "proofstack.agents.configurable_prompt.ConfigurablePromptAgent";
         const configurableCliAgent = "proofstack.agents.configurable_cli.ConfigurableCLIAgent";
+        const humanAgent = "proofstack.agents.human_agent.HumanAgent";
         let presetFileVersion = {{ preset.file_version | tojson }};
         let presetRegistryVersion = {{ preset_registry_version | tojson }};
         let componentConfigs = {{ preset.component_configs | tojson }};
@@ -139,9 +140,10 @@
         let exportedPresets = {{ exported_presets | tojson }};
         let toolDefinitions = {{ tool_definitions | tojson }};
         const fieldHelp = {
+            executor: "Run this CLI component on the Claude or the Codex subscription. Switching keeps the prompt and the entire output configuration and swaps only the command/auth/usage settings.",
             model: "Model config used for this component's API call.",
             cliModel: "Model for this node. 'Default' inherits the workflow model; pick a specific model to override just this node.",
-            cliReasoningEffort: "Reasoning effort passed to Codex as model_reasoning_effort.",
+            cliReasoningEffort: "Reasoning effort for this node: --effort for Claude, model_reasoning_effort for Codex. 'default' uses the CLI's own default.",
             systemPrompt: "High-level instructions that set the component's role and behavior.",
             userPrompt: "The message template sent to the model for each run. Placeholders such as {problem} are filled from graph inputs.",
             promptVariables: "Optional type hints for prompt inputs. The input names are inferred from prompt placeholders.",
@@ -160,7 +162,7 @@
         // tab. Editable: a "Custom…" option always lets you type a value the
         // list doesn't have yet (model names change over time).
         const workflowInputChoices = {
-            claude_model: ['opus', 'sonnet', 'haiku'],
+            claude_model: ['claude-fable-5', 'opus', 'sonnet', 'haiku'],
             codex_model: ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'],
             codex_effort: ['max', 'xhigh', 'high', 'medium', 'low', 'minimal'],
         };
@@ -2722,6 +2724,7 @@
             const isVisualBodyNode = node.visual?.type === 'loop_body';
             const hidesLowLevel = isVisualBodyNode || ['map_chain'].includes(node.kind);
             const behavior = [
+                executorSection(node),
                 nodeConditionSection(node),
                 nodeLoopSection(node),
                 nodeWorkflowRefSection(node),
@@ -4860,6 +4863,76 @@
             return '';
         }
 
+        // Executor picker: a CLI component can run on the Claude or the Codex
+        // subscription. Switching posts a set_executor mutation that swaps the
+        // command/auth/usage scaffold while keeping the prompt and the entire
+        // output configuration. Only Claude <-> Codex is offered — general
+        // API/human translation was descoped (see feat/executor-switching).
+        const executorLabels = {
+            api: 'API model',
+            claude_cli: 'Claude CLI (subscription)',
+            codex_cli: 'Codex CLI (subscription)',
+            human: 'Human',
+        };
+
+        function executorOf(node) {
+            if (node?.agent === humanAgent) return 'human';
+            if (node?.agent === configurablePromptAgent) return 'api';
+            if (node?.agent === configurableCliAgent) {
+                const name = node.component_key || node.name || '';
+                const cfg = node.component_config || componentConfigs[name] || {};
+                return cliCommandParts(cfg.cmd)[0] === 'codex' ? 'codex_cli' : 'claude_cli';
+            }
+            return '';
+        }
+
+        function executorSection(node) {
+            const current = executorOf(node);
+            const name = node?.component_key || node?.name || '';
+            // Only CLI nodes are switchable (Claude <-> Codex); API/human nodes
+            // show nothing, since their switches are disabled.
+            if (!name || (current !== 'claude_cli' && current !== 'codex_cli')) return '';
+            const opts = ['claude_cli', 'codex_cli'].map((value) => `
+                <option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(executorLabels[value])}</option>
+            `).join('');
+            return `
+                <div class="inspector-grid">
+                    <label>${fieldLabel('CLI subscription', fieldHelp.executor)}
+                        <select onchange="onExecutorChange('${escapeAttr(name)}', this.value, '${escapeAttr(current)}', this)">${opts}</select>
+                    </label>
+                </div>
+            `;
+        }
+
+        async function onExecutorChange(name, executor, current, select) {
+            if (executor === current) return;
+            // Almost always a component backs exactly one node; only warn about
+            // shared components when the switch really would change several nodes.
+            const nodes = (currentCanvasNodes && currentCanvasNodes.length) ? currentCanvasNodes : (currentReport.nodes || []);
+            const users = nodes.filter((node) => node?.agent && (node.component_key || node.name || '') === name);
+            const shared = users.length > 1
+                ? ` Note: ${users.length} nodes share this component (${users.map((node) => displayLabel(node)).join(', ')}); all of them switch together.`
+                : '';
+            const ok = await confirmAction({
+                title: 'Switch executor?',
+                message: `Run "${name}" as ${executorLabels[executor] || executor}? Its prompt and inputs/outputs are kept; its executor settings (command, model, sandbox) are replaced by defaults for the new executor. Other nodes are not affected.${shared}`,
+                confirmLabel: 'Switch',
+            });
+            if (!ok) {
+                if (select) select.value = current;
+                return;
+            }
+            const payload = await mutateEditor(
+                {op: 'set_executor', name, executor},
+                {status: 'Switching executor...'},
+            );
+            if (payload?.ok) {
+                renderNodeInspector();
+            } else if (select) {
+                select.value = current;
+            }
+        }
+
         // Per-node model picker for CLI nodes. "Default" clears the override so
         // the node uses its command's model (a {claude_model} binding for Claude,
         // or the literal model for Codex); picking a specific model overrides just
@@ -4869,7 +4942,7 @@
             const bound = cliModelFromCmd(cfg.cmd);
             const boundIsBinding = /^\{[A-Za-z_][\w]*\}$/.test(bound);
             const isCodex = cliCommandParts(cfg.cmd).includes('codex');
-            const known = isCodex ? ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['opus', 'sonnet', 'haiku'];
+            const known = isCodex ? ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini'] : ['claude-fable-5', 'opus', 'sonnet', 'haiku'];
             const isCustom = override !== '' && !known.includes(override);
             const defaultLabel = boundIsBinding
                 ? `Workflow default (${bound})`
@@ -5866,8 +5939,9 @@
         }
 
         function cliOutputSchemaForRow(row, path) {
-            const originalPath = String(row.dataset.originalOutputPath || '').trim();
-            if (originalPath === path && row.dataset.originalOutputSchema) {
+            // The declared type is path-independent, so a saved row keeps it when
+            // only its path is renamed (keying on originalPath dropped type:path).
+            if (row.dataset.originalOutputSchema) {
                 try {
                     return JSON.parse(row.dataset.originalOutputSchema);
                 } catch {
@@ -5882,11 +5956,15 @@
         }
 
         function cliOutputSpecForRow(row, path) {
-            const originalPath = String(row.dataset.originalOutputPath || '').trim();
-            if (originalPath === path && row.dataset.originalOutputSpec) {
+            // Carry the renamed path into the saved spec so its type/default
+            // survive (keying on originalPath collapsed the dict to a bare path,
+            // flipping the collector from path-return to file-contents).
+            if (row.dataset.originalOutputSpec) {
                 try {
                     const spec = JSON.parse(row.dataset.originalOutputSpec);
-                    if (spec && typeof spec === 'object' && !Array.isArray(spec)) return spec;
+                    if (spec && typeof spec === 'object' && !Array.isArray(spec)) {
+                        return { ...spec, path };
+                    }
                 } catch {
                     return path;
                 }
