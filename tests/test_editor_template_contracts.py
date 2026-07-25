@@ -50,7 +50,7 @@ class EditorTemplateContractTests(unittest.TestCase):
             self.assertIn("codex_model: ['gpt-5.6-sol'", template)
             self.assertIn("codex_effort: ['max', 'xhigh'", template)
         self.assertIn("const values = ['', 'low', 'medium', 'high', 'xhigh', 'max'];", editor)
-        self.assertIn("const known = isCodex ? ['gpt-5.6-sol'", editor)
+        self.assertIn("const known = executor === 'codex_cli'", editor)
 
     def test_run_detail_has_live_monitor_section(self) -> None:
         template = (ROOT / "app" / "templates" / "dev_run_detail.html").read_text()
@@ -101,6 +101,14 @@ class EditorTemplateContractTests(unittest.TestCase):
         self.assertIn("model_reasoning_effort", template)
         self.assertIn("cliModelFromCmd", template)
         self.assertIn("cliReasoningEffortFromCmd", template)
+
+    def test_cli_executor_inference_matches_server_rules(self) -> None:
+        template = (ROOT / "app" / "templates" / "dev_preset_editor.html").read_text()
+
+        self.assertIn("function cliExecutorFromConfig(cfg)", template)
+        self.assertIn("cfg?.copy_codex_auth", template)
+        self.assertIn("split(/[\\\\/]/).pop()", template)
+        self.assertNotIn("cliCommandParts(cfg.cmd)[0] === 'codex'", template)
 
     def test_repeat_zone_only_draws_editable_internal_wires(self) -> None:
         template = (ROOT / "app" / "templates" / "dev_preset_editor.html").read_text()

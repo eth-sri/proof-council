@@ -4,6 +4,7 @@
 # in a terminal (Ctrl-C to stop). Runnable from any working directory.
 # Usage: scripts/run_dashboard.sh [PORT]
 set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
 PORT="${1:-5005}"
 cd "$(dirname "$0")/.."
 PYTHONPATH=src PROOFCOUNCIL_DEV_PORT="$PORT" exec uv run python app/dev.py --port "$PORT"
