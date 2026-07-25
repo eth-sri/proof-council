@@ -21,6 +21,33 @@ be able to operate from it alone. Templates referenced below live in
 
 ---
 
+## The two knowledge pools
+
+This file describes the *mode*. The knowledge the mode accumulates
+lives in `lead-researcher/`, split by audience:
+
+- **`lead-researcher/playbook/`** — general strategy that holds for
+  any user on any problem: packet spec, delegation, verification
+  discipline, adversarial rounds, surviving compaction. **Tracked and
+  committed**, so it can be reviewed and improved across users and
+  projects. Start at `playbook/00_index.md`.
+- **`lead-researcher/local/`** — this machine, this person: compute
+  hosts and their gotchas, the collaborator's research taste and
+  working preferences, local conventions. **Gitignored.** Create it by
+  copying `lead-researcher/local.example/`.
+
+**Claude reads both at session start and after every compaction**, and
+`local/` overrides `playbook/` where they conflict, since the playbook
+cannot know your setup.
+
+New learnings default to `local/`; when the same lesson recurs in a
+second project or on a second machine, it is rewritten abstractly and
+promoted into the playbook. `lead-researcher/README.md` documents that
+curation loop. The mechanism is public; the contents of your local
+pool are yours.
+
+---
+
 ## For the human: how to start
 
 1. Clone this repo; put API keys in `.env` or `secrets.env` at the repo

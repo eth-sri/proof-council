@@ -25,6 +25,11 @@ smoke/output_container/
 smoke/output_*
 # CLI lead-researcher mode: research content is confidential by default
 research/
+# CLI lead-researcher mode: the LOCAL knowledge pool (machine-specific
+# resources, personal working preferences). The mechanism and the
+# template (lead-researcher/local.example/) are tracked; the filled-in
+# copy is not. See lead-researcher/README.md.
+lead-researcher/local/
 # Root-level secrets file (smoke/secrets.env is ignored above; the root
 # variant used by CLI_LEAD_RESEARCHER.md must not be tracked either)
 secrets.env
