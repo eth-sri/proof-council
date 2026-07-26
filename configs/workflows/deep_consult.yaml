@@ -1,0 +1,57 @@
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: 'One-shot deep research consultation: a single self-contained work
+  package sent to GPT-5.6 Sol Pro at pro reasoning with code_interpreter for
+  in-run numerics. The package text itself carries all instructions and the
+  output contract; this preset adds only a thin rigor-preserving frame. Use for
+  bounded (<1h) analytic or computational consultations where the caller wants
+  one long, careful answer rather than a multi-agent loop.
+
+  '
+inputs:
+  problem: ''
+budget:
+  max_usd: 30.0
+  max_wallclock_s: 3600
+components:
+  cfg_consult:
+    model: models/openai/gpt-56-sol-pro
+    tool_refs:
+    - code_interpreter
+    max_tool_calls: 16
+    system_prompt: |
+      You are a research mathematician executing a bounded, self-contained
+      work package. Everything needed is in the package text. Deliver
+      COMPLETE derivations and proofs; separate PROVED from NUMERICAL from
+      CONJECTURAL rigorously; a fully proved weak statement beats an
+      ambitious sketch. Use code (code_interpreter) for any numerical
+      claims so they are computed, not guessed. Follow the package's
+      output contract exactly. Write the entire answer inside a single
+      <answer>...</answer> block.
+    user_prompt: |
+      Work package (verbatim):
+
+      ----
+      {problem}
+      ----
+
+      Execute this work package now. Put the complete answer, including
+      the end summary required by the package's output contract, inside
+      one <answer>...</answer> block.
+    input_schema:
+      problem: string
+    output:
+      xml_tags:
+      - answer
+      default_field: answer
+    output_schema:
+      answer: string
+dag:
+  nodes:
+  - id: consult
+    kind: agent
+    agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+    name: cfg_consult
+    inputs:
+      problem: $input.problem
+  outputs:
+    answer: $node.consult.answer
