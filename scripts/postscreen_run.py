@@ -21,16 +21,22 @@ What it does:
      per-round ``compute_workspace_round_*.zip`` snapshots (already
      compressed, redundant) and paper PDFs (their extracted ``.txt`` are
      kept) — this drops a typical run from ~280 MB to ~12 MB without
-     losing the reasoning trace.
+     losing the reasoning trace. Credential material (``.codex-home/``,
+     ``.codex/``, ``.compute_codex_home/``, ``auth.json``) is always
+     excluded, and symlinks are dropped unless they resolve inside the
+     run dir.
   2. Uploads the zip to OpenAI and attaches it to a code_interpreter
      container.
   3. Runs a single audit call (default ``models/openai/gpt-55-pro``,
-     override with ``--model``) through ``APIClient`` (so cost and token
-     accounting stay centralized).
+     override with ``--model``; must be an OpenAI Responses config)
+     through ``APIClient`` (so cost and token accounting stay
+     centralized).
   4. Downloads whatever the model saved under ``/mnt/data/audit_artifacts/``
      (the progress PNG, the CSV, ...).
   5. Writes ``report.md``, ``artifacts/``, ``conversation.json`` and
      ``audit_meta.json`` into the output directory.
+  6. Deletes the uploaded zip from OpenAI again (skip with
+     ``--keep-upload``).
 """
 from __future__ import annotations
 
@@ -62,6 +68,19 @@ DEFAULT_MODEL = "models/openai/gpt-55-pro"
 # The per-round workspace snapshots are already-compressed zips that just
 # duplicate earlier workspace state; the paper PDFs have ``.txt`` siblings.
 WORKSPACE_SNAPSHOT_GLOB = "compute_workspace_round_*.zip"
+
+# Credential material the workflow scrubs on clean teardown but which
+# crashed or legacy runs can leave behind (see compute._ZIP_EXCLUDE_TOP);
+# excluded unconditionally, independent of user-supplied --exclude globs.
+CREDENTIAL_DIR_NAMES = {".codex-home", ".codex", ".compute_codex_home"}
+CREDENTIAL_FILE_NAMES = {"auth.json"}
+
+
+def _is_credential_path(rel: Path) -> bool:
+    return (
+        any(part in CREDENTIAL_DIR_NAMES for part in rel.parts)
+        or rel.name in CREDENTIAL_FILE_NAMES
+    )
 
 SYSTEM_PROMPT = (
     "You are a senior research mathematician and ML-systems auditor "
@@ -126,14 +145,42 @@ def _build_bundle(
     """Zip ``run_dir`` into ``out_zip`` under a top-level folder named after
     the run dir. ``exclude`` holds fnmatch globs tested against the path
     relative to ``run_dir`` (posix form). Returns (files_written,
-    files_skipped)."""
+    files_skipped).
+
+    Credential material (``CREDENTIAL_DIR_NAMES``/``CREDENTIAL_FILE_NAMES``)
+    is always excluded. Symlinks are dropped unless their resolved target
+    stays inside ``run_dir`` and is not credential material —
+    ``ZipFile.write`` follows symlinks, so an unchecked link like
+    ``leak.txt -> ../outside-secret.txt`` would exfiltrate files from
+    outside the run (same policy as ``compute._zip_workspace``)."""
     root_name = run_dir.name
+    run_dir_resolved = run_dir.resolve()
     written = skipped = 0
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     out_zip_resolved = out_zip.resolve()
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(run_dir.rglob("*")):
-            if not path.is_file():
+            if path.is_dir() and not path.is_symlink():
+                continue
+            rel = path.relative_to(run_dir)
+            if _is_credential_path(rel):
+                skipped += 1
+                continue
+            if path.is_symlink():
+                try:
+                    target = path.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    skipped += 1
+                    continue
+                try:
+                    target_rel = target.relative_to(run_dir_resolved)
+                except ValueError:
+                    skipped += 1
+                    continue
+                if _is_credential_path(target_rel) or not target.is_file():
+                    skipped += 1
+                    continue
+            elif not path.is_file():
                 continue
             # Never zip the archive into itself — possible when --out-dir is
             # placed inside --run-dir.
@@ -147,12 +194,10 @@ def _build_bundle(
             if not include_workspace_zips and fnmatch.fnmatch(name, WORKSPACE_SNAPSHOT_GLOB):
                 skipped += 1
                 continue
-            rel = path.relative_to(run_dir).as_posix()
-            if exclude and any(fnmatch.fnmatch(rel, pat) for pat in exclude):
+            if exclude and any(fnmatch.fnmatch(rel.as_posix(), pat) for pat in exclude):
                 skipped += 1
                 continue
-            arcname = Path(root_name) / path.relative_to(run_dir)
-            zf.write(path, arcname.as_posix())
+            zf.write(path, (Path(root_name) / rel).as_posix())
             written += 1
     return written, skipped
 
@@ -172,18 +217,16 @@ def _exclusions_note(
             "unknown to this tool; audit whatever is present and do not assume "
             "any particular file is missing by design."
         )
-    excluded = []
+    excluded = ["framework credential material (Codex auth homes and `auth.json` files)"]
     if not include_workspace_zips:
         excluded.append("per-round `compute_workspace_round_*.zip` workspace snapshots")
     if not include_pdfs:
         excluded.append("downloaded paper PDFs (their extracted `.txt` are kept)")
     for pat in exclude or []:
         excluded.append(f"files matching `{pat}`")
-    if not excluded:
-        return "The bundle is complete: nothing was excluded when it was built."
     return (
-        "To keep the upload small, these bulky, redundant artifacts were "
-        "excluded when building this bundle: " + " and ".join(excluded)
+        "These artifacts (bulky, redundant, or credentials) were excluded "
+        "when building this bundle: " + "; ".join(excluded)
         + ". Do NOT treat their absence as a workflow defect."
     )
 
@@ -288,6 +331,11 @@ def main() -> int:
         "(repeatable); use to stay under the code_interpreter container's "
         "1000-file limit, e.g. --exclude 'events_blobs/*'",
     )
+    parser.add_argument(
+        "--keep-upload",
+        action="store_true",
+        help="keep the uploaded zip on OpenAI after the audit (default: delete it)",
+    )
     args = parser.parse_args()
 
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -314,23 +362,45 @@ def main() -> int:
         )
         print(f"built bundle: {bundle.name} — {written} files ({skipped} excluded), {bundle.stat().st_size / 1e6:.1f} MB")
 
+    # 2. Load the model config and refuse providers that cannot see the
+    #    bundle: it rides an OpenAI code_interpreter container, and
+    #    APIClient silently drops the file_ids when converting the tool
+    #    for other providers — the audit would run blind.
+    cfg = {k: v for k, v in load_solver_config(args.model).items() if not k.startswith("__")}
+    if cfg.get("api") != "openai" or not cfg.get("use_openai_responses_api"):
+        raise SystemExit(
+            f"--model {args.model} is not an OpenAI Responses config "
+            "(needs api: openai and use_openai_responses_api: true); other "
+            "providers cannot receive the uploaded bundle"
+        )
+
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise SystemExit("OPENAI_API_KEY not set")
     oc = OpenAI(api_key=api_key)
 
-    # 2. Upload + attach to a code_interpreter container.
+    # 3. Upload + attach to a code_interpreter container.
     with open(bundle, "rb") as fh:
         uploaded = oc.files.create(file=fh, purpose="user_data")
     print(f"uploaded: file_id={uploaded.id} bytes={uploaded.bytes}")
+    try:
+        return _run_audit(args, cfg, oc, bundle, uploaded, out_dir, ts)
+    finally:
+        if args.keep_upload:
+            print(f"  keeping uploaded file {uploaded.id} (--keep-upload)")
+        else:
+            try:
+                oc.files.delete(uploaded.id)
+                print(f"  deleted uploaded file {uploaded.id}")
+            except Exception as e:
+                print(f"  WARN: could not delete uploaded file {uploaded.id}: {e}", file=sys.stderr)
 
+
+def _run_audit(args, cfg: dict, oc: OpenAI, bundle: Path, uploaded, out_dir: Path, ts: str) -> int:
     tool_pairs = [
         (None, {"type": "code_interpreter", "container": {"type": "auto", "file_ids": [uploaded.id]}}),
         (None, {"type": "web_search_preview"}),
     ]
-
-    # 3. Build the APIClient from the proven Pro model config + our tools.
-    cfg = {k: v for k, v in load_solver_config(args.model).items() if not k.startswith("__")}
     cfg["tools"] = tool_pairs
     client = APIClient(**cfg)
 
@@ -384,10 +454,14 @@ def main() -> int:
         "elapsed_s": round(elapsed, 1),
         "cost": cost,
         "artifacts": artifacts,
-        "excluded": {
+        "source": "prebuilt-zip" if args.zip else "run-dir",
+        # A prebuilt --zip has unknown contents; recording exclusions there
+        # would claim a curation this tool never performed.
+        "excluded": None if args.zip else {
             "workspace_zips": not args.include_workspace_zips,
             "pdfs": not args.include_pdfs,
             "globs": args.exclude,
+            "credentials": sorted(CREDENTIAL_DIR_NAMES | CREDENTIAL_FILE_NAMES),
         },
         "report_chars": len(report),
     }
