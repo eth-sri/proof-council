@@ -1967,11 +1967,20 @@ class ACWorkflow(Agent):
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         except BaseException:
-            # Defensive: asyncio.wait itself shouldn't raise here, but
-            # if it does, cancel everything.
+            # External cancellation (runner shutdown, parent cancel) lands
+            # here: cancel AND drain the children before re-raising, or
+            # browser waiters keep emitting heartbeats/pause credits and
+            # compute cleanup never runs.
             for t in tasks:
                 if not t.done():
                     t.cancel()
+            for t in tasks:
+                if t.cancelled():
+                    continue
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
             raise
 
         # Cancel anything still pending. With the safe wrappers above,

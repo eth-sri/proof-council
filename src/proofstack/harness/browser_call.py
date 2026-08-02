@@ -136,6 +136,9 @@ async def run_browser_call(
             "chat_url": browser_cfg.get("chat_url") or "",
             "expected_model_slugs": list(browser_cfg.get("expected_model_slugs") or []),
             "expected_efforts": list(browser_cfg.get("expected_efforts") or []),
+            "expected_model_variants": list(
+                browser_cfg.get("expected_model_variants") or []
+            ),
         },
         "expected": agent.harness_expectations(inp),
         "output_fields": {},
@@ -155,15 +158,13 @@ async def run_browser_call(
     except OSError:
         pass
 
-    await agent.events.emit(
-        "human.waiting",
-        {
-            "type": "browser_call",
-            "task_path": str(task_path),
-            "response_path": str(response_path),
-            "packet_dir": str(packet_dir),
-        },
-    )
+    waiting_payload = {
+        "type": "browser_call",
+        "task_path": str(task_path),
+        "response_path": str(response_path),
+        "packet_dir": str(packet_dir),
+    }
+    await agent.events.emit("human.waiting", waiting_payload)
     call_id = new_call_id()
     await agent.events.emit(
         "model.call.start",
@@ -175,76 +176,98 @@ async def run_browser_call(
         agent.component_config.get("human_timeout_s") or DEFAULT_HUMAN_TIMEOUT_S
     )
     start = time.monotonic()
-    response = await wait_for_response_file(
-        response_path,
-        events=agent.events,
-        tracker=agent.tracker,
-        timeout_s=timeout_s,
-    )
-    elapsed = time.monotonic() - start
-    if response is None:
-        await agent.events.emit("human.timeout", {"response_path": str(response_path)})
-        raise RuntimeError(
-            f"browser call {stem} timed out after {timeout_s:.0f}s without a response"
+    while True:
+        response = await wait_for_response_file(
+            response_path,
+            events=agent.events,
+            tracker=agent.tracker,
+            timeout_s=timeout_s,
         )
+        elapsed = time.monotonic() - start
+        if response is None:
+            await agent.events.emit(
+                "human.timeout", {"response_path": str(response_path)}
+            )
+            raise RuntimeError(
+                f"browser call {stem} timed out after {timeout_s:.0f}s without a response"
+            )
 
-    await agent.events.emit("human.submitted", {"response_path": str(response_path)})
-
-    try:
-        raw_text = str(response.get("assistant_text") or "")
-        uploads = response.get("uploaded_files") or {}
-        for name in sorted(uploads):
-            body = _read_upload_text(agent.ctx.root_workdir, str(uploads[name]))
-            if body is None:
-                await agent.events.emit(
-                    "harness.upload_skipped",
-                    {"name": str(name), "reason": "unreadable or binary"},
-                )
-                continue
-            if "\n```" in body or body.startswith("```"):
-                await agent.events.emit(
-                    "harness.upload_fence_conflict", {"name": str(name)}
-                )
-            raw_text += f"\n\n```file path={Path(str(name)).name}\n{body}\n```"
-
-        comments = str(response.get("operator_comments") or "").strip()
-        if comments:
-            _append_operator_comment(agent.ctx.root_workdir, agent.name, stem, comments)
+        await agent.events.emit(
+            "human.submitted", {"response_path": str(response_path)}
+        )
 
         try:
-            (agent.workdir / "raw_response.txt").write_text(raw_text, encoding="utf-8")
-            (agent.workdir / "share.json").write_text(
-                json.dumps(
-                    {
-                        "transport": response.get("transport"),
-                        "share_url": response.get("share_url"),
-                        "model_slug": response.get("model_slug"),
-                        "effort": response.get("effort"),
-                        "operator_comments": comments,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
+            raw_text = str(response.get("assistant_text") or "")
+            uploads = response.get("uploaded_files") or {}
+            for name in sorted(uploads):
+                body = _read_upload_text(agent.ctx.root_workdir, str(uploads[name]))
+                if body is None:
+                    await agent.events.emit(
+                        "harness.upload_skipped",
+                        {"name": str(name), "reason": "unreadable or binary"},
+                    )
+                    continue
+                if "\n```" in body or body.startswith("```"):
+                    await agent.events.emit(
+                        "harness.upload_fence_conflict", {"name": str(name)}
+                    )
+                raw_text += f"\n\n```file path={Path(str(name)).name}\n{body}\n```"
 
-        out = agent.parse_output(raw_text, inp)
-    except Exception as e:
-        # A response that cannot be processed must not be consumed again on
-        # every resume: move it aside so the task resurfaces and the
-        # operator can submit a corrected one.
-        rejected = _move_response_aside(response_path)
-        await agent.events.emit(
-            "harness.response_rejected",
-            {
-                "response_path": str(response_path),
-                "moved_to": str(rejected) if rejected else None,
-                "error": f"{type(e).__name__}: {e}",
-            },
-        )
-        raise
+            comments = str(response.get("operator_comments") or "").strip()
+            try:
+                (agent.workdir / "raw_response.txt").write_text(
+                    raw_text, encoding="utf-8"
+                )
+                (agent.workdir / "share.json").write_text(
+                    json.dumps(
+                        {
+                            "transport": response.get("transport"),
+                            "share_url": response.get("share_url"),
+                            "model_slug": response.get("model_slug"),
+                            "effort": response.get("effort"),
+                            "operator_comments": comments,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+
+            out = agent.parse_output(raw_text, inp)
+        except Exception as e:
+            # A response that cannot be processed must not be consumed again
+            # (or kill the run): move it aside, surface the error, and go
+            # back to waiting so the operator can submit a corrected one.
+            rejected = _move_response_aside(response_path)
+            error_text = f"{type(e).__name__}: {e}"
+            await agent.events.emit(
+                "harness.response_rejected",
+                {
+                    "response_path": str(response_path),
+                    "moved_to": str(rejected) if rejected else None,
+                    "error": error_text,
+                },
+            )
+            await agent.events.emit(
+                "human.waiting", {**waiting_payload, "rejected_error": error_text}
+            )
+            continue
+
+        # Steering comments count only once their response actually parsed:
+        # a quarantined submission must not leave its comment queued.
+        if comments:
+            try:
+                _append_operator_comment(
+                    agent.ctx.root_workdir, agent.name, stem, comments
+                )
+            except OSError as e:
+                await agent.events.emit(
+                    "harness.comment_append_failed",
+                    {"error": f"{type(e).__name__}: {e}"},
+                )
+        break
 
     if copy_dir is not None:
         shutil.rmtree(copy_dir, ignore_errors=True)

@@ -16,6 +16,7 @@ import json
 import os
 import random
 import re
+import uuid
 import shutil
 import signal
 import subprocess
@@ -141,6 +142,9 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         static_folder=str(Path(__file__).parent / "static"),
     )
     app.config["RUNS_ROOTS"] = list(runs_roots)
+    # Reject oversized multipart bodies before request handlers read them
+    # into memory (upload validation itself allows 40 MB of files).
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
 
     @app.context_processor
     def inject_human_waiting_runs():
@@ -298,8 +302,37 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         if not problems:
             return jsonify({"ok": False, "errors": ["Select or create at least one problem."]}), 400
 
+        api_keys = payload.get("api_keys") or {}
+        raw_inputs = payload.get("inputs") or {}
+        if not isinstance(api_keys, dict) or not isinstance(raw_inputs, dict):
+            return jsonify(
+                {"ok": False, "errors": ["api_keys and inputs must be objects"]}
+            ), 400
+        # Validate input overrides BEFORE any run directory exists, so a bad
+        # value can't leave an orphaned run behind. Structured values arrive
+        # as `@<json>` (the runner's convention).
+        input_args: list[str] = []
+        for key, value in raw_inputs.items():
+            clean_key = str(key or "").strip()
+            clean_value = str("" if value is None else value).strip()
+            if not clean_key or not clean_value:
+                continue
+            if clean_value.startswith("@"):
+                try:
+                    json.loads(clean_value[1:])
+                except json.JSONDecodeError as e:
+                    return jsonify(
+                        {
+                            "ok": False,
+                            "errors": [
+                                f"Input {clean_key!r} is not valid JSON after '@': {e.msg}"
+                            ],
+                        }
+                    ), 400
+            input_args.extend(["--input", f"{clean_key}={clean_value}"])
+
         env = _dashboard_subprocess_env()
-        for key, value in (payload.get("api_keys") or {}).items():
+        for key, value in api_keys.items():
             clean_key = str(key or "").strip()
             clean_value = str(value or "").strip()
             if clean_key and clean_value:
@@ -377,27 +410,9 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         ]
         if monitor_enabled:
             cmd.extend(["--monitor", "--monitor-model", monitor_model])
-        # Per-run workflow input overrides (e.g. claude_model=haiku). Only
-        # non-empty values are forwarded; blanks fall back to the preset default.
-        # Structured values arrive as `@<json>` (the runner's convention) —
-        # reject bad JSON here, before the child process fails out of sight.
-        for key, value in (payload.get("inputs") or {}).items():
-            clean_key = str(key or "").strip()
-            clean_value = str("" if value is None else value).strip()
-            if clean_key and clean_value:
-                if clean_value.startswith("@"):
-                    try:
-                        json.loads(clean_value[1:])
-                    except json.JSONDecodeError as e:
-                        return jsonify(
-                            {
-                                "ok": False,
-                                "errors": [
-                                    f"Input {clean_key!r} is not valid JSON after '@': {e.msg}"
-                                ],
-                            }
-                        ), 400
-                cmd.extend(["--input", f"{clean_key}={clean_value}"])
+        # Per-run workflow input overrides, validated above before the run
+        # directory was created.
+        cmd.extend(input_args)
         with log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(
                 cmd,
@@ -713,6 +728,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             can_resume=(run.path / "resume.json").exists(),
             prunable_bytes=estimate_prunable_bytes(run.path),
             pruned_kb=request.args.get("pruned_kb", type=int),
+            stored_files_notice=request.args.get("stored", type=int),
         )
 
     @app.route("/run/<run_id>/human", methods=["POST"])
@@ -728,6 +744,24 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         target = (inbox / filename).resolve()
         if target.parent != inbox:
             abort(400, description="response path escapes inbox")
+        # This endpoint serves plain HumanAgent tasks only. A browser-harness
+        # response must go through its own endpoints, which enforce share,
+        # task-token, and upload validation.
+        stem = filename[: -len(".response.json")]
+        try:
+            pending = json.loads(
+                (inbox / f"{stem}.task.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            abort(400, description="no pending human task for this response filename")
+        if not isinstance(pending, dict) or pending.get("type") == "browser_call":
+            abort(
+                400,
+                description=(
+                    "this is a browser-harness task — submit it through its own "
+                    "card, not the generic human-response form"
+                ),
+            )
         _refuse_duplicate_response(target)
         values: dict[str, Any] = {}
         for key, value in request.form.items():
@@ -756,15 +790,20 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         return target, task
 
     def _refuse_duplicate_response(target: Path) -> None:
-        # A *valid* response on disk means another tab (or a stale page)
-        # already submitted; overwriting would race the worker consuming it.
-        # A broken/partial file may be replaced — the run page offers that.
+        # Fast-path courtesy check; `_write_response_atomic` holds the
+        # authoritative reservation. A *valid* response on disk means another
+        # tab already submitted; an empty file is a reservation in progress;
+        # only a broken/partial file may be replaced.
         if not target.exists():
             return
         try:
-            json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
+            text = target.read_text(encoding="utf-8")
+            json.loads(text)
+        except json.JSONDecodeError:
+            if text.strip():
+                return
+        except OSError:
+            pass
         abort(
             409,
             description=(
@@ -774,10 +813,47 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         )
 
     def _write_response_atomic(target: Path, payload: dict[str, Any]) -> None:
+        """Publish a response with an atomic no-clobber reservation.
+
+        Concurrent submissions must not both win: the first exclusive
+        create of ``target`` claims the task; everyone else 409s. Only a
+        *broken* (non-empty, invalid-JSON) response file — the documented
+        repair path — may be replaced."""
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(target.name + ".tmp")
+        tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, target)
+        try:
+            try:
+                with target.open("x", encoding="utf-8"):
+                    pass
+            except FileExistsError:
+                try:
+                    text = target.read_text(encoding="utf-8")
+                except OSError:
+                    text = ""
+                if not text.strip():
+                    abort(
+                        409,
+                        description="another submission for this task is in progress",
+                    )
+                try:
+                    json.loads(text)
+                except json.JSONDecodeError:
+                    os.replace(tmp, target)
+                    tmp = None
+                    return
+                abort(
+                    409,
+                    description=(
+                        "a response for this task was already submitted (another "
+                        "tab or a stale page?) — go back to the run page"
+                    ),
+                )
+            os.replace(tmp, target)
+            tmp = None
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
 
     _UPLOAD_MAX_FILES = 20
     _UPLOAD_MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -830,10 +906,15 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 uploaded_files[name] = str((updir / name).relative_to(run.path))
         return uploaded_files
 
+    _DOWNLOAD_MAX_FILES = 20
+    _DOWNLOAD_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+
     def _auto_download_generated_files(
-        run, stem: str, share_url: str, result: dict[str, Any]
+        run, staging_dir: Path, share_url: str, result: dict[str, Any]
     ) -> tuple[dict[str, str], list[dict[str, Any]], list[str]]:
-        """Fetch the answer's sandbox files through the stateless resolver.
+        """Fetch the answer's sandbox files through the stateless resolver
+        into ``staging_dir`` (a per-fetch nonce directory, so a later fetch
+        can never mutate bytes an earlier confirm page refers to).
 
         Returns (uploads_to_merge, downloaded_info, failure_warnings).
         Text files without fence conflicts are merged into the model text
@@ -850,15 +931,33 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         uploads: dict[str, str] = {}
         downloaded: list[dict[str, Any]] = []
         failures: list[str] = []
-        updir = run.path / "human_inbox" / f"{stem}.uploads"
-        for gf in generated:
+        total = 0
+        if len(generated) > _DOWNLOAD_MAX_FILES:
+            failures.append(
+                f"the answer references {len(generated)} generated files; only "
+                f"the first {_DOWNLOAD_MAX_FILES} were auto-downloaded — fetch "
+                "the rest from the chat by hand if you need them"
+            )
+        for gf in generated[:_DOWNLOAD_MAX_FILES]:
             name = str(gf.get("name") or "file")
+            if total >= _DOWNLOAD_MAX_TOTAL_BYTES:
+                failures.append(
+                    "aggregate auto-download limit reached — remaining generated "
+                    "files must be downloaded from the chat by hand"
+                )
+                break
             try:
                 info = chatgpt_share.resolve_shared_file(
                     sid, str(gf.get("message_id")), str(gf.get("sandbox_path"))
                 )
                 path = chatgpt_share.download_shared_file(
-                    info, updir, fallback_name=name
+                    info,
+                    staging_dir,
+                    fallback_name=name,
+                    max_bytes=min(
+                        chatgpt_share.MAX_SHARED_FILE_BYTES,
+                        _DOWNLOAD_MAX_TOTAL_BYTES - total,
+                    ),
                 )
             except chatgpt_share.ShareFetchError as e:
                 failures.append(
@@ -873,6 +972,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 )
                 continue
             data = path.read_bytes()
+            total += len(data)
             mergeable = False
             try:
                 text = data.decode("utf-8")
@@ -889,6 +989,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                     "bytes": len(data),
                     "merged": mergeable,
                     "path": rel,
+                    "sha256": hashlib.sha256(data).hexdigest(),
                 }
             )
         if downloaded:
@@ -900,13 +1001,11 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             ]
         return uploads, downloaded, failures
 
-    def _transfer_candidate(run, current_filename: str, result: dict[str, Any]):
-        """Find the pending browser task whose tokenized instruction file the
-        share actually contains — the card the operator probably meant."""
-        from proofstack.harness.chatgpt_share import share_contains_token
-
+    def _transfer_candidate(run, current_filename: str, tokens: set[str]):
+        """Find the pending browser task the share's newest task marker
+        actually names — the card the operator probably meant."""
         inbox = run.path / "human_inbox"
-        if not inbox.exists():
+        if not tokens or not inbox.exists():
             return None
         for task_path in sorted(inbox.glob("*.task.json")):
             stem2 = task_path.name[: -len(".task.json")]
@@ -920,9 +1019,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             if not isinstance(t2, dict) or t2.get("type") != "browser_call":
                 continue
             token2 = str(t2.get("task_token") or "")
-            if token2 and share_contains_token(
-                result, token2, str(t2.get("instruction_file") or "")
-            ):
+            if token2 and token2 in tokens:
                 return {
                     "response_filename": fname2,
                     "agent": t2.get("agent") or stem2,
@@ -932,22 +1029,34 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         return None
 
     def _share_reuse_warning(run, filename: str, share_url: str) -> str | None:
+        from proofstack.harness.chatgpt_share import share_id as _canonical_share_id
+
         inbox = run.path / "human_inbox"
-        if not share_url or not inbox.exists():
+        sid = _canonical_share_id(share_url) if share_url else None
+        if not sid or not inbox.exists():
             return None
-        for f in inbox.glob("*.response*.json"):
+        # Only live responses count: a rejected submission's share may be
+        # legitimately resubmitted (typically for the same task).
+        for f in inbox.glob("*.response.json"):
             if f.name == filename:
                 continue
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if isinstance(data, dict) and str(data.get("share_url") or "") == share_url:
+            if not isinstance(data, dict):
+                continue
+            if _canonical_share_id(str(data.get("share_url") or "")) == sid:
                 return (
                     f"this share link was already submitted for another task "
                     f"({f.name}) — double-check it belongs to this card"
                 )
         return None
+
+    def _prune_stale_staging(run, stem: str) -> None:
+        inbox = run.path / "human_inbox"
+        for d in inbox.glob(f"{stem}.staged-*"):
+            shutil.rmtree(d, ignore_errors=True)
 
     @app.route("/run/<run_id>/harness/fetch-share", methods=["POST"])
     def run_harness_fetch_share(run_id: str):
@@ -966,13 +1075,29 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         _refuse_duplicate_response(target)
         share_url = str(request.form.get("share_url") or "").strip()
         operator_comments = str(request.form.get("operator_comments") or "")
+        from proofstack.harness.chatgpt_share import latest_task_tokens
+
         stem = filename[: -len(".response.json")]
+        _prune_stale_staging(run, stem)
+        nonce = uuid.uuid4().hex[:12]
+        staging_dir = run.path / "human_inbox" / f"{stem}.staged-{nonce}"
         try:
             result = extract_result(fetch_share(share_url))
-            auto_uploads, downloaded, download_failures = _auto_download_generated_files(
-                run, stem, share_url, result
+            token = str(task.get("task_token") or "")
+            tokens = latest_task_tokens(result)
+            token_ok = not token or token in tokens
+            if token_ok:
+                auto_uploads, downloaded, download_failures = (
+                    _auto_download_generated_files(run, staging_dir, share_url, result)
+                )
+            else:
+                # The share names a different task: don't spend downloads on
+                # it — the transfer path re-fetches for the right card.
+                auto_uploads, downloaded, download_failures = {}, [], []
+            warnings = (
+                validate_result(result, task, provided_files=set(auto_uploads))
+                + download_failures
             )
-            warnings = validate_result(result, task) + download_failures
         except ShareFetchError as e:
             fetch_error = str(e)
         except Exception as e:
@@ -1002,15 +1127,10 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         reuse = _share_reuse_warning(run, filename, share_url)
         if reuse:
             warnings.append(reuse)
-        from proofstack.harness.chatgpt_share import share_contains_token
-
-        token = str(task.get("task_token") or "")
-        token_verified = not token or share_contains_token(
-            result, token, str(task.get("instruction_file") or "")
-        )
-        transfer = None if token_verified else _transfer_candidate(run, filename, result)
+        transfer = None if token_ok else _transfer_candidate(run, filename, tokens)
         # Stage the extracted answer so that confirming applies exactly this
-        # version — never a re-fetch that may silently differ.
+        # version — never a re-fetch that may silently differ. File hashes
+        # bind the digest to the staged bytes, not just the metadata.
         staged = {
             "share_url": share_url,
             "assistant_text": result["assistant_text"],
@@ -1019,6 +1139,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             "sandbox_artifacts": [str(a) for a in result.get("sandbox_artifacts") or []],
             "uploaded_files": auto_uploads,
             "stored_files": [d for d in downloaded if not d["merged"]],
+            "file_hashes": {d["path"]: d["sha256"] for d in downloaded},
         }
         digest = hashlib.sha256(
             json.dumps(staged, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -1058,6 +1179,13 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             },
         )
         staged_path.unlink(missing_ok=True)
+        if staged["stored_files"]:
+            # Surface non-merged (binary) downloads even on the
+            # warning-free path — the operator would otherwise never
+            # learn they exist.
+            return redirect(
+                url_for("run_detail", run_id=run_id, stored=len(staged["stored_files"]))
+            )
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/harness/confirm", methods=["POST"])
@@ -1089,6 +1217,23 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                     "— fetch the share link again"
                 ),
             )
+        # The digest binds the metadata; verify the staged bytes too, so a
+        # concurrent fetch can never swap file contents under a valid page.
+        for rel, expected_hash in (staged.get("file_hashes") or {}).items():
+            try:
+                p = (run.path / rel).resolve()
+                p.relative_to(run.path.resolve())
+                actual = hashlib.sha256(p.read_bytes()).hexdigest()
+            except (OSError, ValueError):
+                actual = None
+            if actual != expected_hash:
+                abort(
+                    409,
+                    description=(
+                        "staged downloaded files changed since this page was "
+                        "rendered — fetch the share link again"
+                    ),
+                )
         uploads = [f for f in request.files.getlist("files") if f and f.filename]
         # Auto-downloaded share files first; a manual upload of the same
         # name deliberately overrides it.

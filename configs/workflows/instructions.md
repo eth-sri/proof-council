@@ -296,8 +296,10 @@ returns a ChatGPT share link or pastes the answer manually. Cost is $0; the
 
 Config keys: `service` (chatgpt enables the share-link fetch; anything else is
 manual-paste only), `chat_url`, `display_model`, `settings_hint`,
-`expected_model_slugs` / `expected_efforts` (share-link validation, warnings
-only), `instruction_addendum` (appended to every instruction file; the default
+`expected_model_variants` (share-link validation as slug+effort pairs,
+warnings only; legacy `expected_model_slugs`/`expected_efforts` validate the
+two fields independently), `instruction_addendum` (appended to every
+instruction file; the default
 tells the model to print changed files inline as fenced ```file path=...```
 blocks as the robust primary channel).
 
@@ -322,8 +324,8 @@ provider-side tool loops (`code_interpreter`, `web_search` configs are simply
 absent in the browser chat), and `CLIAgent` nodes. System/developer + user
 messages are concatenated into a single browser prompt (role labels are added
 only for longer histories), so strict instruction-hierarchy behavior is not
-preserved. Substituting a model on an unsupported node silently keeps its API
-transport.
+preserved. Substituting a browser model on an unsupported node fails at call
+time with an unknown-api error rather than silently degrading.
 
 Browser models may be substituted through the component `model:` key, a
 model-ref input like `council_models`, or `model_overrides` (the resume-cache

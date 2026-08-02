@@ -52,6 +52,7 @@ def _make_run(outputs_root: Path, *, expected_slugs: list[str]) -> tuple[str, st
         "agent": "echo",
         "run_id": "run1",
         "type": "browser_call",
+        "instruction_file": f"instruction_{stem}.txt",
         "prompt": "DO THE THING",
         "response_path": str(response_path),
         "packet_dir": str(packet),
@@ -122,6 +123,9 @@ class HarnessEndpointTests(unittest.TestCase):
         self.assertIn("Fetch &amp; Continue", html)
         self.assertIn("harness/fetch-share", html)
         self.assertIn("harness/manual", html)
+        # The card must show the real tokenized instruction filename, not a
+        # hardcoded instruction.txt.
+        self.assertIn(f"instruction_{self.stem}.txt", html)
 
     def test_fetch_share_clean_writes_response(self) -> None:
         with mock.patch(
@@ -246,6 +250,59 @@ class HarnessEndpointTests(unittest.TestCase):
             )
         )
         self.assertEqual(payload["assistant_text"], "one")
+
+    def test_inflight_reservation_blocks_submission(self) -> None:
+        # An empty response file is another request's atomic reservation.
+        target = self.run_dir / "human_inbox" / self.response_filename
+        target.write_text("", encoding="utf-8")
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={"response_filename": self.response_filename, "assistant_text": "x"},
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_confirm_with_mutated_staged_file_is_409(self) -> None:
+        stem2, filename2 = self.stem, self.response_filename
+        task_path = self.run_dir / "human_inbox" / f"{stem2}.task.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["browser"]["expected_model_slugs"] = ["some-other-model"]
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+
+        p1, p2 = self._mock_download(b"ORIGINAL BYTES")
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ), p1, p2:
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": filename2, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 200)
+        staged = json.loads(
+            (self.run_dir / "human_inbox" / f"{stem2}.staged.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        # Mutate the staged bytes (what a concurrent fetch could do before
+        # nonce dirs; the digest must catch any such drift).
+        rel = next(iter(staged["file_hashes"]))
+        (self.run_dir / rel).write_bytes(b"SWAPPED BYTES")
+        resp2 = self.client.post(
+            "/run/run1/harness/confirm",
+            data={"response_filename": filename2, "digest": staged["digest"]},
+        )
+        self.assertEqual(resp2.status_code, 409)
+        self.assertFalse((self.run_dir / "human_inbox" / filename2).exists())
+
+    def test_generic_human_endpoint_refuses_browser_tasks(self) -> None:
+        resp = self.client.post(
+            "/run/run1/human",
+            data={"response_filename": self.response_filename, "f_answer": "sneaky"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(
+            (self.run_dir / "human_inbox" / self.response_filename).exists()
+        )
 
     def test_broken_response_may_be_replaced(self) -> None:
         target = self.run_dir / "human_inbox" / self.response_filename
@@ -425,14 +482,10 @@ class HarnessEndpointTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
-        self.assertEqual(
-            payload["uploaded_files"]["report.pdf"],
-            f"human_inbox/{self.stem}.uploads/report.pdf",
-        )
-        saved = (
-            self.run_dir / "human_inbox" / f"{self.stem}.uploads" / "report.pdf"
-        ).read_bytes()
-        self.assertEqual(saved, b"GENERATED TEXT")
+        rel = payload["uploaded_files"]["report.pdf"]
+        self.assertTrue(rel.startswith(f"human_inbox/{self.stem}.staged-"))
+        self.assertTrue(rel.endswith("/report.pdf"))
+        self.assertEqual((self.run_dir / rel).read_bytes(), b"GENERATED TEXT")
 
     def test_generated_binary_file_is_stored_not_merged(self) -> None:
         p1, p2 = self._mock_download(b"\x89PNG\x00\xffbinary")
@@ -495,7 +548,7 @@ class HarnessEndpointTests(unittest.TestCase):
         html = resp.get_data(as_text=True)
         self.assertIn("belong to a different task", html)
         self.assertIn('value="critic__b.response.json"', html)
-        self.assertIn("could not verify this share belongs to this task", html)
+        self.assertIn("most recent ProofCouncil task", html)
 
     def test_waiting_after_timeout_resurfaces_task(self) -> None:
         # waiting -> timeout -> (resume) waiting again: the later wait must

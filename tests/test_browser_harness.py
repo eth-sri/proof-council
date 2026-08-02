@@ -307,27 +307,78 @@ class PauseAccountingTests(unittest.TestCase):
 
 
 class RejectedResponseTests(unittest.TestCase):
-    def test_unparseable_response_is_moved_aside(self) -> None:
-        class BadParseAgent(EchoAgent):
+    def test_unparseable_response_requeues_and_consumes_correction(self) -> None:
+        # First submission fails parse -> quarantined, task re-waits; a
+        # corrected submission then completes the call. The run never dies.
+        class PickyAgent(EchoAgent):
             def parse_output(self, raw_text, inp):
-                raise ValueError("cannot parse this")
+                if "BAD" in raw_text:
+                    raise ValueError("cannot parse this")
+                return super().parse_output(raw_text, inp)
+
+        async def scenario(ctx: RunContext):
+            agent = PickyAgent(ctx, name="echo")
+            stem = f"echo__{agent._cache_key(PickyAgent.Inputs(problem='P'))[:12]}"
+            inbox = ctx.root_workdir / "human_inbox"
+            inbox.mkdir(parents=True, exist_ok=True)
+            response_path = inbox / f"{stem}.response.json"
+            response_path.write_text(
+                json.dumps({"status": "done", "assistant_text": "BAD ANSWER"}),
+                encoding="utf-8",
+            )
+            task = asyncio.create_task(agent(problem="P"))
+            for _ in range(800):
+                if (inbox / f"{stem}.response.rejected-1.json").exists():
+                    break
+                await asyncio.sleep(0.005)
+            response_path.write_text(
+                json.dumps({"status": "done", "assistant_text": "GOOD ANSWER"}),
+                encoding="utf-8",
+            )
+            out = await asyncio.wait_for(task, timeout=5.0)
+            return out, stem, inbox
 
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
             ctx = _ctx(tmp, hdir)
-            agent = BadParseAgent(ctx, name="echo")
-            stem = f"echo__{agent._cache_key(BadParseAgent.Inputs(problem='P'))[:12]}"
-            inbox = ctx.root_workdir / "human_inbox"
-            inbox.mkdir(parents=True, exist_ok=True)
-            (inbox / f"{stem}.response.json").write_text(
-                json.dumps({"status": "done", "assistant_text": "HELLO"}),
-                encoding="utf-8",
-            )
-            with self.assertRaises(ValueError):
-                asyncio.run(agent(problem="P"))
-            self.assertFalse((inbox / f"{stem}.response.json").exists())
+            with mock.patch(
+                "proofstack.harness.browser_call.wait_for_response_file", _fast_wait
+            ):
+                out, stem, inbox = asyncio.run(scenario(ctx))
+            self.assertEqual(out.text, "GOOD ANSWER")
             self.assertTrue((inbox / f"{stem}.response.rejected-1.json").exists())
-            events_text = (ctx.root_workdir / "events.jsonl").read_text(encoding="utf-8")
-            self.assertIn("harness.response_rejected", events_text)
+            events = (ctx.root_workdir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn("harness.response_rejected", events)
+            self.assertIn("rejected_error", events)
+            # waiting was re-emitted after the rejection.
+            self.assertEqual(events.count('"human.waiting"'), 2)
+
+
+class MalformedResponseTimeoutTests(unittest.TestCase):
+    def test_permanently_malformed_response_still_times_out(self) -> None:
+        # A broken response file must fall through to the timeout/pause
+        # path, not spin forever on the fast retry branch.
+        class TrackerStub:
+            def add_paused_interval(self, s: float, e: float) -> None:
+                pass
+
+        class EventsStub:
+            async def emit(self, *a: object, **k: object) -> None:
+                pass
+
+        async def scenario(tmp: str):
+            path = Path(tmp) / "x.response.json"
+            path.write_text("{not json", encoding="utf-8")
+            return await wait_for_response_file(
+                path,
+                events=EventsStub(),
+                tracker=TrackerStub(),
+                timeout_s=0.05,
+                poll_interval_s=0.01,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = asyncio.run(asyncio.wait_for(scenario(tmp), timeout=5.0))
+        self.assertIsNone(out)
 
 
 class CacheKeyTransportTests(unittest.TestCase):

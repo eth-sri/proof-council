@@ -151,6 +151,9 @@ class HumanAgent(Agent):
         return {field: "" for field, typ in output_fields.items() if typ == "string"}
 
 
+_NOT_READY = object()
+
+
 async def wait_for_response_file(
     response_path: Path,
     *,
@@ -168,9 +171,12 @@ async def wait_for_response_file(
             try:
                 raw = json.loads(response_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
-                await asyncio.sleep(poll_interval_s)
-                continue
-            return raw if isinstance(raw, dict) else {"value": raw}
+                # Partial write or broken JSON: keep waiting, but fall
+                # through so a permanently malformed file still hits the
+                # heartbeat, pause credit, and timeout below.
+                raw = _NOT_READY
+            if raw is not _NOT_READY:
+                return raw if isinstance(raw, dict) else {"value": raw}
         elapsed = time.monotonic() - start
         if timeout_s > 0 and elapsed >= timeout_s:
             return None

@@ -12,6 +12,7 @@ richer behavior.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -165,10 +166,13 @@ class APICallAgent(Agent):
         return self.parse_output(raw_text, inp)
 
     def _cache_config_snapshot(self) -> dict[str, Any]:
-        # The resume-cache key must reflect the *effective* model and
-        # transport, not just the raw MODEL ref: a model_overrides swap
-        # (API <-> browser) or an edited model YAML must not replay the
-        # other configuration's cached answer.
+        # The resume-cache key must reflect the *effective* model
+        # configuration, not just the raw MODEL ref: a model_overrides swap
+        # (API <-> browser) or ANY edit to the referenced YAML (transport,
+        # slug, instruction addendum, generation params, …) must not replay
+        # the old configuration's cached answer. Hash the full sanitized
+        # resolved config — the price is that cosmetic YAML edits also
+        # invalidate, which is the safe direction.
         snapshot = super()._cache_config_snapshot()
         try:
             resolved = self.ctx.model_for(self, self.MODEL)
@@ -176,10 +180,14 @@ class APICallAgent(Agent):
             from mathagents import load_solver_config
 
             cfg = load_solver_config(resolved)
-            snapshot["MODEL_TRANSPORT"] = {
-                "api": str(cfg.get("api") or ""),
-                "model": cfg.get("model"),
+            sanitized = {
+                k: v for k, v in cfg.items() if not str(k).startswith("__")
             }
+            snapshot["MODEL_CONFIG_HASH"] = hashlib.sha256(
+                json.dumps(
+                    sanitized, sort_keys=True, ensure_ascii=False, default=str
+                ).encode("utf-8")
+            ).hexdigest()
         except Exception:
             pass
         return snapshot

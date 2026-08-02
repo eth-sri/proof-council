@@ -122,6 +122,13 @@ class BudgetTracker:
         the *union* of their wait intervals at shared ancestors — never N
         times the wall time. Compute that runs concurrently with a human
         wait is deliberately not re-charged: the interval counts as paused.
+
+        Invariant: calls must arrive in nondecreasing ``end`` order (the
+        high-water clip computes the exact union measure only then). All
+        current callers credit an interval immediately at its end on one
+        event loop, which guarantees the ordering; a caller crediting
+        historical intervals out of order would silently under-count the
+        pause (never over-count), which fails safe for budgets.
         """
         clipped = max(start, self.counters.paused_until)
         if end > clipped:

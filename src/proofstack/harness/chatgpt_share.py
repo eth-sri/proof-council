@@ -3,8 +3,9 @@
 Uses the undocumented ``chatgpt.com/backend-api/share/<uuid>`` JSON
 endpoint; it may break without notice, so every consumer must keep the
 manual-paste path as a first-class fallback. Sandbox-generated files
-are never exposed by the share page — ``extract_result`` only detects
-that they exist so the operator can be told to download them by hand.
+are retrievable statelessly through the ``file_from_message`` resolver
+(``resolve_shared_file`` + ``download_shared_file``); when that fails,
+the operator downloads them from the chat by hand.
 """
 from __future__ import annotations
 
@@ -28,8 +29,23 @@ _BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-_SANDBOX_LINK_RE = re.compile(r"sandbox:/[^\s)\"'>]+")
+_SANDBOX_LINK_RE = re.compile(r"sandbox:(/[^\s\"'<>]+)")
 _FILE_FENCE_RE = re.compile(r"```file\s+path=(?P<path>[A-Za-z0-9._/-]+)")
+
+
+def _sandbox_paths(text: str) -> list[str]:
+    """Sandbox link targets, tolerating parentheses in filenames.
+
+    Links usually appear as markdown ``[x](sandbox:/mnt/data/f.pdf)``, so a
+    greedy match swallows the closing paren; trim trailing parens only while
+    they are unbalanced, so ``report_(final).pdf`` survives intact."""
+    out: list[str] = []
+    for m in _SANDBOX_LINK_RE.finditer(text):
+        path = m.group(1)
+        while path.endswith(")") and path.count("(") < path.count(")"):
+            path = path[:-1]
+        out.append(path.rstrip(".,;:"))
+    return out
 
 
 class ShareFetchError(Exception):
@@ -159,6 +175,12 @@ def download_shared_file(
         name = "file"
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / name
+    # Distinct sandbox paths can share a basename (/a/report.tex vs
+    # /b/report.tex) — never silently overwrite an earlier download.
+    counter = 1
+    while dest.exists():
+        counter += 1
+        dest = dest_dir / f"{Path(name).stem}-{counter}{Path(name).suffix}"
     opener = urllib.request.build_opener(_RefuseRedirect)
     req = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
     try:
@@ -287,8 +309,7 @@ def extract_result(data: dict[str, Any]) -> dict[str, Any]:
     generated_files: list[dict[str, str]] = []
     seen_paths: set[str] = set()
     for m in answer_msgs:
-        for link in _SANDBOX_LINK_RE.findall(m["text"]):
-            path = link[len("sandbox:") :]
+        for path in _sandbox_paths(m["text"]):
             if path in seen_paths or not m.get("id"):
                 continue
             seen_paths.add(path)
@@ -300,7 +321,7 @@ def extract_result(data: dict[str, Any]) -> dict[str, Any]:
                 }
             )
 
-    sandbox_artifacts.extend(_SANDBOX_LINK_RE.findall(assistant_text))
+    sandbox_artifacts.extend("sandbox:" + p for p in _sandbox_paths(assistant_text))
     seen: set[str] = set()
     sandbox_artifacts = [
         a for a in sandbox_artifacts if not (a in seen or seen.add(a))
@@ -342,16 +363,23 @@ def _reference_sources(msgs: list[dict[str, Any]]) -> list[str]:
 
     The assistant text keeps only opaque citation markers; the actual
     titles/URLs live in the reference objects (top-level or nested under
-    ``items``) and would otherwise be discarded."""
+    ``items``) and would otherwise be discarded.
+
+    The list is appended to text that downstream workflow parsers treat as
+    model output, so every line is sanitized: no backticks, angle brackets,
+    or newlines survive — citation metadata must never be able to form a
+    fenced ``file`` block, ``<council>``/``<compute_agent>``/``<ready>``
+    markup, or any other control sequence."""
     sources: list[str] = []
     seen: set[str] = set()
 
     def _add(title: Any, url: Any) -> None:
-        url = str(url or "").strip()
+        url = re.sub(r"[\s<>`]+", "", str(url or ""))
         if not url or not url.lower().startswith(("http://", "https://")) or url in seen:
             return
         seen.add(url)
-        title = str(title or "").strip()
+        title = re.sub(r"[<>`]+", " ", str(title or ""))
+        title = re.sub(r"\s+", " ", title).strip()
         sources.append(f"{title} — {url}" if title and title != url else url)
 
     for m in msgs:
@@ -365,22 +393,32 @@ def _reference_sources(msgs: list[dict[str, Any]]) -> list[str]:
     return sources
 
 
-def share_contains_token(result: dict[str, Any], token: str, instruction_file: str) -> bool:
-    """True when the shared conversation demonstrably belongs to the task:
-    the tokenized instruction file was uploaded, or the token (embedded in
-    the instruction's first line) appears in a user message's text."""
-    if not token:
-        return False
+_TOKEN_MARKER_RE = re.compile(r"\[ProofCouncil task ([A-Za-z0-9._-]+)\]")
+_INSTRUCTION_FILE_TOKEN_RE = re.compile(r"^instruction_([A-Za-z0-9._-]+)\.txt$")
+
+
+def latest_task_tokens(result: dict[str, Any]) -> set[str]:
+    """Task tokens named by the *most recent* user message that names any.
+
+    A conversation reused for several harness tasks contains several
+    markers; only the newest binding counts, so submitting the share
+    against an *older* task in the same chat is refused even though that
+    task's token still appears somewhere in the history. Steering messages
+    that name no task never reset the binding."""
+    latest: set[str] = set()
     for m in result.get("messages") or []:
         if m.get("role") != "user":
             continue
+        found: set[str] = set()
         for att in m.get("attachments") or []:
             name = att.get("name") if isinstance(att, dict) else att
-            if str(name) == instruction_file:
-                return True
-        if token in str(m.get("text") or ""):
-            return True
-    return False
+            mt = _INSTRUCTION_FILE_TOKEN_RE.match(str(name or ""))
+            if mt:
+                found.add(mt.group(1))
+        found.update(_TOKEN_MARKER_RE.findall(str(m.get("text") or "")))
+        if found:
+            latest = found
+    return latest
 
 
 def _slug_matches(slug: str, expected: str) -> bool:
@@ -391,8 +429,17 @@ def _slug_matches(slug: str, expected: str) -> bool:
     return slug == expected or slug.startswith(expected + "-")
 
 
-def validate_result(result: dict[str, Any], task: dict[str, Any]) -> list[str]:
-    """Operator-facing warnings; an empty answer is a hard error."""
+def validate_result(
+    result: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    provided_files: set[str] | frozenset[str] = frozenset(),
+) -> list[str]:
+    """Operator-facing warnings; an empty answer is a hard error.
+
+    ``provided_files``: filenames already secured out-of-band (e.g.
+    auto-downloaded mergeable share files) — they satisfy fenced/required
+    file expectations just like inline fenced blocks."""
     text = str(result.get("assistant_text") or "")
     if not text.strip():
         raise ShareFetchError(
@@ -402,45 +449,87 @@ def validate_result(result: dict[str, Any], task: dict[str, Any]) -> list[str]:
     warnings: list[str] = []
 
     browser = task.get("browser") or {}
-    expected_slugs = [s for s in (browser.get("expected_model_slugs") or []) if s]
     slug = result.get("model_slug") or result.get("default_model_slug")
-    if expected_slugs:
+    effort = result.get("effort")
+    variants = [v for v in (browser.get("expected_model_variants") or []) if isinstance(v, dict)]
+    if variants:
+        # Slug/effort form valid *pairs* — validating them independently
+        # would accept e.g. a Pro-capable slug at a non-Pro effort.
+        slugs = [str(v.get("slug") or "") for v in variants]
         if not slug:
             warnings.append(
                 "the share carried no model slug, so the model used cannot be "
-                f"verified (expected one of {expected_slugs})"
+                f"verified (expected one of {slugs})"
             )
-        elif not any(_slug_matches(str(slug), str(s)) for s in expected_slugs):
-            warnings.append(
-                f"the conversation ran on model {slug!r}, expected one of "
-                f"{expected_slugs} — check the model picker"
+        else:
+            matched = next(
+                (v for v in variants if _slug_matches(str(slug), str(v.get("slug") or ""))),
+                None,
             )
-
-    expected_efforts = [
-        str(e).lower() for e in (browser.get("expected_efforts") or []) if e
-    ]
-    if expected_efforts:
-        effort = result.get("effort")
-        if not effort:
-            warnings.append(
-                "the share carried no reasoning-effort marker, so the reasoning "
-                f"mode cannot be verified (expected one of {expected_efforts})"
-            )
-        elif str(effort).lower() not in expected_efforts:
-            warnings.append(
-                f"the answer used reasoning effort {effort!r}, expected one of "
-                f"{expected_efforts} — check the reasoning-mode picker"
-            )
+            if matched is None:
+                warnings.append(
+                    f"the conversation ran on model {slug!r}, expected one of "
+                    f"{slugs} — check the model picker"
+                )
+            else:
+                efforts = [str(e).lower() for e in (matched.get("efforts") or []) if e]
+                if efforts and not effort:
+                    warnings.append(
+                        f"the share carried no reasoning-effort marker for model "
+                        f"{slug!r} (expected one of {efforts})"
+                    )
+                elif efforts and str(effort).lower() not in efforts:
+                    warnings.append(
+                        f"the answer used reasoning effort {effort!r}, but model "
+                        f"{slug!r} is expected at one of {efforts} — check the "
+                        "reasoning-mode picker"
+                    )
+    else:
+        expected_slugs = [s for s in (browser.get("expected_model_slugs") or []) if s]
+        if expected_slugs:
+            if not slug:
+                warnings.append(
+                    "the share carried no model slug, so the model used cannot be "
+                    f"verified (expected one of {expected_slugs})"
+                )
+            elif not any(_slug_matches(str(slug), str(s)) for s in expected_slugs):
+                warnings.append(
+                    f"the conversation ran on model {slug!r}, expected one of "
+                    f"{expected_slugs} — check the model picker"
+                )
+        expected_efforts = [
+            str(e).lower() for e in (browser.get("expected_efforts") or []) if e
+        ]
+        if expected_efforts:
+            if not effort:
+                warnings.append(
+                    "the share carried no reasoning-effort marker, so the reasoning "
+                    f"mode cannot be verified (expected one of {expected_efforts})"
+                )
+            elif str(effort).lower() not in expected_efforts:
+                warnings.append(
+                    f"the answer used reasoning effort {effort!r}, expected one of "
+                    f"{expected_efforts} — check the reasoning-mode picker"
+                )
 
     token = str(task.get("task_token") or "")
     if token:
-        instruction_file = str(task.get("instruction_file") or f"instruction_{token}.txt")
-        if not share_contains_token(result, token, instruction_file):
+        tokens = latest_task_tokens(result)
+        if not tokens:
+            instruction_file = str(
+                task.get("instruction_file") or f"instruction_{token}.txt"
+            )
             warnings.append(
-                f"could not verify this share belongs to this task: {instruction_file} "
-                "was not among the files you uploaded and the task token does not "
-                "appear in your messages — double-check you pasted the link into "
-                "the right card"
+                "could not verify this share belongs to this task: no ProofCouncil "
+                f"task marker found ({instruction_file} was not uploaded and no "
+                "[ProofCouncil task ...] line appears in your messages) — "
+                "double-check you pasted the link into the right card"
+            )
+        elif token not in tokens:
+            warnings.append(
+                "this conversation's most recent ProofCouncil task is "
+                f"{sorted(tokens)}, not this card's ({token}) — the answer you are "
+                "submitting belongs to that newer task"
             )
 
     answer_models = [str(m) for m in (result.get("answer_models") or [])]
@@ -451,7 +540,7 @@ def validate_result(result: dict[str, Any], task: dict[str, Any]) -> list[str]:
         )
 
     expected = task.get("expected") or {}
-    present = set(_FILE_FENCE_RE.findall(text))
+    present = set(_FILE_FENCE_RE.findall(text)) | {str(f) for f in provided_files}
     fenced = [str(f) for f in (expected.get("fenced_files") or [])]
     if fenced and not present.intersection(fenced):
         warnings.append(
@@ -491,5 +580,5 @@ __all__ = [
     "visible_messages",
     "extract_result",
     "validate_result",
-    "share_contains_token",
+    "latest_task_tokens",
 ]

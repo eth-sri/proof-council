@@ -947,6 +947,9 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                 "harness_copy_dir": full.get("harness_copy_dir"),
                 "files": full.get("files") or [],
                 "expected": full.get("expected") or {},
+                "instruction_file": full.get("instruction_file"),
+                "task_token": full.get("task_token"),
+                "rejected_error": payload.get("rejected_error"),
             }
         )
     return tasks
