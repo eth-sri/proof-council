@@ -1,0 +1,36 @@
+{% extends "dev_base.html" %}
+{% block title %}Harness fetch — {{ run.run_id }}{% endblock %}
+{% block content %}
+    <div class="page-header-row">
+        <h1>🌐 Browser call — fetch result</h1>
+        <a class="button-action secondary" href="{{ url_for('run_detail', run_id=run.run_id) }}">← Back to run</a>
+    </div>
+
+    {% if error %}
+        <div class="card">
+            <h2>Fetch failed</h2>
+            <p class="input-warning">{{ error }}</p>
+            <p class="dim">Fix the link and try again from the run page, or use the manual paste fallback there.</p>
+        </div>
+    {% else %}
+        <div class="card">
+            <h2>The fetched conversation has warnings</h2>
+            <ul>
+                {% for w in warnings %}
+                    <li class="input-warning">{{ w }}</li>
+                {% endfor %}
+            </ul>
+            <p class="dim">You can accept the fetched answer anyway, or go back and fix the
+                conversation (e.g. ask the model to print missing files inline, share again,
+                and paste the new link).</p>
+            <form method="post" action="{{ url_for('run_harness_fetch_share', run_id=run.run_id) }}">
+                <input type="hidden" name="response_filename" value="{{ response_filename }}">
+                <input type="hidden" name="share_url" value="{{ share_url }}">
+                <input type="hidden" name="operator_comments" value="{{ operator_comments }}">
+                <input type="hidden" name="confirmed" value="1">
+                <button type="submit" class="btn-primary">Use anyway &amp; Continue</button>
+                <a class="button-action secondary" href="{{ url_for('run_detail', run_id=run.run_id) }}">Cancel</a>
+            </form>
+        </div>
+    {% endif %}
+{% endblock %}

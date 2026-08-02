@@ -721,7 +721,7 @@ class ACWorkflow(Agent):
                 await self.events.emit(
                     "ac.round_start", {"round": 0, "n_rounds": inp.n_rounds}
                 )
-                author_0 = await self.author(
+                author_0 = await self._call_author_with_operator_comments(
                     **self._author_inputs(
                         inp=inp, workspace=workspace,
                         prev_critique="", prev_council="",
@@ -807,7 +807,7 @@ class ACWorkflow(Agent):
                 )
                 pending_critique = ""
 
-                author_k = await self.author(
+                author_k = await self._call_author_with_operator_comments(
                     **self._author_inputs(
                         inp=inp, workspace=workspace,
                         prev_critique=prev_critique_for_author,
@@ -1355,6 +1355,27 @@ class ACWorkflow(Agent):
             effective_path.write_text(effective, encoding="utf-8")
         except OSError:
             pass
+
+    async def _call_author_with_operator_comments(self, **author_inputs):
+        """Fold pending browser-harness operator comments into the Author's
+        workflow_feedback; mark them consumed only after the call succeeds
+        so a crashed round re-reads the same comments (stable cache key)."""
+        from proofstack.harness.browser_call import (
+            commit_operator_comments,
+            peek_operator_comments,
+        )
+
+        comments, mark = peek_operator_comments(self.ctx.root_workdir)
+        if comments:
+            feedback = str(author_inputs.get("workflow_feedback") or "")
+            author_inputs["workflow_feedback"] = (
+                (feedback + "\n\n" if feedback.strip() else "")
+                + "### Operator comments ###\n"
+                + comments
+            )
+        out = await self.author(**author_inputs)
+        commit_operator_comments(self.ctx.root_workdir, mark)
+        return out
 
     def _author_inputs(
         self, *, inp, workspace: Path,

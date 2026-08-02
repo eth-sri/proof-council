@@ -58,6 +58,85 @@
 
     {% if human_tasks %}
         {% for task in human_tasks %}
+            {% if task.type == 'browser_call' %}
+            {% set stem = task.response_filename | replace('.response.json', '') %}
+            {% set is_chatgpt = task.browser.service == 'chatgpt' %}
+            <div class="card human-task-card">
+                <h2>🌐 Browser call — {{ task.browser.display_model or 'browser model' }}{% if task.agent %} <span class="dim">({{ task.agent }})</span>{% endif %}</h2>
+                {% if task.response_error %}
+                    <p class="input-warning">{{ task.response_error }} Submit again to replace it.</p>
+                {% endif %}
+                <ol class="harness-steps">
+                    <li>
+                        {% if task.browser.chat_url %}<a href="{{ task.browser.chat_url }}" target="_blank" rel="noopener">Open a new chat ↗</a>{% else %}Open a new chat{% endif %}
+                        {% if task.browser.settings_hint %} — <span class="dim">{{ task.browser.settings_hint }}</span>{% endif %}
+                    </li>
+                    <li>
+                        Add the packet files to the message.
+                        {% if task.harness_copy_dir %}
+                            Easiest: drag the folder <code>{{ run.run_id }}/{{ stem }}</code> from your <code>harness_packages</code> window into the chat.
+                            <button type="button" class="harness-copy-path" data-path="{{ task.harness_copy_dir }}">Copy folder path</button>
+                        {% endif %}
+                        <span class="dim">Or fetch them here:</span>
+                        <span class="harness-file-links">
+                            {% for f in task.files %}
+                                <a href="{{ url_for('run_blob', run_id=run.run_id, ref='human_inbox/' ~ stem ~ '.packet/' ~ f.name, download=1) }}">{{ f.name }}</a>{% if not loop.last %} · {% endif %}
+                            {% endfor %}
+                            · <a href="{{ url_for('run_blob', run_id=run.run_id, ref='human_inbox/' ~ stem ~ '.packet.zip', download=1) }}">packet.zip</a>
+                            · <a class="harness-drag-chip" draggable="true"
+                                 href="{{ url_for('run_blob', run_id=run.run_id, ref='human_inbox/' ~ stem ~ '.packet.zip', download=1) }}"
+                                 data-download-url="application/zip:{{ stem }}.packet.zip:{{ url_for('run_blob', run_id=run.run_id, ref='human_inbox/' ~ stem ~ '.packet.zip', download=1, _external=True) }}"
+                                 title="Experimental: drag this chip onto your desktop (or, if your browser allows, straight into the chat)">⠿ drag zip</a>
+                        </span>
+                    </li>
+                    <li>Send the message — <code>instruction.txt</code> is the prompt (type e.g. “Follow instruction.txt.” if the site needs message text).</li>
+                    {% if is_chatgpt %}
+                        <li>When the model has <em>finished</em>: press <strong>Share</strong> at the top, copy the link, paste it below.</li>
+                    {% else %}
+                        <li>When the model has finished, copy its complete answer and paste it into the manual form below.</li>
+                    {% endif %}
+                </ol>
+                {% if is_chatgpt %}
+                <form method="post" action="{{ url_for('run_harness_fetch_share', run_id=run.run_id) }}" class="harness-share-form">
+                    <input type="hidden" name="response_filename" value="{{ task.response_filename }}">
+                    <label class="human-task-field">
+                        <span class="key">share link</span>
+                        <input type="text" name="share_url" placeholder="https://chatgpt.com/share/…" spellcheck="false" autocomplete="off">
+                    </label>
+                    <label class="human-task-field">
+                        <span class="key">operator comments <span class="dim">(optional — steering for the next round)</span></span>
+                        <textarea name="operator_comments" rows="2" spellcheck="false"></textarea>
+                    </label>
+                    <button type="submit" class="btn-primary">Fetch &amp; Continue</button>
+                </form>
+                {% endif %}
+                <details class="harness-manual" {% if not is_chatgpt %}open{% endif %}>
+                    <summary>Manual fallback — paste the answer / upload files</summary>
+                    <form method="post" enctype="multipart/form-data" action="{{ url_for('run_harness_manual', run_id=run.run_id) }}">
+                        <input type="hidden" name="response_filename" value="{{ task.response_filename }}">
+                        <label class="human-task-field">
+                            <span class="key">answer text <span class="dim">(paste the model's complete reply verbatim)</span></span>
+                            <textarea name="assistant_text" rows="12" spellcheck="false"></textarea>
+                        </label>
+                        <label class="human-task-field">
+                            <span class="key">generated files <span class="dim">(anything the model produced that you downloaded by hand)</span></span>
+                            <input type="file" name="files" multiple>
+                        </label>
+                        <label class="human-task-field">
+                            <span class="key">operator comments <span class="dim">(optional)</span></span>
+                            <textarea name="operator_comments" rows="2" spellcheck="false"></textarea>
+                        </label>
+                        <button type="submit" class="btn-primary">Submit &amp; Continue</button>
+                    </form>
+                </details>
+                {% if task.prompt %}
+                    <details>
+                        <summary>Instruction preview</summary>
+                        <pre class="human-task-prompt">{{ task.prompt }}</pre>
+                    </details>
+                {% endif %}
+            </div>
+            {% else %}
             <div class="card human-task-card">
                 <h2>⏳ Waiting for your input{% if task.agent %} — <span class="dim">{{ task.agent }}</span>{% endif %}</h2>
                 {% if task.prompt %}
@@ -84,7 +163,32 @@
                     <button type="submit" class="btn-primary">Submit</button>
                 </form>
             </div>
+            {% endif %}
         {% endfor %}
+        <script>
+            (function () {
+                document.querySelectorAll('.harness-copy-path').forEach((btn) => {
+                    btn.addEventListener('click', async () => {
+                        try {
+                            await navigator.clipboard.writeText(btn.dataset.path || '');
+                            const old = btn.textContent;
+                            btn.textContent = 'Copied!';
+                            setTimeout(() => { btn.textContent = old; }, 1500);
+                        } catch (e) { /* clipboard unavailable; path is shown anyway */ }
+                    });
+                });
+                // Experimental drag-out: Chromium's DownloadURL puts a real file on
+                // the OS when dropped on the desktop/file manager; dropping straight
+                // into another page's dropzone usually does NOT deliver a File.
+                document.querySelectorAll('.harness-drag-chip').forEach((chip) => {
+                    chip.addEventListener('dragstart', (e) => {
+                        if (chip.dataset.downloadUrl) {
+                            e.dataTransfer.setData('DownloadURL', chip.dataset.downloadUrl);
+                        }
+                    });
+                });
+            })();
+        </script>
     {% endif %}
 
     {# Poll for human-task changes so a NEW ask (e.g. the 2nd time a loop reaches
@@ -98,11 +202,16 @@
             const pollUrl = "{{ url_for('run_human_pending', run_id=run.run_id) }}";
             function userIsEntering() {
                 const active = document.activeElement;
-                if (active && active.tagName === 'TEXTAREA' && active.closest('.human-task-card')) {
+                if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')
+                        && active.closest('.human-task-card')) {
                     return true;
                 }
-                return [...document.querySelectorAll('.human-task-card textarea')]
-                    .some((t) => t.value.trim() !== '');
+                return [...document.querySelectorAll('.human-task-card textarea, .human-task-card input')]
+                    .some((t) => {
+                        if (t.type === 'hidden') return false;
+                        if (t.type === 'file') return t.files && t.files.length > 0;
+                        return (t.value || '').trim() !== '';
+                    });
             }
             function sameSet(a, b) {
                 if (a.length !== b.length) return false;

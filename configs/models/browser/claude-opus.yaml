@@ -1,0 +1,9 @@
+# No share-link fetcher for claude.ai yet: the dashboard offers the
+# manual paste/upload path only (no expected_model_slugs).
+base: models/browser/chatgpt
+service: claude
+model: claude-opus-browser
+display_model: Claude Opus (claude.ai)
+chat_url: https://claude.ai/new
+settings_hint: 'Model picker: Opus, extended thinking on.'
+expected_model_slugs: []

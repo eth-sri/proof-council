@@ -1,0 +1,43 @@
+{
+  "title": "Consultation test",
+  "default_model_slug": "gpt-5-6-sol",
+  "linear_conversation": [
+    {
+      "message": {
+        "author": {"role": "user"},
+        "content": {"parts": ["hidden bootstrap"]},
+        "metadata": {"is_visually_hidden_from_conversation": true}
+      }
+    },
+    {
+      "message": {
+        "author": {"role": "user"},
+        "content": {"parts": ["Please follow instruction.txt."]},
+        "metadata": {
+          "attachments": [{"name": "instruction.txt", "mime_type": "text/plain", "size": 1234}]
+        }
+      }
+    },
+    {
+      "message": {
+        "author": {"role": "assistant"},
+        "content": {"parts": ["Progress note: verifying the lemma numerically."]},
+        "metadata": {
+          "resolved_model_slug": "gpt-5-6-sol-pro",
+          "thinking_effort": "max"
+        }
+      }
+    },
+    {
+      "message": {
+        "author": {"role": "assistant"},
+        "content": {"parts": ["<answer>The lemma holds.</answer>\nDownload: [report](sandbox:/mnt/data/report.pdf)"]},
+        "metadata": {
+          "resolved_model_slug": "gpt-5-6-sol-pro",
+          "thinking_effort": "max",
+          "attachments": [{"name": "report.pdf", "mime_type": "application/pdf", "size": 99}]
+        }
+      }
+    }
+  ]
+}

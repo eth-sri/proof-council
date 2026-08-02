@@ -286,6 +286,25 @@ class ACCritic(APICallAgent):
             new_user = CRITIC_FRESH_USER.format(**fields)
         return [{"role": "user", "content": new_user}]
 
+    def render_harness_packet(self, inp: Inputs) -> tuple[str, dict[str, str | bytes]]:
+        attachments: dict[str, str | bytes] = {}
+        update: dict[str, str] = {}
+        for name, field in (
+            ("answer.tex", "answer_tex"),
+            ("research_notes.tex", "research_notes_tex"),
+            ("references.bib", "references_bib"),
+        ):
+            body = getattr(inp, field) or ""
+            if body.strip():
+                attachments[name] = body
+                update[field] = f"(attached as {name})"
+        harness_inp = inp.model_copy(update=update) if update else inp
+        instruction, _ = super().render_harness_packet(harness_inp)
+        return instruction, attachments
+
+    def harness_expectations(self, inp: Inputs) -> dict[str, Any]:
+        return {"markers": ["<answer_ready>"]}
+
     def parse_output(self, raw_text: str, inp: Inputs) -> Outputs:
         answer_ready, parse_failed = _parse_answer_ready(raw_text)
         review_md = _strip_answer_ready(raw_text) if not parse_failed else raw_text

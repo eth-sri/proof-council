@@ -1,0 +1,18 @@
+# Base for browser-harness "models": the call is executed by a human in
+# a browser chat and returned via share link or manual paste. api: browser
+# is the discriminator APICallAgent branches on; no API key is needed.
+api: browser
+service: chatgpt
+chat_url: https://chatgpt.com/
+instruction_addendum: |
+  You are being run through a browser chat. Your reply text is the only
+  thing returned to the caller — file downloads you offer are NOT
+  visible to it. If you create or change any file, ALSO print its full
+  contents inline as a fenced block:
+
+  ```file path=<name>
+  <full contents>
+  ```
+
+  Any files mentioned as "(attached as ...)" in the instructions are
+  uploaded to this conversation.

@@ -284,6 +284,30 @@ reasoning:
 
 The `--high` suffix is parsed by `APIClient` into `reasoning_effort`.
 
+### Browser-harness models
+
+A model config with `api: browser` (see `configs/models/browser/`) turns any
+`APICallAgent`-based node into a human-executed browser call: the run writes a
+packet (instruction.txt + attachments) into `<run>/human_inbox/` and a mirror
+under `harness_packages/<run_id>/`, surfaces a TODO card on the dashboard's run
+page, and blocks (wallclock-paused, like `HumanAgent`) until the operator
+returns a ChatGPT share link or pastes the answer manually. Cost is $0; the
+`model.call` event carries `via: browser_harness`.
+
+Config keys: `service` (chatgpt enables the share-link fetch; anything else is
+manual-paste only), `chat_url`, `display_model`, `settings_hint`,
+`expected_model_slugs` (share-link validation), `instruction_addendum`
+(appended to every instruction.txt; the default tells the model to print
+changed files inline as fenced ```file path=...``` blocks, since sandbox file
+downloads are not retrievable through share links).
+
+Always substitute browser models through the component `model:` key (or a
+model-ref input like `council_models`), never through `model_overrides` — the
+resume-cache key must reflect the transport. Presets: `browser_consult`
+(one-shot demo), `author_critic_browser` (Author/Critic/council harnessed;
+`full_critic_interval: 1` because a browser chat cannot replay a stateful API
+conversation; Author needs `USE_CONTAINER_FILES: false`).
+
 ## If / else branches
 
 Use Python expressions with `inputs.get(...)`; avoid mixing Python mode with `equals`, `min_len`, or `max_len`.

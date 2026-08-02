@@ -126,30 +126,14 @@ class HumanAgent(Agent):
         timeout_s = float(
             self.component_config.get("human_timeout_s") or self.DEFAULT_HUMAN_TIMEOUT_S
         )
-        start = time.monotonic()
-        last_heartbeat = start
-        while True:
-            if response_path.exists():
-                try:
-                    raw = json.loads(response_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    await asyncio.sleep(self.POLL_INTERVAL_S)
-                    continue
-                return raw if isinstance(raw, dict) else {"value": raw}
-            elapsed = time.monotonic() - start
-            if timeout_s > 0 and elapsed >= timeout_s:
-                return None
-            now = time.monotonic()
-            if now - last_heartbeat >= self.HEARTBEAT_INTERVAL_S:
-                last_heartbeat = now
-                await self.events.emit(
-                    "human.heartbeat",
-                    {"waited_s": elapsed, "response_path": str(response_path)},
-                )
-            await asyncio.sleep(self.POLL_INTERVAL_S)
-            # Human thinking time is not compute time: credit it back so it never
-            # eats the run's wallclock budget.
-            self.tracker.add_paused(self.POLL_INTERVAL_S)
+        return await wait_for_response_file(
+            response_path,
+            events=self.events,
+            tracker=self.tracker,
+            timeout_s=timeout_s,
+            poll_interval_s=self.POLL_INTERVAL_S,
+            heartbeat_interval_s=self.HEARTBEAT_INTERVAL_S,
+        )
 
     def _output_fields(self) -> dict[str, str]:
         schema = self.component_config.get("output_schema")
@@ -167,6 +151,42 @@ class HumanAgent(Agent):
         return {field: "" for field, typ in output_fields.items() if typ == "string"}
 
 
+async def wait_for_response_file(
+    response_path: Path,
+    *,
+    events: Any,
+    tracker: Any,
+    timeout_s: float,
+    poll_interval_s: float = 2.0,
+    heartbeat_interval_s: float = 30.0,
+) -> dict[str, Any] | None:
+    """Poll for a ``*.response.json`` dropped by a human; None on timeout."""
+    start = time.monotonic()
+    last_heartbeat = start
+    while True:
+        if response_path.exists():
+            try:
+                raw = json.loads(response_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                await asyncio.sleep(poll_interval_s)
+                continue
+            return raw if isinstance(raw, dict) else {"value": raw}
+        elapsed = time.monotonic() - start
+        if timeout_s > 0 and elapsed >= timeout_s:
+            return None
+        now = time.monotonic()
+        if now - last_heartbeat >= heartbeat_interval_s:
+            last_heartbeat = now
+            await events.emit(
+                "human.heartbeat",
+                {"waited_s": elapsed, "response_path": str(response_path)},
+            )
+        await asyncio.sleep(poll_interval_s)
+        # Human thinking time is not compute time: credit it back so it never
+        # eats the run's wallclock budget.
+        tracker.add_paused(poll_interval_s)
+
+
 def _format_template(template: str, fields: dict[str, Any]) -> str:
     def repl(match: re.Match[str]) -> str:
         key = match.group(1)
@@ -178,4 +198,4 @@ def _format_template(template: str, fields: dict[str, Any]) -> str:
     return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", repl, template)
 
 
-__all__ = ["HumanAgent"]
+__all__ = ["HumanAgent", "wait_for_response_file"]

@@ -936,6 +936,13 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                 "inputs": full.get("inputs") or {},
                 "response_filename": filename,
                 "response_error": response_error,
+                "type": full.get("type") or payload.get("type") or "human",
+                "browser": full.get("browser") or {},
+                "packet_dir": full.get("packet_dir"),
+                "packet_zip": full.get("packet_zip"),
+                "harness_copy_dir": full.get("harness_copy_dir"),
+                "files": full.get("files") or [],
+                "expected": full.get("expected") or {},
             }
         )
     return tasks

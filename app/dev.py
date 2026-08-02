@@ -722,6 +722,117 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
         return redirect(url_for("run_detail", run_id=run_id))
 
+    def _harness_task_for(run, filename: str) -> tuple[Path, dict]:
+        # Same write-back safety rules as run_human_submit, plus the task
+        # on disk must actually be a browser-harness one.
+        if "/" in filename or "\\" in filename or not filename.endswith(".response.json"):
+            abort(400, description="invalid response filename")
+        inbox = (run.path / "human_inbox").resolve()
+        target = (inbox / filename).resolve()
+        if target.parent != inbox:
+            abort(400, description="response path escapes inbox")
+        stem = filename[: -len(".response.json")]
+        try:
+            task = json.loads((inbox / f"{stem}.task.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            abort(400, description="no harness task for this response filename")
+        if not isinstance(task, dict) or task.get("type") != "browser_call":
+            abort(400, description="not a browser-harness task")
+        return target, task
+
+    @app.route("/run/<run_id>/harness/fetch-share", methods=["POST"])
+    def run_harness_fetch_share(run_id: str):
+        from proofstack.harness.chatgpt_share import (
+            ShareFetchError,
+            extract_result,
+            fetch_share,
+            validate_result,
+        )
+
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        target, task = _harness_task_for(run, filename)
+        share_url = str(request.form.get("share_url") or "").strip()
+        operator_comments = str(request.form.get("operator_comments") or "")
+        try:
+            result = extract_result(fetch_share(share_url))
+            warnings = validate_result(result, task)
+        except ShareFetchError as e:
+            return (
+                render_template(
+                    "dev_harness_confirm.html",
+                    run=run,
+                    task=task,
+                    error=str(e),
+                    warnings=[],
+                    share_url=share_url,
+                    operator_comments=operator_comments,
+                    response_filename=filename,
+                ),
+                422,
+            )
+        if warnings and request.form.get("confirmed") != "1":
+            return render_template(
+                "dev_harness_confirm.html",
+                run=run,
+                task=task,
+                error=None,
+                warnings=warnings,
+                share_url=share_url,
+                operator_comments=operator_comments,
+                response_filename=filename,
+            )
+        payload = {
+            "status": "done",
+            "transport": "share_link",
+            "assistant_text": result["assistant_text"],
+            "share_url": share_url,
+            "model_slug": result.get("model_slug"),
+            "effort": result.get("effort"),
+            "operator_comments": operator_comments,
+            "uploaded_files": None,
+        }
+        target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/harness/manual", methods=["POST"])
+    def run_harness_manual(run_id: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        target, task = _harness_task_for(run, filename)
+        assistant_text = str(request.form.get("assistant_text") or "")
+        operator_comments = str(request.form.get("operator_comments") or "")
+        uploads = [f for f in request.files.getlist("files") if f and f.filename]
+        if not assistant_text.strip() and not uploads:
+            abort(400, description="provide pasted answer text and/or uploaded files")
+        uploaded_files: dict[str, str] = {}
+        if uploads:
+            stem = filename[: -len(".response.json")]
+            updir = run.path / "human_inbox" / f"{stem}.uploads"
+            updir.mkdir(parents=True, exist_ok=True)
+            for f in uploads:
+                name = Path(f.filename).name
+                if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+                    abort(400, description=f"invalid upload filename: {f.filename!r}")
+                f.save(updir / name)
+                uploaded_files[name] = str((updir / name).relative_to(run.path))
+        payload = {
+            "status": "done",
+            "transport": "manual",
+            "assistant_text": assistant_text,
+            "share_url": None,
+            "model_slug": None,
+            "effort": None,
+            "operator_comments": operator_comments,
+            "uploaded_files": uploaded_files or None,
+        }
+        target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return redirect(url_for("run_detail", run_id=run_id))
+
     @app.route("/run/<run_id>/resume", methods=["POST"])
     def run_resume(run_id: str):
         # Relaunch a stopped/crashed run in place: same run_id, --resume-from
@@ -864,6 +975,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             path = safe_blob_path(run.path, ref)
         except ValueError as e:
             abort(400, description=str(e))
+        if request.args.get("download"):
+            return send_file(path, as_attachment=True, download_name=path.name)
         return send_file(path, mimetype="text/plain")
 
     @app.route("/run/<run_id>/output/<field>/download")

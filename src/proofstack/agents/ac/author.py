@@ -662,6 +662,34 @@ class Author(APICallAgent):
             via="inline_blocks",
         )
 
+    # ---- browser-harness packet ------------------------------------------
+
+    def render_harness_packet(self, inp: Inputs) -> tuple[str, dict[str, str | bytes]]:
+        # Pull the workspace file bodies out of the prompt and into
+        # attachments: the operator drags real files into the browser
+        # chat, and the instruction stays readable.
+        attachments: dict[str, str | bytes] = {}
+        update: dict[str, str] = {}
+        for name, field in (
+            ("answer.tex", "answer_tex"),
+            ("research_notes.tex", "research_notes_tex"),
+            ("references.bib", "references_bib"),
+        ):
+            body = getattr(inp, field) or ""
+            if body.strip():
+                attachments[name] = body
+                update[field] = f"(attached as {name})"
+        if inp.compute_zip_path is not None:
+            zip_path = Path(inp.compute_zip_path)
+            if zip_path.exists():
+                attachments["compute_workspace.zip"] = zip_path.read_bytes()
+        harness_inp = inp.model_copy(update=update) if update else inp
+        instruction, _ = super().render_harness_packet(harness_inp)
+        return instruction, attachments
+
+    def harness_expectations(self, inp: Inputs) -> dict[str, Any]:
+        return {"fenced_files": list(CANONICAL_FILES)}
+
     # ---- container-files run path ---------------------------------------
 
     async def run(self, inp: Inputs) -> Outputs:  # type: ignore[override]

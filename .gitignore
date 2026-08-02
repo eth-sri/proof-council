@@ -33,3 +33,6 @@ lead-researcher/local/
 # Root-level secrets file (smoke/secrets.env is ignored above; the root
 # variant used by CLI_LEAD_RESEARCHER.md must not be tracked either)
 secrets.env
+# Browser-harness packet mirror: open TODOs for the human operator
+# (canonical copies live under outputs/<run>/human_inbox/)
+harness_packages/
