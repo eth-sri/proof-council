@@ -166,33 +166,36 @@ async def wait_for_response_file(
     """Poll for a ``*.response.json`` dropped by a human; None on timeout."""
     start = time.monotonic()
     last_heartbeat = start
-    while True:
-        if response_path.exists():
-            try:
-                raw = json.loads(response_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                # Partial write or broken JSON: keep waiting, but fall
-                # through so a permanently malformed file still hits the
-                # heartbeat, pause credit, and timeout below.
-                raw = _NOT_READY
-            if raw is not _NOT_READY:
-                return raw if isinstance(raw, dict) else {"value": raw}
-        elapsed = time.monotonic() - start
-        if timeout_s > 0 and elapsed >= timeout_s:
-            return None
-        now = time.monotonic()
-        if now - last_heartbeat >= heartbeat_interval_s:
-            last_heartbeat = now
-            await events.emit(
-                "human.heartbeat",
-                {"waited_s": elapsed, "response_path": str(response_path)},
-            )
-        # Human thinking time is not compute time: credit the slept interval
-        # back so it never eats the run's wallclock budget. Interval-based so
-        # parallel waiters don't multiply the credit at shared scopes.
-        sleep_start = time.monotonic()
-        await asyncio.sleep(poll_interval_s)
-        tracker.add_paused_interval(sleep_start, time.monotonic())
+    # Human thinking time is not compute time: the whole wait span is
+    # marked paused so it never eats the run's wallclock budget.
+    # Reference-counted begin/end keeps parallel waiters at the union of
+    # their spans with O(1) tracker state.
+    tracker.begin_pause()
+    try:
+        while True:
+            if response_path.exists():
+                try:
+                    raw = json.loads(response_path.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    # Partial write or broken JSON: keep waiting, but fall
+                    # through so a permanently malformed file still hits the
+                    # heartbeat and timeout below.
+                    raw = _NOT_READY
+                if raw is not _NOT_READY:
+                    return raw if isinstance(raw, dict) else {"value": raw}
+            elapsed = time.monotonic() - start
+            if timeout_s > 0 and elapsed >= timeout_s:
+                return None
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_interval_s:
+                last_heartbeat = now
+                await events.emit(
+                    "human.heartbeat",
+                    {"waited_s": elapsed, "response_path": str(response_path)},
+                )
+            await asyncio.sleep(poll_interval_s)
+    finally:
+        tracker.end_pause()
 
 
 def _format_template(template: str, fields: dict[str, Any]) -> str:

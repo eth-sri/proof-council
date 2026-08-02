@@ -12,7 +12,6 @@ is no preemption.
 from __future__ import annotations
 
 import asyncio
-import bisect
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -76,19 +75,22 @@ class _Counters:
     tokens: int = 0
     tool_calls: int = 0
     paused_s: float = 0.0
-    # Disjoint, sorted (start, end) monotonic intervals already credited as
-    # paused, so overlapping waits from parallel human-in-the-loop nodes
-    # count exactly once regardless of arrival order. Contiguous credits
-    # merge, so the list stays as small as the number of distinct wait
-    # episodes.
-    paused_intervals: list[tuple[float, float]] = field(default_factory=list)
+    # Reference count of waiters currently pausing this scope, plus when the
+    # count last went 0 -> 1. The union of overlapping waits is computed in
+    # O(1) state: while any waiter is active the whole span counts once.
+    active_pauses: int = 0
+    pause_started_at: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
-    def wallclock_s(self) -> float:
-        # Time spent waiting on a human (paused_s) does not count as compute
-        # wallclock, so a node that waits hours/days for input never trips the
-        # run's wallclock budget.
-        return max(0.0, time.monotonic() - self.started_at - self.paused_s)
+    def wallclock_s(self, now: float | None = None) -> float:
+        # Time spent waiting on a human (paused_s, plus any pause still in
+        # progress) does not count as compute wallclock, so a node that waits
+        # hours/days for input never trips the run's wallclock budget.
+        now = time.monotonic() if now is None else now
+        paused = self.paused_s
+        if self.active_pauses > 0:
+            paused += max(0.0, now - self.pause_started_at)
+        return max(0.0, now - self.started_at - paused)
 
 
 @dataclass
@@ -116,24 +118,32 @@ class BudgetTracker:
         if self.parent is not None:
             self.parent.add_tool_call(n)
 
-    def add_paused_interval(self, start: float, end: float) -> None:
-        """Exclude the monotonic interval ``[start, end]`` from wallclock at
-        this scope and all parents.
+    def begin_pause(self, now: float | None = None) -> None:
+        """Mark a human wait as active at this scope and all parents.
 
-        Used by human-in-the-loop nodes so time spent waiting for a person is
-        not charged against the run's compute wallclock budget. Each node
-        maintains a true merged interval set, so N parallel waiters credit
-        exactly the *union* of their wait intervals at shared ancestors —
-        never N times the wall time — regardless of poll cadence or arrival
-        order. Compute that runs concurrently with a human wait is
-        deliberately not re-charged: the interval counts as paused.
-        """
-        if end > start:
-            self.counters.paused_s += _merge_interval(
-                self.counters.paused_intervals, start, end
-            )
+        Paired with ``end_pause`` (call in ``finally``). Reference counting
+        makes N overlapping waiters credit exactly the *union* of their wait
+        spans at shared ancestors — never N times the wall time — in O(1)
+        state. Compute that runs concurrently with a human wait is
+        deliberately not re-charged: the span counts as paused. ``now`` is
+        injectable for tests."""
+        now = time.monotonic() if now is None else now
+        if self.counters.active_pauses == 0:
+            self.counters.pause_started_at = now
+        self.counters.active_pauses += 1
         if self.parent is not None:
-            self.parent.add_paused_interval(start, end)
+            self.parent.begin_pause(now)
+
+    def end_pause(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        if self.counters.active_pauses > 0:
+            self.counters.active_pauses -= 1
+            if self.counters.active_pauses == 0:
+                self.counters.paused_s += max(
+                    0.0, now - self.counters.pause_started_at
+                )
+        if self.parent is not None:
+            self.parent.end_pause(now)
 
     def chain(self) -> Iterable["BudgetTracker"]:
         node: BudgetTracker | None = self
@@ -178,27 +188,6 @@ class BudgetTracker:
         if not remaining:
             return None
         return max(0.0, min(remaining))
-
-
-def _merge_interval(
-    intervals: list[tuple[float, float]], start: float, end: float
-) -> float:
-    """Insert ``[start, end]`` into a sorted disjoint interval list in place;
-    return the measure of newly covered time (0 if fully overlapped)."""
-    i = bisect.bisect_left(intervals, (start,))
-    if i > 0 and intervals[i - 1][1] >= start:
-        i -= 1
-    new_start, new_end = start, end
-    added = end - start
-    j = i
-    while j < len(intervals) and intervals[j][0] <= end:
-        s, e = intervals[j]
-        added -= max(0.0, min(end, e) - max(start, s))
-        new_start = min(new_start, s)
-        new_end = max(new_end, e)
-        j += 1
-    intervals[i:j] = [(new_start, new_end)]
-    return max(0.0, added)
 
 
 class BudgetRegistry:

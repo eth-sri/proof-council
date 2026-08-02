@@ -283,15 +283,16 @@ def extract_result(data: dict[str, Any]) -> dict[str, Any]:
         m["text"] for m in answer_msgs if m["text"].strip()
     )
 
-    # Slug and effort must come from the SAME message — filling them
-    # independently could pair one turn's model with another's effort.
+    # Slug and effort must come from the SAME, NEWEST message — walking
+    # back to an older turn could verify the final answer with a progress
+    # turn's metadata. A metadata-less final answer keeps slug None, which
+    # triggers the cannot-verify warning downstream.
     model_slug = None
     effort = None
-    for m in reversed(answer_msgs or [m for m in msgs if m["role"] == "assistant"]):
-        if m["model"]:
-            model_slug = m["model"]
-            effort = m["effort"]
-            break
+    source_msgs = answer_msgs or [m for m in msgs if m["role"] == "assistant"]
+    if source_msgs:
+        model_slug = source_msgs[-1]["model"]
+        effort = source_msgs[-1]["effort"]
 
     # Only the answer turns (after the operator's final message) can carry
     # model-generated files worth downloading; earlier turns and citation
@@ -400,8 +401,12 @@ def _reference_sources(msgs: list[dict[str, Any]]) -> list[str]:
 _TOKEN_MARKER_RE = re.compile(r"\[ProofCouncil task ([A-Za-z0-9._-]+)\]")
 _INSTRUCTION_FILE_TOKEN_RE = re.compile(r"^instruction_([A-Za-z0-9._-]+)\.txt$")
 # Typed references ("Follow instruction_<token>.txt.") and the packet zip
-# itself also bind the message to a task.
-_INSTRUCTION_MENTION_RE = re.compile(r"instruction_([A-Za-z0-9._-]+?)\.txt")
+# itself also bind the message to a task. Greedy with a boundary lookahead
+# so a token whose agent-name part contains ".txt" is not truncated; a
+# trailing sentence period is still allowed.
+_INSTRUCTION_MENTION_RE = re.compile(
+    r"instruction_([A-Za-z0-9._-]+)\.txt(?![A-Za-z0-9_-])"
+)
 _PACKET_ZIP_TOKEN_RE = re.compile(r"^([A-Za-z0-9._-]+)\.packet\.zip$")
 
 

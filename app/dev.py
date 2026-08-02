@@ -796,7 +796,11 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
 
     # Serializes the mutating tail (verify -> stage -> publish) of every
     # submission endpoint per task, so concurrent requests cannot interleave
-    # hash checks, upload writes, and publication.
+    # hash checks, upload writes, and publication. Process-local: the
+    # dashboard is a single-process localhost dev server. Running two
+    # dashboard instances against the same run directory keeps the
+    # absent-target publication safe (hard-link no-clobber) but not the
+    # broken/aged-file repair branches.
     _task_locks: dict[str, threading.Lock] = {}
     _task_locks_guard = threading.Lock()
 
@@ -853,8 +857,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         target.parent.mkdir(parents=True, exist_ok=True)
         payload_text = json.dumps(payload, ensure_ascii=False)
         tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(payload_text, encoding="utf-8")
         try:
+            tmp.write_text(payload_text, encoding="utf-8")
             try:
                 os.link(tmp, target)
                 return
@@ -900,7 +904,10 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             )
         finally:
             if tmp is not None:
-                tmp.unlink(missing_ok=True)
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     _UPLOAD_MAX_FILES = 20
     _UPLOAD_MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -1105,6 +1112,13 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
 
     _STAGING_MAX_AGE_S = 24 * 3600
 
+    def _remove_upload_dirs(run, uploaded_files: dict[str, str]) -> None:
+        inbox = run.path / "human_inbox"
+        for rel in uploaded_files.values():
+            parts = Path(str(rel)).parts
+            if len(parts) > 1 and parts[0] == "human_inbox":
+                shutil.rmtree(inbox / parts[1], ignore_errors=True)
+
     def _prune_stale_staging(run, stem: str) -> None:
         # Conservative: never delete young directories (a concurrent
         # fetch/confirm may hold one) nor any directory the published
@@ -1163,118 +1177,145 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         from proofstack.harness.chatgpt_share import latest_task_tokens
 
         stem = filename[: -len(".response.json")]
-        _prune_stale_staging(run, stem)
         nonce = uuid.uuid4().hex[:12]
         staging_dir = run.path / "human_inbox" / f"{stem}.staged-{nonce}"
+        # Ownership: this request's staging directory is deleted on every
+        # exit path unless the staged manifest or the published response
+        # took ownership of it inside the locked commit section.
+        claimed = False
         try:
-            result = extract_result(fetch_share(share_url))
-            token = str(task.get("task_token") or "")
-            tokens = latest_task_tokens(result)
-            # Binding must be an unambiguous singleton: a message naming
-            # several tasks must not satisfy any of their cards.
-            token_ok = not token or tokens == {token}
-            if token_ok:
-                auto_uploads, downloaded, download_failures = (
-                    _auto_download_generated_files(run, staging_dir, share_url, result)
+            try:
+                result = extract_result(fetch_share(share_url))
+                token = str(task.get("task_token") or "")
+                tokens = latest_task_tokens(result)
+                # Binding must be an unambiguous singleton: a message naming
+                # several tasks must not satisfy any of their cards.
+                token_ok = not token or tokens == {token}
+                if token_ok:
+                    auto_uploads, downloaded, download_failures = (
+                        _auto_download_generated_files(
+                            run, staging_dir, share_url, result
+                        )
+                    )
+                else:
+                    # The share names a different task: don't spend downloads
+                    # on it — the transfer path re-fetches for the right card.
+                    auto_uploads, downloaded, download_failures = {}, [], []
+                warnings = (
+                    validate_result(result, task, provided_files=set(auto_uploads))
+                    + download_failures
+                )
+            except ShareFetchError as e:
+                fetch_error = str(e)
+            except Exception as e:
+                # Endpoint/schema drift must degrade to the manual fallback
+                # page, never to a bare 500.
+                fetch_error = (
+                    f"unexpected error extracting the share ({type(e).__name__}: {e}) "
+                    "— the endpoint may have changed; use the manual paste fallback"
                 )
             else:
-                # The share names a different task: don't spend downloads on
-                # it — the transfer path re-fetches for the right card.
-                auto_uploads, downloaded, download_failures = {}, [], []
-            warnings = (
-                validate_result(result, task, provided_files=set(auto_uploads))
-                + download_failures
+                fetch_error = None
+            if fetch_error is not None:
+                return (
+                    render_template(
+                        "dev_harness_confirm.html",
+                        run=run,
+                        task=task,
+                        error=fetch_error,
+                        warnings=[],
+                        share_url=share_url,
+                        operator_comments=operator_comments,
+                        response_filename=filename,
+                        digest=None,
+                    ),
+                    422,
+                )
+            reuse = _share_reuse_warning(run, filename, share_url)
+            if reuse:
+                warnings.append(reuse)
+            transfer = (
+                None
+                if token_ok or len(tokens) != 1
+                else _transfer_candidate(run, filename, tokens)
             )
-        except ShareFetchError as e:
-            fetch_error = str(e)
-        except Exception as e:
-            # Endpoint/schema drift must degrade to the manual fallback
-            # page, never to a bare 500.
-            fetch_error = (
-                f"unexpected error extracting the share ({type(e).__name__}: {e}) "
-                "— the endpoint may have changed; use the manual paste fallback"
-            )
-        else:
-            fetch_error = None
-        if fetch_error is not None:
-            return (
-                render_template(
+            # Stage the extracted answer so that confirming applies exactly
+            # this version — never a re-fetch that may silently differ. File
+            # hashes bind the digest to the staged bytes, not just metadata.
+            staged = {
+                "share_url": share_url,
+                "assistant_text": result["assistant_text"],
+                "model_slug": result.get("model_slug"),
+                "effort": result.get("effort"),
+                "sandbox_artifacts": [
+                    str(a) for a in result.get("sandbox_artifacts") or []
+                ],
+                "uploaded_files": auto_uploads,
+                "stored_files": [d for d in downloaded if not d["merged"]],
+                "file_hashes": {d["path"]: d["sha256"] for d in downloaded},
+            }
+            digest = hashlib.sha256(
+                json.dumps(staged, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
+            with _locked_task(run_id, filename):
+                # Commit section: recheck, install the manifest, prune, and
+                # (on the warning-free path) publish — all serialized so a
+                # concurrent fetch can never prune files this manifest or
+                # response references.
+                _refuse_duplicate_response(target)
+                staged_path.write_text(
+                    json.dumps(
+                        {**staged, "digest": digest}, ensure_ascii=False, indent=2
+                    ),
+                    encoding="utf-8",
+                )
+                claimed = True
+                _prune_stale_staging(run, stem)
+                if not warnings:
+                    _write_response_atomic(
+                        target,
+                        {
+                            "status": "done",
+                            "transport": "share_link",
+                            "assistant_text": result["assistant_text"],
+                            "share_url": share_url,
+                            "model_slug": result.get("model_slug"),
+                            "effort": result.get("effort"),
+                            "operator_comments": operator_comments,
+                            "uploaded_files": auto_uploads or None,
+                            "stored_files": staged["stored_files"] or None,
+                        },
+                    )
+                    staged_path.unlink(missing_ok=True)
+            if warnings:
+                return render_template(
                     "dev_harness_confirm.html",
                     run=run,
                     task=task,
-                    error=fetch_error,
-                    warnings=[],
+                    error=None,
+                    warnings=warnings,
                     share_url=share_url,
                     operator_comments=operator_comments,
                     response_filename=filename,
-                    digest=None,
-                ),
-                422,
-            )
-        reuse = _share_reuse_warning(run, filename, share_url)
-        if reuse:
-            warnings.append(reuse)
-        transfer = None if token_ok else _transfer_candidate(run, filename, tokens)
-        # Stage the extracted answer so that confirming applies exactly this
-        # version — never a re-fetch that may silently differ. File hashes
-        # bind the digest to the staged bytes, not just the metadata.
-        staged = {
-            "share_url": share_url,
-            "assistant_text": result["assistant_text"],
-            "model_slug": result.get("model_slug"),
-            "effort": result.get("effort"),
-            "sandbox_artifacts": [str(a) for a in result.get("sandbox_artifacts") or []],
-            "uploaded_files": auto_uploads,
-            "stored_files": [d for d in downloaded if not d["merged"]],
-            "file_hashes": {d["path"]: d["sha256"] for d in downloaded},
-        }
-        digest = hashlib.sha256(
-            json.dumps(staged, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
-        staged_path.write_text(
-            json.dumps({**staged, "digest": digest}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        if warnings:
-            return render_template(
-                "dev_harness_confirm.html",
-                run=run,
-                task=task,
-                error=None,
-                warnings=warnings,
-                share_url=share_url,
-                operator_comments=operator_comments,
-                response_filename=filename,
-                digest=digest,
-                answer_preview=result["assistant_text"][:2000],
-                downloaded=downloaded,
-                transfer=transfer,
-            )
-        with _locked_task(run_id, filename):
-            _write_response_atomic(
-                target,
-                {
-                    "status": "done",
-                    "transport": "share_link",
-                    "assistant_text": result["assistant_text"],
-                    "share_url": share_url,
-                    "model_slug": result.get("model_slug"),
-                    "effort": result.get("effort"),
-                    "operator_comments": operator_comments,
-                    "uploaded_files": auto_uploads or None,
-                    "stored_files": staged["stored_files"] or None,
-                },
-            )
-            staged_path.unlink(missing_ok=True)
-        if staged["stored_files"]:
-            # Surface non-merged (binary) downloads even on the
-            # warning-free path — the operator would otherwise never
-            # learn they exist.
-            return redirect(
-                url_for("run_detail", run_id=run_id, stored=len(staged["stored_files"]))
-            )
-        return redirect(url_for("run_detail", run_id=run_id))
+                    digest=digest,
+                    answer_preview=result["assistant_text"][:2000],
+                    downloaded=downloaded,
+                    transfer=transfer,
+                )
+            if staged["stored_files"]:
+                # Surface non-merged (binary) downloads even on the
+                # warning-free path — the operator would otherwise never
+                # learn they exist.
+                return redirect(
+                    url_for(
+                        "run_detail", run_id=run_id, stored=len(staged["stored_files"])
+                    )
+                )
+            return redirect(url_for("run_detail", run_id=run_id))
+        finally:
+            if not claimed:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
     @app.route("/run/<run_id>/harness/confirm", methods=["POST"])
     def run_harness_confirm(run_id: str):
@@ -1289,26 +1330,28 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         _refuse_duplicate_response(target)
         stem = filename[: -len(".response.json")]
         staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
-        try:
-            staged = json.loads(staged_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            abort(
-                409,
-                description="no staged fetch result for this task — fetch the share link again",
-            )
-        digest = str(request.form.get("digest") or "")
-        if not digest or staged.get("digest") != digest:
-            abort(
-                409,
-                description=(
-                    "the staged fetch result changed since this page was rendered "
-                    "— fetch the share link again"
-                ),
-            )
         with _locked_task(run_id, filename):
-            # The digest binds the metadata; verify the staged bytes too —
-            # under the task lock, so nothing can swap them between the
-            # check and publication.
+            # The entire read-verify-publish sequence runs under the task
+            # lock: the manifest read, the digest check, the byte
+            # verification, and publication cannot interleave with a
+            # concurrent fetch's manifest replacement or pruning.
+            _refuse_duplicate_response(target)
+            try:
+                staged = json.loads(staged_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                abort(
+                    409,
+                    description="no staged fetch result for this task — fetch the share link again",
+                )
+            digest = str(request.form.get("digest") or "")
+            if not digest or staged.get("digest") != digest:
+                abort(
+                    409,
+                    description=(
+                        "the staged fetch result changed since this page was rendered "
+                        "— fetch the share link again"
+                    ),
+                )
             for rel, expected_hash in (staged.get("file_hashes") or {}).items():
                 try:
                     p = (run.path / rel).resolve()
@@ -1328,21 +1371,26 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             # Auto-downloaded share files first; a manual upload of the same
             # name deliberately overrides it.
             uploaded_files = dict(staged.get("uploaded_files") or {})
-            uploaded_files.update(_save_harness_uploads(run, stem, uploads))
-            _write_response_atomic(
-                target,
-                {
-                    "status": "done",
-                    "transport": "share_link",
-                    "assistant_text": str(staged.get("assistant_text") or ""),
-                    "share_url": staged.get("share_url"),
-                    "model_slug": staged.get("model_slug"),
-                    "effort": staged.get("effort"),
-                    "operator_comments": str(request.form.get("operator_comments") or ""),
-                    "uploaded_files": uploaded_files or None,
-                    "stored_files": staged.get("stored_files") or None,
-                },
-            )
+            manual_files = _save_harness_uploads(run, stem, uploads)
+            uploaded_files.update(manual_files)
+            try:
+                _write_response_atomic(
+                    target,
+                    {
+                        "status": "done",
+                        "transport": "share_link",
+                        "assistant_text": str(staged.get("assistant_text") or ""),
+                        "share_url": staged.get("share_url"),
+                        "model_slug": staged.get("model_slug"),
+                        "effort": staged.get("effort"),
+                        "operator_comments": str(request.form.get("operator_comments") or ""),
+                        "uploaded_files": uploaded_files or None,
+                        "stored_files": staged.get("stored_files") or None,
+                    },
+                )
+            except BaseException:
+                _remove_upload_dirs(run, manual_files)
+                raise
             staged_path.unlink(missing_ok=True)
         return redirect(url_for("run_detail", run_id=run_id))
 
@@ -1361,20 +1409,27 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description="provide pasted answer text and/or uploaded files")
         stem = filename[: -len(".response.json")]
         with _locked_task(run_id, filename):
+            # Recheck under the lock BEFORE writing any bytes, so a losing
+            # concurrent submission leaves no orphaned upload directory.
+            _refuse_duplicate_response(target)
             uploaded_files = _save_harness_uploads(run, stem, uploads)
-            _write_response_atomic(
-                target,
-                {
-                    "status": "done",
-                    "transport": "manual",
-                    "assistant_text": assistant_text,
-                    "share_url": None,
-                    "model_slug": None,
-                    "effort": None,
-                    "operator_comments": operator_comments,
-                    "uploaded_files": uploaded_files or None,
-                },
-            )
+            try:
+                _write_response_atomic(
+                    target,
+                    {
+                        "status": "done",
+                        "transport": "manual",
+                        "assistant_text": assistant_text,
+                        "share_url": None,
+                        "model_slug": None,
+                        "effort": None,
+                        "operator_comments": operator_comments,
+                        "uploaded_files": uploaded_files or None,
+                    },
+                )
+            except BaseException:
+                _remove_upload_dirs(run, uploaded_files)
+                raise
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/resume", methods=["POST"])

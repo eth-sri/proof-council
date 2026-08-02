@@ -291,41 +291,62 @@ class PauseAccountingTests(unittest.TestCase):
         root = BudgetTracker(scope="run")
         child1 = BudgetTracker(scope="a", parent=root)
         child2 = BudgetTracker(scope="b", parent=root)
-        child1.add_paused_interval(100.0, 110.0)
-        child2.add_paused_interval(105.0, 115.0)
+        child1.begin_pause(now=100.0)
+        child2.begin_pause(now=105.0)
+        child1.end_pause(now=110.0)
+        child2.end_pause(now=115.0)
         self.assertAlmostEqual(child1.counters.paused_s, 10.0)
         self.assertAlmostEqual(child2.counters.paused_s, 10.0)
         # Root sees the union [100, 115], not 20 summed seconds.
         self.assertAlmostEqual(root.counters.paused_s, 15.0)
 
-    def test_disjoint_intervals_sum(self) -> None:
+    def test_disjoint_wait_episodes_sum(self) -> None:
         from proofstack.budget import BudgetTracker
 
         root = BudgetTracker(scope="run")
-        root.add_paused_interval(10.0, 20.0)
-        root.add_paused_interval(30.0, 35.0)
+        root.begin_pause(now=10.0)
+        root.end_pause(now=20.0)
+        root.begin_pause(now=30.0)
+        root.end_pause(now=35.0)
         self.assertAlmostEqual(root.counters.paused_s, 15.0)
 
-    def test_containing_interval_after_contained_counts_full_union(self) -> None:
-        # The codex counterexample: [105,110] then [100,120] arrives in
-        # nondecreasing end order but a high-water-mark scheme records 15;
-        # the true union is 20.
+    def test_nested_wait_fully_contained_counts_once(self) -> None:
+        # Analog of the earlier high-water counterexample: a long wait
+        # containing a shorter one counts the full outer span exactly once.
         from proofstack.budget import BudgetTracker
 
         root = BudgetTracker(scope="run")
-        root.add_paused_interval(105.0, 110.0)
-        root.add_paused_interval(100.0, 120.0)
+        root.begin_pause(now=100.0)  # long waiter
+        root.begin_pause(now=105.0)  # short waiter, contained
+        root.end_pause(now=110.0)
+        root.end_pause(now=120.0)
         self.assertAlmostEqual(root.counters.paused_s, 20.0)
 
-    def test_interval_merging_bridges_gaps(self) -> None:
+    def test_state_is_constant_size(self) -> None:
+        # Reference counting keeps O(1) state per node: no per-poll history.
         from proofstack.budget import BudgetTracker
 
         root = BudgetTracker(scope="run")
-        root.add_paused_interval(10.0, 20.0)
-        root.add_paused_interval(30.0, 40.0)
-        root.add_paused_interval(15.0, 35.0)  # bridges both
-        self.assertAlmostEqual(root.counters.paused_s, 30.0)
-        self.assertEqual(root.counters.paused_intervals, [(10.0, 40.0)])
+        for i in range(10_000):
+            root.begin_pause(now=float(i))
+            root.end_pause(now=float(i) + 0.5)
+        self.assertAlmostEqual(root.counters.paused_s, 5000.0)
+        self.assertEqual(root.counters.active_pauses, 0)
+
+    def test_ongoing_pause_excluded_from_wallclock(self) -> None:
+        from proofstack.budget import BudgetTracker
+
+        root = BudgetTracker(scope="run")
+        start = root.counters.started_at
+        root.begin_pause(now=start + 5.0)
+        # 100s in, with a pause running since t=5: only 5s count as compute.
+        self.assertAlmostEqual(
+            root.counters.wallclock_s(now=start + 100.0), 5.0
+        )
+        root.end_pause(now=start + 100.0)
+        self.assertAlmostEqual(
+            root.counters.wallclock_s(now=start + 100.0), 5.0
+        )
 
 
 class TaskStemScopingTests(unittest.TestCase):
@@ -395,7 +416,10 @@ class MalformedResponseTimeoutTests(unittest.TestCase):
         # A broken response file must fall through to the timeout/pause
         # path, not spin forever on the fast retry branch.
         class TrackerStub:
-            def add_paused_interval(self, s: float, e: float) -> None:
+            def begin_pause(self) -> None:
+                pass
+
+            def end_pause(self) -> None:
                 pass
 
         class EventsStub:

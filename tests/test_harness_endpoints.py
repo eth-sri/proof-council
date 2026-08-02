@@ -324,6 +324,94 @@ class HarnessEndpointTests(unittest.TestCase):
             (self.run_dir / "human_inbox" / self.response_filename).exists()
         )
 
+    def test_losing_submission_leaves_no_upload_directory(self) -> None:
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={
+                "response_filename": self.response_filename,
+                "assistant_text": "winner",
+                "files": (io.BytesIO(b"WINNER BYTES"), "answer.tex"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 302)
+        resp2 = self.client.post(
+            "/run/run1/harness/manual",
+            data={
+                "response_filename": self.response_filename,
+                "assistant_text": "loser",
+                "files": (io.BytesIO(b"LOSER BYTES"), "answer.tex"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp2.status_code, 409)
+        dirs = list((self.run_dir / "human_inbox").glob(f"{self.stem}.uploads-*"))
+        self.assertEqual(len(dirs), 1)
+        self.assertEqual((dirs[0] / "answer.tex").read_bytes(), b"WINNER BYTES")
+
+    def test_failed_fetch_leaves_no_staging_directory(self) -> None:
+        from proofstack.harness.chatgpt_share import ShareFetchError
+
+        p1, p2 = self._mock_download(b"DOWNLOADED")
+        # Downloads succeed, but validation then hard-fails (empty answer).
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ), p1, p2, mock.patch(
+            "proofstack.harness.chatgpt_share.validate_result",
+            side_effect=ShareFetchError("no answer"),
+        ):
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(
+            list((self.run_dir / "human_inbox").glob(f"{self.stem}.staged-*")), []
+        )
+
+    def test_ambiguous_share_offers_no_transfer(self) -> None:
+        inbox = self.run_dir / "human_inbox"
+        task_path = inbox / f"{self.stem}.task.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["task_token"] = "tokA"
+        task["instruction_file"] = "instruction_tokA.txt"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        other = {
+            "agent": "critic",
+            "run_id": "run1",
+            "type": "browser_call",
+            "task_token": "tokB",
+            "instruction_file": "instruction_tokB.txt",
+            "response_path": str(inbox / "critic__b.response.json"),
+            "browser": {"display_model": "Fake B"},
+            "expected": {},
+        }
+        (inbox / "critic__b.task.json").write_text(json.dumps(other), encoding="utf-8")
+
+        fixture = _clean_fixture()
+        for node in fixture["linear_conversation"]:
+            msg = node.get("message") or {}
+            meta = msg.get("metadata") or {}
+            if (msg.get("author") or {}).get("role") == "user" and not meta.get(
+                "is_visually_hidden_from_conversation"
+            ):
+                msg["content"]["parts"] = [
+                    "[ProofCouncil task tokB]\n[ProofCouncil task tokC]\ndo it"
+                ]
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=fixture,
+        ):
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 200)
+        html = resp.get_data(as_text=True)
+        self.assertIn("ambiguous", html)
+        self.assertNotIn("belong to a different task", html)
+
     def test_broken_response_may_be_replaced(self) -> None:
         target = self.run_dir / "human_inbox" / self.response_filename
         target.write_text("{not json", encoding="utf-8")

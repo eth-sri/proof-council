@@ -49,6 +49,25 @@ class ExtractResultTests(unittest.TestCase):
         self.assertEqual(result["effort"], "max")
         self.assertEqual(result["default_model_slug"], "gpt-5-6-sol")
 
+    def test_metadata_less_final_answer_is_not_verified_by_older_turn(self) -> None:
+        # The newest answer message lacks model metadata: verification must
+        # warn rather than borrow an earlier progress turn's slug.
+        data = {
+            "linear_conversation": [
+                _node("u1", None, "user", "question"),
+                _node(
+                    "a1", "u1", "assistant", "progress",
+                    {"resolved_model_slug": "gpt-5-6-sol-pro", "thinking_effort": "max"},
+                ),
+                _node("a2", "a1", "assistant", "final answer"),
+            ]
+        }
+        result = extract_result(data)
+        self.assertIsNone(result["model_slug"])
+        task = {"browser": {"expected_model_slugs": ["gpt-5-6-sol-pro"]}}
+        warnings = validate_result(result, task)
+        self.assertTrue(any("no model slug" in w for w in warnings))
+
     def test_generated_files_are_structured_with_message_ids(self) -> None:
         result = extract_result(FIXTURE)
         self.assertEqual(
@@ -353,7 +372,8 @@ class ValidateResultTests(unittest.TestCase):
 
     def test_task_token_via_typed_instruction_mention(self) -> None:
         # The UI suggests typing "Follow instruction_<token>.txt." — that
-        # must bind the task even without any file upload.
+        # must bind the task even without any file upload (trailing
+        # sentence period included).
         data = {
             "linear_conversation": [
                 _node("u1", None, "user", "Follow instruction_tokZ.txt."),
@@ -362,6 +382,16 @@ class ValidateResultTests(unittest.TestCase):
         }
         result = extract_result(data)
         self.assertEqual(latest_task_tokens(result), {"tokZ"})
+
+    def test_typed_mention_with_dotted_agent_name_not_truncated(self) -> None:
+        data = {
+            "linear_conversation": [
+                _node("u1", None, "user", "Follow instruction_foo.txt__abc123.txt"),
+                _node("a1", "u1", "assistant", "done"),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(latest_task_tokens(result), {"foo.txt__abc123"})
 
     def test_task_token_via_packet_zip_upload(self) -> None:
         data = {
