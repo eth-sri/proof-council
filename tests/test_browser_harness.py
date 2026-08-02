@@ -23,6 +23,7 @@ from proofstack.context import RunContext  # noqa: E402
 from proofstack.harness.browser_call import (  # noqa: E402
     commit_operator_comments,
     peek_operator_comments,
+    task_stem,
 )
 from proofstack.kinds.api_call import (  # noqa: E402
     APICallAgent,
@@ -156,7 +157,7 @@ class BrowserCallEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
             ctx = _ctx(tmp, hdir)
             agent = EchoAgent(ctx, name="echo")
-            stem = f"echo__{agent._cache_key(EchoAgent.Inputs(problem='P'))[:12]}"
+            stem = task_stem(ctx.run_id, "echo", agent._cache_key(EchoAgent.Inputs(problem='P')))
             inbox = ctx.root_workdir / "human_inbox"
             inbox.mkdir(parents=True, exist_ok=True)
             (inbox / f"{stem}.response.json").write_text(
@@ -212,7 +213,7 @@ class BrowserCallEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
             ctx = _ctx(tmp, hdir)
             agent = EchoAgent(ctx, name="echo")
-            stem = f"echo__{agent._cache_key(EchoAgent.Inputs(problem='P'))[:12]}"
+            stem = task_stem(ctx.run_id, "echo", agent._cache_key(EchoAgent.Inputs(problem='P')))
             inbox = ctx.root_workdir / "human_inbox"
             inbox.mkdir(parents=True, exist_ok=True)
             (inbox / f"{stem}.response.json").write_text(
@@ -230,7 +231,7 @@ class BrowserCallEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
             ctx = _ctx(tmp, hdir)
             agent = EchoAgent(ctx, name="echo")
-            stem = f"echo__{agent._cache_key(EchoAgent.Inputs(problem='P'))[:12]}"
+            stem = task_stem(ctx.run_id, "echo", agent._cache_key(EchoAgent.Inputs(problem='P')))
             inbox = ctx.root_workdir / "human_inbox"
             uploads = inbox / f"{stem}.uploads"
             uploads.mkdir(parents=True, exist_ok=True)
@@ -305,6 +306,42 @@ class PauseAccountingTests(unittest.TestCase):
         root.add_paused_interval(30.0, 35.0)
         self.assertAlmostEqual(root.counters.paused_s, 15.0)
 
+    def test_containing_interval_after_contained_counts_full_union(self) -> None:
+        # The codex counterexample: [105,110] then [100,120] arrives in
+        # nondecreasing end order but a high-water-mark scheme records 15;
+        # the true union is 20.
+        from proofstack.budget import BudgetTracker
+
+        root = BudgetTracker(scope="run")
+        root.add_paused_interval(105.0, 110.0)
+        root.add_paused_interval(100.0, 120.0)
+        self.assertAlmostEqual(root.counters.paused_s, 20.0)
+
+    def test_interval_merging_bridges_gaps(self) -> None:
+        from proofstack.budget import BudgetTracker
+
+        root = BudgetTracker(scope="run")
+        root.add_paused_interval(10.0, 20.0)
+        root.add_paused_interval(30.0, 40.0)
+        root.add_paused_interval(15.0, 35.0)  # bridges both
+        self.assertAlmostEqual(root.counters.paused_s, 30.0)
+        self.assertEqual(root.counters.paused_intervals, [(10.0, 40.0)])
+
+
+class TaskStemScopingTests(unittest.TestCase):
+    def test_stem_is_stable_within_a_run_but_distinct_across_runs(self) -> None:
+        stem1 = task_stem("run-a", "echo", "cachekey123")
+        stem2 = task_stem("run-a", "echo", "cachekey123")
+        stem3 = task_stem("run-b", "echo", "cachekey123")
+        self.assertEqual(stem1, stem2)
+        self.assertNotEqual(stem1, stem3)
+        self.assertTrue(stem1.startswith("echo__"))
+
+    def test_unsafe_agent_names_are_sanitized(self) -> None:
+        stem = task_stem("run-a", "week/../ird name", "k")
+        self.assertNotIn("/", stem)
+        self.assertNotIn(" ", stem)
+
 
 class RejectedResponseTests(unittest.TestCase):
     def test_unparseable_response_requeues_and_consumes_correction(self) -> None:
@@ -318,7 +355,7 @@ class RejectedResponseTests(unittest.TestCase):
 
         async def scenario(ctx: RunContext):
             agent = PickyAgent(ctx, name="echo")
-            stem = f"echo__{agent._cache_key(PickyAgent.Inputs(problem='P'))[:12]}"
+            stem = task_stem(ctx.run_id, "echo", agent._cache_key(PickyAgent.Inputs(problem='P')))
             inbox = ctx.root_workdir / "human_inbox"
             inbox.mkdir(parents=True, exist_ok=True)
             response_path = inbox / f"{stem}.response.json"
@@ -382,6 +419,21 @@ class MalformedResponseTimeoutTests(unittest.TestCase):
 
 
 class CacheKeyTransportTests(unittest.TestCase):
+    def test_edited_model_config_changes_cache_key(self) -> None:
+        # The full parsed effective config is hashed: changing any resolved
+        # value (here the instruction addendum) invalidates the cache key
+        # even when the model ref itself is unchanged.
+        cfg_v1 = {"api": "browser", "model": "m", "instruction_addendum": "A"}
+        cfg_v2 = {"api": "browser", "model": "m", "instruction_addendum": "B"}
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext.create(run_id="t", root_workdir=tmp, flat=True)
+            agent = EchoAgent(ctx, name="echo")
+            with mock.patch("mathagents.load_solver_config", return_value=cfg_v1):
+                key1 = agent._cache_key(EchoAgent.Inputs(problem="P"))
+            with mock.patch("mathagents.load_solver_config", return_value=cfg_v2):
+                key2 = agent._cache_key(EchoAgent.Inputs(problem="P"))
+        self.assertNotEqual(key1, key2)
+
     def test_model_override_to_browser_changes_cache_key(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx_api = RunContext.create(run_id="t1", root_workdir=tmp, flat=True)

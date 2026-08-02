@@ -283,11 +283,15 @@ def extract_result(data: dict[str, Any]) -> dict[str, Any]:
         m["text"] for m in answer_msgs if m["text"].strip()
     )
 
+    # Slug and effort must come from the SAME message — filling them
+    # independently could pair one turn's model with another's effort.
     model_slug = None
     effort = None
     for m in reversed(answer_msgs or [m for m in msgs if m["role"] == "assistant"]):
-        model_slug = model_slug or m["model"]
-        effort = effort or m["effort"]
+        if m["model"]:
+            model_slug = m["model"]
+            effort = m["effort"]
+            break
 
     # Only the answer turns (after the operator's final message) can carry
     # model-generated files worth downloading; earlier turns and citation
@@ -306,20 +310,20 @@ def extract_result(data: dict[str, Any]) -> dict[str, Any]:
                 sandbox_artifacts.append(str(ref.get("name") or ref_type))
     # Structured generated-file records: sandbox links paired with their own
     # message id, which is exactly what the stateless file resolver needs.
-    generated_files: list[dict[str, str]] = []
-    seen_paths: set[str] = set()
+    # Keyed by path with later messages overwriting earlier ones: when the
+    # model regenerates a file, the LATEST message's copy is the one to
+    # download.
+    by_path: dict[str, dict[str, str]] = {}
     for m in answer_msgs:
+        if not m.get("id"):
+            continue
         for path in _sandbox_paths(m["text"]):
-            if path in seen_paths or not m.get("id"):
-                continue
-            seen_paths.add(path)
-            generated_files.append(
-                {
-                    "message_id": str(m["id"]),
-                    "sandbox_path": path,
-                    "name": path.rsplit("/", 1)[-1],
-                }
-            )
+            by_path[path] = {
+                "message_id": str(m["id"]),
+                "sandbox_path": path,
+                "name": path.rsplit("/", 1)[-1],
+            }
+    generated_files = list(by_path.values())
 
     sandbox_artifacts.extend("sandbox:" + p for p in _sandbox_paths(assistant_text))
     seen: set[str] = set()
@@ -395,6 +399,10 @@ def _reference_sources(msgs: list[dict[str, Any]]) -> list[str]:
 
 _TOKEN_MARKER_RE = re.compile(r"\[ProofCouncil task ([A-Za-z0-9._-]+)\]")
 _INSTRUCTION_FILE_TOKEN_RE = re.compile(r"^instruction_([A-Za-z0-9._-]+)\.txt$")
+# Typed references ("Follow instruction_<token>.txt.") and the packet zip
+# itself also bind the message to a task.
+_INSTRUCTION_MENTION_RE = re.compile(r"instruction_([A-Za-z0-9._-]+?)\.txt")
+_PACKET_ZIP_TOKEN_RE = re.compile(r"^([A-Za-z0-9._-]+)\.packet\.zip$")
 
 
 def latest_task_tokens(result: dict[str, Any]) -> set[str]:
@@ -404,18 +412,28 @@ def latest_task_tokens(result: dict[str, Any]) -> set[str]:
     markers; only the newest binding counts, so submitting the share
     against an *older* task in the same chat is refused even though that
     task's token still appears somewhere in the history. Steering messages
-    that name no task never reset the binding."""
+    that name no task never reset the binding. Tokens are recognized from
+    uploaded ``instruction_<token>.txt`` / ``<token>.packet.zip`` names,
+    the ``[ProofCouncil task <token>]`` marker, and typed
+    ``instruction_<token>.txt`` mentions."""
     latest: set[str] = set()
     for m in result.get("messages") or []:
         if m.get("role") != "user":
             continue
         found: set[str] = set()
         for att in m.get("attachments") or []:
-            name = att.get("name") if isinstance(att, dict) else att
-            mt = _INSTRUCTION_FILE_TOKEN_RE.match(str(name or ""))
+            name = str(
+                (att.get("name") if isinstance(att, dict) else att) or ""
+            )
+            mt = _INSTRUCTION_FILE_TOKEN_RE.match(name)
             if mt:
                 found.add(mt.group(1))
-        found.update(_TOKEN_MARKER_RE.findall(str(m.get("text") or "")))
+            mz = _PACKET_ZIP_TOKEN_RE.match(name)
+            if mz:
+                found.add(mz.group(1))
+        text = str(m.get("text") or "")
+        found.update(_TOKEN_MARKER_RE.findall(text))
+        found.update(_INSTRUCTION_MENTION_RE.findall(text))
         if found:
             latest = found
     return latest
@@ -462,9 +480,14 @@ def validate_result(
                 f"verified (expected one of {slugs})"
             )
         else:
+            # Exact slug match wins; among prefix matches prefer the most
+            # specific, so overlapping variants are order-independent.
+            candidates = [
+                v for v in variants if _slug_matches(str(slug), str(v.get("slug") or ""))
+            ]
             matched = next(
-                (v for v in variants if _slug_matches(str(slug), str(v.get("slug") or ""))),
-                None,
+                (v for v in candidates if str(v.get("slug") or "").lower() == str(slug).lower()),
+                max(candidates, key=lambda v: len(str(v.get("slug") or "")), default=None),
             )
             if matched is None:
                 warnings.append(
@@ -524,6 +547,15 @@ def validate_result(
                 f"task marker found ({instruction_file} was not uploaded and no "
                 "[ProofCouncil task ...] line appears in your messages) — "
                 "double-check you pasted the link into the right card"
+            )
+        elif len(tokens) > 1:
+            # Binding must be unambiguous: a message naming several tasks
+            # could otherwise satisfy every one of their cards.
+            warnings.append(
+                "the conversation's most recent message names several "
+                f"ProofCouncil tasks ({sorted(tokens)}) — the binding is "
+                "ambiguous, so this answer cannot be verified as belonging "
+                "to this card"
             )
         elif token not in tokens:
             warnings.append(

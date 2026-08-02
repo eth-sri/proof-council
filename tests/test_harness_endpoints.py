@@ -4,6 +4,7 @@ import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -204,10 +205,9 @@ class HarnessEndpointTests(unittest.TestCase):
         )
         self.assertEqual(payload["transport"], "share_link")
         self.assertEqual(payload["operator_comments"], "steer")
-        self.assertEqual(
-            payload["uploaded_files"]["answer.tex"],
-            f"human_inbox/{stem2}.uploads/answer.tex",
-        )
+        rel = payload["uploaded_files"]["answer.tex"]
+        self.assertTrue(rel.startswith(f"human_inbox/{stem2}.uploads-"))
+        self.assertTrue(rel.endswith("/answer.tex"))
         self.assertFalse(staged_path.exists())
 
     def test_confirm_with_stale_digest_is_409(self) -> None:
@@ -252,7 +252,8 @@ class HarnessEndpointTests(unittest.TestCase):
         self.assertEqual(payload["assistant_text"], "one")
 
     def test_inflight_reservation_blocks_submission(self) -> None:
-        # An empty response file is another request's atomic reservation.
+        # A fresh empty response file is another request's in-flight
+        # fallback write.
         target = self.run_dir / "human_inbox" / self.response_filename
         target.write_text("", encoding="utf-8")
         resp = self.client.post(
@@ -260,6 +261,25 @@ class HarnessEndpointTests(unittest.TestCase):
             data={"response_filename": self.response_filename, "assistant_text": "x"},
         )
         self.assertEqual(resp.status_code, 409)
+
+    def test_aged_empty_reservation_is_recoverable(self) -> None:
+        # A crashed publication must not brick the task: an empty file
+        # older than the grace period may be replaced.
+        import os as _os
+
+        target = self.run_dir / "human_inbox" / self.response_filename
+        target.write_text("", encoding="utf-8")
+        old = time.time() - 3600
+        _os.utime(target, (old, old))
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={"response_filename": self.response_filename, "assistant_text": "recovered"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(
+            json.loads(target.read_text(encoding="utf-8"))["assistant_text"],
+            "recovered",
+        )
 
     def test_confirm_with_mutated_staged_file_is_409(self) -> None:
         stem2, filename2 = self.stem, self.response_filename
@@ -383,14 +403,10 @@ class HarnessEndpointTests(unittest.TestCase):
             )
         )
         self.assertEqual(payload["transport"], "manual")
-        self.assertEqual(
-            payload["uploaded_files"]["answer.tex"],
-            f"human_inbox/{self.stem}.uploads/answer.tex",
-        )
-        saved = (
-            self.run_dir / "human_inbox" / f"{self.stem}.uploads" / "answer.tex"
-        ).read_text(encoding="utf-8")
-        self.assertEqual(saved, "TEX BODY")
+        rel = payload["uploaded_files"]["answer.tex"]
+        self.assertTrue(rel.startswith(f"human_inbox/{self.stem}.uploads-"))
+        self.assertTrue(rel.endswith("/answer.tex"))
+        self.assertEqual((self.run_dir / rel).read_text(encoding="utf-8"), "TEX BODY")
 
     def test_manual_submit_empty_is_rejected(self) -> None:
         resp = self.client.post(

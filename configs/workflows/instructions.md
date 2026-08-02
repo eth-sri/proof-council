@@ -288,7 +288,8 @@ The `--high` suffix is parsed by `APIClient` into `reasoning_effort`.
 
 A model config with `api: browser` (see `configs/models/browser/`) turns any
 `APICallAgent`-based node into a human-executed browser call: the run writes a
-packet (instruction.txt + attachments) into `<run>/human_inbox/` and a mirror
+packet (`instruction_<task-token>.txt` + attachments) into
+`<run>/human_inbox/` and a mirror
 under `harness_packages/<run_id>/`, surfaces a TODO card on the dashboard's run
 page, and blocks (wallclock-paused, like `HumanAgent`) until the operator
 returns a ChatGPT share link or pastes the answer manually. Cost is $0; the
@@ -307,7 +308,8 @@ Generated sandbox files are auto-downloaded from public shares through the
 stateless `file_from_message` resolver (undocumented endpoint; HTTPS +
 `*.oaiusercontent.com` allowlist, size-capped, signed URLs never persisted).
 Text files merge into the answer as fenced file blocks; binaries are kept
-under `<stem>.uploads/` and listed as `stored_files`. Any resolver failure
+in per-fetch staging directories (`<stem>.staged-<nonce>/`) and listed as
+`stored_files`. Any resolver failure
 degrades to a warning plus the manual-upload fallback.
 
 Each packet's instruction file is tokenized (`instruction_<task-token>.txt`,

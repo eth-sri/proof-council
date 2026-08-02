@@ -22,7 +22,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -282,6 +284,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
     @app.route("/run-agent/start", methods=["POST"])
     def run_agent_start():
         payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({"ok": False, "errors": ["request body must be a JSON object"]}), 400
         preset_name = str(payload.get("preset") or "").strip()
         preset = find_preset(preset_name)
         if preset is None:
@@ -762,13 +766,14 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                     "card, not the generic human-response form"
                 ),
             )
-        _refuse_duplicate_response(target)
         values: dict[str, Any] = {}
         for key, value in request.form.items():
             if key.startswith("f_"):
                 values[key[2:]] = value
         values.setdefault("status", "done")
-        _write_response_atomic(target, values)
+        with _locked_task(run_id, filename):
+            _refuse_duplicate_response(target)
+            _write_response_atomic(target, values)
         return redirect(url_for("run_detail", run_id=run_id))
 
     def _harness_task_for(run, filename: str) -> tuple[Path, dict]:
@@ -789,6 +794,24 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description="not a browser-harness task")
         return target, task
 
+    # Serializes the mutating tail (verify -> stage -> publish) of every
+    # submission endpoint per task, so concurrent requests cannot interleave
+    # hash checks, upload writes, and publication.
+    _task_locks: dict[str, threading.Lock] = {}
+    _task_locks_guard = threading.Lock()
+
+    @contextmanager
+    def _locked_task(run_id: str, filename: str):
+        key = f"{run_id}:{filename}"
+        with _task_locks_guard:
+            lock = _task_locks.setdefault(key, threading.Lock())
+        if not lock.acquire(timeout=30):
+            abort(409, description="another submission for this task is in progress")
+        try:
+            yield
+        finally:
+            lock.release()
+
     def _refuse_duplicate_response(target: Path) -> None:
         # Fast-path courtesy check; `_write_response_atomic` holds the
         # authoritative reservation. A *valid* response on disk means another
@@ -801,7 +824,12 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             json.loads(text)
         except json.JSONDecodeError:
             if text.strip():
-                return
+                return  # broken response: replaceable via the repair path
+            try:
+                if time.time() - target.stat().st_mtime > 60:
+                    return  # aged-out crashed reservation: replaceable
+            except OSError:
+                pass
         except OSError:
             pass
         abort(
@@ -813,44 +841,63 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         )
 
     def _write_response_atomic(target: Path, payload: dict[str, Any]) -> None:
-        """Publish a response with an atomic no-clobber reservation.
+        """Publish a response as a complete-file atomic no-clobber operation.
 
-        Concurrent submissions must not both win: the first exclusive
-        create of ``target`` claims the task; everyone else 409s. Only a
-        *broken* (non-empty, invalid-JSON) response file — the documented
-        repair path — may be replaced."""
+        The complete payload is written to a request-unique temp file and
+        published via ``os.link`` (atomic: succeeds only if ``target`` is
+        absent, and the target is never observable in a partial state).
+        Filesystems without hard links fall back to exclusive-create +
+        write; a crash there can leave an empty/partial target, which is
+        recoverable — empty files older than a minute and non-empty
+        invalid-JSON files may be replaced. A valid response always 409s."""
         target.parent.mkdir(parents=True, exist_ok=True)
+        payload_text = json.dumps(payload, ensure_ascii=False)
         tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(payload_text, encoding="utf-8")
         try:
             try:
-                with target.open("x", encoding="utf-8"):
-                    pass
+                os.link(tmp, target)
+                return
             except FileExistsError:
+                pass
+            except OSError:
                 try:
-                    text = target.read_text(encoding="utf-8")
+                    with target.open("x", encoding="utf-8") as fh:
+                        fh.write(payload_text)
+                    return
+                except FileExistsError:
+                    pass
+            # Target exists: only broken leftovers may be replaced.
+            try:
+                text = target.read_text(encoding="utf-8")
+            except OSError:
+                abort(409, description="could not inspect the existing response")
+            if not text.strip():
+                try:
+                    age = time.time() - target.stat().st_mtime
                 except OSError:
-                    text = ""
-                if not text.strip():
+                    age = 0.0
+                if age <= 60:
                     abort(
                         409,
                         description="another submission for this task is in progress",
                     )
-                try:
-                    json.loads(text)
-                except json.JSONDecodeError:
-                    os.replace(tmp, target)
-                    tmp = None
-                    return
-                abort(
-                    409,
-                    description=(
-                        "a response for this task was already submitted (another "
-                        "tab or a stale page?) — go back to the run page"
-                    ),
-                )
-            os.replace(tmp, target)
-            tmp = None
+                os.replace(tmp, target)  # crashed fallback write, aged out
+                tmp = None
+                return
+            try:
+                json.loads(text)
+            except json.JSONDecodeError:
+                os.replace(tmp, target)  # documented broken-file repair
+                tmp = None
+                return
+            abort(
+                409,
+                description=(
+                    "a response for this task was already submitted (another "
+                    "tab or a stale page?) — go back to the run page"
+                ),
+            )
         finally:
             if tmp is not None:
                 tmp.unlink(missing_ok=True)
@@ -899,7 +946,10 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             staged[name] = data
         uploaded_files: dict[str, str] = {}
         if staged:
-            updir = run.path / "human_inbox" / f"{stem}.uploads"
+            # Request-unique directory: a losing concurrent submission must
+            # never leave its bytes under paths the winner's response
+            # references.
+            updir = run.path / "human_inbox" / f"{stem}.uploads-{uuid.uuid4().hex[:12]}"
             updir.mkdir(parents=True, exist_ok=True)
             for name, data in staged.items():
                 (updir / name).write_bytes(data)
@@ -1053,10 +1103,45 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 )
         return None
 
+    _STAGING_MAX_AGE_S = 24 * 3600
+
     def _prune_stale_staging(run, stem: str) -> None:
+        # Conservative: never delete young directories (a concurrent
+        # fetch/confirm may hold one) nor any directory the published
+        # response or current staged metadata still references (binary
+        # stored_files live only there). Day-old unreferenced leftovers
+        # from abandoned fetches are dead.
         inbox = run.path / "human_inbox"
-        for d in inbox.glob(f"{stem}.staged-*"):
-            shutil.rmtree(d, ignore_errors=True)
+        keep: set[str] = set()
+        for meta_name in (f"{stem}.response.json", f"{stem}.staged.json"):
+            try:
+                meta = json.loads((inbox / meta_name).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            rels = list((meta.get("uploaded_files") or {}).values())
+            rels += [
+                d.get("path")
+                for d in meta.get("stored_files") or []
+                if isinstance(d, dict)
+            ]
+            rels += list((meta.get("file_hashes") or {}).keys())
+            for rel in rels:
+                parts = Path(str(rel or "")).parts
+                if len(parts) > 1:
+                    keep.add(parts[1])
+        now = time.time()
+        for d in list(inbox.glob(f"{stem}.staged-*")) + list(
+            inbox.glob(f"{stem}.uploads-*")
+        ):
+            if d.name in keep:
+                continue
+            try:
+                if now - d.stat().st_mtime > _STAGING_MAX_AGE_S:
+                    shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                continue
 
     @app.route("/run/<run_id>/harness/fetch-share", methods=["POST"])
     def run_harness_fetch_share(run_id: str):
@@ -1085,7 +1170,9 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             result = extract_result(fetch_share(share_url))
             token = str(task.get("task_token") or "")
             tokens = latest_task_tokens(result)
-            token_ok = not token or token in tokens
+            # Binding must be an unambiguous singleton: a message naming
+            # several tasks must not satisfy any of their cards.
+            token_ok = not token or tokens == {token}
             if token_ok:
                 auto_uploads, downloaded, download_failures = (
                     _auto_download_generated_files(run, staging_dir, share_url, result)
@@ -1164,21 +1251,22 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 downloaded=downloaded,
                 transfer=transfer,
             )
-        _write_response_atomic(
-            target,
-            {
-                "status": "done",
-                "transport": "share_link",
-                "assistant_text": result["assistant_text"],
-                "share_url": share_url,
-                "model_slug": result.get("model_slug"),
-                "effort": result.get("effort"),
-                "operator_comments": operator_comments,
-                "uploaded_files": auto_uploads or None,
-                "stored_files": staged["stored_files"] or None,
-            },
-        )
-        staged_path.unlink(missing_ok=True)
+        with _locked_task(run_id, filename):
+            _write_response_atomic(
+                target,
+                {
+                    "status": "done",
+                    "transport": "share_link",
+                    "assistant_text": result["assistant_text"],
+                    "share_url": share_url,
+                    "model_slug": result.get("model_slug"),
+                    "effort": result.get("effort"),
+                    "operator_comments": operator_comments,
+                    "uploaded_files": auto_uploads or None,
+                    "stored_files": staged["stored_files"] or None,
+                },
+            )
+            staged_path.unlink(missing_ok=True)
         if staged["stored_files"]:
             # Surface non-merged (binary) downloads even on the
             # warning-free path — the operator would otherwise never
@@ -1217,43 +1305,45 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                     "— fetch the share link again"
                 ),
             )
-        # The digest binds the metadata; verify the staged bytes too, so a
-        # concurrent fetch can never swap file contents under a valid page.
-        for rel, expected_hash in (staged.get("file_hashes") or {}).items():
-            try:
-                p = (run.path / rel).resolve()
-                p.relative_to(run.path.resolve())
-                actual = hashlib.sha256(p.read_bytes()).hexdigest()
-            except (OSError, ValueError):
-                actual = None
-            if actual != expected_hash:
-                abort(
-                    409,
-                    description=(
-                        "staged downloaded files changed since this page was "
-                        "rendered — fetch the share link again"
-                    ),
-                )
-        uploads = [f for f in request.files.getlist("files") if f and f.filename]
-        # Auto-downloaded share files first; a manual upload of the same
-        # name deliberately overrides it.
-        uploaded_files = dict(staged.get("uploaded_files") or {})
-        uploaded_files.update(_save_harness_uploads(run, stem, uploads))
-        _write_response_atomic(
-            target,
-            {
-                "status": "done",
-                "transport": "share_link",
-                "assistant_text": str(staged.get("assistant_text") or ""),
-                "share_url": staged.get("share_url"),
-                "model_slug": staged.get("model_slug"),
-                "effort": staged.get("effort"),
-                "operator_comments": str(request.form.get("operator_comments") or ""),
-                "uploaded_files": uploaded_files or None,
-                "stored_files": staged.get("stored_files") or None,
-            },
-        )
-        staged_path.unlink(missing_ok=True)
+        with _locked_task(run_id, filename):
+            # The digest binds the metadata; verify the staged bytes too —
+            # under the task lock, so nothing can swap them between the
+            # check and publication.
+            for rel, expected_hash in (staged.get("file_hashes") or {}).items():
+                try:
+                    p = (run.path / rel).resolve()
+                    p.relative_to(run.path.resolve())
+                    actual = hashlib.sha256(p.read_bytes()).hexdigest()
+                except (OSError, ValueError):
+                    actual = None
+                if actual != expected_hash:
+                    abort(
+                        409,
+                        description=(
+                            "staged downloaded files changed since this page was "
+                            "rendered — fetch the share link again"
+                        ),
+                    )
+            uploads = [f for f in request.files.getlist("files") if f and f.filename]
+            # Auto-downloaded share files first; a manual upload of the same
+            # name deliberately overrides it.
+            uploaded_files = dict(staged.get("uploaded_files") or {})
+            uploaded_files.update(_save_harness_uploads(run, stem, uploads))
+            _write_response_atomic(
+                target,
+                {
+                    "status": "done",
+                    "transport": "share_link",
+                    "assistant_text": str(staged.get("assistant_text") or ""),
+                    "share_url": staged.get("share_url"),
+                    "model_slug": staged.get("model_slug"),
+                    "effort": staged.get("effort"),
+                    "operator_comments": str(request.form.get("operator_comments") or ""),
+                    "uploaded_files": uploaded_files or None,
+                    "stored_files": staged.get("stored_files") or None,
+                },
+            )
+            staged_path.unlink(missing_ok=True)
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/harness/manual", methods=["POST"])
@@ -1270,20 +1360,21 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         if not assistant_text.strip() and not uploads:
             abort(400, description="provide pasted answer text and/or uploaded files")
         stem = filename[: -len(".response.json")]
-        uploaded_files = _save_harness_uploads(run, stem, uploads)
-        _write_response_atomic(
-            target,
-            {
-                "status": "done",
-                "transport": "manual",
-                "assistant_text": assistant_text,
-                "share_url": None,
-                "model_slug": None,
-                "effort": None,
-                "operator_comments": operator_comments,
-                "uploaded_files": uploaded_files or None,
-            },
-        )
+        with _locked_task(run_id, filename):
+            uploaded_files = _save_harness_uploads(run, stem, uploads)
+            _write_response_atomic(
+                target,
+                {
+                    "status": "done",
+                    "transport": "manual",
+                    "assistant_text": assistant_text,
+                    "share_url": None,
+                    "model_slug": None,
+                    "effort": None,
+                    "operator_comments": operator_comments,
+                    "uploaded_files": uploaded_files or None,
+                },
+            )
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/resume", methods=["POST"])

@@ -1911,6 +1911,21 @@ class ACWorkflow(Agent):
         startup error (e.g. missing docker image, missing codex binary)
         from cancelling the Critic and aborting the whole round.
         """
+        # Everything that can await or raise happens BEFORE the first
+        # create_task: a cancellation or setup error must not orphan an
+        # already-started Critic/Council outside the cleanup scope below.
+        member_models: list[str] = []
+        if run_council:
+            member_models = await self._council_member_models(
+                round=round,
+                requested=list(author_k.council_to),
+                allowed=list(inp.council_models),
+            )
+        compute_workspace: Path | None = None
+        if run_compute:
+            compute_workspace = workspace / "compute"
+            compute_workspace.mkdir(parents=True, exist_ok=True)
+
         critic_task = asyncio.create_task(
             self.critic(
                 **self._critic_inputs(
@@ -1926,11 +1941,6 @@ class ACWorkflow(Agent):
         )
         council_task: asyncio.Task | None = None
         if run_council:
-            member_models = await self._council_member_models(
-                round=round,
-                requested=list(author_k.council_to),
-                allowed=list(inp.council_models),
-            )
             council_task = asyncio.create_task(
                 self._safe_council(
                     round=round,
@@ -1943,9 +1953,7 @@ class ACWorkflow(Agent):
                 name=f"Council-r{round}",
             )
         compute_task: asyncio.Task | None = None
-        if run_compute:
-            compute_workspace = workspace / "compute"
-            compute_workspace.mkdir(parents=True, exist_ok=True)
+        if run_compute and compute_workspace is not None:
             compute_task = asyncio.create_task(
                 self._safe_compute(
                     inp=inp,

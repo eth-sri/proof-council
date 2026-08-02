@@ -182,6 +182,20 @@ class CitationSourcesTests(unittest.TestCase):
         self.assertNotIn("<ready", text)
         self.assertNotIn("<compute_agent", text)
 
+    def test_regenerated_file_uses_latest_message_id(self) -> None:
+        # The model regenerated report.md in a later turn; the resolver
+        # must be pointed at the newest copy, not stale bytes.
+        data = {
+            "linear_conversation": [
+                _node("u1", None, "user", "question"),
+                _node("a1", "u1", "assistant", "v1: [r](sandbox:/mnt/data/report.md)"),
+                _node("a2", "a1", "assistant", "v2: [r](sandbox:/mnt/data/report.md)"),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(len(result["generated_files"]), 1)
+        self.assertEqual(result["generated_files"][0]["message_id"], "a2")
+
     def test_sandbox_paths_with_parentheses_survive(self) -> None:
         data = {
             "linear_conversation": [
@@ -337,6 +351,47 @@ class ValidateResultTests(unittest.TestCase):
         result = extract_result(data)
         self.assertEqual(latest_task_tokens(result), {"tokY"})
 
+    def test_task_token_via_typed_instruction_mention(self) -> None:
+        # The UI suggests typing "Follow instruction_<token>.txt." — that
+        # must bind the task even without any file upload.
+        data = {
+            "linear_conversation": [
+                _node("u1", None, "user", "Follow instruction_tokZ.txt."),
+                _node("a1", "u1", "assistant", "done"),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(latest_task_tokens(result), {"tokZ"})
+
+    def test_task_token_via_packet_zip_upload(self) -> None:
+        data = {
+            "linear_conversation": [
+                _node(
+                    "u1", None, "user", "see the packet",
+                    {"attachments": [{"name": "echo__abc123.packet.zip"}]},
+                ),
+                _node("a1", "u1", "assistant", "done"),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(latest_task_tokens(result), {"echo__abc123"})
+
+    def test_ambiguous_multi_token_message_warns_for_every_card(self) -> None:
+        data = {
+            "linear_conversation": [
+                _node(
+                    "u1", None, "user",
+                    "[ProofCouncil task tokA]\n[ProofCouncil task tokB]\ndo both",
+                ),
+                _node("a1", "u1", "assistant", "done"),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(latest_task_tokens(result), {"tokA", "tokB"})
+        for token in ("tokA", "tokB"):
+            warnings = validate_result(result, {"task_token": token})
+            self.assertTrue(any("ambiguous" in w for w in warnings), token)
+
     def test_missing_token_marker_warns(self) -> None:
         result = extract_result(FIXTURE)  # fixture uploads plain instruction.txt
         warnings = validate_result(result, {"task_token": "tokX"})
@@ -387,6 +442,28 @@ class ValidateResultTests(unittest.TestCase):
             self._result(model_slug="gpt-5-6-sol", effort="max"), task
         )
         self.assertTrue(any("model picker" in w for w in wrong))
+
+    def test_overlapping_variant_slugs_prefer_most_specific(self) -> None:
+        # Order-independent: gpt-5-6-sol-pro must match its own variant,
+        # not the shorter gpt-5-6-sol prefix listed first.
+        task = {
+            "browser": {
+                "expected_model_variants": [
+                    {"slug": "gpt-5-6-sol", "efforts": ["standard"]},
+                    {"slug": "gpt-5-6-sol-pro", "efforts": ["max"]},
+                ]
+            }
+        }
+        self.assertEqual(
+            validate_result(
+                self._result(model_slug="gpt-5-6-sol-pro", effort="max"), task
+            ),
+            [],
+        )
+        warnings = validate_result(
+            self._result(model_slug="gpt-5-6-sol-pro", effort="standard"), task
+        )
+        self.assertTrue(any("reasoning effort" in w for w in warnings))
 
 
 class DownloadGuardrailTests(unittest.TestCase):

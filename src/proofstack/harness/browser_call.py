@@ -11,14 +11,18 @@ response's assistant text (plus any uploaded files, synthesized as
 fenced ``file path=...`` blocks) then goes through the agent's normal
 ``parse_output``.
 
-The task stem is derived from the agent's resume-cache key, not the
-per-call workdir: if the run crashes mid-wait, the resumed node lands on
+The task stem is derived from the run id plus the agent's resume-cache
+key: if the run crashes mid-wait, the resumed node (same run id) lands on
 the same task/response path, so an answer submitted in the meantime is
-picked up immediately (and an existing response file is deliberately
-consumed rather than cleared).
+picked up immediately — while a *different* run never accepts a share
+produced for this one. A submission that fails to parse is quarantined
+and the task re-enters waiting (each cycle restarts the full
+``human_timeout_s`` window — deliberate, since every cycle requires a
+fresh operator action).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -41,6 +45,20 @@ INSTRUCTION_PREVIEW_CHARS = 800
 OPERATOR_COMMENTS_FILE = "harness/operator_comments.jsonl"
 
 
+def task_stem(run_id: str, agent_name: str, cache_key: str) -> str:
+    """Filesystem-safe, run-scoped task identity.
+
+    Deterministic within a run (a resumed node lands on the same task and
+    consumes an already-submitted answer immediately) but distinct across
+    runs: without run scoping, an identical agent/config/input in a NEW run
+    would accept a share produced for an OLD one. Agent names come from
+    workflow YAML but end up in recursively-deleted paths — keep them
+    strictly safe."""
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", agent_name)
+    digest = hashlib.sha256(f"{run_id}:{cache_key}".encode("utf-8")).hexdigest()[:12]
+    return f"{safe_name}__{digest}"
+
+
 def harness_packages_root() -> Path:
     env = os.environ.get("PROOFCOUNCIL_HARNESS_DIR")
     if env:
@@ -57,10 +75,7 @@ async def run_browser_call(
             {"scope": scope, "kind": kind, "used": used, "limit": limit},
         )
 
-    # Agent names come from workflow YAML, but they end up in filesystem
-    # paths that get recursively deleted — keep the stem strictly safe.
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", agent.name)
-    stem = f"{safe_name}__{agent._cache_key(inp)[:12]}"
+    stem = task_stem(agent.ctx.run_id, agent.name, agent._cache_key(inp))
 
     instruction, attachments = agent.render_harness_packet(inp)
     # The token binds a share back to this exact task: it names the
@@ -112,7 +127,7 @@ async def run_browser_call(
     )
     preview = instruction[:INSTRUCTION_PREVIEW_CHARS]
     if len(instruction) > INSTRUCTION_PREVIEW_CHARS:
-        preview += "\n… (full instruction in the packet's instruction.txt)"
+        preview += f"\n… (full instruction in the packet's {instruction_file})"
     task = {
         "agent": agent.name,
         "run_id": agent.ctx.run_id,
@@ -176,6 +191,7 @@ async def run_browser_call(
         agent.component_config.get("human_timeout_s") or DEFAULT_HUMAN_TIMEOUT_S
     )
     start = time.monotonic()
+    rejections = 0
     while True:
         response = await wait_for_response_file(
             response_path,
@@ -241,6 +257,7 @@ async def run_browser_call(
             # (or kill the run): move it aside, surface the error, and go
             # back to waiting so the operator can submit a corrected one.
             rejected = _move_response_aside(response_path)
+            rejections += 1
             error_text = f"{type(e).__name__}: {e}"
             await agent.events.emit(
                 "harness.response_rejected",
@@ -248,10 +265,25 @@ async def run_browser_call(
                     "response_path": str(response_path),
                     "moved_to": str(rejected) if rejected else None,
                     "error": error_text,
+                    "rejections": rejections,
                 },
             )
+            if rejected is None:
+                # Quarantine failed (rename error / too many rejects): the
+                # bad response is still in place, so looping would consume
+                # it again instantly and flood the event log. Fail the run
+                # instead of spinning.
+                raise RuntimeError(
+                    f"browser call {stem}: response failed to parse "
+                    f"({error_text}) and could not be quarantined"
+                ) from e
             await agent.events.emit(
-                "human.waiting", {**waiting_payload, "rejected_error": error_text}
+                "human.waiting",
+                {
+                    **waiting_payload,
+                    "rejected_error": f"{error_text} (rejection #{rejections})",
+                    "rejections": rejections,
+                },
             )
             continue
 
@@ -401,6 +433,7 @@ def commit_operator_comments(run_dir: Path, offset: int) -> None:
 
 __all__ = [
     "run_browser_call",
+    "task_stem",
     "peek_operator_comments",
     "commit_operator_comments",
     "harness_packages_root",

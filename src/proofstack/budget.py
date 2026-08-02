@@ -12,6 +12,7 @@ is no preemption.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -75,9 +76,12 @@ class _Counters:
     tokens: int = 0
     tool_calls: int = 0
     paused_s: float = 0.0
-    # High-water mark (monotonic) of pause intervals already credited, so
-    # overlapping waits from parallel human-in-the-loop nodes count once.
-    paused_until: float = 0.0
+    # Disjoint, sorted (start, end) monotonic intervals already credited as
+    # paused, so overlapping waits from parallel human-in-the-loop nodes
+    # count exactly once regardless of arrival order. Contiguous credits
+    # merge, so the list stays as small as the number of distinct wait
+    # episodes.
+    paused_intervals: list[tuple[float, float]] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
 
     def wallclock_s(self) -> float:
@@ -118,22 +122,16 @@ class BudgetTracker:
 
         Used by human-in-the-loop nodes so time spent waiting for a person is
         not charged against the run's compute wallclock budget. Each node
-        clips against its own high-water mark, so N parallel waiters credit
-        the *union* of their wait intervals at shared ancestors — never N
-        times the wall time. Compute that runs concurrently with a human
-        wait is deliberately not re-charged: the interval counts as paused.
-
-        Invariant: calls must arrive in nondecreasing ``end`` order (the
-        high-water clip computes the exact union measure only then). All
-        current callers credit an interval immediately at its end on one
-        event loop, which guarantees the ordering; a caller crediting
-        historical intervals out of order would silently under-count the
-        pause (never over-count), which fails safe for budgets.
+        maintains a true merged interval set, so N parallel waiters credit
+        exactly the *union* of their wait intervals at shared ancestors —
+        never N times the wall time — regardless of poll cadence or arrival
+        order. Compute that runs concurrently with a human wait is
+        deliberately not re-charged: the interval counts as paused.
         """
-        clipped = max(start, self.counters.paused_until)
-        if end > clipped:
-            self.counters.paused_s += end - clipped
-            self.counters.paused_until = end
+        if end > start:
+            self.counters.paused_s += _merge_interval(
+                self.counters.paused_intervals, start, end
+            )
         if self.parent is not None:
             self.parent.add_paused_interval(start, end)
 
@@ -180,6 +178,27 @@ class BudgetTracker:
         if not remaining:
             return None
         return max(0.0, min(remaining))
+
+
+def _merge_interval(
+    intervals: list[tuple[float, float]], start: float, end: float
+) -> float:
+    """Insert ``[start, end]`` into a sorted disjoint interval list in place;
+    return the measure of newly covered time (0 if fully overlapped)."""
+    i = bisect.bisect_left(intervals, (start,))
+    if i > 0 and intervals[i - 1][1] >= start:
+        i -= 1
+    new_start, new_end = start, end
+    added = end - start
+    j = i
+    while j < len(intervals) and intervals[j][0] <= end:
+        s, e = intervals[j]
+        added -= max(0.0, min(end, e) - max(start, s))
+        new_start = min(new_start, s)
+        new_end = max(new_end, e)
+        j += 1
+    intervals[i:j] = [(new_start, new_end)]
+    return max(0.0, added)
 
 
 class BudgetRegistry:
