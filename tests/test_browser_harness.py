@@ -95,13 +95,19 @@ class AuthorPacketTests(unittest.TestCase):
         ctx = RunContext.create(run_id="t", root_workdir=tmp, flat=True)
         return Author(ctx)
 
-    def test_round0_has_no_attachments(self) -> None:
+    def test_round0_ships_all_canonical_files_like_api_path(self) -> None:
+        # Mirrors _run_with_openai_container_files: round 0 uploads the
+        # three canonical files even when they are still empty.
         with tempfile.TemporaryDirectory() as tmp:
             author = self._author(tmp)
             instruction, attachments = author.render_harness_packet(
                 Author.Inputs(problem="P?", round=0, n_rounds=3)
             )
-        self.assertEqual(attachments, {})
+        self.assertEqual(
+            sorted(attachments),
+            ["answer.tex", "references.bib", "research_notes.tex"],
+        )
+        self.assertEqual(attachments["answer.tex"], "")
         self.assertIn("P?", instruction)
 
     def test_loop_round_moves_files_to_attachments(self) -> None:
@@ -122,10 +128,11 @@ class AuthorPacketTests(unittest.TestCase):
             )
         self.assertEqual(attachments["answer.tex"], "ANSWER BODY")
         self.assertEqual(attachments["references.bib"], "BIB BODY")
-        self.assertNotIn("research_notes.tex", attachments)
+        self.assertEqual(attachments["research_notes.tex"], "")
         self.assertIsInstance(attachments["compute_workspace.zip"], bytes)
         self.assertIn("(attached as answer.tex)", instruction)
         self.assertIn("(attached as references.bib)", instruction)
+        self.assertIn("(attached as research_notes.tex — currently empty)", instruction)
         self.assertNotIn("ANSWER BODY", instruction)
 
     def test_expectations(self) -> None:
@@ -169,9 +176,12 @@ class BrowserCallEndToEndTests(unittest.TestCase):
             task = json.loads((inbox / f"{stem}.task.json").read_text(encoding="utf-8"))
             self.assertEqual(task["type"], "browser_call")
             self.assertEqual(task["browser"]["display_model"], "Fake Browser")
-            instruction = (inbox / f"{stem}.packet" / "instruction.txt").read_text(
-                encoding="utf-8"
-            )
+            self.assertEqual(task["task_token"], stem)
+            self.assertEqual(task["instruction_file"], f"instruction_{stem}.txt")
+            instruction = (
+                inbox / f"{stem}.packet" / f"instruction_{stem}.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn(f"[ProofCouncil task {stem}]", instruction)
             self.assertIn("SYS PROMPT", instruction)
             self.assertIn("USER: P", instruction)
             self.assertIn("PRINT FILES INLINE.", instruction)
@@ -271,6 +281,154 @@ class BrowserCallEndToEndTests(unittest.TestCase):
             ):
                 out = asyncio.run(scenario(ctx))
         self.assertEqual(out.text, "LATE")
+
+
+class PauseAccountingTests(unittest.TestCase):
+    def test_parallel_waiters_credit_union_not_sum(self) -> None:
+        from proofstack.budget import BudgetTracker
+
+        root = BudgetTracker(scope="run")
+        child1 = BudgetTracker(scope="a", parent=root)
+        child2 = BudgetTracker(scope="b", parent=root)
+        child1.add_paused_interval(100.0, 110.0)
+        child2.add_paused_interval(105.0, 115.0)
+        self.assertAlmostEqual(child1.counters.paused_s, 10.0)
+        self.assertAlmostEqual(child2.counters.paused_s, 10.0)
+        # Root sees the union [100, 115], not 20 summed seconds.
+        self.assertAlmostEqual(root.counters.paused_s, 15.0)
+
+    def test_disjoint_intervals_sum(self) -> None:
+        from proofstack.budget import BudgetTracker
+
+        root = BudgetTracker(scope="run")
+        root.add_paused_interval(10.0, 20.0)
+        root.add_paused_interval(30.0, 35.0)
+        self.assertAlmostEqual(root.counters.paused_s, 15.0)
+
+
+class RejectedResponseTests(unittest.TestCase):
+    def test_unparseable_response_is_moved_aside(self) -> None:
+        class BadParseAgent(EchoAgent):
+            def parse_output(self, raw_text, inp):
+                raise ValueError("cannot parse this")
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
+            ctx = _ctx(tmp, hdir)
+            agent = BadParseAgent(ctx, name="echo")
+            stem = f"echo__{agent._cache_key(BadParseAgent.Inputs(problem='P'))[:12]}"
+            inbox = ctx.root_workdir / "human_inbox"
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / f"{stem}.response.json").write_text(
+                json.dumps({"status": "done", "assistant_text": "HELLO"}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                asyncio.run(agent(problem="P"))
+            self.assertFalse((inbox / f"{stem}.response.json").exists())
+            self.assertTrue((inbox / f"{stem}.response.rejected-1.json").exists())
+            events_text = (ctx.root_workdir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn("harness.response_rejected", events_text)
+
+
+class CacheKeyTransportTests(unittest.TestCase):
+    def test_model_override_to_browser_changes_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx_api = RunContext.create(run_id="t1", root_workdir=tmp, flat=True)
+            ctx_browser = RunContext.create(
+                run_id="t2",
+                root_workdir=tmp,
+                flat=True,
+                model_overrides={"echo": BROWSER_MODEL},
+            )
+            key_api = EchoAgent(ctx_api, name="echo")._cache_key(
+                EchoAgent.Inputs(problem="P")
+            )
+            key_browser = EchoAgent(ctx_browser, name="echo")._cache_key(
+                EchoAgent.Inputs(problem="P")
+            )
+        self.assertNotEqual(key_api, key_browser)
+
+
+class CouncilAllowlistTests(unittest.TestCase):
+    def _workflow(self, tmp: str):
+        from proofstack.agents.ac.ac_workflow import ACWorkflow
+
+        ctx = RunContext.create(run_id="t", root_workdir=tmp, flat=True)
+        return ACWorkflow(ctx)
+
+    def test_author_cannot_authorize_models_outside_allowlist(self) -> None:
+        allowed = ["models/browser/chatgpt-gpt56-sol-pro", "models/browser/claude-opus"]
+        with tempfile.TemporaryDirectory() as tmp:
+            wf = self._workflow(tmp)
+            used = asyncio.run(
+                wf._council_member_models(
+                    round=1,
+                    requested=["models/openai/gpt-56-sol-pro", "claude-opus"],
+                    allowed=allowed,
+                )
+            )
+        self.assertEqual(used, ["models/browser/claude-opus"])
+
+    def test_no_match_falls_back_to_full_allowlist(self) -> None:
+        allowed = ["models/browser/claude-opus"]
+        with tempfile.TemporaryDirectory() as tmp:
+            wf = self._workflow(tmp)
+            used = asyncio.run(
+                wf._council_member_models(
+                    round=1, requested=["models/openai/o5"], allowed=allowed
+                )
+            )
+        self.assertEqual(used, allowed)
+
+    def test_empty_request_uses_configured_list(self) -> None:
+        allowed = ["models/browser/claude-opus", "models/browser/gemini-pro"]
+        with tempfile.TemporaryDirectory() as tmp:
+            wf = self._workflow(tmp)
+            used = asyncio.run(
+                wf._council_member_models(round=0, requested=[], allowed=allowed)
+            )
+        self.assertEqual(used, allowed)
+
+
+class OperatorCommentRoutingTests(unittest.TestCase):
+    def test_comments_fold_into_author_feedback_and_commit_after_success(self) -> None:
+        from proofstack.agents.ac.ac_workflow import ACWorkflow
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext.create(run_id="t", root_workdir=tmp, flat=True)
+            wf = ACWorkflow(ctx)
+            comments_path = ctx.root_workdir / "harness" / "operator_comments.jsonl"
+            comments_path.parent.mkdir(parents=True, exist_ok=True)
+            comments_path.write_text(
+                json.dumps({"agent": "Author", "stem": "s1", "text": "try the dual"})
+                + "\n",
+                encoding="utf-8",
+            )
+            calls: list[dict] = []
+
+            async def fake_author(**kwargs):
+                calls.append(kwargs)
+                return "AUTHOR_OUT"
+
+            wf.author = fake_author
+            out = asyncio.run(
+                wf._call_author_with_operator_comments(workflow_feedback="compile ok")
+            )
+            self.assertEqual(out, "AUTHOR_OUT")
+            self.assertIn("try the dual", calls[0]["workflow_feedback"])
+            self.assertIn("compile ok", calls[0]["workflow_feedback"])
+            # Committed: a second Author round no longer sees the comment.
+            calls.clear()
+            asyncio.run(wf._call_author_with_operator_comments(workflow_feedback=""))
+            self.assertNotIn("try the dual", str(calls[0].get("workflow_feedback")))
+
+    def test_visual_author_block_routes_through_comment_helper(self) -> None:
+        import inspect
+
+        from proofstack.agents.ac import visual_blocks
+
+        src = inspect.getsource(visual_blocks.ACAuthorBlock.run)
+        self.assertIn("_call_author_with_operator_comments", src)
 
 
 if __name__ == "__main__":

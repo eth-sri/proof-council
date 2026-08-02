@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 import zipfile
@@ -56,7 +57,17 @@ async def run_browser_call(
             {"scope": scope, "kind": kind, "used": used, "limit": limit},
         )
 
+    # Agent names come from workflow YAML, but they end up in filesystem
+    # paths that get recursively deleted — keep the stem strictly safe.
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", agent.name)
+    stem = f"{safe_name}__{agent._cache_key(inp)[:12]}"
+
     instruction, attachments = agent.render_harness_packet(inp)
+    # The token binds a share back to this exact task: it names the
+    # instruction file (checked against the share's uploaded-file names) and
+    # heads the instruction text (checked when the operator pastes instead
+    # of uploading).
+    instruction = f"[ProofCouncil task {stem}]\n\n" + instruction
     addendum = str(browser_cfg.get("instruction_addendum") or "").strip()
     if addendum:
         instruction = (
@@ -66,14 +77,14 @@ async def run_browser_call(
             + "\n"
         )
 
-    stem = f"{agent.name}__{agent._cache_key(inp)[:12]}"
+    instruction_file = f"instruction_{stem}.txt"
     inbox = agent.ctx.root_workdir / "human_inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     packet_dir = inbox / f"{stem}.packet"
     if packet_dir.exists():
         shutil.rmtree(packet_dir)
     packet_dir.mkdir(parents=True)
-    (packet_dir / "instruction.txt").write_text(instruction, encoding="utf-8")
+    (packet_dir / instruction_file).write_text(instruction, encoding="utf-8")
     for name, body in attachments.items():
         target = packet_dir / Path(str(name)).name
         if isinstance(body, bytes):
@@ -106,6 +117,8 @@ async def run_browser_call(
         "agent": agent.name,
         "run_id": agent.ctx.run_id,
         "type": "browser_call",
+        "task_token": stem,
+        "instruction_file": instruction_file,
         "prompt": preview,
         "response_path": str(response_path),
         "packet_dir": str(packet_dir),
@@ -122,6 +135,7 @@ async def run_browser_call(
             "settings_hint": browser_cfg.get("settings_hint") or "",
             "chat_url": browser_cfg.get("chat_url") or "",
             "expected_model_slugs": list(browser_cfg.get("expected_model_slugs") or []),
+            "expected_efforts": list(browser_cfg.get("expected_efforts") or []),
         },
         "expected": agent.harness_expectations(inp),
         "output_fields": {},
@@ -176,53 +190,61 @@ async def run_browser_call(
 
     await agent.events.emit("human.submitted", {"response_path": str(response_path)})
 
-    raw_text = str(response.get("assistant_text") or "")
-    uploads = response.get("uploaded_files") or {}
-    for name in sorted(uploads):
-        body = _read_upload_text(agent.ctx.root_workdir, str(uploads[name]))
-        if body is None:
-            await agent.events.emit(
-                "harness.upload_skipped",
-                {"name": str(name), "reason": "unreadable or binary"},
-            )
-            continue
-        if "\n```" in body or body.startswith("```"):
-            await agent.events.emit(
-                "harness.upload_fence_conflict", {"name": str(name)}
-            )
-        raw_text += f"\n\n```file path={Path(str(name)).name}\n{body}\n```"
-
-    comments = str(response.get("operator_comments") or "").strip()
-    if comments:
-        comments_path = agent.ctx.root_workdir / OPERATOR_COMMENTS_FILE
-        comments_path.parent.mkdir(parents=True, exist_ok=True)
-        with comments_path.open("a", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps(
-                    {"agent": agent.name, "stem": stem, "text": comments, "ts": time.time()},
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-
     try:
-        (agent.workdir / "raw_response.txt").write_text(raw_text, encoding="utf-8")
-        (agent.workdir / "share.json").write_text(
-            json.dumps(
-                {
-                    "transport": response.get("transport"),
-                    "share_url": response.get("share_url"),
-                    "model_slug": response.get("model_slug"),
-                    "effort": response.get("effort"),
-                    "operator_comments": comments,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        raw_text = str(response.get("assistant_text") or "")
+        uploads = response.get("uploaded_files") or {}
+        for name in sorted(uploads):
+            body = _read_upload_text(agent.ctx.root_workdir, str(uploads[name]))
+            if body is None:
+                await agent.events.emit(
+                    "harness.upload_skipped",
+                    {"name": str(name), "reason": "unreadable or binary"},
+                )
+                continue
+            if "\n```" in body or body.startswith("```"):
+                await agent.events.emit(
+                    "harness.upload_fence_conflict", {"name": str(name)}
+                )
+            raw_text += f"\n\n```file path={Path(str(name)).name}\n{body}\n```"
+
+        comments = str(response.get("operator_comments") or "").strip()
+        if comments:
+            _append_operator_comment(agent.ctx.root_workdir, agent.name, stem, comments)
+
+        try:
+            (agent.workdir / "raw_response.txt").write_text(raw_text, encoding="utf-8")
+            (agent.workdir / "share.json").write_text(
+                json.dumps(
+                    {
+                        "transport": response.get("transport"),
+                        "share_url": response.get("share_url"),
+                        "model_slug": response.get("model_slug"),
+                        "effort": response.get("effort"),
+                        "operator_comments": comments,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        out = agent.parse_output(raw_text, inp)
+    except Exception as e:
+        # A response that cannot be processed must not be consumed again on
+        # every resume: move it aside so the task resurfaces and the
+        # operator can submit a corrected one.
+        rejected = _move_response_aside(response_path)
+        await agent.events.emit(
+            "harness.response_rejected",
+            {
+                "response_path": str(response_path),
+                "moved_to": str(rejected) if rejected else None,
+                "error": f"{type(e).__name__}: {e}",
+            },
         )
-    except OSError:
-        pass
+        raise
 
     if copy_dir is not None:
         shutil.rmtree(copy_dir, ignore_errors=True)
@@ -255,7 +277,47 @@ async def run_browser_call(
             },
             call_id=call_id,
         )
-    return agent.parse_output(raw_text, inp)
+    return out
+
+
+def _append_operator_comment(run_dir: Path, agent_name: str, stem: str, text: str) -> None:
+    """Append a comment, deduplicated by (stem, text): a crash between
+    consuming a response and persisting the cache re-appends the same
+    comment on resume otherwise."""
+    comments_path = run_dir / OPERATOR_COMMENTS_FILE
+    comments_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for line in comments_path.read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("stem") == stem and entry.get("text") == text:
+                return
+    except OSError:
+        pass
+    with comments_path.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {"agent": agent_name, "stem": stem, "text": text, "ts": time.time()},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+
+
+def _move_response_aside(response_path: Path) -> Path | None:
+    for i in range(1, 100):
+        rejected = response_path.with_name(
+            response_path.name.replace(".response.json", f".response.rejected-{i}.json")
+        )
+        if not rejected.exists():
+            try:
+                response_path.rename(rejected)
+                return rejected
+            except OSError:
+                return None
+    return None
 
 
 def _read_upload_text(run_dir: Path, rel: str) -> str | None:

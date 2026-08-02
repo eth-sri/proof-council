@@ -1926,8 +1926,10 @@ class ACWorkflow(Agent):
         )
         council_task: asyncio.Task | None = None
         if run_council:
-            member_models = (
-                author_k.council_to or list(inp.council_models)
+            member_models = await self._council_member_models(
+                round=round,
+                requested=list(author_k.council_to),
+                allowed=list(inp.council_models),
             )
             council_task = asyncio.create_task(
                 self._safe_council(
@@ -2028,6 +2030,41 @@ class ACWorkflow(Agent):
                 # without a compute reply.
                 compute_out = None
         return review_k, council_replies, compute_out
+
+    async def _council_member_models(
+        self, *, round: int, requested: list[str], allowed: list[str]
+    ) -> list[str]:
+        """Resolve the Author's ``<council to=...>`` against the configured
+        allowlist. The Author must never be able to authorize models outside
+        ``council_models`` (e.g. redirect a subscription-covered browser
+        council to paid API refs, or fan out to extra seats). Requested
+        entries match a configured ref exactly or by its short label;
+        anything else is dropped. No match at all falls back to the full
+        configured list so the question still goes out."""
+        allowed = [str(m) for m in allowed]
+        if not requested:
+            return allowed
+        by_label = {ref.rsplit("/", 1)[-1].lower(): ref for ref in reversed(allowed)}
+        used: list[str] = []
+        dropped: list[str] = []
+        for req in requested:
+            key = str(req).strip()
+            ref = key if key in allowed else by_label.get(key.rsplit("/", 1)[-1].lower())
+            if ref is None:
+                dropped.append(key)
+            elif ref not in used:
+                used.append(ref)
+        if dropped or not used:
+            await self.events.emit(
+                "ac.council_to_filtered",
+                {
+                    "round": round,
+                    "requested": [str(r) for r in requested],
+                    "used": used or allowed,
+                    "dropped": dropped,
+                },
+            )
+        return used or allowed
 
     async def _safe_council(
         self,

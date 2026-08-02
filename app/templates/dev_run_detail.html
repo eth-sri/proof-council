@@ -89,9 +89,13 @@
                                  title="Experimental: drag this chip onto your desktop (or, if your browser allows, straight into the chat)">⠿ drag zip</a>
                         </span>
                     </li>
-                    <li>Send the message — <code>instruction.txt</code> is the prompt (type e.g. “Follow instruction.txt.” if the site needs message text).</li>
+                    {% set instr_name = task.instruction_file or 'instruction.txt' %}
+                    <li>Send the message — <code>{{ instr_name }}</code> is the prompt (type e.g. “Follow {{ instr_name }}.” if the site needs message text).</li>
                     {% if is_chatgpt %}
-                        <li>When the model has <em>finished</em>: press <strong>Share</strong> at the top, copy the link, paste it below.</li>
+                        <li>When the model has <em>finished</em>: press <strong>Share</strong> at the top, copy the link, paste it below.
+                            <span class="dim">Note: anyone with the share URL can read the whole conversation, and the URL is
+                            kept in this run's artifacts — for sensitive/unpublished mathematics, delete the share
+                            in ChatGPT (Settings → Data controls → Shared links) once the run is done.</span></li>
                     {% else %}
                         <li>When the model has finished, copy its complete answer and paste it into the manual form below.</li>
                     {% endif %}
@@ -104,7 +108,7 @@
                         <input type="text" name="share_url" placeholder="https://chatgpt.com/share/…" spellcheck="false" autocomplete="off">
                     </label>
                     <label class="human-task-field">
-                        <span class="key">operator comments <span class="dim">(optional — steering for the next round)</span></span>
+                        <span class="key">operator comments <span class="dim">(optional — fed into the next Author round; ignored by workflows without an Author)</span></span>
                         <textarea name="operator_comments" rows="2" spellcheck="false"></textarea>
                     </label>
                     <button type="submit" class="btn-primary">Fetch &amp; Continue</button>
@@ -119,11 +123,11 @@
                             <textarea name="assistant_text" rows="12" spellcheck="false"></textarea>
                         </label>
                         <label class="human-task-field">
-                            <span class="key">generated files <span class="dim">(anything the model produced that you downloaded by hand)</span></span>
+                            <span class="key">generated files <span class="dim">(text files the model produced that you downloaded by hand — binary files can't be passed back; ask the model to print contents inline)</span></span>
                             <input type="file" name="files" multiple>
                         </label>
                         <label class="human-task-field">
-                            <span class="key">operator comments <span class="dim">(optional)</span></span>
+                            <span class="key">operator comments <span class="dim">(optional — fed into the next Author round; ignored by workflows without an Author)</span></span>
                             <textarea name="operator_comments" rows="2" spellcheck="false"></textarea>
                         </label>
                         <button type="submit" class="btn-primary">Submit &amp; Continue</button>
@@ -167,14 +171,28 @@
         {% endfor %}
         <script>
             (function () {
+                // Under WSL the server-side path is /mnt/c/... — convert to a
+                // Windows-native C:\... path so it works in Explorer's address
+                // bar (the browser and file manager live on the Windows side).
+                function hostUsablePath(p) {
+                    const m = /^\/mnt\/([a-z])\//.exec(p || '');
+                    if (m) return m[1].toUpperCase() + ':\\' + p.slice(m[0].length).replace(/\//g, '\\');
+                    return p || '';
+                }
                 document.querySelectorAll('.harness-copy-path').forEach((btn) => {
+                    const path = hostUsablePath(btn.dataset.path);
+                    btn.title = path;
                     btn.addEventListener('click', async () => {
                         try {
-                            await navigator.clipboard.writeText(btn.dataset.path || '');
+                            await navigator.clipboard.writeText(path);
                             const old = btn.textContent;
                             btn.textContent = 'Copied!';
                             setTimeout(() => { btn.textContent = old; }, 1500);
-                        } catch (e) { /* clipboard unavailable; path is shown anyway */ }
+                        } catch (e) {
+                            // Clipboard unavailable (permissions/non-secure context):
+                            // show the path in a prompt so it stays selectable.
+                            window.prompt('Copy the folder path:', path);
+                        }
                     });
                 });
                 // Experimental drag-out: Chromium's DownloadURL puts a real file on

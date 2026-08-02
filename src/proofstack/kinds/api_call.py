@@ -164,6 +164,26 @@ class APICallAgent(Agent):
             )
         return self.parse_output(raw_text, inp)
 
+    def _cache_config_snapshot(self) -> dict[str, Any]:
+        # The resume-cache key must reflect the *effective* model and
+        # transport, not just the raw MODEL ref: a model_overrides swap
+        # (API <-> browser) or an edited model YAML must not replay the
+        # other configuration's cached answer.
+        snapshot = super()._cache_config_snapshot()
+        try:
+            resolved = self.ctx.model_for(self, self.MODEL)
+            snapshot["RESOLVED_MODEL"] = str(resolved)
+            from mathagents import load_solver_config
+
+            cfg = load_solver_config(resolved)
+            snapshot["MODEL_TRANSPORT"] = {
+                "api": str(cfg.get("api") or ""),
+                "model": cfg.get("model"),
+            }
+        except Exception:
+            pass
+        return snapshot
+
     def _browser_model_config(self) -> dict[str, Any] | None:
         from mathagents import load_solver_config
 

@@ -20,6 +20,7 @@
     },
     {
       "message": {
+        "id": "msg-progress",
         "author": {"role": "assistant"},
         "content": {"parts": ["Progress note: verifying the lemma numerically."]},
         "metadata": {
@@ -30,6 +31,7 @@
     },
     {
       "message": {
+        "id": "msg-final",
         "author": {"role": "assistant"},
         "content": {"parts": ["<answer>The lemma holds.</answer>\nDownload: [report](sandbox:/mnt/data/report.pdf)"]},
         "metadata": {

@@ -667,7 +667,9 @@ class Author(APICallAgent):
     def render_harness_packet(self, inp: Inputs) -> tuple[str, dict[str, str | bytes]]:
         # Pull the workspace file bodies out of the prompt and into
         # attachments: the operator drags real files into the browser
-        # chat, and the instruction stays readable.
+        # chat, and the instruction stays readable. All three canonical
+        # files ship even when empty — mirroring the container-files API
+        # path, which uploads empty round-0 files too.
         attachments: dict[str, str | bytes] = {}
         update: dict[str, str] = {}
         for name, field in (
@@ -676,9 +678,12 @@ class Author(APICallAgent):
             ("references.bib", "references_bib"),
         ):
             body = getattr(inp, field) or ""
-            if body.strip():
-                attachments[name] = body
-                update[field] = f"(attached as {name})"
+            attachments[name] = body
+            update[field] = (
+                f"(attached as {name})"
+                if body.strip()
+                else f"(attached as {name} — currently empty)"
+            )
         if inp.compute_zip_path is not None:
             zip_path = Path(inp.compute_zip_path)
             if zip_path.exists():
@@ -688,7 +693,12 @@ class Author(APICallAgent):
         return instruction, attachments
 
     def harness_expectations(self, inp: Inputs) -> dict[str, Any]:
-        return {"fenced_files": list(CANONICAL_FILES)}
+        expected: dict[str, Any] = {"fenced_files": list(CANONICAL_FILES)}
+        # Round 0 has no prior contents to fall back on: an answer without
+        # answer.tex would leave the round with no usable output at all.
+        if inp.round == 0:
+            expected["required_files"] = ["answer.tex"]
+        return expected
 
     # ---- container-files run path ---------------------------------------
 

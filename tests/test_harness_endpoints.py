@@ -147,7 +147,7 @@ class HarnessEndpointTests(unittest.TestCase):
         self.assertEqual(payload["model_slug"], "gpt-5-6-sol-pro")
         self.assertEqual(payload["operator_comments"], "note")
 
-    def test_fetch_share_with_warnings_needs_confirmation(self) -> None:
+    def test_fetch_share_with_warnings_stages_then_confirms(self) -> None:
         # The fixture's assistant generated sandbox files -> warning page.
         stem2, filename2 = self.stem, self.response_filename
         task_path = self.run_dir / "human_inbox" / f"{stem2}.task.json"
@@ -155,30 +155,141 @@ class HarnessEndpointTests(unittest.TestCase):
         task["browser"]["expected_model_slugs"] = ["some-other-model"]
         task_path.write_text(json.dumps(task), encoding="utf-8")
 
+        from proofstack.harness.chatgpt_share import ShareFetchError
+
         with mock.patch(
             "proofstack.harness.chatgpt_share.fetch_share",
             return_value=SHARE_FIXTURE,
+        ), mock.patch(
+            "proofstack.harness.chatgpt_share.resolve_shared_file",
+            side_effect=ShareFetchError("resolver down"),
         ):
             resp = self.client.post(
                 "/run/run1/harness/fetch-share",
                 data={"response_filename": filename2, "share_url": SHARE_URL},
             )
-            self.assertEqual(resp.status_code, 200)
-            html = resp.get_data(as_text=True)
-            self.assertIn("Use anyway", html)
-            self.assertFalse(
-                (self.run_dir / "human_inbox" / filename2).exists()
-            )
+        self.assertEqual(resp.status_code, 200)
+        html = resp.get_data(as_text=True)
+        self.assertIn("Use fetched answer", html)
+        self.assertIn("could not auto-download", html)
+        self.assertFalse((self.run_dir / "human_inbox" / filename2).exists())
+        staged_path = self.run_dir / "human_inbox" / f"{stem2}.staged.json"
+        staged = json.loads(staged_path.read_text(encoding="utf-8"))
+
+        # Confirming applies the staged version — no re-fetch happens.
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            side_effect=AssertionError("confirm must not re-fetch"),
+        ), mock.patch(
+            "proofstack.harness.chatgpt_share.resolve_shared_file",
+            side_effect=AssertionError("confirm must not re-resolve files"),
+        ):
             resp2 = self.client.post(
-                "/run/run1/harness/fetch-share",
+                "/run/run1/harness/confirm",
                 data={
                     "response_filename": filename2,
-                    "share_url": SHARE_URL,
-                    "confirmed": "1",
+                    "digest": staged["digest"],
+                    "operator_comments": "steer",
+                    "files": (io.BytesIO(b"DOWNLOADED BODY"), "answer.tex"),
                 },
+                content_type="multipart/form-data",
             )
         self.assertEqual(resp2.status_code, 302)
-        self.assertTrue((self.run_dir / "human_inbox" / filename2).exists())
+        payload = json.loads(
+            (self.run_dir / "human_inbox" / filename2).read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["transport"], "share_link")
+        self.assertEqual(payload["operator_comments"], "steer")
+        self.assertEqual(
+            payload["uploaded_files"]["answer.tex"],
+            f"human_inbox/{stem2}.uploads/answer.tex",
+        )
+        self.assertFalse(staged_path.exists())
+
+    def test_confirm_with_stale_digest_is_409(self) -> None:
+        from proofstack.harness.chatgpt_share import ShareFetchError
+
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ), mock.patch(
+            "proofstack.harness.chatgpt_share.resolve_shared_file",
+            side_effect=ShareFetchError("resolver down"),
+        ):
+            self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        resp = self.client.post(
+            "/run/run1/harness/confirm",
+            data={"response_filename": self.response_filename, "digest": "not-the-digest"},
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(
+            (self.run_dir / "human_inbox" / self.response_filename).exists()
+        )
+
+    def test_double_submit_is_409(self) -> None:
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={"response_filename": self.response_filename, "assistant_text": "one"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        resp2 = self.client.post(
+            "/run/run1/harness/manual",
+            data={"response_filename": self.response_filename, "assistant_text": "two"},
+        )
+        self.assertEqual(resp2.status_code, 409)
+        payload = json.loads(
+            (self.run_dir / "human_inbox" / self.response_filename).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(payload["assistant_text"], "one")
+
+    def test_broken_response_may_be_replaced(self) -> None:
+        target = self.run_dir / "human_inbox" / self.response_filename
+        target.write_text("{not json", encoding="utf-8")
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={"response_filename": self.response_filename, "assistant_text": "fixed"},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(
+            json.loads(target.read_text(encoding="utf-8"))["assistant_text"], "fixed"
+        )
+
+    def test_share_reuse_across_tasks_warns(self) -> None:
+        other = self.run_dir / "human_inbox" / "other__000.response.json"
+        other.write_text(
+            json.dumps({"share_url": SHARE_URL, "assistant_text": "x"}),
+            encoding="utf-8",
+        )
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=_clean_fixture(),
+        ):
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("already submitted for another task", resp.get_data(as_text=True))
+        self.assertFalse(
+            (self.run_dir / "human_inbox" / self.response_filename).exists()
+        )
+
+    def test_unexpected_extraction_error_renders_fallback_not_500(self) -> None:
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            side_effect=KeyError("schema drift"),
+        ):
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("manual paste fallback", resp.get_data(as_text=True))
 
     def test_fetch_share_error_is_422(self) -> None:
         from proofstack.harness.chatgpt_share import ShareFetchError
@@ -231,6 +342,33 @@ class HarnessEndpointTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
+    def test_manual_upload_binary_rejected(self) -> None:
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={
+                "response_filename": self.response_filename,
+                "assistant_text": "x",
+                "files": (io.BytesIO(b"\x89PNG\x00\xff"), "plot.png"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(
+            (self.run_dir / "human_inbox" / self.response_filename).exists()
+        )
+
+    def test_manual_upload_fence_conflict_rejected(self) -> None:
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={
+                "response_filename": self.response_filename,
+                "assistant_text": "x",
+                "files": (io.BytesIO(b"ok\n```\nfence"), "notes.md"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(resp.status_code, 400)
+
     def test_manual_upload_bad_filename_rejected(self) -> None:
         resp = self.client.post(
             "/run/run1/harness/manual",
@@ -249,6 +387,130 @@ class HarnessEndpointTests(unittest.TestCase):
             data={"response_filename": "nope.response.json", "assistant_text": "x"},
         )
         self.assertEqual(resp.status_code, 400)
+
+    def _mock_download(self, body: bytes):
+        def fake_resolve(sid, message_id, sandbox_path, **kw):
+            return {
+                "download_url": "https://sub.oaiusercontent.com/signed",
+                "file_name": sandbox_path.rsplit("/", 1)[-1],
+                "file_size_bytes": len(body),
+            }
+
+        def fake_download(info, dest_dir, **kw):
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / info["file_name"]
+            dest.write_bytes(body)
+            return dest
+
+        return mock.patch(
+            "proofstack.harness.chatgpt_share.resolve_shared_file", fake_resolve
+        ), mock.patch(
+            "proofstack.harness.chatgpt_share.download_shared_file", fake_download
+        )
+
+    def test_generated_text_file_is_auto_downloaded_and_merged(self) -> None:
+        p1, p2 = self._mock_download(b"GENERATED TEXT")
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ), p1, p2:
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        # Everything auto-downloaded -> no sandbox warning -> direct write.
+        self.assertEqual(resp.status_code, 302)
+        payload = json.loads(
+            (self.run_dir / "human_inbox" / self.response_filename).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            payload["uploaded_files"]["report.pdf"],
+            f"human_inbox/{self.stem}.uploads/report.pdf",
+        )
+        saved = (
+            self.run_dir / "human_inbox" / f"{self.stem}.uploads" / "report.pdf"
+        ).read_bytes()
+        self.assertEqual(saved, b"GENERATED TEXT")
+
+    def test_generated_binary_file_is_stored_not_merged(self) -> None:
+        p1, p2 = self._mock_download(b"\x89PNG\x00\xffbinary")
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ), p1, p2:
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 302)
+        payload = json.loads(
+            (self.run_dir / "human_inbox" / self.response_filename).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIsNone(payload["uploaded_files"])
+        self.assertEqual(payload["stored_files"][0]["name"], "report.pdf")
+        self.assertFalse(payload["stored_files"][0]["merged"])
+
+    def test_wrong_task_share_offers_transfer(self) -> None:
+        inbox = self.run_dir / "human_inbox"
+        task_path = inbox / f"{self.stem}.task.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["task_token"] = "tokA"
+        task["instruction_file"] = "instruction_tokA.txt"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        other = {
+            "agent": "critic",
+            "run_id": "run1",
+            "type": "browser_call",
+            "task_token": "tokB",
+            "instruction_file": "instruction_tokB.txt",
+            "response_path": str(inbox / "critic__b.response.json"),
+            "browser": {"display_model": "Fake B"},
+            "expected": {},
+        }
+        (inbox / "critic__b.task.json").write_text(json.dumps(other), encoding="utf-8")
+
+        fixture = _clean_fixture()
+        for node in fixture["linear_conversation"]:
+            msg = node.get("message") or {}
+            meta = msg.get("metadata") or {}
+            if (msg.get("author") or {}).get("role") == "user" and not meta.get(
+                "is_visually_hidden_from_conversation"
+            ):
+                msg.setdefault("metadata", {})["attachments"] = [
+                    {"name": "instruction_tokB.txt"}
+                ]
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=fixture,
+        ):
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 200)
+        html = resp.get_data(as_text=True)
+        self.assertIn("belong to a different task", html)
+        self.assertIn('value="critic__b.response.json"', html)
+        self.assertIn("could not verify this share belongs to this task", html)
+
+    def test_waiting_after_timeout_resurfaces_task(self) -> None:
+        # waiting -> timeout -> (resume) waiting again: the later wait must
+        # clear the earlier resolution or the card stays hidden forever.
+        events_path = self.run_dir / "events.jsonl"
+        events = [json.loads(line) for line in events_path.read_text().splitlines()]
+        waiting = next(e for e in events if e["kind"] == "human.waiting")
+        events.append(
+            {"kind": "human.timeout", "payload": {"response_path": waiting["payload"]["response_path"]}}
+        )
+        events_path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+        self.assertEqual(load_pending_human_tasks(self.run_dir), [])
+        events.append(waiting)
+        events_path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+        self.assertEqual(len(load_pending_human_tasks(self.run_dir)), 1)
 
     def test_blob_download_param(self) -> None:
         resp = self.client.get(

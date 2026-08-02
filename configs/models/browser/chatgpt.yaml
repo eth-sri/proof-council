@@ -6,8 +6,8 @@ service: chatgpt
 chat_url: https://chatgpt.com/
 instruction_addendum: |
   You are being run through a browser chat. Your reply text is the only
-  thing returned to the caller — file downloads you offer are NOT
-  visible to it. If you create or change any file, ALSO print its full
+  thing reliably returned to the caller — file downloads you offer may
+  not reach it. If you create or change any file, ALSO print its full
   contents inline as a fenced block:
 
   ```file path=<name>

@@ -296,15 +296,39 @@ returns a ChatGPT share link or pastes the answer manually. Cost is $0; the
 
 Config keys: `service` (chatgpt enables the share-link fetch; anything else is
 manual-paste only), `chat_url`, `display_model`, `settings_hint`,
-`expected_model_slugs` (share-link validation), `instruction_addendum`
-(appended to every instruction.txt; the default tells the model to print
-changed files inline as fenced ```file path=...``` blocks, since sandbox file
-downloads are not retrievable through share links).
+`expected_model_slugs` / `expected_efforts` (share-link validation, warnings
+only), `instruction_addendum` (appended to every instruction file; the default
+tells the model to print changed files inline as fenced ```file path=...```
+blocks as the robust primary channel).
 
-Always substitute browser models through the component `model:` key (or a
-model-ref input like `council_models`), never through `model_overrides` — the
-resume-cache key must reflect the transport. Presets: `browser_consult`
-(one-shot demo), `author_critic_browser` (Author/Critic/council harnessed;
+Generated sandbox files are auto-downloaded from public shares through the
+stateless `file_from_message` resolver (undocumented endpoint; HTTPS +
+`*.oaiusercontent.com` allowlist, size-capped, signed URLs never persisted).
+Text files merge into the answer as fenced file blocks; binaries are kept
+under `<stem>.uploads/` and listed as `stored_files`. Any resolver failure
+degrades to a warning plus the manual-upload fallback.
+
+Each packet's instruction file is tokenized (`instruction_<task-token>.txt`,
+token also heads the instruction text). Share validation warns when a share
+carries no evidence of the task token, and if the share matches a *different*
+pending task, the confirm page offers to transfer it there. The Author packet
+ships all three canonical files even when empty, mirroring the
+container-files API path.
+
+**Supported subset.** Interception happens in `APICallAgent.run` only: one-shot
+prompt→answer nodes (Author, ACCritic, council seats, `ConfigurablePromptAgent`
+one-shots). Not intercepted: API-backed `MultiTurnAgent` conversations,
+provider-side tool loops (`code_interpreter`, `web_search` configs are simply
+absent in the browser chat), and `CLIAgent` nodes. System/developer + user
+messages are concatenated into a single browser prompt (role labels are added
+only for longer histories), so strict instruction-hierarchy behavior is not
+preserved. Substituting a model on an unsupported node silently keeps its API
+transport.
+
+Browser models may be substituted through the component `model:` key, a
+model-ref input like `council_models`, or `model_overrides` (the resume-cache
+key includes the resolved transport). Presets: `browser_consult` (one-shot
+demo), `author_critic_browser` (Author/Critic/council harnessed;
 `full_critic_interval: 1` because a browser chat cannot replay a stateful API
 conversation; Author needs `USE_CONTAINER_FILES: false`).
 

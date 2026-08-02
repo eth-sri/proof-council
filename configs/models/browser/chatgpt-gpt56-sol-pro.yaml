@@ -2,7 +2,14 @@ base: models/browser/chatgpt
 model: gpt-5.6-sol-pro-browser
 display_model: GPT-5.6 Sol (Pro)
 settings_hint: 'Model picker: GPT-5.6 Sol, reasoning mode: Pro.'
+# Warning-only checks. Observed live: "GPT-5.6 Sol + Pro reasoning" shares
+# report slug gpt-5-6-sol-pro with thinking_effort max; the dedicated
+# "GPT-5.6 Pro" picker entry reports gpt-5-6-pro with thinking_effort
+# standard. Plain gpt-5-6-sol / gpt-5-6-thinking are deliberately NOT
+# accepted so a forgotten reasoning-mode picker triggers the slug warning.
 expected_model_slugs:
   - gpt-5-6-sol-pro
-  - gpt-5-6-sol
-  - gpt-5-6-thinking
+  - gpt-5-6-pro
+expected_efforts:
+  - max
+  - standard

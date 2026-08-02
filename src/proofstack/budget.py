@@ -75,6 +75,9 @@ class _Counters:
     tokens: int = 0
     tool_calls: int = 0
     paused_s: float = 0.0
+    # High-water mark (monotonic) of pause intervals already credited, so
+    # overlapping waits from parallel human-in-the-loop nodes count once.
+    paused_until: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
     def wallclock_s(self) -> float:
@@ -109,15 +112,23 @@ class BudgetTracker:
         if self.parent is not None:
             self.parent.add_tool_call(n)
 
-    def add_paused(self, seconds: float) -> None:
-        """Exclude ``seconds`` from wallclock at this scope and all parents.
+    def add_paused_interval(self, start: float, end: float) -> None:
+        """Exclude the monotonic interval ``[start, end]`` from wallclock at
+        this scope and all parents.
 
         Used by human-in-the-loop nodes so time spent waiting for a person is
-        not charged against the run's compute wallclock budget.
+        not charged against the run's compute wallclock budget. Each node
+        clips against its own high-water mark, so N parallel waiters credit
+        the *union* of their wait intervals at shared ancestors — never N
+        times the wall time. Compute that runs concurrently with a human
+        wait is deliberately not re-charged: the interval counts as paused.
         """
-        self.counters.paused_s += seconds
+        clipped = max(start, self.counters.paused_until)
+        if end > clipped:
+            self.counters.paused_s += end - clipped
+            self.counters.paused_until = end
         if self.parent is not None:
-            self.parent.add_paused(seconds)
+            self.parent.add_paused_interval(start, end)
 
     def chain(self) -> Iterable["BudgetTracker"]:
         node: BudgetTracker | None = self

@@ -181,10 +181,12 @@ async def wait_for_response_file(
                 "human.heartbeat",
                 {"waited_s": elapsed, "response_path": str(response_path)},
             )
+        # Human thinking time is not compute time: credit the slept interval
+        # back so it never eats the run's wallclock budget. Interval-based so
+        # parallel waiters don't multiply the credit at shared scopes.
+        sleep_start = time.monotonic()
         await asyncio.sleep(poll_interval_s)
-        # Human thinking time is not compute time: credit it back so it never
-        # eats the run's wallclock budget.
-        tracker.add_paused(poll_interval_s)
+        tracker.add_paused_interval(sleep_start, time.monotonic())
 
 
 def _format_template(template: str, fields: dict[str, Any]) -> str:

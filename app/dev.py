@@ -11,6 +11,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -378,10 +379,24 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             cmd.extend(["--monitor", "--monitor-model", monitor_model])
         # Per-run workflow input overrides (e.g. claude_model=haiku). Only
         # non-empty values are forwarded; blanks fall back to the preset default.
+        # Structured values arrive as `@<json>` (the runner's convention) —
+        # reject bad JSON here, before the child process fails out of sight.
         for key, value in (payload.get("inputs") or {}).items():
             clean_key = str(key or "").strip()
             clean_value = str("" if value is None else value).strip()
             if clean_key and clean_value:
+                if clean_value.startswith("@"):
+                    try:
+                        json.loads(clean_value[1:])
+                    except json.JSONDecodeError as e:
+                        return jsonify(
+                            {
+                                "ok": False,
+                                "errors": [
+                                    f"Input {clean_key!r} is not valid JSON after '@': {e.msg}"
+                                ],
+                            }
+                        ), 400
                 cmd.extend(["--input", f"{clean_key}={clean_value}"])
         with log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(
@@ -713,13 +728,13 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         target = (inbox / filename).resolve()
         if target.parent != inbox:
             abort(400, description="response path escapes inbox")
+        _refuse_duplicate_response(target)
         values: dict[str, Any] = {}
         for key, value in request.form.items():
             if key.startswith("f_"):
                 values[key[2:]] = value
         values.setdefault("status", "done")
-        inbox.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+        _write_response_atomic(target, values)
         return redirect(url_for("run_detail", run_id=run_id))
 
     def _harness_task_for(run, filename: str) -> tuple[Path, dict]:
@@ -740,6 +755,200 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description="not a browser-harness task")
         return target, task
 
+    def _refuse_duplicate_response(target: Path) -> None:
+        # A *valid* response on disk means another tab (or a stale page)
+        # already submitted; overwriting would race the worker consuming it.
+        # A broken/partial file may be replaced — the run page offers that.
+        if not target.exists():
+            return
+        try:
+            json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        abort(
+            409,
+            description=(
+                "a response for this task was already submitted (another tab "
+                "or a stale page?) — go back to the run page for the current state"
+            ),
+        )
+
+    def _write_response_atomic(target: Path, payload: dict[str, Any]) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, target)
+
+    _UPLOAD_MAX_FILES = 20
+    _UPLOAD_MAX_FILE_BYTES = 8 * 1024 * 1024
+    _UPLOAD_MAX_TOTAL_BYTES = 40 * 1024 * 1024
+
+    def _save_harness_uploads(run, stem: str, uploads: list) -> dict[str, str]:
+        """Validate + persist manual uploads; abort(400) with a specific
+        message on anything the fenced-file consumer cannot represent."""
+        if len(uploads) > _UPLOAD_MAX_FILES:
+            abort(400, description=f"too many files (max {_UPLOAD_MAX_FILES})")
+        staged: dict[str, bytes] = {}
+        total = 0
+        for f in uploads:
+            name = Path(f.filename).name
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+                abort(400, description=f"invalid upload filename: {f.filename!r}")
+            if name in staged:
+                abort(400, description=f"duplicate upload filename: {name!r}")
+            data = f.read()
+            total += len(data)
+            if len(data) > _UPLOAD_MAX_FILE_BYTES or total > _UPLOAD_MAX_TOTAL_BYTES:
+                abort(400, description=f"upload too large: {name!r}")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                abort(
+                    400,
+                    description=(
+                        f"upload {name!r} is binary or not UTF-8 — the harness can "
+                        "only pass text files back to the workflow; ask the model "
+                        "to print the content inline instead"
+                    ),
+                )
+            if "\n```" in text or text.startswith("```"):
+                abort(
+                    400,
+                    description=(
+                        f"upload {name!r} contains a ``` fence line, which would "
+                        "corrupt the fenced-file format the workflow parses — "
+                        "paste its content via the answer text instead"
+                    ),
+                )
+            staged[name] = data
+        uploaded_files: dict[str, str] = {}
+        if staged:
+            updir = run.path / "human_inbox" / f"{stem}.uploads"
+            updir.mkdir(parents=True, exist_ok=True)
+            for name, data in staged.items():
+                (updir / name).write_bytes(data)
+                uploaded_files[name] = str((updir / name).relative_to(run.path))
+        return uploaded_files
+
+    def _auto_download_generated_files(
+        run, stem: str, share_url: str, result: dict[str, Any]
+    ) -> tuple[dict[str, str], list[dict[str, Any]], list[str]]:
+        """Fetch the answer's sandbox files through the stateless resolver.
+
+        Returns (uploads_to_merge, downloaded_info, failure_warnings).
+        Text files without fence conflicts are merged into the model text
+        like manual uploads; binaries stay on disk for the operator.
+        Undocumented endpoint — every failure degrades to a warning that
+        points at the manual-upload fallback.
+        """
+        from proofstack.harness import chatgpt_share
+
+        generated = result.get("generated_files") or []
+        if not generated:
+            return {}, [], []
+        sid = chatgpt_share.share_id(share_url)
+        uploads: dict[str, str] = {}
+        downloaded: list[dict[str, Any]] = []
+        failures: list[str] = []
+        updir = run.path / "human_inbox" / f"{stem}.uploads"
+        for gf in generated:
+            name = str(gf.get("name") or "file")
+            try:
+                info = chatgpt_share.resolve_shared_file(
+                    sid, str(gf.get("message_id")), str(gf.get("sandbox_path"))
+                )
+                path = chatgpt_share.download_shared_file(
+                    info, updir, fallback_name=name
+                )
+            except chatgpt_share.ShareFetchError as e:
+                failures.append(
+                    f"could not auto-download {name!r} ({e}) — download it from "
+                    "the chat and add it via the file upload"
+                )
+                continue
+            except Exception as e:
+                failures.append(
+                    f"could not auto-download {name!r} ({type(e).__name__}) — "
+                    "download it from the chat and add it via the file upload"
+                )
+                continue
+            data = path.read_bytes()
+            mergeable = False
+            try:
+                text = data.decode("utf-8")
+                mergeable = not (text.startswith("```") or "\n```" in text)
+            except UnicodeDecodeError:
+                pass
+            rel = str(path.relative_to(run.path))
+            if mergeable:
+                uploads[path.name] = rel
+            downloaded.append(
+                {
+                    "name": path.name,
+                    "source_name": name,
+                    "bytes": len(data),
+                    "merged": mergeable,
+                    "path": rel,
+                }
+            )
+        if downloaded:
+            got = {d["name"] for d in downloaded} | {d["source_name"] for d in downloaded}
+            result["sandbox_artifacts"] = [
+                a
+                for a in result.get("sandbox_artifacts") or []
+                if str(a).removeprefix("sandbox:").rsplit("/", 1)[-1] not in got
+            ]
+        return uploads, downloaded, failures
+
+    def _transfer_candidate(run, current_filename: str, result: dict[str, Any]):
+        """Find the pending browser task whose tokenized instruction file the
+        share actually contains — the card the operator probably meant."""
+        from proofstack.harness.chatgpt_share import share_contains_token
+
+        inbox = run.path / "human_inbox"
+        if not inbox.exists():
+            return None
+        for task_path in sorted(inbox.glob("*.task.json")):
+            stem2 = task_path.name[: -len(".task.json")]
+            fname2 = f"{stem2}.response.json"
+            if fname2 == current_filename or (inbox / fname2).exists():
+                continue
+            try:
+                t2 = json.loads(task_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(t2, dict) or t2.get("type") != "browser_call":
+                continue
+            token2 = str(t2.get("task_token") or "")
+            if token2 and share_contains_token(
+                result, token2, str(t2.get("instruction_file") or "")
+            ):
+                return {
+                    "response_filename": fname2,
+                    "agent": t2.get("agent") or stem2,
+                    "task_token": token2,
+                    "display_model": (t2.get("browser") or {}).get("display_model") or "",
+                }
+        return None
+
+    def _share_reuse_warning(run, filename: str, share_url: str) -> str | None:
+        inbox = run.path / "human_inbox"
+        if not share_url or not inbox.exists():
+            return None
+        for f in inbox.glob("*.response*.json"):
+            if f.name == filename:
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and str(data.get("share_url") or "") == share_url:
+                return (
+                    f"this share link was already submitted for another task "
+                    f"({f.name}) — double-check it belongs to this card"
+                )
+        return None
+
     @app.route("/run/<run_id>/harness/fetch-share", methods=["POST"])
     def run_harness_fetch_share(run_id: str):
         from proofstack.harness.chatgpt_share import (
@@ -754,26 +963,72 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(404)
         filename = str(request.form.get("response_filename") or "")
         target, task = _harness_task_for(run, filename)
+        _refuse_duplicate_response(target)
         share_url = str(request.form.get("share_url") or "").strip()
         operator_comments = str(request.form.get("operator_comments") or "")
+        stem = filename[: -len(".response.json")]
         try:
             result = extract_result(fetch_share(share_url))
-            warnings = validate_result(result, task)
+            auto_uploads, downloaded, download_failures = _auto_download_generated_files(
+                run, stem, share_url, result
+            )
+            warnings = validate_result(result, task) + download_failures
         except ShareFetchError as e:
+            fetch_error = str(e)
+        except Exception as e:
+            # Endpoint/schema drift must degrade to the manual fallback
+            # page, never to a bare 500.
+            fetch_error = (
+                f"unexpected error extracting the share ({type(e).__name__}: {e}) "
+                "— the endpoint may have changed; use the manual paste fallback"
+            )
+        else:
+            fetch_error = None
+        if fetch_error is not None:
             return (
                 render_template(
                     "dev_harness_confirm.html",
                     run=run,
                     task=task,
-                    error=str(e),
+                    error=fetch_error,
                     warnings=[],
                     share_url=share_url,
                     operator_comments=operator_comments,
                     response_filename=filename,
+                    digest=None,
                 ),
                 422,
             )
-        if warnings and request.form.get("confirmed") != "1":
+        reuse = _share_reuse_warning(run, filename, share_url)
+        if reuse:
+            warnings.append(reuse)
+        from proofstack.harness.chatgpt_share import share_contains_token
+
+        token = str(task.get("task_token") or "")
+        token_verified = not token or share_contains_token(
+            result, token, str(task.get("instruction_file") or "")
+        )
+        transfer = None if token_verified else _transfer_candidate(run, filename, result)
+        # Stage the extracted answer so that confirming applies exactly this
+        # version — never a re-fetch that may silently differ.
+        staged = {
+            "share_url": share_url,
+            "assistant_text": result["assistant_text"],
+            "model_slug": result.get("model_slug"),
+            "effort": result.get("effort"),
+            "sandbox_artifacts": [str(a) for a in result.get("sandbox_artifacts") or []],
+            "uploaded_files": auto_uploads,
+            "stored_files": [d for d in downloaded if not d["merged"]],
+        }
+        digest = hashlib.sha256(
+            json.dumps(staged, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+        staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
+        staged_path.write_text(
+            json.dumps({**staged, "digest": digest}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if warnings:
             return render_template(
                 "dev_harness_confirm.html",
                 run=run,
@@ -783,18 +1038,77 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 share_url=share_url,
                 operator_comments=operator_comments,
                 response_filename=filename,
+                digest=digest,
+                answer_preview=result["assistant_text"][:2000],
+                downloaded=downloaded,
+                transfer=transfer,
             )
-        payload = {
-            "status": "done",
-            "transport": "share_link",
-            "assistant_text": result["assistant_text"],
-            "share_url": share_url,
-            "model_slug": result.get("model_slug"),
-            "effort": result.get("effort"),
-            "operator_comments": operator_comments,
-            "uploaded_files": None,
-        }
-        target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        _write_response_atomic(
+            target,
+            {
+                "status": "done",
+                "transport": "share_link",
+                "assistant_text": result["assistant_text"],
+                "share_url": share_url,
+                "model_slug": result.get("model_slug"),
+                "effort": result.get("effort"),
+                "operator_comments": operator_comments,
+                "uploaded_files": auto_uploads or None,
+                "stored_files": staged["stored_files"] or None,
+            },
+        )
+        staged_path.unlink(missing_ok=True)
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/harness/confirm", methods=["POST"])
+    def run_harness_confirm(run_id: str):
+        # Apply a previously staged share fetch (optionally merging manually
+        # downloaded generated files), verified by digest so a stale confirm
+        # page can never submit content the operator did not review.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        target, task = _harness_task_for(run, filename)
+        _refuse_duplicate_response(target)
+        stem = filename[: -len(".response.json")]
+        staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
+        try:
+            staged = json.loads(staged_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            abort(
+                409,
+                description="no staged fetch result for this task — fetch the share link again",
+            )
+        digest = str(request.form.get("digest") or "")
+        if not digest or staged.get("digest") != digest:
+            abort(
+                409,
+                description=(
+                    "the staged fetch result changed since this page was rendered "
+                    "— fetch the share link again"
+                ),
+            )
+        uploads = [f for f in request.files.getlist("files") if f and f.filename]
+        # Auto-downloaded share files first; a manual upload of the same
+        # name deliberately overrides it.
+        uploaded_files = dict(staged.get("uploaded_files") or {})
+        uploaded_files.update(_save_harness_uploads(run, stem, uploads))
+        _write_response_atomic(
+            target,
+            {
+                "status": "done",
+                "transport": "share_link",
+                "assistant_text": str(staged.get("assistant_text") or ""),
+                "share_url": staged.get("share_url"),
+                "model_slug": staged.get("model_slug"),
+                "effort": staged.get("effort"),
+                "operator_comments": str(request.form.get("operator_comments") or ""),
+                "uploaded_files": uploaded_files or None,
+                "stored_files": staged.get("stored_files") or None,
+            },
+        )
+        staged_path.unlink(missing_ok=True)
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/harness/manual", methods=["POST"])
@@ -804,33 +1118,27 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(404)
         filename = str(request.form.get("response_filename") or "")
         target, task = _harness_task_for(run, filename)
+        _refuse_duplicate_response(target)
         assistant_text = str(request.form.get("assistant_text") or "")
         operator_comments = str(request.form.get("operator_comments") or "")
         uploads = [f for f in request.files.getlist("files") if f and f.filename]
         if not assistant_text.strip() and not uploads:
             abort(400, description="provide pasted answer text and/or uploaded files")
-        uploaded_files: dict[str, str] = {}
-        if uploads:
-            stem = filename[: -len(".response.json")]
-            updir = run.path / "human_inbox" / f"{stem}.uploads"
-            updir.mkdir(parents=True, exist_ok=True)
-            for f in uploads:
-                name = Path(f.filename).name
-                if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
-                    abort(400, description=f"invalid upload filename: {f.filename!r}")
-                f.save(updir / name)
-                uploaded_files[name] = str((updir / name).relative_to(run.path))
-        payload = {
-            "status": "done",
-            "transport": "manual",
-            "assistant_text": assistant_text,
-            "share_url": None,
-            "model_slug": None,
-            "effort": None,
-            "operator_comments": operator_comments,
-            "uploaded_files": uploaded_files or None,
-        }
-        target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        stem = filename[: -len(".response.json")]
+        uploaded_files = _save_harness_uploads(run, stem, uploads)
+        _write_response_atomic(
+            target,
+            {
+                "status": "done",
+                "transport": "manual",
+                "assistant_text": assistant_text,
+                "share_url": None,
+                "model_slug": None,
+                "effort": None,
+                "operator_comments": operator_comments,
+                "uploaded_files": uploaded_files or None,
+            },
+        )
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/resume", methods=["POST"])

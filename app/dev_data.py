@@ -884,6 +884,10 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                 kind = e.get("kind")
                 if kind == "human.waiting":
                     waiting[response_path] = {**payload, "agent": e.get("agent")}
+                    # A fresh wait supersedes any earlier resolution on the same
+                    # deterministic path (timeout -> resume -> waiting again):
+                    # the task must become visible again.
+                    resolved.discard(response_path)
                 elif kind in ("human.submitted", "human.timeout"):
                     resolved.add(response_path)
     except OSError:

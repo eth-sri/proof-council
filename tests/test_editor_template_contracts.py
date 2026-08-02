@@ -78,8 +78,17 @@ class EditorTemplateContractTests(unittest.TestCase):
         # link into an <input> or has picked upload files.
         self.assertIn(".human-task-card textarea, .human-task-card input", template)
         self.assertIn("t.files && t.files.length > 0", template)
-        self.assertIn("Use anyway", confirm)
-        self.assertIn("confirmed", confirm)
+        # Confirming applies the staged fetch (digest-bound), optionally
+        # merging manually downloaded generated files.
+        self.assertIn("Use fetched answer", confirm)
+        self.assertIn('name="digest"', confirm)
+        self.assertIn("run_harness_confirm", confirm)
+        self.assertIn('enctype="multipart/form-data"', confirm)
+        self.assertIn('type="file"', confirm)
+        # Structured preset inputs (lists/mappings) must survive the trip to
+        # the CLI via the runner's @<json> convention.
+        run_agent = (ROOT / "app" / "templates" / "dev_run_agent.html").read_text()
+        self.assertIn("'@' + JSON.stringify(value)", run_agent)
 
     def test_workflow_output_edges_from_repeat_nodes_are_mapped_before_output_target(self) -> None:
         template = (ROOT / "app" / "templates" / "dev_preset_editor.html").read_text()
