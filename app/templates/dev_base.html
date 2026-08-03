@@ -2838,12 +2838,17 @@
         function filterExecutionGraph() {
             const query = (document.getElementById('graph-search')?.value || '').trim().toLowerCase();
             const status = document.getElementById('graph-status')?.value || '';
+            const showProcedural = document.getElementById('graph-procedural')?.checked || false;
             const matches = (node) => {
                 const agent = node.dataset.agent || '';
                 const nodeStatus = node.dataset.status || '';
                 const matchesQuery = !query || agent.includes(query);
                 const matchesStatus = !status || nodeStatus === status;
-                return matchesQuery && matchesStatus;
+                // Procedural plumbing stays hidden by default; errors always show.
+                const proceduralOk = showProcedural
+                    || node.dataset.procedural !== '1'
+                    || nodeStatus === 'error';
+                return matchesQuery && matchesStatus && proceduralOk;
             };
             const apply = (node) => {
                 const childMatches = [...node.querySelectorAll(':scope > .graph-children > .graph-node')]
@@ -2856,6 +2861,7 @@
                 apply(node);
             });
         }
+        filterExecutionGraph();
         function renderLatexElements(root = document) {
             if (!window.MathJax || typeof window.MathJax.typesetPromise !== 'function') return;
             const elements = [...root.querySelectorAll('.latex-text')]
@@ -2877,6 +2883,7 @@
                 inFlight = true;
                 const query = document.getElementById('graph-search')?.value || '';
                 const status = document.getElementById('graph-status')?.value || '';
+                const showProcedural = document.getElementById('graph-procedural')?.checked || false;
                 try {
                     const response = await fetch(url, {cache: 'no-store'});
                     if (!response.ok) return;
@@ -2886,8 +2893,10 @@
                         panel.innerHTML = html;
                         const search = document.getElementById('graph-search');
                         const statusSelect = document.getElementById('graph-status');
+                        const proceduralToggle = document.getElementById('graph-procedural');
                         if (search) search.value = query;
                         if (statusSelect) statusSelect.value = status;
+                        if (proceduralToggle) proceduralToggle.checked = showProcedural;
                         filterExecutionGraph();
                     }
                     const live = panel.querySelector('[data-live-status]');

@@ -38,6 +38,19 @@ DEFAULT_TOOL_ROOT = CONFIGS_ROOT / "tools"
 WORKFLOW_OUTPUT_NODE_ID = "__workflow_outputs"
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REPEAT_KINDS = {"repeat"}
+
+# DAG node ids that are mechanical plumbing rather than AI-agent work; the
+# graph view hides them (plus every if_else gate) unless "Show procedural
+# nodes" is ticked. Errors are always shown regardless.
+_PROCEDURAL_RAW_IDS = {
+    "problem",
+    "init",
+    "review_join",
+    "ready_gate",
+    "compile_gate",
+    "compile_latex",
+    "return",
+}
 REPEAT_BODY_MARKER = "::body::"
 REPEAT_INPUT_SUFFIX = "::repeat_input"
 REPEAT_OUTPUT_SUFFIX = "::repeat_output"
@@ -1219,6 +1232,9 @@ class ExecutionGraphNode:
     cache_hit: bool = False
     execution_index: int = 1
     parent_node_id: str = ""
+    # Mechanical plumbing (init/join/gate/compile/return nodes) rather than
+    # an AI agent doing work — the graph view hides these by default.
+    procedural: bool = False
     children: list["ExecutionGraphNode"] = field(default_factory=list)
 
 
@@ -1694,14 +1710,17 @@ def load_execution_graph(
                 node.reason = node.reason or "Run ended before this node finished."
 
     # A resume appends a fresh run.start; a stop leaves no clean terminal
-    # event, so nodes interrupted by the stop stay "running" forever. Any agent
-    # node still "running" that started before the latest run.start belongs to
-    # the superseded attempt (it was re-run on resume), so mark it interrupted.
+    # event, so nodes interrupted by the stop stay "running" forever. Any
+    # non-repeat node still "running" that started before the latest
+    # run.start belongs to the superseded attempt (it was re-run on resume),
+    # so mark it interrupted. Repeat loops are excluded: the resumed
+    # iterations keep attaching to the original loop node, which therefore
+    # genuinely continues.
     if len(run_start_ts) >= 2:
         latest_start = max(run_start_ts)
         for node in by_id.values():
             if (
-                node.kind == "agent"
+                node.kind not in REPEAT_KINDS
                 and node.status == "running"
                 and node.start_ts
                 and node.start_ts < latest_start
@@ -1726,6 +1745,11 @@ def load_execution_graph(
                 node.status = "error"
                 node.end_ts = node.end_ts or call.end_ts
                 node.reason = node.reason or _call_error_message(call)
+
+    for node in by_id.values():
+        node.procedural = (
+            node.kind == "if_else" or node.raw_id in _PROCEDURAL_RAW_IDS
+        )
 
     return ExecutionGraph(
         run_id=run_path.name,
@@ -2159,6 +2183,11 @@ def _runtime_execution_node(
     execution_counts: dict[tuple[str, str], int] | None,
 ) -> ExecutionGraphNode:
     if not for_start:
+        return node
+    if node.kind in REPEAT_KINDS:
+        # A resumed run re-emits node.started for its repeat loop, but the
+        # loop's iterations keep attaching to the ORIGINAL node — a fresh
+        # "#2" instance would sit empty and "running" forever.
         return node
     key = ((parent_node.node_id if parent_node else node.parent_node_id), node.node_id)
     if execution_counts is None:
