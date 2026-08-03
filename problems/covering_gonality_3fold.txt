@@ -1,0 +1,6 @@
+Prove or construct a counterexample to the following claim:
+
+\medskip
+
+\noindent There exists an integer $n$ such that every smooth projective 3-fold
+$X$ over $\mathbb{C}$ with covering gonality at least $n$ is of general type.
