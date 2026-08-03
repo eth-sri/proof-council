@@ -225,6 +225,43 @@ def test_compute_always_uses_scrubbed_codex_home() -> None:
         assert not codex_home.exists()
 
 
+def test_compute_sandbox_passes_no_provider_keys_alongside_codex_login() -> None:
+    from unittest import mock
+
+    from proofstack.kinds.cli import CLIAgent
+    from proofstack.sandbox.base import SandboxSpec as Spec
+
+    async def fake_super_run(self, inp):
+        return Compute.Outputs()
+
+    def spec_for(home: Path) -> Spec:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test", root_workdir=Path(temp_dir) / "run", flat=True
+            )
+            agent = Compute(ctx)
+            inp = Compute.Inputs(
+                problem="P",
+                problem_id="p",
+                round=1,
+                instructions="compute",
+                compute_workspace=Path(temp_dir) / "ws",
+                sandbox_backend="subprocess",
+            )
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.object(
+                CLIAgent, "run", fake_super_run
+            ):
+                asyncio.run(agent.run(inp))
+            return agent.SANDBOX
+
+    with tempfile.TemporaryDirectory() as home_dir:
+        home = Path(home_dir)
+        assert spec_for(home).provider_keys == Spec.provider_keys  # no login: paid fallback
+        (home / ".codex").mkdir()
+        (home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+        assert spec_for(home).provider_keys == ()  # login present: keys stripped
+
+
 def test_compute_usage_subscription_auth_charges_no_usd() -> None:
     import json as _json
 

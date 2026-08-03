@@ -316,6 +316,16 @@ class Compute(CLIAgent):
             docker_image=str(inp.docker_image or DEFAULT_DOCKER_IMAGE),  # type: ignore[attr-defined]
             docker_no_new_privileges=False,
             docker_extra_args=docker_extra_args,
+            # When a codex login exists, auth travels ONLY via the copied
+            # auth.json in CODEX_HOME — passing provider keys through as
+            # well would let codex silently bill a paid key while the
+            # accounting reports the call as subscription-covered $0. With
+            # no login, the env-key fallback stays (and bills as paid).
+            provider_keys=(
+                ()
+                if (Path.home() / ".codex" / "auth.json").is_file()
+                else SandboxSpec.provider_keys
+            ),
         )
         self.CLI_CMD = _build_codex_cmd(
             model=inp.model,  # type: ignore[attr-defined]
