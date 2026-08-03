@@ -209,7 +209,19 @@ class Agent(ABC):
 
         out_json = self._dump_output(out)
         if self.cache_enabled:
-            self.ctx.resume_cache.put(cache_key, out_json)
+            if self._output_cacheable(out_json):
+                self.ctx.resume_cache.put(cache_key, out_json)
+            else:
+                await self.events.emit(
+                    "agent.uncacheable_output",
+                    {
+                        "key": cache_key,
+                        "status": str((out_json or {}).get("status") or ""),
+                        "reason": "self-reported failure; a resume re-attempts this node",
+                    },
+                    call_id=call_id,
+                    parent_call_id=parent_call_id,
+                )
         await self._persist_output(out, workdir)
         await self.events.emit(
             "agent.end",
@@ -256,6 +268,22 @@ class Agent(ABC):
             )
         except Exception:
             return
+
+    # Self-reported outcomes that must never be replayed from the resume
+    # cache: replaying a failed/truncated result on resume silently turns
+    # one bad round into a permanent one. Salvage output still flows to the
+    # CURRENT run's consumers — only persistence is refused.
+    UNCACHEABLE_STATUSES: ClassVar[frozenset[str]] = frozenset(
+        {"error", "timeout", "partial", "blocked"}
+    )
+
+    def _output_cacheable(self, out_json: Any) -> bool:
+        if not isinstance(out_json, dict):
+            return True
+        if out_json.get("error"):
+            return False
+        status = str(out_json.get("status") or "").lower()
+        return status not in self.UNCACHEABLE_STATUSES
 
     def _cache_key(self, inp: BaseModel) -> str:
         payload = {

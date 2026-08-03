@@ -569,7 +569,12 @@ async def amain() -> int:
 
     out_json = out.model_dump(mode="json") if hasattr(out, "model_dump") else out
 
-    status = "error" if isinstance(out_json, dict) and out_json.get("error") else "ok"
+    failed = isinstance(out_json, dict) and (
+        bool(out_json.get("error"))
+        or str(out_json.get("status") or "").lower()
+        in {"error", "timeout", "blocked"}
+    )
+    status = "error" if failed else "ok"
     await ctx.events.emit("run.end", {"status": status})
     await _drain_monitor(ctx)
     ctx.write_metadata(
