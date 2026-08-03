@@ -21,22 +21,23 @@ What it does:
      per-round ``compute_workspace_round_*.zip`` snapshots (already
      compressed, redundant) and paper PDFs (their extracted ``.txt`` are
      kept) — this drops a typical run from ~280 MB to ~12 MB without
-     losing the reasoning trace. Credential material (``.codex-home/``,
-     ``.codex/``, ``.compute_codex_home/``, ``auth.json``) is always
-     excluded, and symlinks are dropped unless they resolve inside the
-     run dir.
-  2. Uploads the zip to OpenAI and attaches it to a code_interpreter
-     container.
+     losing the reasoning trace. Credential/secret material (the shared
+     ``_secret_paths`` policy: ``.codex-home/``, ``.ssh/``, ``auth.json``,
+     ``.env``, key files, ...) is always excluded — prebuilt ``--zip``
+     archives are rebuilt without such members — and symlinks are
+     dropped unless they resolve inside the run dir.
+  2. Uploads the zip to OpenAI (bounded 24 h expiry) and attaches it to
+     a code_interpreter container.
   3. Runs a single audit call (default ``models/openai/gpt-55-pro``,
      override with ``--model``; must be an OpenAI Responses config)
      through ``APIClient`` (so cost and token accounting stay
      centralized).
   4. Downloads whatever the model saved under ``/mnt/data/audit_artifacts/``
-     (the progress PNG, the CSV, ...).
+     (the progress PNG, the CSV, ...), then deletes the container.
   5. Writes ``report.md``, ``artifacts/``, ``conversation.json`` and
      ``audit_meta.json`` into the output directory.
-  6. Deletes the uploaded zip from OpenAI again (skip with
-     ``--keep-upload``).
+  6. Deletes the uploaded zip from OpenAI again (``--keep-upload`` skips
+     this; the 24 h expiry still applies).
 """
 from __future__ import annotations
 
@@ -47,7 +48,7 @@ import os
 import sys
 import zipfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -55,6 +56,7 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 from _env import load_dotenv_file  # noqa: E402
+from _secret_paths import SECRET_DIR_NAMES, SECRET_FILE_NAMES, is_secret_rel_path  # noqa: E402
 
 load_dotenv_file(REPO_ROOT / ".env")
 
@@ -69,18 +71,15 @@ DEFAULT_MODEL = "models/openai/gpt-55-pro"
 # duplicate earlier workspace state; the paper PDFs have ``.txt`` siblings.
 WORKSPACE_SNAPSHOT_GLOB = "compute_workspace_round_*.zip"
 
-# Credential material the workflow scrubs on clean teardown but which
-# crashed or legacy runs can leave behind (see compute._ZIP_EXCLUDE_TOP);
-# excluded unconditionally, independent of user-supplied --exclude globs.
-CREDENTIAL_DIR_NAMES = {".codex-home", ".codex", ".compute_codex_home"}
-CREDENTIAL_FILE_NAMES = {"auth.json"}
+# Secret material (shared _secret_paths policy) is excluded
+# unconditionally, independent of user-supplied --exclude globs: the
+# workflow scrubs it on clean teardown, but crashed or legacy runs can
+# leave it behind (see compute._ZIP_EXCLUDE_TOP).
+SECRET_EXCLUSION_NAMES = sorted(SECRET_DIR_NAMES | SECRET_FILE_NAMES) + ["*.env"]
 
-
-def _is_credential_path(rel: Path) -> bool:
-    return (
-        any(part in CREDENTIAL_DIR_NAMES for part in rel.parts)
-        or rel.name in CREDENTIAL_FILE_NAMES
-    )
+# The upload should never outlive the audit by much, even when this
+# process dies before its eager cleanup runs (SIGKILL, power loss).
+UPLOAD_TTL_S = 24 * 3600
 
 SYSTEM_PROMPT = (
     "You are a senior research mathematician and ML-systems auditor "
@@ -129,7 +128,9 @@ progression, and the final solution.
 - Deliverables: create the directory /mnt/data/audit_artifacts/ and save \
 into it (a) the progress-vs-round curve as a PNG and (b) the round-by-round \
 progress estimates as a CSV. Anything you put there will be retrieved and \
-filed next to your report, so reference these files by name in the report.
+filed in an artifacts/ directory next to your report, so reference each \
+such file as artifacts/<basename> in the report (e.g. \
+![progress](artifacts/progress.png)).
 - Return the full audit as your final assistant message in GitHub-flavored \
 Markdown."""
 
@@ -147,9 +148,9 @@ def _build_bundle(
     relative to ``run_dir`` (posix form). Returns (files_written,
     files_skipped).
 
-    Credential material (``CREDENTIAL_DIR_NAMES``/``CREDENTIAL_FILE_NAMES``)
-    is always excluded. Symlinks are dropped unless their resolved target
-    stays inside ``run_dir`` and is not credential material —
+    Secret material (shared ``_secret_paths`` policy) is always excluded.
+    Symlinks are dropped unless their resolved target stays inside
+    ``run_dir`` and is not secret material —
     ``ZipFile.write`` follows symlinks, so an unchecked link like
     ``leak.txt -> ../outside-secret.txt`` would exfiltrate files from
     outside the run (same policy as ``compute._zip_workspace``)."""
@@ -163,7 +164,7 @@ def _build_bundle(
             if path.is_dir() and not path.is_symlink():
                 continue
             rel = path.relative_to(run_dir)
-            if _is_credential_path(rel):
+            if is_secret_rel_path(rel):
                 skipped += 1
                 continue
             if path.is_symlink():
@@ -177,7 +178,7 @@ def _build_bundle(
                 except ValueError:
                     skipped += 1
                     continue
-                if _is_credential_path(target_rel) or not target.is_file():
+                if is_secret_rel_path(target_rel) or not target.is_file():
                     skipped += 1
                     continue
             elif not path.is_file():
@@ -215,9 +216,15 @@ def _exclusions_note(
         return (
             "This bundle was prepared externally, so its exact contents are "
             "unknown to this tool; audit whatever is present and do not assume "
-            "any particular file is missing by design."
+            "any particular file is missing by design. Only framework "
+            "credential/secret files (auth homes, `auth.json`, `.env`, key "
+            "files) were filtered out before upload; their absence is not a "
+            "defect."
         )
-    excluded = ["framework credential material (Codex auth homes and `auth.json` files)"]
+    excluded = [
+        "framework credential/secret material (auth homes like `.codex-home/`"
+        " or `.ssh/`, and `auth.json` / `.env` / key files)"
+    ]
     if not include_workspace_zips:
         excluded.append("per-round `compute_workspace_round_*.zip` workspace snapshots")
     if not include_pdfs:
@@ -229,6 +236,46 @@ def _exclusions_note(
         "when building this bundle: " + "; ".join(excluded)
         + ". Do NOT treat their absence as a workflow defect."
     )
+
+
+def _sanitize_prebuilt_zip(src_zip: Path, out_zip: Path) -> tuple[Path, list[str]]:
+    """Return an upload-safe archive for a prebuilt ``--zip``.
+
+    Member names are checked against the shared secret policy; a clean
+    archive is uploaded as-is, otherwise a filtered copy is rebuilt at
+    ``out_zip`` (the original is left untouched). Members are streamed
+    between the archives, never extracted to disk. Returns the archive to
+    upload and the dropped member names."""
+    with zipfile.ZipFile(src_zip) as zin:
+        infos = zin.infolist()
+        dropped = [
+            info.filename for info in infos
+            if is_secret_rel_path(PurePosixPath(info.filename.replace("\\", "/")))
+        ]
+        if not dropped:
+            return src_zip, []
+        dropped_set = set(dropped)
+        out_zip.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in infos:
+                if info.filename in dropped_set:
+                    continue
+                zout.writestr(info, zin.read(info))
+    return out_zip, dropped
+
+
+def _rewrite_artifact_links(report: str, artifacts: list[str]) -> str:
+    """Repoint sandbox paths (and bare-name links) the model emits at the
+    local ``artifacts/`` copies so references in report.md resolve."""
+    for name in artifacts:
+        local = f"artifacts/{name}"
+        report = (
+            report.replace(f"sandbox:/mnt/data/audit_artifacts/{name}", local)
+            .replace(f"/mnt/data/audit_artifacts/{name}", local)
+            .replace(f"sandbox:/mnt/data/{name}", local)
+            .replace(f"]({name})", f"]({local})")
+        )
+    return report
 
 
 def _container_id_from_conversation(conversation: list[dict]) -> str | None:
@@ -334,7 +381,8 @@ def main() -> int:
     parser.add_argument(
         "--keep-upload",
         action="store_true",
-        help="keep the uploaded zip on OpenAI after the audit (default: delete it)",
+        help="skip the eager post-audit deletion of the uploaded zip; it "
+        "still expires on OpenAI after 24 h",
     )
     args = parser.parse_args()
 
@@ -344,10 +392,18 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Resolve the bundle.
+    zip_members_dropped: list[str] = []
     if args.zip:
-        bundle = args.zip.resolve()
-        if not bundle.is_file():
-            raise SystemExit(f"--zip not found: {bundle}")
+        src = args.zip.resolve()
+        if not src.is_file():
+            raise SystemExit(f"--zip not found: {src}")
+        bundle, zip_members_dropped = _sanitize_prebuilt_zip(
+            src, out_dir / f"{src.stem}_sanitized.zip"
+        )
+        if zip_members_dropped:
+            shown = ", ".join(zip_members_dropped[:5])
+            more = f" (+{len(zip_members_dropped) - 5} more)" if len(zip_members_dropped) > 5 else ""
+            print(f"sanitized prebuilt zip: dropped secret members {shown}{more}")
         print(f"using bundle: {bundle} ({bundle.stat().st_size / 1e6:.1f} MB)")
     else:
         run_dir = args.run_dir.resolve()
@@ -379,12 +435,18 @@ def main() -> int:
         raise SystemExit("OPENAI_API_KEY not set")
     oc = OpenAI(api_key=api_key)
 
-    # 3. Upload + attach to a code_interpreter container.
+    # 3. Upload + attach to a code_interpreter container. The bounded
+    #    expiry caps retention even if this process is killed before the
+    #    eager cleanup below can run.
     with open(bundle, "rb") as fh:
-        uploaded = oc.files.create(file=fh, purpose="user_data")
-    print(f"uploaded: file_id={uploaded.id} bytes={uploaded.bytes}")
+        uploaded = oc.files.create(
+            file=fh,
+            purpose="user_data",
+            expires_after={"anchor": "created_at", "seconds": UPLOAD_TTL_S},
+        )
+    print(f"uploaded: file_id={uploaded.id} bytes={uploaded.bytes} (expires in {UPLOAD_TTL_S // 3600} h)")
     try:
-        return _run_audit(args, cfg, oc, bundle, uploaded, out_dir, ts)
+        return _run_audit(args, cfg, oc, bundle, uploaded, out_dir, ts, zip_members_dropped)
     finally:
         if args.keep_upload:
             print(f"  keeping uploaded file {uploaded.id} (--keep-upload)")
@@ -396,7 +458,10 @@ def main() -> int:
                 print(f"  WARN: could not delete uploaded file {uploaded.id}: {e}", file=sys.stderr)
 
 
-def _run_audit(args, cfg: dict, oc: OpenAI, bundle: Path, uploaded, out_dir: Path, ts: str) -> int:
+def _run_audit(
+    args, cfg: dict, oc: OpenAI, bundle: Path, uploaded, out_dir: Path, ts: str,
+    zip_members_dropped: list[str],
+) -> int:
     tool_pairs = [
         (None, {"type": "code_interpreter", "container": {"type": "auto", "file_ids": [uploaded.id]}}),
         (None, {"type": "web_search_preview"}),
@@ -430,15 +495,23 @@ def _run_audit(args, cfg: dict, oc: OpenAI, bundle: Path, uploaded, out_dir: Pat
     container_id = _container_id_from_conversation(conversation)
     print(f"  done in {elapsed / 60:.1f} min; ${cost.get('cost', 0):.2f}; report {len(report)} chars; container={container_id}")
 
-    # 4. Download artifacts the model produced.
+    # 4. Download artifacts the model produced, then drop the container
+    #    (it holds a copy of the bundle and would otherwise linger until
+    #    its inactivity expiry).
     artifacts: list[str] = []
     if container_id:
         artifacts = _download_artifacts(oc, container_id, bundle.name, out_dir / "artifacts")
         print(f"  artifacts: {artifacts or 'none'}")
+        try:
+            oc.containers.delete(container_id)
+            print(f"  deleted container {container_id}")
+        except Exception as e:
+            print(f"  WARN: could not delete container {container_id}: {e}", file=sys.stderr)
     else:
         print("  WARN: no container_id in conversation; cannot fetch artifacts", file=sys.stderr)
 
     # 5. Persist everything.
+    report = _rewrite_artifact_links(report, artifacts)
     (out_dir / "report.md").write_text(report + "\n", encoding="utf-8")
     (out_dir / "conversation.json").write_text(
         json.dumps(conversation, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
@@ -455,13 +528,16 @@ def _run_audit(args, cfg: dict, oc: OpenAI, bundle: Path, uploaded, out_dir: Pat
         "cost": cost,
         "artifacts": artifacts,
         "source": "prebuilt-zip" if args.zip else "run-dir",
-        # A prebuilt --zip has unknown contents; recording exclusions there
-        # would claim a curation this tool never performed.
-        "excluded": None if args.zip else {
+        # A prebuilt --zip has unknown contents; the only curation this
+        # tool performs on it is the secret-member sanitization.
+        "excluded": {
+            "credentials": SECRET_EXCLUSION_NAMES,
+            "zip_members_dropped": zip_members_dropped,
+        } if args.zip else {
             "workspace_zips": not args.include_workspace_zips,
             "pdfs": not args.include_pdfs,
             "globs": args.exclude,
-            "credentials": sorted(CREDENTIAL_DIR_NAMES | CREDENTIAL_FILE_NAMES),
+            "credentials": SECRET_EXCLUSION_NAMES,
         },
         "report_chars": len(report),
     }

@@ -3,10 +3,12 @@
 The bundle is uploaded to a third-party API, so ``_build_bundle`` must
 never follow a symlink out of the run directory (``ZipFile.write``
 follows symlinks and would exfiltrate the target's contents) and must
-unconditionally strip credential material that crashed or legacy runs
-leave behind (``.codex-home/``, ``.compute_codex_home/``, ``.codex/``,
-``auth.json``). ``main`` must refuse non-OpenAI model configs because
-the uploaded bundle only rides an OpenAI code_interpreter container.
+unconditionally strip secret material per the shared ``_secret_paths``
+policy (``.codex-home/``, ``.ssh/``, ``auth.json``, ``.env``, ...).
+Prebuilt ``--zip`` archives go through ``_sanitize_prebuilt_zip`` so the
+same guarantee holds for them. ``main`` must refuse non-OpenAI model
+configs because the uploaded bundle only rides an OpenAI
+code_interpreter container.
 """
 from __future__ import annotations
 
@@ -48,6 +50,11 @@ class BuildBundleTests(unittest.TestCase):
         (run / "subdir" / ".codex").mkdir()
         (run / "subdir" / ".codex" / "config.toml").write_text("cfg")
         (run / "subdir" / "auth.json").write_text("CRED")
+        (run / ".env").write_text("CRED")
+        (run / "prod.env").write_text("CRED")
+        (run / "subdir" / "credentials.json").write_text("CRED")
+        (run / ".ssh").mkdir()
+        (run / ".ssh" / "id_rsa").write_text("CRED")
         (run / "leak.txt").symlink_to("../outside-secret.txt")
         (run / "alias.txt").symlink_to("normal.txt")
         (run / "sneaky.json").symlink_to(".codex-home/auth.json")
@@ -80,7 +87,8 @@ class BuildBundleTests(unittest.TestCase):
     def test_credentials_excluded_even_with_include_flags(self):
         names = self._bundle(include_workspace_zips=True, include_pdfs=True)
         self.assertNotIn(b"CRED", self.blob)
-        self.assertFalse(any(".codex" in n or "auth.json" in n for n in names), names)
+        secret_markers = (".codex", "auth.json", ".env", "credentials", ".ssh", "id_rsa")
+        self.assertFalse(any(m in n for n in names for m in secret_markers), names)
         self.assertIn("run_x/paper.pdf", names)
         self.assertIn("run_x/compute_workspace_round_1.zip", names)
 
@@ -106,6 +114,67 @@ class ExclusionsNoteTests(unittest.TestCase):
         )
         self.assertIn("prepared externally", note)
         self.assertNotIn("excluded when building", note)
+
+
+class SanitizePrebuiltZipTests(unittest.TestCase):
+    def setUp(self):
+        self.ps = _load_module()
+        self.tmp = Path(tempfile.mkdtemp(prefix="pss_"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _make_zip(self, members: dict[str, str]) -> Path:
+        src = self.tmp / "src.zip"
+        with zipfile.ZipFile(src, "w") as zf:
+            for name, content in members.items():
+                zf.writestr(name, content)
+        return src
+
+    def test_dirty_zip_is_rebuilt_without_secret_members(self):
+        src = self._make_zip({
+            "run/ok.txt": "hello",
+            "run/.codex-home/auth.json": "CRED",
+            "run/.env": "CRED",
+            "run/sub/credentials.json": "CRED",
+        })
+        out = self.tmp / "out" / "sanitized.zip"
+        bundle, dropped = self.ps._sanitize_prebuilt_zip(src, out)
+        self.assertEqual(bundle, out)
+        self.assertEqual(
+            sorted(dropped),
+            ["run/.codex-home/auth.json", "run/.env", "run/sub/credentials.json"],
+        )
+        with zipfile.ZipFile(bundle) as zf:
+            self.assertEqual(zf.namelist(), ["run/ok.txt"])
+            self.assertEqual(zf.read("run/ok.txt"), b"hello")
+        with zipfile.ZipFile(src) as zf:
+            self.assertIn("run/.env", zf.namelist())
+
+    def test_clean_zip_is_used_as_is(self):
+        src = self._make_zip({"run/ok.txt": "hello", "run/sub/log.md": "x"})
+        out = self.tmp / "out" / "sanitized.zip"
+        bundle, dropped = self.ps._sanitize_prebuilt_zip(src, out)
+        self.assertEqual(bundle, src)
+        self.assertEqual(dropped, [])
+        self.assertFalse(out.exists())
+
+
+class RewriteArtifactLinksTests(unittest.TestCase):
+    def test_sandbox_and_bare_links_are_repointed(self):
+        ps = _load_module()
+        report = (
+            "![p](sandbox:/mnt/data/audit_artifacts/progress.png) and "
+            "see /mnt/data/audit_artifacts/rounds.csv plus "
+            "![q](progress.png) but keep ![r](artifacts/progress.png) "
+            "and unrelated /mnt/data/audit_artifacts/other.csv"
+        )
+        out = ps._rewrite_artifact_links(report, ["progress.png", "rounds.csv"])
+        self.assertEqual(
+            out,
+            "![p](artifacts/progress.png) and "
+            "see artifacts/rounds.csv plus "
+            "![q](artifacts/progress.png) but keep ![r](artifacts/progress.png) "
+            "and unrelated /mnt/data/audit_artifacts/other.csv",
+        )
 
 
 class ModelGuardTests(unittest.TestCase):

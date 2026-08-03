@@ -29,6 +29,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 if SRC_ROOT.exists() and str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 from proofstack.latex_contract import (  # noqa: E402
     DEFAULT_FIRSTPROOF_PAGE_LIMIT,
@@ -37,17 +40,14 @@ from proofstack.latex_contract import (  # noqa: E402
     strip_forbidden_formatting_commands,
     strip_forbidden_packages,
 )
+from _secret_paths import (  # noqa: E402
+    SECRET_DIR_NAMES as _RETRIEVAL_SECRET_DIR_NAMES,
+    is_secret_file_name as _is_retrieval_secret_file,
+)
 
 DEFAULT_INPUT_PATH = Path("/data/input/input.json")
 DEFAULT_OUTPUT_DIR = Path("/data/output")
 DEFAULT_TMP_PROBLEM_DIR = Path("/tmp/firstproof_problems")
-
-_RETRIEVAL_SECRET_DIR_NAMES = frozenset(
-    {".aws", ".codex", ".codex-home", ".compute_codex_home", ".ssh", "secrets"}
-)
-_RETRIEVAL_SECRET_FILE_NAMES = frozenset(
-    {".env", "auth.json", "credentials", "credentials.json", "id_ed25519", "id_rsa"}
-)
 
 
 @dataclass(frozen=True)
@@ -291,10 +291,6 @@ def _prepare_output_dir(path: Path) -> None:
     # any solution exists. Those subdirs are created lazily by
     # ``_run_problem`` (for ``logs/``) and by the workflow subprocess
     # (for ``workflow_runs/``) only once we actually commit to running.
-
-
-def _is_retrieval_secret_file(name: str) -> bool:
-    return name in _RETRIEVAL_SECRET_FILE_NAMES or name.endswith(".env")
 
 
 def _chmod_for_removal(path: Path, warnings: list[str]) -> None:
