@@ -59,6 +59,7 @@ from app.dev_data import (
     find_preset,
     find_run,
     find_runs_awaiting_human,
+    find_runs_with_busy_compute,
     run_process_alive,
     stop_run_process,
     write_stopped_marker,
@@ -160,7 +161,11 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             waiting = find_runs_awaiting_human(app.config["RUNS_ROOTS"])
         except Exception:
             waiting = []
-        return {"human_waiting_runs": waiting}
+        try:
+            compute_busy = find_runs_with_busy_compute(app.config["RUNS_ROOTS"])
+        except Exception:
+            compute_busy = []
+        return {"human_waiting_runs": waiting, "compute_busy_runs": compute_busy}
 
     @app.template_filter("display_scalar")
     def display_scalar(value):

@@ -475,6 +475,13 @@
             animation: nav-waiting-pulse 2s ease-in-out infinite;
         }
         .nav-waiting-btn:hover { background: #fbbf24 !important; }
+        .nav-waiting ~ .nav-waiting { margin-left: 8px; }
+        .nav-compute-btn {
+            background: #3b82f6 !important;
+            color: #f9fafb !important;
+            animation: none;
+        }
+        .nav-compute-btn:hover { background: #60a5fa !important; }
         @keyframes nav-waiting-pulse {
             0%, 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.5); }
             50% { box-shadow: 0 0 0 5px rgba(245,158,11,0); }
@@ -3011,6 +3018,16 @@
                 <a class="nav-waiting-btn" href="{{ url_for('run_detail', run_id=human_waiting_runs[0].run_id) }}">⏳ Waiting on you ({{ human_waiting_runs|sum(attribute='count') }})</a>
                 <div class="nav-waiting-menu">
                     {% for w in human_waiting_runs %}
+                    <a href="{{ url_for('run_detail', run_id=w.run_id) }}">{{ w.display_name }}<span class="nav-waiting-count">{{ w.count }}</span></a>
+                    {% endfor %}
+                </div>
+            </div>
+            {% endif %}
+            {% if compute_busy_runs %}
+            <div class="nav-waiting nav-compute">
+                <a class="nav-waiting-btn nav-compute-btn" href="{{ url_for('run_detail', run_id=compute_busy_runs[0].run_id) }}">⚙️ Waiting on compute worker{% if compute_busy_runs|length > 1 %} ({{ compute_busy_runs|length }} runs){% endif %}</a>
+                <div class="nav-waiting-menu">
+                    {% for w in compute_busy_runs %}
                     <a href="{{ url_for('run_detail', run_id=w.run_id) }}">{{ w.display_name }}<span class="nav-waiting-count">{{ w.count }}</span></a>
                     {% endfor %}
                 </div>

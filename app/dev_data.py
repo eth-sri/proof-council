@@ -1079,6 +1079,80 @@ def find_runs_awaiting_human(roots: Iterable[Path]) -> list[dict[str, Any]]:
     return out
 
 
+# CLI worker processes are recognized by command line; attribution to a run
+# happens via /proc/<pid>/cwd containment, so the dashboard's own processes
+# (cwd = repo root) never match. Docker-backend children are not visible this
+# way — the indicator covers the subprocess sandbox backend only.
+_CLI_WORKER_CMD_MARKERS = ("codex", "claude")
+_WORKER_SCAN_TTL_S = 3.0
+_worker_scan_cache: tuple[float, list[Path]] = (0.0, [])
+
+
+def _cli_worker_cwds() -> list[Path]:
+    """Distinct cwds of live CLI worker processes (codex/claude), cached
+    briefly because the nav indicator triggers this on every page render."""
+    global _worker_scan_cache
+    now = time.monotonic()
+    cached_at, cached = _worker_scan_cache
+    if now - cached_at < _WORKER_SCAN_TTL_S:
+        return cached
+    cwds: set[Path] = set()
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (
+                (entry / "cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")
+            )
+            head = cmdline.split(" ", 3)[:3]
+            if not any(m in part for m in _CLI_WORKER_CMD_MARKERS for part in head):
+                continue
+            cwds.add(Path(os.readlink(entry / "cwd")))
+        except OSError:
+            continue
+    result = sorted(cwds)
+    _worker_scan_cache = (now, result)
+    return result
+
+
+def find_runs_with_busy_compute(roots: Iterable[Path]) -> list[dict[str, Any]]:
+    """Every non-terminal run with a live CLI worker child (codex/claude)
+    whose cwd sits inside the run directory.
+
+    Powers the nav "waiting on compute worker" indicator. Distinct worker
+    cwds are counted so a wrapper + its child binary count once.
+    """
+    workers = _cli_worker_cwds()
+    if not workers:
+        return []
+    out: list[dict[str, Any]] = []
+    for run in discover_runs(roots, include_batch_children=True):
+        if (run.status or "running") in {"finished", "error", "stopped"}:
+            continue
+        try:
+            run_path = run.path.resolve()
+        except OSError:
+            continue
+        count = sum(1 for cwd in workers if cwd == run_path or run_path in cwd.parents)
+        if count:
+            out.append(
+                {
+                    "run_id": run.run_id,
+                    "display_name": run.display_name or run.run_id,
+                    "count": count,
+                }
+            )
+    return out
+
+
 def _path_size(path: Path) -> int:
     """Total bytes under ``path`` (a file or a directory tree)."""
     try:
