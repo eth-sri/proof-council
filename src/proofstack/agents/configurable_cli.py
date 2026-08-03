@@ -410,6 +410,7 @@ class ConfigurableCLIAgent(CLIAgent):
             return
         cost = 0.0
         nominal: float | None = None
+        billing_unknown = False
         # Only observed copied subscription auth suppresses USD accounting.
         # A declarative bill:false flag must never hide a paid-key fallback.
         subscription = self._copied_codex_auth
@@ -423,10 +424,10 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cli.cost_lookup_failed",
                 {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
             )
-            if not subscription:
-                # A paid call whose price cannot be determined must not be
-                # silently recorded as free.
-                return
+            # A paid call whose price cannot be determined must not vanish
+            # from accounting: record tokens and the call, marked
+            # billing_unknown, instead of silently dropping the spend.
+            billing_unknown = not subscription
             cfg_ref = None
         else:
             nominal = cost_for_codex_usage(usage, **rates)
@@ -445,6 +446,7 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cost_usd": cost,
                 "api_equivalent_usd": nominal,
                 "subscription": subscription,
+                "billing_unknown": billing_unknown,
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,

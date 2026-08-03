@@ -616,7 +616,7 @@ async def amain() -> int:
     failed = isinstance(out_json, dict) and (
         bool(out_json.get("error"))
         or str(out_json.get("status") or "").lower()
-        in {"error", "timeout", "blocked"}
+        in {"error", "timeout", "partial", "blocked"}
     )
     status = "error" if failed else "ok"
     await ctx.events.emit("run.end", {"status": status})
@@ -633,7 +633,9 @@ async def amain() -> int:
     print(f"output: {ctx.root_workdir}")
     print("outputs:")
     print(json.dumps(out_json, ensure_ascii=False, indent=2, default=str))
-    return 0
+    # A failed final output must surface to callers (batch runners key off
+    # the exit code), not just to the metadata.
+    return 1 if failed else 0
 
 
 async def _drain_monitor(ctx: RunContext) -> None:

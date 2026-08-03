@@ -492,6 +492,7 @@ class Compute(CLIAgent):
             return
         cost = 0.0
         nominal: float | None = None
+        billing_unknown = False
         subscription = self._subscription_codex_auth
         cfg_ref: str | None = self._last_cost_config or DEFAULT_COST_CONFIG
         try:
@@ -501,10 +502,10 @@ class Compute(CLIAgent):
                 "cli.cost_lookup_failed",
                 {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
             )
-            if not subscription:
-                # A paid call whose price cannot be determined must not be
-                # silently recorded as free.
-                return
+            # A paid call whose price cannot be determined must not vanish
+            # from accounting: tokens and the call are still recorded, with
+            # billing_unknown marking the unpriced spend.
+            billing_unknown = not subscription
             cfg_ref = None
         else:
             nominal = cost_for_codex_usage(usage, **rates)
@@ -527,6 +528,7 @@ class Compute(CLIAgent):
                 "cost_usd": cost,
                 "api_equivalent_usd": nominal,
                 "subscription": subscription,
+                "billing_unknown": billing_unknown,
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,

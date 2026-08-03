@@ -150,9 +150,18 @@ class RunMonitor:
         monitor_call_id = new_call_id()
         # The monitor spends real API money; once the run's budget is gone it
         # must stop adding to the overrun instead of racing the cooperative
-        # agent-side checks.
+        # agent-side checks. A max_usd of exactly 0 declares "no paid spend
+        # at all" — check() only trips AFTER positive spending, which would
+        # still allow one free call.
+        root = self.ctx.budgets.root("run")
+        zero_usd = any(
+            node.spec is not None and node.spec.max_usd == 0
+            for node in root.chain()
+        )
         try:
-            self.ctx.budgets.root("run").check()
+            if zero_usd:
+                raise BudgetExhausted("run", "usd", 0.0, root.counters.usd)
+            root.check()
         except BudgetExhausted as e:
             await self.ctx.events.emit(
                 "monitor.skipped",

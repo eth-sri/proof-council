@@ -1552,6 +1552,7 @@ def load_event_tree(run_path: Path) -> RunEventTree:
     by_id: dict[str, CallNode] = {}
     run_status = ""
     run_end_ts: str | None = None
+    latest_run_start_ts: str | None = None
     if not events_path.exists():
         return RunEventTree(
             run_id=run_path.name,
@@ -1578,6 +1579,8 @@ def load_event_tree(run_path: Path) -> RunEventTree:
                 # state must not bleed onto calls the resumed worker runs.
                 run_status = ""
                 run_end_ts = None
+                if evt.get("ts"):
+                    latest_run_start_ts = str(evt.get("ts"))
 
             if kind == "run.end":
                 payload = evt.get("payload") or {}
@@ -1675,6 +1678,24 @@ def load_event_tree(run_path: Path) -> RunEventTree:
                 "type": "IncompleteCall",
                 "msg": "Run ended with an error before this call emitted a completion event.",
             }
+
+    # A call started before the newest attempt that never completed was
+    # killed with its attempt — a later attempt re-ran or replayed it under
+    # a new call id. Without this it renders as "running" forever.
+    if latest_run_start_ts:
+        for node in by_id.values():
+            if (
+                node.status == "running"
+                and node.start_ts
+                and node.start_ts < latest_run_start_ts
+            ):
+                node.status = "error"
+                node.end_ts = node.end_ts or latest_run_start_ts
+                node.duration_s = _duration(node.start_ts, node.end_ts)
+                node.error = node.error or {
+                    "type": "Interrupted",
+                    "msg": "Call was in flight when the run was restarted; a later attempt re-ran or replayed it.",
+                }
 
     # Build parent->children links (sorted by start_ts so the tree is stable)
     roots: list[CallNode] = []
@@ -2039,7 +2060,10 @@ def load_execution_graph(
             node.cost_usd = float(getattr(call, "cost_usd_subtree", call.cost_usd) or 0.0)
             if node.duration_s is None:
                 node.duration_s = call.duration_s
-            if call.status == "error":
+            if call.status == "error" and node.status != "skipped":
+                # A "skipped" graph node was interrupted and superseded by a
+                # resume; the tree closes its call as Interrupted, which must
+                # not repaint the graph node as a failure.
                 node.status = "error"
                 node.end_ts = node.end_ts or call.end_ts
                 node.reason = node.reason or _call_error_message(call)

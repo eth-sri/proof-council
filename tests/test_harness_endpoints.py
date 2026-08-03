@@ -253,6 +253,40 @@ class HarnessEndpointTests(unittest.TestCase):
         )
         self.assertEqual(resp2.status_code, 409)
 
+    def test_restart_between_fetch_and_confirm_is_409(self) -> None:
+        # The operator can sit on the confirm page across a run restart;
+        # the commit section must re-check the pending set.
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ):
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={
+                    "response_filename": self.response_filename,
+                    "share_url": SHARE_URL,
+                },
+            )
+        self.assertEqual(resp.status_code, 200)  # warnings -> confirm page
+        staged = json.loads(
+            (self.run_dir / "human_inbox" / f"{self.stem}.staged.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        with (self.run_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": "run.start", "payload": {}}) + "\n")
+        confirm = self.client.post(
+            "/run/run1/harness/confirm",
+            data={
+                "response_filename": self.response_filename,
+                "digest": staged["digest"],
+            },
+        )
+        self.assertEqual(confirm.status_code, 409)
+        self.assertFalse(
+            (self.run_dir / "human_inbox" / self.response_filename).exists()
+        )
+
     def test_double_submit_is_409(self) -> None:
         resp = self.client.post(
             "/run/run1/harness/manual",

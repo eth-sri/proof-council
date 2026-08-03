@@ -855,6 +855,25 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             )
         return target, task
 
+    def _ensure_task_still_pending(run, filename: str) -> None:
+        # Re-checked INSIDE the locked commit section: a slow share fetch (or
+        # a form left open) can span a run restart, after which the task may
+        # have been orphaned by the new attempt. Publishing then would plant
+        # an answer no live waiter asked for.
+        pending = {
+            item.get("response_filename")
+            for item in load_pending_human_tasks(run.path)
+        }
+        if filename not in pending:
+            abort(
+                409,
+                description=(
+                    "the run was restarted while this submission was in "
+                    "flight and the task is no longer pending — reload the "
+                    "run page and use the current card"
+                ),
+            )
+
     # Serializes the mutating tail (verify -> stage -> publish) of every
     # submission endpoint per task, so concurrent requests cannot interleave
     # hash checks, upload writes, and publication. Process-local: the
@@ -1417,6 +1436,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 # the superseded fetch, and (on the warning-free path)
                 # publish — all serialized so a concurrent fetch can never
                 # prune files this manifest or response references.
+                _ensure_task_still_pending(run, filename)
                 _refuse_duplicate_response(target)
                 try:
                     superseded = json.loads(
@@ -1516,6 +1536,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             # lock: the manifest read, the digest check, the byte
             # verification, and publication cannot interleave with a
             # concurrent fetch's manifest replacement or pruning.
+            _ensure_task_still_pending(run, filename)
             _refuse_duplicate_response(target)
             try:
                 staged = json.loads(staged_path.read_text(encoding="utf-8"))
@@ -1590,6 +1611,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         with _locked_task(run_id, filename):
             # Recheck under the lock BEFORE writing any bytes, so a losing
             # concurrent submission leaves no orphaned upload directory.
+            _ensure_task_still_pending(run, filename)
             _refuse_duplicate_response(target)
             uploaded_files = _save_harness_uploads(run, stem, uploads)
             response_payload = {

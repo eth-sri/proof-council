@@ -219,6 +219,36 @@ class RunMonitorTests(unittest.TestCase):
             ]
             self.assertEqual(monitor_calls, [])
 
+    def test_monitor_makes_no_call_under_zero_usd_budget(self) -> None:
+        # max_usd == 0 declares "no paid spend at all": even the FIRST
+        # monitor call must be skipped (check() only trips after positive
+        # spending).
+        from proofstack.budget import BudgetSpec
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                api_client_factory=lambda _model: _FakeClient(),
+            )
+            ctx.budgets.root("run").spec = BudgetSpec(max_usd=0.0)
+            ctx.monitor = RunMonitor(ctx, model="fake", problem="P", problem_id="p")
+
+            async def run_agent() -> None:
+                await _TinyAgent(ctx, name="solver")(problem="P")
+                await ctx.monitor.drain()
+
+            asyncio.run(run_agent())
+
+            events = [
+                json.loads(line)
+                for line in (Path(temp_dir) / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            kinds = [e.get("kind") for e in events]
+            self.assertIn("monitor.skipped", kinds)
+            self.assertNotIn("monitor.summary", kinds)
+
     def test_monitor_prompt_uses_node_label_instead_of_internal_dag_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ctx = RunContext.create(

@@ -524,6 +524,10 @@ class RunDiscoveryTests(unittest.TestCase):
             tree = load_event_tree(run_dir)
 
         self.assertEqual(tree.by_id["c2"].status, "running")
+        # The attempt-1 call that never completed is closed as interrupted,
+        # not left "running" forever.
+        self.assertEqual(tree.by_id["c1"].status, "error")
+        self.assertEqual((tree.by_id["c1"].error or {}).get("type"), "Interrupted")
 
     def test_discover_runs_hides_batch_children_and_sums_child_costs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
