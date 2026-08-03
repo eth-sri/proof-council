@@ -978,13 +978,20 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                     e = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                kind = e.get("kind")
+                if kind == "run.start":
+                    # A new process attempt. Only waits the new attempt
+                    # re-emits are live; anything else is an orphan from a
+                    # previous attempt (e.g. re-keyed by changed inputs) whose
+                    # answer no waiter would ever consume in this attempt.
+                    pending.clear()
+                    continue
                 payload = e.get("payload") or {}
                 if not isinstance(payload, dict):
                     continue
                 response_path = str(payload.get("response_path") or "")
                 if not response_path:
                     continue
-                kind = e.get("kind")
                 if kind == "human.waiting":
                     waiting[response_path] = {**payload, "agent": e.get("agent")}
                     pending[response_path] = None
