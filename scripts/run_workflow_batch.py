@@ -84,6 +84,19 @@ def _write_metadata(path: Path, meta: dict[str, Any]) -> None:
     path.write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 
+def _child_recorded_parked(child_dir: Path) -> bool:
+    """True only if the child run itself recorded a subscription park.
+
+    A parked child writes status "parked" before returning exit 2; an argparse
+    or launch failure also exits 2 but records no such status (A3).
+    """
+    try:
+        meta = json.loads((child_dir / "run-metadata.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and meta.get("status") == "parked"
+
+
 async def amain() -> int:
     args = _argparser().parse_args()
     problems = _load_problems(args.problems_file)
@@ -173,21 +186,38 @@ async def amain() -> int:
                     start_new_session=True,
                 )
                 code = await proc.wait()
+            # Exit 2 means the child parked on a subscription window (resumable)
+            # — but argparse ALSO exits 2 on a bad launch, so only trust it as a
+            # park when the child actually recorded status "parked" (A3).
+            if code == 0:
+                child_status = "ok"
+            elif code == 2 and _child_recorded_parked(outputs_root / run_id):
+                child_status = "parked"
+            else:
+                child_status = "error"
             await update_problem(
                 problem_id,
-                status="ok" if code == 0 else "error",
+                status=child_status,
                 finished_at=_now(),
                 returncode=code,
                 log=f"logs/{log_path.name}",
             )
-            return code
+            return child_status
 
-    codes = await asyncio.gather(*(run_one(problem) for problem in problems))
-    meta["status"] = "ok" if all(code == 0 for code in codes) else "error"
+    statuses = await asyncio.gather(*(run_one(problem) for problem in problems))
+    # Mirror the child tri-state at the parent: a real crash is an error, but a
+    # batch whose only non-ok children parked is itself parked and resumable —
+    # collapsing it to error/exit-1 hid that and refused Resume (B5).
+    if all(s == "ok" for s in statuses):
+        meta["status"] = "ok"
+    elif any(s == "error" for s in statuses):
+        meta["status"] = "error"
+    else:
+        meta["status"] = "parked"
     meta["finished_at"] = _now()
     manifest["finished_at"] = meta["finished_at"]
     _write_metadata(metadata_path, meta)
-    return 0 if meta["status"] == "ok" else 1
+    return {"ok": 0, "parked": 2}.get(meta["status"], 1)
 
 
 def main() -> int:

@@ -180,6 +180,51 @@ class DAGSchemaReportTests(unittest.TestCase):
         self.assertEqual(loop["output_fields"], ["solution"])
         self.assertEqual(loop["outputs_schema"], {"solution": {"type": "string"}})
 
+    def test_repeat_coalesce_state_update_preserves_candidate_type(self) -> None:
+        raw_yaml = textwrap.dedent(
+            """
+            workflow: proofstack.agents.dag_workflow.DAGWorkflow
+            components:
+              cfg:
+                output_schema:
+                  solution: string
+            dag:
+              nodes:
+                - id: draft
+                  kind: agent
+                  agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+                  name: cfg
+                - id: loop
+                  kind: repeat
+                  needs: [draft]
+                  max_iterations: 1
+                  condition: true
+                  initial_state:
+                    solution: $node.draft.solution
+                  body:
+                    nodes:
+                      - id: maybe
+                        kind: agent
+                        agent: proofstack.agents.configurable_prompt.ConfigurablePromptAgent
+                        name: cfg
+                    state_updates:
+                      solution:
+                        coalesce:
+                          - $node.maybe.solution
+                          - $state.solution
+                  outputs:
+                    solution: $state.solution
+              outputs:
+                solution: $node.loop.solution
+            """
+        )
+
+        report = _report(raw_yaml)
+        loop = next(node for node in report["nodes"] if node["id"] == "loop")
+
+        self.assertEqual(loop["outputs_schema"]["solution"], {"type": "string"})
+        self.assertNotIn("Type mismatch", "\n".join(report["warnings"]))
+
     def test_regular_workflow_outputs_count_as_returned_outputs(self) -> None:
         raw_yaml = textwrap.dedent(
             """

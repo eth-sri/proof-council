@@ -17,6 +17,7 @@ from proofstack.agents.dag_workflow import (  # noqa: E402
     _agent_inputs_with_workflow_defaults,
     _condition,
     _eval_value,
+    _node_condition_scope,
     _resolve_path,
 )
 from proofstack.context import RunContext  # noqa: E402
