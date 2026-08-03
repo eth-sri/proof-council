@@ -409,21 +409,30 @@ class ConfigurableCLIAgent(CLIAgent):
         if usage.n_turns == 0:
             return
         cost = 0.0
-        cfg_ref = None
+        nominal: float | None = None
         # Only observed copied subscription auth suppresses USD accounting.
         # A declarative bill:false flag must never hide a paid-key fallback.
-        if not self._copied_codex_auth:
-            cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
-            try:
-                rates = load_cost_rates(cfg_ref)
-            except (KeyError, FileNotFoundError, ValueError) as e:
-                await self.events.emit(
-                    "cli.cost_lookup_failed",
-                    {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
-                )
+        subscription = self._copied_codex_auth
+        cfg_ref: str | None = str(
+            usage_cfg.get("cost_config") or "models/openai/gpt-54-mini"
+        )
+        try:
+            rates = load_cost_rates(cfg_ref)
+        except (KeyError, FileNotFoundError, ValueError) as e:
+            await self.events.emit(
+                "cli.cost_lookup_failed",
+                {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
+            )
+            if not subscription:
+                # A paid call whose price cannot be determined must not be
+                # silently recorded as free.
                 return
-            cost = cost_for_codex_usage(usage, **rates)
-            self.tracker.add_usd(cost)
+            cfg_ref = None
+        else:
+            nominal = cost_for_codex_usage(usage, **rates)
+            if not subscription:
+                cost = nominal
+                self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
         await self.events.emit(
             "model.call",
@@ -434,6 +443,8 @@ class ConfigurableCLIAgent(CLIAgent):
                 "out_tokens": usage.output_tokens,
                 "reasoning_out_tokens": usage.reasoning_output_tokens,
                 "cost_usd": cost,
+                "api_equivalent_usd": nominal,
+                "subscription": subscription,
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
@@ -477,7 +488,12 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cached_in_tokens": usage.cache_read_input_tokens,
                 "out_tokens": usage.output_tokens,
                 "metered_tokens": usage.metered_tokens,
-                "cost_usd": usage.total_cost_usd,
+                # The CLI reports its nominal API-equivalent price; a
+                # subscription run's actual spend is $0 and must display as
+                # such — the estimate stays visible under its own key.
+                "cost_usd": 0.0,
+                "api_equivalent_usd": usage.total_cost_usd,
+                "subscription": True,
                 "n_turns": usage.num_turns,
                 "via": "claude_exec_json",
             },

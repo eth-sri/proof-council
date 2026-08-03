@@ -225,6 +225,51 @@ def test_compute_always_uses_scrubbed_codex_home() -> None:
         assert not codex_home.exists()
 
 
+def test_compute_usage_subscription_auth_charges_no_usd() -> None:
+    import json as _json
+
+    stdout = _json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 1000, "output_tokens": 100},
+        }
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test", root_workdir=Path(temp_dir) / "run", flat=True
+        )
+        agent = Compute(ctx)
+        agent._last_cost_config = DEFAULT_COST_CONFIG
+        calls: list[dict] = []
+
+        async def emit(kind, payload):
+            calls.append({"kind": kind, **payload})
+
+        agent.events = SimpleNamespace(emit=emit)
+        agent.tracker = SimpleNamespace(
+            usd=0.0,
+            tokens=0,
+            add_usd=lambda a: setattr(agent.tracker, "usd", agent.tracker.usd + a),
+            add_tokens=lambda n: setattr(
+                agent.tracker, "tokens", agent.tracker.tokens + n
+            ),
+        )
+
+        agent._subscription_codex_auth = True
+        asyncio.run(agent.record_cli_usage(stdout, "", CLIDoneRecord(status="done")))
+        assert agent.tracker.usd == 0.0
+        assert agent.tracker.tokens == 1100
+        assert calls[-1]["cost_usd"] == 0.0
+        assert calls[-1]["subscription"] is True
+        assert calls[-1]["api_equivalent_usd"] > 0
+
+        agent._subscription_codex_auth = False
+        asyncio.run(agent.record_cli_usage(stdout, "", CLIDoneRecord(status="done")))
+        assert agent.tracker.usd > 0.0
+        assert calls[-1]["cost_usd"] == calls[-1]["api_equivalent_usd"] > 0
+        assert calls[-1]["subscription"] is False
+
+
 def test_compute_utils_serializes_numpy_and_complex_values() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)

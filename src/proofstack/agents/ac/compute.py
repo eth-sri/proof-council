@@ -31,6 +31,7 @@ overridden per call through ``Inputs``.
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import zipfile
@@ -283,6 +284,7 @@ class Compute(CLIAgent):
     def __init__(self, ctx: Any, **kw: Any) -> None:
         super().__init__(ctx, **kw)
         self._copied_codex_auth = False
+        self._subscription_codex_auth = False
         self._last_model: str | None = None
         self._last_cost_config: str | None = None
         self._codex_home_host: Path | None = None
@@ -362,13 +364,26 @@ class Compute(CLIAgent):
         # ``copy_codex_auth``. Scrubbed in teardown.
         host_auth = Path.home() / ".codex" / "auth.json"
         if host_auth.exists():
+            auth_text = host_auth.read_text(encoding="utf-8")
             auth_path = codex_home / "auth.json"
-            auth_path.write_text(host_auth.read_text(encoding="utf-8"), encoding="utf-8")
+            auth_path.write_text(auth_text, encoding="utf-8")
             try:
                 auth_path.chmod(0o600)
             except OSError:
                 pass
             self._copied_codex_auth = True
+            try:
+                auth_data = json.loads(auth_text)
+            except json.JSONDecodeError:
+                auth_data = None
+            # A ChatGPT-login auth.json runs the worker on the subscription:
+            # no API spend. Anything else (embedded API key, unknown mode)
+            # is treated as paid so real spend is never hidden.
+            self._subscription_codex_auth = (
+                isinstance(auth_data, dict)
+                and str(auth_data.get("auth_mode") or "").lower() == "chatgpt"
+                and not str(auth_data.get("OPENAI_API_KEY") or "").strip()
+            )
 
     async def teardown(self, sandbox: Sandbox, inp: BaseModel) -> None:
         if self._codex_home_host is not None:
@@ -377,6 +392,7 @@ class Compute(CLIAgent):
         self._codex_home_host = None
         self._codex_home_env = None
         self._copied_codex_auth = False
+        self._subscription_codex_auth = False
 
     def extra_env(self, sandbox: Sandbox, inp: BaseModel) -> dict[str, str]:
         self._ensure_codex_home(inp)
@@ -464,7 +480,10 @@ class Compute(CLIAgent):
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
             return
-        cfg_ref = self._last_cost_config or DEFAULT_COST_CONFIG
+        cost = 0.0
+        nominal: float | None = None
+        subscription = self._subscription_codex_auth
+        cfg_ref: str | None = self._last_cost_config or DEFAULT_COST_CONFIG
         try:
             rates = load_cost_rates(cfg_ref)
         except (KeyError, FileNotFoundError, ValueError) as e:
@@ -472,9 +491,19 @@ class Compute(CLIAgent):
                 "cli.cost_lookup_failed",
                 {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
             )
-            return
-        cost = cost_for_codex_usage(usage, **rates)
-        self.tracker.add_usd(cost)
+            if not subscription:
+                # A paid call whose price cannot be determined must not be
+                # silently recorded as free.
+                return
+            cfg_ref = None
+        else:
+            nominal = cost_for_codex_usage(usage, **rates)
+            if not subscription:
+                # Subscription-auth runs have no API spend: the price book
+                # yields an API-equivalent estimate for display, never a
+                # budget charge.
+                cost = nominal
+                self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
         await self.events.emit(
             "model.call",
@@ -486,6 +515,8 @@ class Compute(CLIAgent):
                 "out_tokens": usage.output_tokens,
                 "reasoning_out_tokens": usage.reasoning_output_tokens,
                 "cost_usd": cost,
+                "api_equivalent_usd": nominal,
+                "subscription": subscription,
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,

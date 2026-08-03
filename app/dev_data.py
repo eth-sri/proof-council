@@ -452,6 +452,8 @@ class RunInfo:
     preset: str | None = None
     problem_summary: str | None = None
     cost_usd: float | None = None
+    # API-equivalent price of subscription-covered CLI work (not real spend).
+    subscription_equiv_usd: float | None = None
     tokens: int | None = None    # total tokens processed (the subscription dial)
     wallclock_s: float | None = None
     n_problems: int | None = None
@@ -611,8 +613,10 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
         if not info.problems:
             continue
         total_cost = 0.0
+        total_sub_equiv = 0.0
         total_tokens = 0
         saw_cost = False
+        saw_sub_equiv = False
         saw_tokens = False
         for problem in info.problems.values():
             if not isinstance(problem, dict):
@@ -624,6 +628,9 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
             if child.cost_usd is not None:
                 total_cost += float(child.cost_usd)
                 saw_cost = True
+            if child.subscription_equiv_usd is not None:
+                total_sub_equiv += float(child.subscription_equiv_usd)
+                saw_sub_equiv = True
             if child.tokens is not None:
                 total_tokens += int(child.tokens)
                 saw_tokens = True
@@ -637,6 +644,8 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
                 info.process_dead = True
         if saw_cost:
             info.cost_usd = total_cost
+        if saw_sub_equiv:
+            info.subscription_equiv_usd = total_sub_equiv
         if saw_tokens:
             info.tokens = total_tokens
         # Recompute the parent status from the children's REAL statuses (just
@@ -702,6 +711,7 @@ def _dashboard_subprocess_failure_message(path: Path) -> str:
 
 def _enrich_from_events(info: RunInfo) -> None:
     cost = 0.0
+    sub_equiv = 0.0
     tokens = 0
     saw_tokens = False
     first_ts: str | None = None
@@ -743,6 +753,8 @@ def _enrich_from_events(info: RunInfo) -> None:
                 if e.get("kind") == "model.call":
                     p = e.get("payload") or {}
                     cost += float(p.get("cost_usd") or 0.0)
+                    if p.get("subscription"):
+                        sub_equiv += float(p.get("api_equivalent_usd") or 0.0)
                     if "metered_tokens" in p or "in_tokens" in p or "out_tokens" in p:
                         saw_tokens = True
                         if p.get("metered_tokens") is not None:
@@ -755,6 +767,8 @@ def _enrich_from_events(info: RunInfo) -> None:
         info.started_at = first_ts
     if info.cost_usd is None and cost:
         info.cost_usd = cost
+    if info.subscription_equiv_usd is None and sub_equiv:
+        info.subscription_equiv_usd = sub_equiv
     if info.tokens is None and saw_tokens:
         info.tokens = tokens
     if info.wallclock_s is None and first_ts and last_ts:

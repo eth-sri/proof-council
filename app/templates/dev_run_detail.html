@@ -11,6 +11,7 @@
             {% if run.started_at %}<div class="key">Started:</div><div class="val">{{ run.started_at | display_time }}</div>{% endif %}
             {% if run.wallclock_s is not none %}<div class="key">Wallclock:</div><div class="val">{{ run.wallclock_s | display_duration }}</div>{% endif %}
             {% if run.cost_usd is not none %}<div class="key">USD:</div><div class="val">${{ '%.4f'|format(run.cost_usd) }}</div>{% endif %}
+            {% if run.subscription_equiv_usd %}<div class="key">Subscription-covered:</div><div class="val" title="API-equivalent price of subscription-covered CLI work — not billed">≈${{ '%.2f'|format(run.subscription_equiv_usd) }} (not billed)</div>{% endif %}
             {% if run.tokens is not none %}<div class="key">Tokens:</div><div class="val">{{ run.tokens | display_tokens }}</div>{% endif %}
         </div>
     </div>
