@@ -1427,13 +1427,16 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 staged_tmp = staged_path.with_name(
                     f"{staged_path.name}.{nonce}.tmp"
                 )
-                staged_tmp.write_text(
-                    json.dumps(
-                        {**staged, "digest": digest}, ensure_ascii=False, indent=2
-                    ),
-                    encoding="utf-8",
-                )
-                os.replace(staged_tmp, staged_path)
+                try:
+                    staged_tmp.write_text(
+                        json.dumps(
+                            {**staged, "digest": digest}, ensure_ascii=False, indent=2
+                        ),
+                        encoding="utf-8",
+                    )
+                    os.replace(staged_tmp, staged_path)
+                finally:
+                    staged_tmp.unlink(missing_ok=True)
                 claimed = True
                 # The replaced manifest can never be confirmed again (its
                 # digest no longer matches), so directories only it
@@ -1628,10 +1631,33 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description="invalid resume spec")
         if not argv:
             abort(400, description="empty resume spec")
+        # One live worker per run: refuse while the recorded PID is alive, and
+        # take a cross-process launch reservation so two tabs (or a double
+        # POST) cannot Popen two workers into the same run dir. A reservation
+        # older than a minute is a crashed launch and may be replaced.
+        if run_process_alive(run.path):
+            abort(409, description="this run's worker is already alive")
+        lock_path = run.path / "resume.launch.lock"
+        fd = None
+        for _attempt in (1, 2):
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:
+                    age = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    age = 0.0
+                if age < 60:
+                    abort(409, description="a resume for this run is already in progress")
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+        if fd is None:
+            abort(409, description="a resume for this run is already in progress")
+        os.close(fd)
         cmd = [sys.executable, *[str(a) for a in argv], "--resume-from", run_id]
-        # Drop any "stopped" marker so the relaunched run reads as running again,
-        # not as the stopped run it was a moment ago.
-        clear_stopped_marker(run.path)
         env = _dashboard_subprocess_env()
         spec_env = spec.get("env")
         if isinstance(spec_env, dict):
@@ -1646,15 +1672,26 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 }
             )
         log_path = run.path / "dashboard-resume.log"
-        with log_path.open("a", encoding="utf-8") as log:
-            subprocess.Popen(
-                cmd,
-                cwd=REPO_ROOT,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+        launched = False
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                subprocess.Popen(
+                    cmd,
+                    cwd=REPO_ROOT,
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            launched = True
+        finally:
+            if not launched:
+                # A failed launch must not consume the reservation or the
+                # run's valid stopped state.
+                lock_path.unlink(missing_ok=True)
+        # Only now drop the "stopped" marker: the relaunched run reads as
+        # running again, and a launch failure above kept the stopped state.
+        clear_stopped_marker(run.path)
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/stop", methods=["POST"])
@@ -2287,13 +2324,17 @@ def _next_preset_name(base: str) -> str:
 
 
 def _next_run_id(base: str, outputs_root: Path) -> str:
+    """Allocate AND claim a fresh run directory in one atomic mkdir, so two
+    simultaneous launch requests can never share a run dir."""
     safe = _slug(base).lower()
-    if not (outputs_root / safe).exists():
-        return safe
-    idx = 2
-    while (outputs_root / f"{safe}-{idx}").exists():
-        idx += 1
-    return f"{safe}-{idx}"
+    outputs_root.mkdir(parents=True, exist_ok=True)
+    for candidate in (safe, *(f"{safe}-{i}" for i in range(2, 10_000))):
+        try:
+            (outputs_root / candidate).mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"could not allocate a run id for {safe!r} under {outputs_root}")
 
 
 def _random_agent_label() -> str:

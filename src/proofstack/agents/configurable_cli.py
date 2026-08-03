@@ -509,14 +509,16 @@ class ConfigurableCLIAgent(CLIAgent):
             reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
             if reasoning_effort:
                 cmd = _with_codex_reasoning_effort(cmd, reasoning_effort)
-        else:
-            # Per-node model override for non-codex CLIs (e.g. claude): a node can
-            # use a stronger model than the global {claude_model} default.
+        elif _is_claude_cmd(cmd):
+            # Per-node model override for the claude CLI: a node can use a
+            # stronger model than the global {claude_model} default. Other
+            # custom commands are never mutated — --model flags mean
+            # different things (or nothing) to them.
             model = str(self.component_config.get("model") or "").strip()
             if model:
                 cmd = _with_claude_model(cmd, model)
             reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
-            if reasoning_effort and _is_claude_cmd(cmd):
+            if reasoning_effort:
                 cmd = _with_claude_effort(cmd, reasoning_effort)
         if self.component_config.get("prompt") and _is_codex_exec_cmd(cmd) and _codex_prompt_arg_index(cmd) is None:
             cmd = [*cmd, "-"]

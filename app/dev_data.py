@@ -717,6 +717,7 @@ def _enrich_from_events(info: RunInfo) -> None:
     first_ts: str | None = None
     last_ts: str | None = None
     saw_workflow_failure = False
+    status_from_events: str | None = None
     try:
         with (info.path / "events.jsonl").open("r", encoding="utf-8") as f:
             for line in f:
@@ -731,6 +732,9 @@ def _enrich_from_events(info: RunInfo) -> None:
                 if e.get("kind") == "run.start":
                     if info.status is None:
                         info.status = "running"
+                    # Attempt-local state: a resumed attempt starts clean.
+                    status_from_events = "running"
+                    saw_workflow_failure = False
                     payload = e.get("payload") or {}
                     if isinstance(payload, dict):
                         info.preset = info.preset or str(payload.get("preset") or "").strip() or None
@@ -748,6 +752,10 @@ def _enrich_from_events(info: RunInfo) -> None:
                     payload = e.get("payload") or {}
                     if isinstance(payload, dict):
                         info.status = _normalize_run_status(payload.get("status")) or info.status
+                        status_from_events = (
+                            _normalize_run_status(payload.get("status"))
+                            or status_from_events
+                        )
                 if e.get("kind") == "workflow.last_gasp":
                     saw_workflow_failure = True
                 if e.get("kind") == "model.call":
@@ -775,6 +783,11 @@ def _enrich_from_events(info: RunInfo) -> None:
         info.wallclock_s = _duration(first_ts, last_ts)
     if saw_workflow_failure:
         info.status = "error"
+    elif status_from_events == "running" and info.status in {"error", "parked"}:
+        # The metadata snapshot is from an EARLIER attempt: the newest
+        # run.start has no terminal run.end, so a resumed worker is live
+        # (or _apply_process_liveness will flag its PID as dead).
+        info.status = "running"
 
 
 def _finalize_run_info(info: RunInfo) -> None:
@@ -1198,6 +1211,21 @@ def _path_size(path: Path) -> int:
 _PRUNABLE_NODE_ARTIFACTS = ("sandbox", "cli_stdout.log", "cli_stderr.log")
 
 
+def _sandbox_exposed(node_dir: Path) -> bool:
+    """True when the node's output references its own sandbox path.
+
+    A CLI node that exposes ``workspace`` hands that path to downstream
+    consumers, and the resume cache stores the path rather than the files —
+    pruning such a sandbox would break a later resume. When in doubt
+    (unreadable output), keep the sandbox.
+    """
+    try:
+        text = (node_dir / "output.json").read_text(encoding="utf-8")
+    except OSError:
+        return True
+    return str(node_dir / "sandbox") in text
+
+
 def estimate_prunable_bytes(run_path: Path) -> int:
     """Bytes reclaimable by prune_run_artifacts without actually deleting."""
     agents_dir = run_path / "agents"
@@ -1208,6 +1236,8 @@ def estimate_prunable_bytes(run_path: Path) -> int:
         if not node_dir.is_dir() or not (node_dir / "output.json").exists():
             continue
         for name in _PRUNABLE_NODE_ARTIFACTS:
+            if name == "sandbox" and _sandbox_exposed(node_dir):
+                continue
             target = node_dir / name
             if target.exists():
                 total += _path_size(target)
@@ -1235,6 +1265,8 @@ def prune_run_artifacts(run_path: Path) -> dict[str, int]:
             continue
         node_freed = 0
         for name in _PRUNABLE_NODE_ARTIFACTS:
+            if name == "sandbox" and _sandbox_exposed(node_dir):
+                continue
             target = node_dir / name
             if not target.exists():
                 continue
@@ -1523,6 +1555,12 @@ def load_event_tree(run_path: Path) -> RunEventTree:
             kind = evt.get("kind")
             call_id = evt.get("call_id")
             parent_id = evt.get("parent_call_id")
+
+            if kind == "run.start":
+                # A new process attempt: the previous attempt's terminal
+                # state must not bleed onto calls the resumed worker runs.
+                run_status = ""
+                run_end_ts = None
 
             if kind == "run.end":
                 payload = evt.get("payload") or {}
