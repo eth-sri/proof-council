@@ -6,8 +6,10 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from proofstack.budget import BudgetExhausted
 from proofstack.context import ModelSpec, RunContext
 from proofstack.events import new_call_id
 
@@ -15,6 +17,40 @@ from proofstack.events import new_call_id
 DEFAULT_MONITOR_MODEL: ModelSpec = "models/openai/gpt-54-mini"
 
 _WRAPPER_BLOCK_RE = re.compile(r"AC\w*Block")
+
+# Prior summaries shown to the model for dedup context. A full history grows
+# the prompt quadratically over a long run; the recent window is what "do not
+# repeat" actually needs.
+_HISTORY_LIMIT = 12
+
+
+def _load_prior_summaries(events_path: Path, limit: int = _HISTORY_LIMIT) -> list[dict[str, Any]]:
+    """Seed dedup context from a previous attempt's monitor.summary events,
+    so a resumed run does not re-narrate everything it already reported."""
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("kind") != "monitor.summary":
+            continue
+        p = e.get("payload") or {}
+        if isinstance(p, dict) and p.get("summary"):
+            out.append(
+                {
+                    "agent": p.get("agent"),
+                    "display_label": p.get("display_label"),
+                    "call_id": p.get("call_id"),
+                    "status": p.get("status"),
+                    "summary": p.get("summary"),
+                }
+            )
+    return out[-limit:]
 
 
 @dataclass
@@ -32,6 +68,10 @@ class RunMonitor:
 
     def __post_init__(self) -> None:
         self.model = normalize_monitor_model_spec(self.model)
+        if not self.summaries:
+            self.summaries = _load_prior_summaries(
+                self.ctx.root_workdir / "events.jsonl"
+            )
 
     def schedule_agent_end(
         self,
@@ -108,6 +148,19 @@ class RunMonitor:
         error: dict[str, Any] | None,
     ) -> None:
         monitor_call_id = new_call_id()
+        # The monitor spends real API money; once the run's budget is gone it
+        # must stop adding to the overrun instead of racing the cooperative
+        # agent-side checks.
+        try:
+            self.ctx.budgets.root("run").check()
+        except BudgetExhausted as e:
+            await self.ctx.events.emit(
+                "monitor.skipped",
+                {"agent": agent, "reason": f"budget exhausted: {e}"},
+                call_id=monitor_call_id,
+                parent_call_id=call_id,
+            )
+            return
         display_agent = self._display_agent(agent=agent, agent_path=agent_path)
         prompt = self._prompt(
             agent=agent,
@@ -233,7 +286,7 @@ class RunMonitor:
                     "status": item.get("status"),
                     "summary": item.get("summary"),
                 }
-                for item in self.summaries
+                for item in self.summaries[-_HISTORY_LIMIT:]
             ],
         }
         return (
