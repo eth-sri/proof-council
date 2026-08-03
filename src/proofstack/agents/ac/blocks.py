@@ -29,7 +29,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from proofstack.harness.chatgpt_share import canonical_workspace_name
+from proofstack.harness.chatgpt_share import (
+    canonical_workspace_name,
+    workspace_name_token,
+)
 
 
 CANONICAL_FILES = ("answer.tex", "research_notes.tex", "references.bib")
@@ -82,7 +85,9 @@ class ParsedAuthorOutput:
     parse_warnings: list[str] = field(default_factory=list)
 
 
-def parse_author_output(raw_text: str) -> ParsedAuthorOutput:
+def parse_author_output(
+    raw_text: str, task_token: str | None = None
+) -> ParsedAuthorOutput:
     """Extract file rewrites, optional council request, and ready flag.
 
     Files outside ``CANONICAL_FILES`` are recorded with a parse warning
@@ -97,14 +102,25 @@ def parse_author_output(raw_text: str) -> ParsedAuthorOutput:
     for m in _FILE_BLOCK_RE.finditer(raw_text):
         # Canonicalize: browser-harness responses may tag paths with the
         # task token (``answer___<token>.tex``) or prefix sandbox dirs
-        # (``/mnt/data/answer.tex``); both mean the canonical file.
-        path = canonical_workspace_name(m.group("path").strip())
+        # (``/mnt/data/answer.tex``); both mean the canonical file. With a
+        # ``task_token``, a name tagged for a DIFFERENT task keeps its tag
+        # and can never become this task's canonical file — even after an
+        # operator confirmed past the validation warning.
+        raw_path = m.group("path").strip()
+        path = canonical_workspace_name(raw_path, task_token=task_token)
         body = m.group("body")
         file_block_spans.append((m.start(), m.end()))
         if path not in CANONICAL_FILES:
-            out.parse_warnings.append(
-                f"ignored non-canonical file block path={m.group('path').strip()!r}"
-            )
+            tag = workspace_name_token(raw_path)
+            if task_token is not None and tag is not None and tag != task_token:
+                out.parse_warnings.append(
+                    f"file block path={raw_path!r} is tagged for a different "
+                    f"task (this task is {task_token}); ignored"
+                )
+            else:
+                out.parse_warnings.append(
+                    f"ignored non-canonical file block path={raw_path!r}"
+                )
             continue
         if path in files:
             out.parse_warnings.append(

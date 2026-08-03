@@ -202,6 +202,12 @@ changed this round through exactly ONE of two channels:
 Files you neither link nor print are kept unchanged by the harness —
 never re-print a long unchanged file just to restate it.
 
+ONLY your final message is parsed. It must be self-contained: any
+<council>...</council> or <compute_agent>...</compute_agent> request
+and the READY line must appear in that final message — a request made
+in an earlier message and not repeated there is silently lost. If you
+are asked to continue or re-confirm, restate them.
+
 Any files mentioned as "(attached as ...)" in the instructions are
 uploaded to this conversation.
 """
@@ -670,7 +676,12 @@ class Author(APICallAgent):
         ]
 
     def parse_output(self, raw_text: str, inp: Inputs) -> Outputs:
-        parsed = parse_author_output(raw_text)
+        # The browser transport pins the active task token around this call
+        # so a fenced file tagged for another task can never canonicalize
+        # into this task's answer.tex.
+        parsed = parse_author_output(
+            raw_text, task_token=getattr(self, "_harness_task_token", None)
+        )
         # Carry forward existing file contents for any file the Author
         # did not re-emit. Round 0 has no prior contents, so omitted
         # files default to empty.

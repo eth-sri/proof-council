@@ -266,7 +266,11 @@ async def run_browser_call(
             except OSError:
                 pass
 
-            out = agent.parse_output(raw_text, inp)
+            agent._harness_task_token = stem
+            try:
+                out = agent.parse_output(raw_text, inp)
+            finally:
+                agent._harness_task_token = None
         except Exception as e:
             # A response that cannot be processed must not be consumed again
             # (or kill the run): move it aside, surface the error, and go

@@ -266,6 +266,51 @@ class BrowserCallEndToEndTests(unittest.TestCase):
         parsed = parse_author_output(out.text)
         self.assertEqual(parsed.files["answer.tex"], "TAGGED BODY")
 
+    def test_foreign_tagged_fence_never_becomes_canonical(self) -> None:
+        # Blocker: a confirmed-past-warning foreign file must STILL not
+        # parse into this task's answer.tex.
+        text = "```file path=answer___tokB.tex\nSTALE FOREIGN\n```"
+        parsed = parse_author_output(text, task_token="tokA")
+        self.assertNotIn("answer.tex", parsed.files)
+        self.assertTrue(
+            any("different task" in w for w in parsed.parse_warnings)
+        )
+        # Own-token tags canonicalize normally.
+        parsed_own = parse_author_output(
+            "```file path=answer___tokA.tex\nMINE\n```", task_token="tokA"
+        )
+        self.assertEqual(parsed_own.files["answer.tex"], "MINE")
+        # Tokenless parsing (non-harness paths) keeps the legacy stripping.
+        parsed_no_token = parse_author_output(text)
+        self.assertEqual(parsed_no_token.files["answer.tex"], "STALE FOREIGN")
+
+    def test_foreign_tagged_upload_stays_tagged_in_merged_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
+            ctx = _ctx(tmp, hdir)
+            agent = EchoAgent(ctx, name="echo")
+            stem = task_stem(ctx.run_id, "echo", agent._cache_key(EchoAgent.Inputs(problem='P')))
+            inbox = ctx.root_workdir / "human_inbox"
+            uploads = inbox / f"{stem}.uploads"
+            uploads.mkdir(parents=True, exist_ok=True)
+            foreign = "answer___Author__deadbeef0000.tex"
+            (uploads / foreign).write_text("FOREIGN BODY", encoding="utf-8")
+            (inbox / f"{stem}.response.json").write_text(
+                json.dumps(
+                    {
+                        "status": "done",
+                        "assistant_text": "ok",
+                        "uploaded_files": {
+                            foreign: f"human_inbox/{stem}.uploads/{foreign}"
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out = asyncio.run(agent(problem="P"))
+        self.assertIn(f"path={foreign}", out.text)
+        parsed = parse_author_output(out.text, task_token=stem)
+        self.assertNotIn("answer.tex", parsed.files)
+
     def test_second_call_replays_from_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
             ctx = _ctx(tmp, hdir)
