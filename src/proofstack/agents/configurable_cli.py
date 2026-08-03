@@ -84,6 +84,9 @@ class ConfigurableCLIAgent(CLIAgent):
             raise ValueError(
                 "component completion_signal must be 'finish', 'file', or 'exit'"
             )
+        # Enforced by the CLI layer: 'finish'/'file' require the completion
+        # record; 'exit' opts into exit-code-as-done.
+        self.COMPLETION_SIGNAL = completion_signal
 
         sandbox_spec = self.SANDBOX
         blocked_keys = self._subscription_api_key_envs()

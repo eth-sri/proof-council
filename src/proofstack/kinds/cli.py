@@ -79,6 +79,12 @@ class CLIAgent(Agent):
     CLEANUP_GRACE_S: ClassVar[float] = 30.0
     DONE_DRAIN_GRACE_S: ClassVar[float] = 30.0
     SOFT_TIMEOUT_S: ClassVar[int] = 0
+    # 'finish'/'file': the completion record (done.json) is REQUIRED — a CLI
+    # exit without it (or with an unparseable one) is an error even on rc 0.
+    # 'exit': the exit code is the completion signal (codex-style CLIs that
+    # never call finish). Plain subclasses keep the legacy 'exit' semantics;
+    # ConfigurableCLIAgent sets this from its completion_signal config.
+    COMPLETION_SIGNAL: ClassVar[str] = "exit"
 
     def __init__(
         self,
@@ -393,14 +399,22 @@ class CLIAgent(Agent):
                 await stream.terminate()
                 return self._read_done(done_path, fallback_status="done")
             if stream.done:
-                # CLI exited without calling finish. Use the exit
-                # code as the done signal: 0 == clean termination == done,
-                # non-zero == failure == error. This is a pragmatic
-                # default for agents that don't (yet) wire finish
-                # reliably. TODO(SPEC §13): harden the explicit
-                # finish handshake and make exit-as-done opt-in.
+                # CLI exited without calling finish. With an enforced
+                # completion signal ('finish'/'file'), a missing record is a
+                # failed handshake even on exit code 0 — treating it as done
+                # let failed calls masquerade as successes. 'exit' opts into
+                # the pragmatic exit-code-as-done behavior (codex-style CLIs
+                # that never call finish).
                 rc = stream.proc.returncode
-                fallback = "done" if rc == 0 else "error"
+                if self._strict_completion():
+                    fallback = "error"
+                    fallback_summary = (
+                        f"CLI exited (rc={rc}) without writing the required "
+                        "completion record"
+                    )
+                else:
+                    fallback = "done" if rc == 0 else "error"
+                    fallback_summary = None
                 try:
                     await stream.terminate()
                 except Exception:
@@ -419,7 +433,11 @@ class CLIAgent(Agent):
                     },
                     call_id=spawn_call_id,
                 )
-                return self._read_done(done_path, fallback_status=fallback)
+                return self._read_done(
+                    done_path,
+                    fallback_status=fallback,
+                    fallback_summary=fallback_summary,
+                )
             if (
                 not cleanup_warned
                 and self.CLEANUP_GRACE_S > 0
@@ -496,6 +514,13 @@ class CLIAgent(Agent):
                 data = json.loads(done_path.read_text(encoding="utf-8"))
                 return CLIDoneRecord.model_validate(data)
             except (json.JSONDecodeError, Exception):
+                if self._strict_completion():
+                    # An enforced completion record that does not parse is a
+                    # failed handshake, never an implicit success.
+                    return CLIDoneRecord(
+                        status="error",
+                        summary="completion record exists but is invalid JSON/schema",
+                    )
                 return CLIDoneRecord(
                     status=fallback_status,
                     summary=fallback_summary or "(invalid done.json)",
@@ -504,6 +529,9 @@ class CLIAgent(Agent):
             status=fallback_status,
             summary=fallback_summary or "(no done.json written)",
         )
+
+    def _strict_completion(self) -> bool:
+        return str(self.COMPLETION_SIGNAL).lower() in ("finish", "file")
 
     async def _emit_budget_warnings(
         self,

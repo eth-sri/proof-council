@@ -788,6 +788,49 @@ class ConfigurableCLITests(unittest.TestCase):
 
             self.assertEqual(out.home, "/portable/home")
 
+    def test_strict_completion_marks_clean_exit_without_done_as_error(self) -> None:
+        # Default completion_signal 'finish': exit code 0 with no finish
+        # call must NOT masquerade as success.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["sh", "-c", "cat > /dev/null; exit 0"],
+                        "prompt": "P",
+                        "sandbox": {"backend": "subprocess"},
+                        "input_schema": {},
+                        "output_schema": {"workspace": "string", "status": "string"},
+                        "done_outputs": {"status": "status"},
+                    }
+                },
+            )
+            out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
+        self.assertEqual(out.status, "error")
+
+    def test_exit_completion_signal_keeps_exit_as_done(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["sh", "-c", "cat > /dev/null; exit 0"],
+                        "prompt": "P",
+                        "completion_signal": "exit",
+                        "sandbox": {"backend": "subprocess"},
+                        "input_schema": {},
+                        "output_schema": {"workspace": "string", "status": "string"},
+                        "done_outputs": {"status": "status"},
+                    }
+                },
+            )
+            out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
+        self.assertEqual(out.status, "done")
+
 
 if __name__ == "__main__":
     unittest.main()
