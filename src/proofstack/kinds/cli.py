@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from proofstack.agent import Agent
 from proofstack.budget import BudgetExhausted
+from proofstack.child_registry import register_child, unregister_child
 from proofstack.context import RunContext
 from proofstack.events import new_call_id
 from proofstack.sandbox import make_sandbox, resolve_backend
@@ -226,6 +227,17 @@ class CLIAgent(Agent):
                 extra_path=[bin_dir],
                 timeout_s=timeout_s,
             )
+            # The child runs in its own session/process group, out of reach
+            # of a kill on the worker's group. Register it durably so the
+            # dashboard's Stop can hard-clean what a dead worker left.
+            child_pid = getattr(stream.proc, "pid", None)
+            if child_pid:
+                register_child(
+                    self.ctx.root_workdir,
+                    pid=int(child_pid),
+                    cmd0=str((self.CLI_CMD or ["?"])[0]),
+                    label=self.name,
+                )
             # Pipe the initial message to stdin if the process accepts it.
             if stream.proc.stdin is not None:
                 payload = self.cli_input(inp).encode("utf-8")
@@ -302,6 +314,9 @@ class CLIAgent(Agent):
                         continue
                     except Exception:
                         break
+                child_pid = getattr(stream.proc, "pid", None)
+                if child_pid:
+                    unregister_child(self.ctx.root_workdir, int(child_pid))
             # Meter exactly once, even under cancellation — else the run loses
             # real token/cost accounting. If the run reached a done record,
             # metering was already dispatched as meter_task; await that same task

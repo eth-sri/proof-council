@@ -33,6 +33,7 @@ from proofstack.registry import (
     list_presets,
     load_preset,
 )
+from proofstack.child_registry import kill_registered_children
 from proofstack.transient_auth import remove_codex_auth_for_run
 
 DEFAULT_TOOL_ROOT = CONFIGS_ROOT / "tools"
@@ -1365,30 +1366,43 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
     wait briefly for a clean exit, then SIGKILL anything still alive. ``signalled``
     is False when there was no live process to stop (already crashed/finished) —
     the caller still marks the run stopped so Resume appears.
+
+    Sandbox CLI children run in their OWN sessions, out of killpg's reach;
+    ``stop_run_process`` returns via ``_stop_result`` so every exit path also
+    hard-kills the groups registered in ``run-children.json``.
     """
     pid = read_run_pid(run_path)
     if pid is None:
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
     if not _pid_alive(pid):
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
     # Only signal the GROUP if this PID is genuinely its own group leader, else
     # killpg would hit an unrelated group; otherwise signal just the process.
     try:
         use_group = os.getpgid(pid) == pid
     except ProcessLookupError:
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
 
     def send(sig: int) -> None:
         if use_group:
@@ -1399,13 +1413,18 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
     try:
         send(signal.SIGTERM)
     except ProcessLookupError:
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
     except PermissionError:
-        return {"signalled": False, "pid": pid, "credentials_scrubbed": 0}
+        return _stop_result(
+            run_path, {"signalled": False, "pid": pid, "credentials_scrubbed": 0}
+        )
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline and _pid_alive(pid):
         time.sleep(0.1)
@@ -1418,11 +1437,25 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
         (run_path / "run.pid").unlink()
     except OSError:
         pass
-    return {
-        "signalled": True,
-        "pid": pid,
-        "credentials_scrubbed": _scrub_transient_credentials(run_path),
-    }
+    return _stop_result(
+        run_path,
+        {
+            "signalled": True,
+            "pid": pid,
+            "credentials_scrubbed": _scrub_transient_credentials(run_path),
+        },
+    )
+
+
+def _stop_result(run_path: Path, base: dict[str, Any]) -> dict[str, Any]:
+    # Hard cleanup of session-detached CLI children happens on EVERY stop
+    # path — including "worker already dead", which is exactly the case
+    # where orphans exist.
+    try:
+        base.update(kill_registered_children(run_path))
+    except Exception:
+        base.setdefault("children_signalled", [])
+    return base
 
 
 def run_process_alive(run_path: Path) -> bool:
