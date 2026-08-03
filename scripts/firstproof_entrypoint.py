@@ -41,7 +41,7 @@ from proofstack.latex_contract import (  # noqa: E402
     strip_forbidden_packages,
 )
 from _secret_paths import (  # noqa: E402
-    SECRET_DIR_NAMES as _RETRIEVAL_SECRET_DIR_NAMES,
+    is_secret_dir_name as _is_retrieval_secret_dir,
     is_secret_file_name as _is_retrieval_secret_file,
 )
 
@@ -380,7 +380,7 @@ def _finalize_output_permissions(output_dir: Path) -> list[str]:
                 if not _remove_output_path_robust(child, warnings, "symlink"):
                     unsafe_paths.add(child)
                 continue
-            if dirname in _RETRIEVAL_SECRET_DIR_NAMES:
+            if _is_retrieval_secret_dir(dirname):
                 if not _remove_output_path_robust(child, warnings, "secret"):
                     unsafe_paths.add(child)
                 continue
@@ -429,7 +429,7 @@ def _finalize_output_permissions(output_dir: Path) -> list[str]:
                     unsafe_paths.add(child)
                     warnings.append(f"RETRIEVAL_UNSAFE: skipping chmod for unrecovered unsafe output directory {child}")
                 continue
-            if dirname in _RETRIEVAL_SECRET_DIR_NAMES:
+            if _is_retrieval_secret_dir(dirname):
                 if not _remove_output_path_robust(child, warnings, "late secret"):
                     unsafe_paths.add(child)
                     warnings.append(f"RETRIEVAL_UNSAFE: skipping chmod for unrecovered unsafe output directory {child}")

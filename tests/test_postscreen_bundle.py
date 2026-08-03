@@ -51,10 +51,13 @@ class BuildBundleTests(unittest.TestCase):
         (run / "subdir" / ".codex" / "config.toml").write_text("cfg")
         (run / "subdir" / "auth.json").write_text("CRED")
         (run / ".env").write_text("CRED")
+        (run / ".env.local").write_text("CRED")
         (run / "prod.env").write_text("CRED")
         (run / "subdir" / "credentials.json").write_text("CRED")
         (run / ".ssh").mkdir()
         (run / ".ssh" / "id_rsa").write_text("CRED")
+        (run / "Secrets").mkdir()
+        (run / "Secrets" / "key.txt").write_text("CRED")
         (run / "leak.txt").symlink_to("../outside-secret.txt")
         (run / "alias.txt").symlink_to("normal.txt")
         (run / "sneaky.json").symlink_to(".codex-home/auth.json")
@@ -87,8 +90,8 @@ class BuildBundleTests(unittest.TestCase):
     def test_credentials_excluded_even_with_include_flags(self):
         names = self._bundle(include_workspace_zips=True, include_pdfs=True)
         self.assertNotIn(b"CRED", self.blob)
-        secret_markers = (".codex", "auth.json", ".env", "credentials", ".ssh", "id_rsa")
-        self.assertFalse(any(m in n for n in names for m in secret_markers), names)
+        secret_markers = (".codex", "auth.json", ".env", "credentials", ".ssh", "id_rsa", "secrets")
+        self.assertFalse(any(m in n.lower() for n in names for m in secret_markers), names)
         self.assertIn("run_x/paper.pdf", names)
         self.assertIn("run_x/compute_workspace_round_1.zip", names)
 
@@ -175,6 +178,64 @@ class RewriteArtifactLinksTests(unittest.TestCase):
             "![q](artifacts/progress.png) but keep ![r](artifacts/progress.png) "
             "and unrelated /mnt/data/audit_artifacts/other.csv",
         )
+
+
+class SafeArtifactNameTests(unittest.TestCase):
+    def test_model_controlled_names_cannot_traverse(self):
+        ps = _load_module()
+        self.assertEqual(ps._safe_artifact_name("/mnt/data/audit_artifacts/p.png"), "p.png")
+        self.assertEqual(ps._safe_artifact_name("/mnt/data/C:\\evil.png"), "C__evil.png")
+        self.assertEqual(ps._safe_artifact_name("/mnt/data/..\\..\\x"), ".._.._x")
+        self.assertIsNone(ps._safe_artifact_name("/mnt/data/audit_artifacts/.."))
+        self.assertIsNone(ps._safe_artifact_name(""))
+
+
+class AuditCfgTests(unittest.TestCase):
+    def test_batch_mode_is_forced_off_and_store_disabled(self):
+        ps = _load_module()
+        cfg = ps._load_audit_cfg(ps.DEFAULT_MODEL)
+        self.assertIs(cfg["batch_processing"], False)
+        self.assertIs(cfg["store"], False)
+
+    def test_batch_config_dict_is_overridden(self):
+        ps = _load_module()
+        cfg = ps._load_audit_cfg(
+            {"base": ps.DEFAULT_MODEL, "batch_processing": True}
+        )
+        self.assertIs(cfg["batch_processing"], False)
+
+
+class EmptyBundleTests(unittest.TestCase):
+    def _run_main(self, argv: list[str]):
+        ps = _load_module()
+        old_argv = sys.argv
+        sys.argv = ["postscreen_run.py"] + argv
+        try:
+            return ps.main()
+        finally:
+            sys.argv = old_argv
+
+    def test_run_dir_with_only_secrets_is_rejected(self):
+        tmp = Path(tempfile.mkdtemp(prefix="pse_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        run = tmp / "run"
+        run.mkdir()
+        (run / ".env").write_text("CRED")
+        with self.assertRaisesRegex(SystemExit, "empty bundle"):
+            self._run_main(
+                ["--run-dir", str(run), "--slug", "t", "--out-dir", str(tmp / "out")]
+            )
+
+    def test_zip_with_only_secret_members_is_rejected(self):
+        tmp = Path(tempfile.mkdtemp(prefix="pse_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        src = tmp / "src.zip"
+        with zipfile.ZipFile(src, "w") as zf:
+            zf.writestr("run/.codex-home/auth.json", "CRED")
+        with self.assertRaisesRegex(SystemExit, "no files"):
+            self._run_main(
+                ["--zip", str(src), "--slug", "t", "--out-dir", str(tmp / "out")]
+            )
 
 
 class ModelGuardTests(unittest.TestCase):

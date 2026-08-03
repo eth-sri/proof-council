@@ -13,12 +13,22 @@ SECRET_FILE_NAMES = frozenset(
 )
 
 
+def is_secret_dir_name(name: str) -> bool:
+    return name.lower() in SECRET_DIR_NAMES
+
+
 def is_secret_file_name(name: str) -> bool:
-    return name in SECRET_FILE_NAMES or name.endswith(".env")
+    lowered = name.lower()
+    return (
+        lowered in SECRET_FILE_NAMES
+        # Dotenv variants: .env.local, .env.production, .envrc, prod.env, ...
+        or lowered.startswith(".env")
+        or lowered.endswith(".env")
+    )
 
 
 def is_secret_rel_path(rel: PurePath) -> bool:
     return (
-        any(part in SECRET_DIR_NAMES for part in rel.parts)
+        any(is_secret_dir_name(part) for part in rel.parts)
         or is_secret_file_name(rel.name)
     )

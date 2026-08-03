@@ -29,15 +29,19 @@ What it does:
   2. Uploads the zip to OpenAI (bounded 24 h expiry) and attaches it to
      a code_interpreter container.
   3. Runs a single audit call (default ``models/openai/gpt-55-pro``,
-     override with ``--model``; must be an OpenAI Responses config)
-     through ``APIClient`` (so cost and token accounting stay
-     centralized).
-  4. Downloads whatever the model saved under ``/mnt/data/audit_artifacts/``
-     (the progress PNG, the CSV, ...), then deletes the container.
-  5. Writes ``report.md``, ``artifacts/``, ``conversation.json`` and
-     ``audit_meta.json`` into the output directory.
-  6. Deletes the uploaded zip from OpenAI again (``--keep-upload`` skips
+     override with ``--model``; must be an OpenAI Responses config —
+     batch mode is forced off and the response is not stored
+     server-side) through ``APIClient`` (so cost and token accounting
+     stay centralized).
+  4. Persists ``report.md`` and ``conversation.json``, then downloads
+     whatever the model saved under ``/mnt/data/audit_artifacts/`` (the
+     progress PNG, the CSV, ...) into ``artifacts/`` and deletes the
+     container. ``audit_meta.json`` records the run.
+  5. Deletes the uploaded zip from OpenAI again (``--keep-upload`` skips
      this; the 24 h expiry still applies).
+
+Exits nonzero when the report is empty or the model never invoked
+code_interpreter (it cannot have opened the bundle).
 """
 from __future__ import annotations
 
@@ -45,6 +49,7 @@ import argparse
 import fnmatch
 import json
 import os
+import shutil
 import sys
 import zipfile
 from datetime import datetime
@@ -260,8 +265,18 @@ def _sanitize_prebuilt_zip(src_zip: Path, out_zip: Path) -> tuple[Path, list[str
             for info in infos:
                 if info.filename in dropped_set:
                     continue
-                zout.writestr(info, zin.read(info))
+                if info.is_dir():
+                    zout.writestr(info, b"")
+                    continue
+                # Chunked copy: a member's uncompressed size can exceed RAM.
+                with zin.open(info) as src_f, zout.open(info, "w") as dst_f:
+                    shutil.copyfileobj(src_f, dst_f, 1024 * 1024)
     return out_zip, dropped
+
+
+def _zip_file_count(bundle: Path) -> int:
+    with zipfile.ZipFile(bundle) as zf:
+        return sum(1 for info in zf.infolist() if not info.is_dir())
 
 
 def _rewrite_artifact_links(report: str, artifacts: list[str]) -> str:
@@ -344,18 +359,53 @@ def _download_artifacts(oc: OpenAI, container_id: str, bundle_name: str, dest: P
     saved: list[str] = []
     seen: set[str] = set()
     for cf in chosen:
-        base = str(getattr(cf, "path", "") or "").rsplit("/", 1)[-1]
-        if base in seen:
+        base = _safe_artifact_name(str(getattr(cf, "path", "") or ""))
+        if base is None or base in seen:
             continue
         seen.add(base)
         try:
             body = _read_body(oc.containers.files.content.retrieve(cf.id, container_id=container_id))
+            (dest / base).write_bytes(body)
         except Exception as e:
             print(f"  WARN: could not download {base}: {e}", file=sys.stderr)
             continue
-        (dest / base).write_bytes(body)
         saved.append(base)
     return saved
+
+
+def _safe_artifact_name(container_path: str) -> str | None:
+    """Basename a model-controlled container path defensively: on native
+    Windows a name like ``C:\\evil`` or ``..\\x`` would otherwise become an
+    absolute/traversing local path."""
+    base = container_path.rsplit("/", 1)[-1]
+    base = base.replace("\\", "_").replace(":", "_")
+    if not base or base in {".", ".."}:
+        return None
+    return base
+
+
+def _load_audit_cfg(model_arg: str) -> dict:
+    """Load the model config and refuse providers that cannot see the
+    bundle: it rides an OpenAI code_interpreter container, and APIClient
+    silently drops the file_ids when converting the tool for other
+    providers — the audit would run blind."""
+    cfg = {k: v for k, v in load_solver_config(model_arg).items() if not k.startswith("__")}
+    if cfg.get("api") != "openai" or not cfg.get("use_openai_responses_api"):
+        raise SystemExit(
+            f"--model {model_arg} is not an OpenAI Responses config "
+            "(needs api: openai and use_openai_responses_api: true); other "
+            "providers cannot receive the uploaded bundle"
+        )
+    # Batch mode would submit Chat Completions without the uploaded file
+    # or the hosted tools — an expensive blind audit that looks successful.
+    if cfg.get("batch_processing"):
+        print("note: overriding batch_processing=false for the single audit call")
+    cfg["batch_processing"] = False
+    # Don't retain the response (which embeds run data) server-side beyond
+    # the call; background mode keeps temporary polling state with
+    # store=false, so polling still works.
+    cfg.setdefault("store", False)
+    return cfg
 
 
 def main() -> int:
@@ -386,6 +436,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    # Validate all local inputs before anything is transferred.
+    audit_prompt = (
+        args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else AUDIT_PROMPT
+    )
+    cfg = _load_audit_cfg(args.model)
+
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = args.out_dir or (REPO_ROOT / "outputs" / f"postscreen-{args.slug}-{ts}")
     out_dir = out_dir.resolve()
@@ -404,6 +460,8 @@ def main() -> int:
             shown = ", ".join(zip_members_dropped[:5])
             more = f" (+{len(zip_members_dropped) - 5} more)" if len(zip_members_dropped) > 5 else ""
             print(f"sanitized prebuilt zip: dropped secret members {shown}{more}")
+        if _zip_file_count(bundle) == 0:
+            raise SystemExit(f"--zip contains no files (after sanitization): {src}")
         print(f"using bundle: {bundle} ({bundle.stat().st_size / 1e6:.1f} MB)")
     else:
         run_dir = args.run_dir.resolve()
@@ -416,26 +474,18 @@ def main() -> int:
             include_pdfs=args.include_pdfs,
             exclude=args.exclude,
         )
+        if written == 0:
+            raise SystemExit(
+                f"--run-dir produced an empty bundle ({skipped} files excluded): {run_dir}"
+            )
         print(f"built bundle: {bundle.name} — {written} files ({skipped} excluded), {bundle.stat().st_size / 1e6:.1f} MB")
-
-    # 2. Load the model config and refuse providers that cannot see the
-    #    bundle: it rides an OpenAI code_interpreter container, and
-    #    APIClient silently drops the file_ids when converting the tool
-    #    for other providers — the audit would run blind.
-    cfg = {k: v for k, v in load_solver_config(args.model).items() if not k.startswith("__")}
-    if cfg.get("api") != "openai" or not cfg.get("use_openai_responses_api"):
-        raise SystemExit(
-            f"--model {args.model} is not an OpenAI Responses config "
-            "(needs api: openai and use_openai_responses_api: true); other "
-            "providers cannot receive the uploaded bundle"
-        )
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise SystemExit("OPENAI_API_KEY not set")
     oc = OpenAI(api_key=api_key)
 
-    # 3. Upload + attach to a code_interpreter container. The bounded
+    # 2. Upload + attach to a code_interpreter container. The bounded
     #    expiry caps retention even if this process is killed before the
     #    eager cleanup below can run.
     with open(bundle, "rb") as fh:
@@ -446,7 +496,9 @@ def main() -> int:
         )
     print(f"uploaded: file_id={uploaded.id} bytes={uploaded.bytes} (expires in {UPLOAD_TTL_S // 3600} h)")
     try:
-        return _run_audit(args, cfg, oc, bundle, uploaded, out_dir, ts, zip_members_dropped)
+        return _run_audit(
+            args, cfg, oc, bundle, uploaded, out_dir, ts, zip_members_dropped, audit_prompt
+        )
     finally:
         if args.keep_upload:
             print(f"  keeping uploaded file {uploaded.id} (--keep-upload)")
@@ -460,7 +512,7 @@ def main() -> int:
 
 def _run_audit(
     args, cfg: dict, oc: OpenAI, bundle: Path, uploaded, out_dir: Path, ts: str,
-    zip_members_dropped: list[str],
+    zip_members_dropped: list[str], audit_prompt: str,
 ) -> int:
     tool_pairs = [
         (None, {"type": "code_interpreter", "container": {"type": "auto", "file_ids": [uploaded.id]}}),
@@ -469,9 +521,6 @@ def _run_audit(
     cfg["tools"] = tool_pairs
     client = APIClient(**cfg)
 
-    audit_prompt = (
-        args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else AUDIT_PROMPT
-    )
     operator_note = OPERATOR_INSTRUCTIONS.replace(
         "{exclusions_note}",
         _exclusions_note(
@@ -493,29 +542,38 @@ def _run_audit(
 
     report = _assistant_text(conversation).strip()
     container_id = _container_id_from_conversation(conversation)
-    print(f"  done in {elapsed / 60:.1f} min; ${cost.get('cost', 0):.2f}; report {len(report)} chars; container={container_id}")
+    print(
+        f"  done in {elapsed / 60:.1f} min; ${cost.get('cost', 0):.2f} (tokens only); "
+        f"report {len(report)} chars; container={container_id}"
+    )
 
-    # 4. Download artifacts the model produced, then drop the container
-    #    (it holds a copy of the bundle and would otherwise linger until
-    #    its inactivity expiry).
-    artifacts: list[str] = []
-    if container_id:
-        artifacts = _download_artifacts(oc, container_id, bundle.name, out_dir / "artifacts")
-        print(f"  artifacts: {artifacts or 'none'}")
-        try:
-            oc.containers.delete(container_id)
-            print(f"  deleted container {container_id}")
-        except Exception as e:
-            print(f"  WARN: could not delete container {container_id}: {e}", file=sys.stderr)
-    else:
-        print("  WARN: no container_id in conversation; cannot fetch artifacts", file=sys.stderr)
-
-    # 5. Persist everything.
-    report = _rewrite_artifact_links(report, artifacts)
-    (out_dir / "report.md").write_text(report + "\n", encoding="utf-8")
+    # 4. Persist the raw response FIRST: a failure while fetching
+    #    artifacts must not lose a completed (expensive) audit.
     (out_dir / "conversation.json").write_text(
         json.dumps(conversation, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
+    (out_dir / "report.md").write_text(report + "\n", encoding="utf-8")
+
+    # 5. Download artifacts the model produced; always drop the container
+    #    afterwards (it holds a copy of the bundle and would otherwise
+    #    linger until its inactivity expiry).
+    artifacts: list[str] = []
+    if container_id:
+        try:
+            artifacts = _download_artifacts(oc, container_id, bundle.name, out_dir / "artifacts")
+            print(f"  artifacts: {artifacts or 'none'}")
+        finally:
+            try:
+                oc.containers.delete(container_id)
+                print(f"  deleted container {container_id}")
+            except Exception as e:
+                print(f"  WARN: could not delete container {container_id}: {e}", file=sys.stderr)
+    else:
+        print("  WARN: no code_interpreter call in conversation; cannot fetch artifacts", file=sys.stderr)
+
+    # 6. Rewrite artifact links in the persisted report + write meta.
+    report = _rewrite_artifact_links(report, artifacts)
+    (out_dir / "report.md").write_text(report + "\n", encoding="utf-8")
     meta = {
         "slug": args.slug,
         "model": cfg.get("model"),
@@ -525,7 +583,9 @@ def _run_audit(
         "file_id": uploaded.id,
         "container_id": container_id,
         "elapsed_s": round(elapsed, 1),
-        "cost": cost,
+        # APIClient token accounting only; hosted web_search and
+        # code_interpreter tool invocations are billed separately by OpenAI.
+        "token_cost": cost,
         "artifacts": artifacts,
         "source": "prebuilt-zip" if args.zip else "run-dir",
         # A prebuilt --zip has unknown contents; the only curation this
@@ -550,6 +610,13 @@ def _run_audit(
     print(f"  meta:      {out_dir / 'audit_meta.json'}")
     if not report:
         print("  WARN: report is empty; inspect conversation.json", file=sys.stderr)
+        return 1
+    if not container_id:
+        print(
+            "  WARN: the model never invoked code_interpreter, so it cannot "
+            "have opened the bundle; treating the audit as failed",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
