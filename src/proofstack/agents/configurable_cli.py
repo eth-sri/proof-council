@@ -30,6 +30,7 @@ from proofstack.cli_usage import (
     parse_claude_json,
     parse_codex_jsonl,
 )
+from proofstack.codex_auth import classify_codex_auth
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
@@ -224,27 +225,15 @@ class ConfigurableCLIAgent(CLIAgent):
                 )
             try:
                 auth_text = host_auth.read_text(encoding="utf-8")
-                auth_data = json.loads(auth_text)
             except OSError as e:
                 raise RuntimeError(
                     f"could not read Codex subscription authentication from {host_auth}: {e}"
                 ) from e
-            except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"Codex authentication at {host_auth} is not valid JSON. "
-                    "Run `codex login` again."
-                ) from e
-            auth_mode = (
-                str(auth_data.get("auth_mode") or "").lower()
-                if isinstance(auth_data, dict)
-                else ""
-            )
-            api_key = auth_data.get("OPENAI_API_KEY") if isinstance(auth_data, dict) else None
-            if auth_mode != "chatgpt" or (isinstance(api_key, str) and api_key.strip()):
+            if classify_codex_auth(auth_text) != "subscription":
                 raise RuntimeError(
                     "Codex subscription authentication is unavailable: "
-                    f"{host_auth} is not a ChatGPT login. Run `codex login` "
-                    "with a ChatGPT subscription."
+                    f"{host_auth} is not a ChatGPT login (or embeds an API "
+                    "key). Run `codex login` with a ChatGPT subscription."
                 )
             auth_home, auth_home_env = self._new_codex_home(sandbox)
             auth_path = auth_home / "auth.json"
@@ -391,6 +380,12 @@ class ConfigurableCLIAgent(CLIAgent):
         data.update(self._constant_outputs(inp, sandbox))
         data.update(self._done_outputs(done))
         await self._collect_file_outputs(sandbox, data)
+        # A failed completion must survive the configured projection: with a
+        # done_outputs that omits status, the error would vanish and the DAG
+        # would report the node as a success (Outputs allows extra fields).
+        if str(done.status or "").lower() in ("error", "timeout", "partial", "blocked"):
+            data["status"] = done.status
+            data.setdefault("error", done.summary or done.status)
         return self.Outputs.model_validate(data)
 
     async def record_cli_usage(

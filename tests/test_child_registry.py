@@ -66,6 +66,32 @@ class ChildRegistryTests(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
 
+    def test_starttime_mismatch_means_pid_reuse_and_is_skipped(self) -> None:
+        # An entry whose recorded kernel start time differs from the live
+        # process's is a reused pid: never signal it.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                start_new_session=True,
+            )
+            try:
+                register_child(run_dir, pid=proc.pid, cmd0=sys.executable)
+                entries = json.loads(
+                    (run_dir / "run-children.json").read_text(encoding="utf-8")
+                )
+                self.assertIsNotNone(entries[0]["starttime"])
+                entries[0]["starttime"] = int(entries[0]["starttime"]) - 12345
+                (run_dir / "run-children.json").write_text(
+                    json.dumps(entries), encoding="utf-8"
+                )
+                result = kill_registered_children(run_dir, grace_s=0.5)
+                self.assertEqual(result["children_signalled"], [])
+                self.assertIsNone(proc.poll())  # untouched
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+
     def test_stale_entry_with_dead_pid_is_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

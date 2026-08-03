@@ -384,7 +384,9 @@ def _seed_budget_from_prior_events(ctx: RunContext) -> None:
                 p = e.get("payload") or {}
                 if not isinstance(p, dict):
                     continue
-                if kind == "model.call":
+                # multiturn.end is MultiTurnAgent's ledger entry (same field
+                # names); its spend must survive a resume like model.call's.
+                if kind in ("model.call", "multiturn.end"):
                     usd += float(p.get("cost_usd") or 0.0)
                     if p.get("metered_tokens") is not None:
                         tokens += int(p.get("metered_tokens") or 0)

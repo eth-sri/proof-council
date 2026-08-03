@@ -715,6 +715,45 @@ class ConfigurableCLITests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "not a ChatGPT login"):
                     asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
 
+    def test_copy_codex_auth_accepts_token_schema_login(self) -> None:
+        # The CURRENT `codex login` schema has no auth_mode field at all;
+        # it must not be rejected as "not a ChatGPT login".
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            auth = home / ".codex" / "auth.json"
+            auth.parent.mkdir(parents=True)
+            auth.write_text(
+                json.dumps(
+                    {
+                        "OPENAI_API_KEY": None,
+                        "tokens": {
+                            "id_token": "i",
+                            "access_token": "a",
+                            "refresh_token": "r",
+                        },
+                        "last_refresh": "2026-08-01T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=Path(temp_dir) / "run",
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["sh", "-c", "cat > /dev/null; finish '{\"status\":\"done\"}'"],
+                        "copy_codex_auth": True,
+                        "sandbox": {"backend": "subprocess"},
+                        "output_schema": {"workspace": "string", "status": "string"},
+                        "done_outputs": {"status": "status"},
+                    }
+                },
+            )
+            with mock.patch.object(Path, "home", return_value=home):
+                out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
+        self.assertEqual(out.status, "done")
+
     def test_copy_codex_auth_accepts_chatgpt_login(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir) / "home"
@@ -809,6 +848,29 @@ class ConfigurableCLITests(unittest.TestCase):
             )
             out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
         self.assertEqual(out.status, "error")
+
+    def test_completion_failure_survives_output_projection(self) -> None:
+        # With an output schema that omits status entirely, a failed
+        # completion must still surface — otherwise the DAG sees success.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["sh", "-c", "cat > /dev/null; exit 0"],
+                        "prompt": "P",
+                        "sandbox": {"backend": "subprocess"},
+                        "input_schema": {},
+                        "output_schema": {"workspace": "string"},
+                    }
+                },
+            )
+            out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
+        data = out.model_dump()
+        self.assertEqual(data.get("status"), "error")
+        self.assertTrue(data.get("error"))
 
     def test_exit_completion_signal_keeps_exit_as_done(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

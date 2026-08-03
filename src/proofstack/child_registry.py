@@ -53,6 +53,17 @@ def _store(path: Path, entries: list[dict]) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _proc_starttime(pid: int) -> int | None:
+    """Kernel start time of the process (clock ticks since boot) — the
+    canonical pid-reuse discriminator. None when /proc is unavailable."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+        # comm (field 2) may contain spaces/parens; split after the LAST ')'.
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def register_child(run_dir: Path, *, pid: int, cmd0: str = "", label: str = "") -> None:
     try:
         pgid = os.getpgid(pid)
@@ -67,6 +78,7 @@ def register_child(run_dir: Path, *, pid: int, cmd0: str = "", label: str = "") 
                 "pgid": int(pgid),
                 "cmd0": os.path.basename(str(cmd0)),
                 "label": str(label),
+                "starttime": _proc_starttime(pid),
             }
         )
         _store(path, entries)
@@ -91,6 +103,11 @@ def _entry_still_matches(entry: dict) -> bool:
             return False
     except OSError:
         return False
+    recorded_start = entry.get("starttime")
+    if recorded_start is not None:
+        current_start = _proc_starttime(pid)
+        if current_start is not None and current_start != int(recorded_start):
+            return False  # pid was reused by a different process
     cmd0 = str(entry.get("cmd0") or "")
     if cmd0:
         try:
@@ -150,8 +167,13 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def pid_alive(pid: int) -> bool:
+    return _pid_alive(pid)
+
+
 __all__ = [
     "register_child",
     "unregister_child",
     "kill_registered_children",
+    "pid_alive",
 ]

@@ -43,6 +43,25 @@ class PruneSymlinkTests(unittest.TestCase):
             self.assertTrue((external / "sandbox" / "precious.txt").exists())
             self.assertEqual(estimate_prunable_bytes(run_dir), 0)
 
+    def test_symlinked_agents_root_is_refused(self) -> None:
+        # A symlinked top-level agents/ would bless its external target as
+        # the containment root; refuse the whole prune instead.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as ext:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            external = Path(ext) / "agents"
+            node = external / "node"
+            (node / "sandbox").mkdir(parents=True)
+            (node / "sandbox" / "precious.txt").write_text("keep", encoding="utf-8")
+            (node / "output.json").write_text("{}", encoding="utf-8")
+            (run_dir / "agents").symlink_to(external)
+
+            result = prune_run_artifacts(run_dir)
+
+            self.assertEqual(result["pruned_nodes"], 0)
+            self.assertTrue((node / "sandbox" / "precious.txt").exists())
+            self.assertEqual(estimate_prunable_bytes(run_dir), 0)
+
     def test_symlinked_sandbox_artifact_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as ext:
             run_dir = Path(tmp) / "run"

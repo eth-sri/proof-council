@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from proofstack.agent import Agent
 from proofstack.budget import BudgetExhausted
-from proofstack.child_registry import register_child, unregister_child
+from proofstack.child_registry import pid_alive, register_child, unregister_child
 from proofstack.context import RunContext
 from proofstack.events import new_call_id
 from proofstack.sandbox import make_sandbox, resolve_backend
@@ -321,7 +321,10 @@ class CLIAgent(Agent):
                     except Exception:
                         break
                 child_pid = getattr(stream.proc, "pid", None)
-                if child_pid:
+                if child_pid and not pid_alive(int(child_pid)):
+                    # Only drop the registry entry once the child is actually
+                    # dead; a failed termination must stay visible so the
+                    # dashboard's hard cleanup can finish the job.
                     unregister_child(self.ctx.root_workdir, int(child_pid))
             # Meter exactly once, even under cancellation — else the run loses
             # real token/cost accounting. If the run reached a done record,

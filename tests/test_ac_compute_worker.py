@@ -262,6 +262,33 @@ def test_compute_sandbox_passes_no_provider_keys_alongside_codex_login() -> None
         assert spec_for(home).provider_keys == ()  # login present: keys stripped
 
 
+def test_compute_recognizes_token_schema_auth_as_subscription() -> None:
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        root = temp / "compute"
+        root.mkdir()
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="prob-001",
+            round=1,
+            instructions="compute",
+            compute_workspace=root,
+        )
+        # What run() captures from the CURRENT codex login schema.
+        agent._host_codex_auth_text = _json.dumps(
+            {"OPENAI_API_KEY": None, "tokens": {"access_token": "t"}}
+        )
+        asyncio.run(agent.setup(FakeSandbox(root=root), inp))
+        assert agent._copied_codex_auth is True
+        assert agent._subscription_codex_auth is True
+        asyncio.run(agent.teardown(FakeSandbox(root=root), inp))
+        assert agent._subscription_codex_auth is False
+
+
 def test_compute_usage_subscription_auth_charges_no_usd() -> None:
     import json as _json
 

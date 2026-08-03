@@ -73,6 +73,7 @@ class BudgetSeedTests(unittest.TestCase):
             events = [
                 {"kind": "model.call", "payload": {"cost_usd": 1.5, "in_tokens": 100, "out_tokens": 20}},
                 {"kind": "model.call", "payload": {"cost_usd": 0.0, "metered_tokens": 5000}},
+                {"kind": "multiturn.end", "payload": {"cost_usd": 7.5, "in_tokens": 10, "out_tokens": 10}},
                 {"kind": "tool.call", "payload": {}},
                 {"kind": "tool.call", "payload": {}},
                 {"kind": "run.start", "payload": {}},
@@ -83,8 +84,8 @@ class BudgetSeedTests(unittest.TestCase):
             ctx = RunContext.create(run_id="r", root_workdir=run_dir, flat=True)
             module._seed_budget_from_prior_events(ctx)
             root = ctx.budgets.root("run")
-        self.assertAlmostEqual(root.counters.usd, 1.5)
-        self.assertEqual(root.counters.tokens, 5120)
+        self.assertAlmostEqual(root.counters.usd, 9.0)
+        self.assertEqual(root.counters.tokens, 5140)
         self.assertEqual(root.counters.tool_calls, 2)
 
     def test_fresh_run_seeds_nothing(self) -> None:

@@ -45,6 +45,7 @@ from proofstack.cli_usage import (
     load_cost_rates,
     parse_codex_jsonl,
 )
+from proofstack.codex_auth import classify_codex_auth
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
@@ -285,6 +286,7 @@ class Compute(CLIAgent):
         super().__init__(ctx, **kw)
         self._copied_codex_auth = False
         self._subscription_codex_auth = False
+        self._host_codex_auth_text: str | None = None
         self._last_model: str | None = None
         self._last_cost_config: str | None = None
         self._codex_home_host: Path | None = None
@@ -308,6 +310,17 @@ class Compute(CLIAgent):
         self._codex_home_env = codex_home_env
         # Build per-call SandboxSpec so callers can switch between
         # docker and subprocess without subclassing.
+        # ONE read + classification drives BOTH the sandbox env decision and
+        # the billing decision. Re-reading the file later would reopen the
+        # absent->present race in which ChatGPT auth and a paid env key
+        # reach codex simultaneously while accounting says subscription/$0.
+        try:
+            self._host_codex_auth_text = (
+                Path.home() / ".codex" / "auth.json"
+            ).read_text(encoding="utf-8")
+        except OSError:
+            self._host_codex_auth_text = None
+        auth_class = classify_codex_auth(self._host_codex_auth_text)
         self.SANDBOX = SandboxSpec(
             cpu_limit=4,
             memory_gb=8,
@@ -322,9 +335,9 @@ class Compute(CLIAgent):
             # accounting reports the call as subscription-covered $0. With
             # no login, the env-key fallback stays (and bills as paid).
             provider_keys=(
-                ()
-                if (Path.home() / ".codex" / "auth.json").is_file()
-                else SandboxSpec.provider_keys
+                SandboxSpec.provider_keys
+                if auth_class == "absent"
+                else ()
             ),
         )
         self.CLI_CMD = _build_codex_cmd(
@@ -371,10 +384,10 @@ class Compute(CLIAgent):
             pass
 
         # Copy codex auth — same approach as PWC worker's
-        # ``copy_codex_auth``. Scrubbed in teardown.
-        host_auth = Path.home() / ".codex" / "auth.json"
-        if host_auth.exists():
-            auth_text = host_auth.read_text(encoding="utf-8")
+        # ``copy_codex_auth``. Scrubbed in teardown. Uses the text captured
+        # (and classified) once in run(); never re-reads the host file.
+        auth_text = self._host_codex_auth_text
+        if auth_text is not None:
             auth_path = codex_home / "auth.json"
             auth_path.write_text(auth_text, encoding="utf-8")
             try:
@@ -382,17 +395,11 @@ class Compute(CLIAgent):
             except OSError:
                 pass
             self._copied_codex_auth = True
-            try:
-                auth_data = json.loads(auth_text)
-            except json.JSONDecodeError:
-                auth_data = None
             # A ChatGPT-login auth.json runs the worker on the subscription:
-            # no API spend. Anything else (embedded API key, unknown mode)
+            # no API spend. Anything else (embedded API key, unknown schema)
             # is treated as paid so real spend is never hidden.
             self._subscription_codex_auth = (
-                isinstance(auth_data, dict)
-                and str(auth_data.get("auth_mode") or "").lower() == "chatgpt"
-                and not str(auth_data.get("OPENAI_API_KEY") or "").strip()
+                classify_codex_auth(auth_text) == "subscription"
             )
 
     async def teardown(self, sandbox: Sandbox, inp: BaseModel) -> None:
@@ -403,6 +410,7 @@ class Compute(CLIAgent):
         self._codex_home_env = None
         self._copied_codex_auth = False
         self._subscription_codex_auth = False
+        self._host_codex_auth_text = None
 
     def extra_env(self, sandbox: Sandbox, inp: BaseModel) -> dict[str, str]:
         self._ensure_codex_home(inp)

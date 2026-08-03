@@ -1233,7 +1233,7 @@ def _sandbox_exposed(node_dir: Path) -> bool:
 def estimate_prunable_bytes(run_path: Path) -> int:
     """Bytes reclaimable by prune_run_artifacts without actually deleting."""
     agents_dir = run_path / "agents"
-    if not agents_dir.exists():
+    if agents_dir.is_symlink() or not agents_dir.is_dir():
         return 0
     total = 0
     for node_dir in agents_dir.iterdir():
@@ -1264,7 +1264,9 @@ def prune_run_artifacts(run_path: Path) -> dict[str, int]:
     agents_dir = run_path / "agents"
     pruned_nodes = 0
     bytes_freed = 0
-    if not agents_dir.exists():
+    # agents/ itself must be a real directory: a symlinked agents/ would
+    # bless its external target as the containment root below.
+    if agents_dir.is_symlink() or not agents_dir.is_dir():
         return {"pruned_nodes": 0, "bytes_freed": 0}
     agents_root = agents_dir.resolve()
     for node_dir in agents_dir.iterdir():
@@ -1951,8 +1953,12 @@ def load_execution_graph(
         payload = evt.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
-        if kind == "run.start" and evt.get("ts"):
-            run_start_ts.append(str(evt.get("ts")))
+        if kind == "run.start":
+            if evt.get("ts"):
+                run_start_ts.append(str(evt.get("ts")))
+            # New attempt: an old run.end error must not repaint this
+            # attempt's running nodes as failures.
+            run_status = None
         if kind == "run.end":
             run_status = str(payload.get("status") or "")
         if not str(kind or "").startswith("dag.node_"):
