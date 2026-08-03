@@ -61,7 +61,7 @@ if "loguru" not in sys.modules:
     loguru.logger = _Logger()
     sys.modules["loguru"] = loguru
 
-from mathagents.api_client import APIClient  # noqa: E402
+from mathagents.api_client import APIClient, _ClientTerminated  # noqa: E402
 
 
 def _function_tool(name: str = "list_persisted_files") -> dict:
@@ -585,6 +585,60 @@ class BackgroundTimeoutRetryTests(unittest.TestCase):
         # at or after ``self.timeout``, not at the wallclock midpoint.
         self.assertGreater(cancelled_at[0], float(timeout) - 60.0)
         self.assertLess(cancelled_at[0], float(timeout) + 120.0)
+
+
+class TerminateDuringBackgroundPollTests(unittest.TestCase):
+    def test_terminate_cancels_response_and_escapes_poll(self) -> None:
+        # terminate() must interrupt the poll within one sleep slice,
+        # cancel the server-side response, and escape the retry loops
+        # (a _ClientTerminated retry would relaunch the whole call).
+        pending = SimpleNamespace(
+            id="resp_pending_1",
+            status="in_progress",
+            output=[],
+            usage=None,
+            model_dump=lambda: {"status": "in_progress"},
+        )
+
+        class _BackgroundResponses:
+            def __init__(self):
+                self.cancelled = []
+                self.retrieve_calls = 0
+
+            def create(self, **payload):
+                return pending
+
+            def retrieve(self, response_id):
+                self.retrieve_calls += 1
+                return pending
+
+            def cancel(self, response_id):
+                self.cancelled.append(response_id)
+
+        api = APIClient(
+            model="gpt-5.5-pro--xhigh",
+            api="custom",
+            use_openai_responses_api=True,
+            background=True,
+            timeout=3600,
+        )
+
+        def fake_sleep(seconds):
+            api.terminated = True
+
+        responses = _BackgroundResponses()
+        client = SimpleNamespace(responses=responses)
+
+        with patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ), patch("mathagents.api_client.time.sleep", fake_sleep):
+            with self.assertRaises(_ClientTerminated):
+                api._openai_query_responses_api(
+                    client, 0, [{"role": "user", "content": "hi"}]
+                )
+
+        self.assertEqual(responses.cancelled, ["resp_pending_1"])
+        self.assertEqual(responses.retrieve_calls, 0)
 
 
 if __name__ == "__main__":

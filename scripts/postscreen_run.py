@@ -537,7 +537,13 @@ def _run_audit(
 
     print(f"calling {cfg.get('model')} (background, may run 15-60+ min)...")
     start = datetime.now()
-    _idx, conversation, cost = next(iter(client.run_queries([messages], no_tqdm=True)))
+    try:
+        _idx, conversation, cost = next(iter(client.run_queries([messages], no_tqdm=True)))
+    except KeyboardInterrupt:
+        # Stop the worker's background polling promptly (it also cancels
+        # the server-side response); main()'s finally deletes the upload.
+        client.terminate()
+        raise
     elapsed = (datetime.now() - start).total_seconds()
 
     report = _assistant_text(conversation).strip()

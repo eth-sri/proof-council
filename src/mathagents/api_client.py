@@ -97,6 +97,12 @@ class _BackgroundResponseTimeout(TimeoutError):
     pass
 
 
+class _ClientTerminated(Exception):
+    """Raised inside workers when ``terminate()`` was called; must escape
+    the retry loops instead of being retried."""
+    pass
+
+
 class _ProviderWallclockTimeout(TimeoutError):
     pass
 
@@ -2124,6 +2130,8 @@ class APIClient:
             n_retries = -1
             while response is None and n_retries < self.max_retries_inner:
                 n_retries += 1
+                if self.terminated:
+                    raise _ClientTerminated("APIClient terminated during OpenAI responses retry loop.")
                 # Wallclock cap (shared across all inner attempts for this
                 # call): stop ~retries x 60s + provider-overload storms
                 # from running longer than the per-call budget set on
@@ -2171,7 +2179,23 @@ class APIClient:
                                 inner_start + self.max_wallclock_per_call_s,
                             )
                         while response.status in {"queued", "in_progress"}:
-                            time.sleep(60)
+                            # Sleep in short slices so terminate() can
+                            # interrupt the up-to-hours-long poll promptly.
+                            for _ in range(60):
+                                if self.terminated:
+                                    break
+                                time.sleep(1)
+                            if self.terminated:
+                                response_id = getattr(response, "id", None)
+                                if response_id is not None:
+                                    try:
+                                        client.responses.cancel(response_id)
+                                    except Exception as cancel_exc:
+                                        logger.warning(
+                                            f"Could not cancel terminated OpenAI background response "
+                                            f"{response_id}: {cancel_exc}"
+                                        )
+                                raise _ClientTerminated("APIClient terminated while polling background response.")
                             response = client.responses.retrieve(response.id)
                             if time.time() > attempt_deadline_at:
                                 response_id = getattr(response, "id", None)
@@ -2245,6 +2269,8 @@ class APIClient:
                     else:
                         request_logger.log_response(ts=ts, batch_idx=idx, response=response.model_dump())
                 except Exception as e:
+                    if isinstance(e, _ClientTerminated):
+                        raise
                     if isinstance(e, _BackgroundResponseTimeout):
                         background_timeout_count += 1
                         next_effort = self._background_timeout_retry_reasoning_effort(background_timeout_count)
