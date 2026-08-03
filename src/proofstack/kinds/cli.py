@@ -289,10 +289,19 @@ class CLIAgent(Agent):
             # us here. Done before metering so the transcript is complete
             # when we meter partial usage.
             if stream is not None:
-                try:
-                    await asyncio.shield(stream.terminate())
-                except (asyncio.CancelledError, Exception):
-                    pass
+                # Retained + re-awaited under REPEATED cancellation (same
+                # pattern as metering below): a second cancel while awaiting
+                # the shield would otherwise abandon a mid-escalation
+                # terminate (TERM -> wait -> KILL) and leave a
+                # SIGTERM-ignoring CLI child alive.
+                terminate_task = asyncio.ensure_future(stream.terminate())
+                while not terminate_task.done():
+                    try:
+                        await asyncio.shield(terminate_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
             # Meter exactly once, even under cancellation — else the run loses
             # real token/cost accounting. If the run reached a done record,
             # metering was already dispatched as meter_task; await that same task

@@ -635,5 +635,61 @@ class DAGWorkflowRuntimeHelperTests(unittest.TestCase):
         self.assertEqual(state["node"]["latex"]["tex_body"], "polished proof")
 
 
+class CancelAndDrainTests(unittest.TestCase):
+    def test_children_are_cancelled_and_drained(self) -> None:
+        from proofstack.agents.dag_workflow import _cancel_and_drain
+
+        async def scenario() -> bool:
+            started = asyncio.Event()
+            saw_cancel = asyncio.Event()
+
+            async def child() -> None:
+                started.set()
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    saw_cancel.set()
+                    raise
+
+            task = asyncio.create_task(child())
+            await started.wait()
+            await _cancel_and_drain({task: "child"})
+            return saw_cancel.is_set() and task.done()
+
+        self.assertTrue(asyncio.run(scenario()))
+
+    def test_drain_survives_external_cancellation(self) -> None:
+        # A second cancellation landing mid-drain must not abandon
+        # still-running children.
+        from proofstack.agents.dag_workflow import _cancel_and_drain
+
+        async def scenario() -> bool:
+            slow_cleanup_done = asyncio.Event()
+
+            async def stubborn_child() -> None:
+                try:
+                    await asyncio.sleep(60)
+                finally:
+                    # Cleanup that takes a moment — the window in which the
+                    # drain itself can be cancelled.
+                    await asyncio.sleep(0.05)
+                    slow_cleanup_done.set()
+
+            child = asyncio.create_task(stubborn_child())
+            await asyncio.sleep(0)
+
+            drain = asyncio.create_task(_cancel_and_drain({child: "x"}))
+            await asyncio.sleep(0.01)
+            drain.cancel()  # external second cancellation
+            try:
+                await drain
+            except asyncio.CancelledError:
+                pass
+            await asyncio.sleep(0.1)
+            return slow_cleanup_done.is_set() and child.done()
+
+        self.assertTrue(asyncio.run(scenario()))
+
+
 if __name__ == "__main__":
     unittest.main()
