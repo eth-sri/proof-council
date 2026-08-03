@@ -62,5 +62,43 @@ class RunWorkflowResumeTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--budget-usd") + 1], "1.25")
 
 
+class BudgetSeedTests(unittest.TestCase):
+    def test_resume_seeds_root_tracker_from_prior_events(self) -> None:
+        from proofstack.context import RunContext
+
+        module = _run_workflow_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            run_dir.mkdir()
+            events = [
+                {"kind": "model.call", "payload": {"cost_usd": 1.5, "in_tokens": 100, "out_tokens": 20}},
+                {"kind": "model.call", "payload": {"cost_usd": 0.0, "metered_tokens": 5000}},
+                {"kind": "tool.call", "payload": {}},
+                {"kind": "tool.call", "payload": {}},
+                {"kind": "run.start", "payload": {}},
+            ]
+            (run_dir / "events.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8"
+            )
+            ctx = RunContext.create(run_id="r", root_workdir=run_dir, flat=True)
+            module._seed_budget_from_prior_events(ctx)
+            root = ctx.budgets.root("run")
+        self.assertAlmostEqual(root.counters.usd, 1.5)
+        self.assertEqual(root.counters.tokens, 5120)
+        self.assertEqual(root.counters.tool_calls, 2)
+
+    def test_fresh_run_seeds_nothing(self) -> None:
+        from proofstack.context import RunContext
+
+        module = _run_workflow_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            ctx = RunContext.create(run_id="r", root_workdir=run_dir, flat=True)
+            module._seed_budget_from_prior_events(ctx)
+            root = ctx.budgets.root("run")
+        self.assertEqual(root.counters.usd, 0.0)
+        self.assertEqual(root.counters.tokens, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

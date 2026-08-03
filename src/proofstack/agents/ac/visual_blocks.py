@@ -100,7 +100,8 @@ class ACInitBlock(ACWorkflow):
         )
         if resume_state is not None:
             self._restore_workspace_from_resume(workspace, resume_state)
-            self._apply_resume_budget_offset()
+            # Prior spend is re-seeded centrally by the launcher
+            # (run_workflow._seed_budget_from_prior_events), not here.
             await self.events.emit(
                 "ac.resume",
                 {

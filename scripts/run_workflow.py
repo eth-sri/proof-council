@@ -358,6 +358,49 @@ def _write_resume_spec(
         pass
 
 
+def _seed_budget_from_prior_events(ctx: RunContext) -> None:
+    """Restore cumulative spend into the root tracker on resume/restart.
+
+    ``RunContext.create`` builds a fresh ``BudgetRegistry``, so without this
+    every restart silently refills the run's USD/token/tool-call allowances
+    and repeated resumes bypass the configured caps. Wallclock stays
+    attempt-local: the human-wait pause union is not cheaply reconstructable
+    from events, and charging raw prior span would over-count runs that
+    waited on browser cards for hours.
+    """
+    events_path = ctx.root_workdir / "events.jsonl"
+    root = ctx.budgets.root("run")
+    usd = 0.0
+    tokens = 0
+    tool_calls = 0
+    try:
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = e.get("kind")
+                p = e.get("payload") or {}
+                if not isinstance(p, dict):
+                    continue
+                if kind == "model.call":
+                    usd += float(p.get("cost_usd") or 0.0)
+                    if p.get("metered_tokens") is not None:
+                        tokens += int(p.get("metered_tokens") or 0)
+                    else:
+                        tokens += int(p.get("in_tokens") or 0) + int(
+                            p.get("out_tokens") or 0
+                        )
+                elif kind == "tool.call":
+                    tool_calls += 1
+    except OSError:
+        return
+    root.counters.usd += usd
+    root.counters.tokens += tokens
+    root.counters.tool_calls += tool_calls
+
+
 def _write_run_pid(run_dir: Path) -> None:
     """Record this process's PID so the dashboard's Stop button can terminate
     the run's process group. The dashboard launches this script as a process-
@@ -490,6 +533,7 @@ async def amain() -> int:
     # button can replay it with --resume-from (in-place resume from the cache).
     _write_resume_spec(ctx.root_workdir, args, problem_text, problem_id, run_id, output_root)
     _write_run_pid(ctx.root_workdir)
+    _seed_budget_from_prior_events(ctx)
 
     built_inputs = preset.build_inputs(
         problem=problem_text,

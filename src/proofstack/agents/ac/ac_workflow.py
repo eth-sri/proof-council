@@ -454,7 +454,6 @@ class ACWorkflow(Agent):
         self.critic = ACCritic(ctx, parent_budget_scope=self.tracker.scope)
         self.council = Council(ctx, parent_budget_scope=self.tracker.scope)
         self.compute = Compute(ctx, parent_budget_scope=self.tracker.scope)
-        self._resume_cost_offset_applied = False
         # No sub-agent for latex compile any more — ``_simple_compile_latex``
         # is a plain helper. Cost-tracked as part of the workflow's own
         # wallclock; no separate budget bucket needed.
@@ -501,7 +500,6 @@ class ACWorkflow(Agent):
         )
         if resume_state is not None:
             self._restore_workspace_from_resume(workspace, resume_state)
-            self._apply_resume_budget_offset()
             await self.events.emit(
                 "ac.resume",
                 {
@@ -1878,14 +1876,6 @@ class ACWorkflow(Agent):
             return path
         return self.ctx.root_workdir / path
 
-    def _apply_resume_budget_offset(self) -> None:
-        if self._resume_cost_offset_applied:
-            return
-        self._resume_cost_offset_applied = True
-        prior_cost = _sum_logged_model_cost(self.ctx.root_workdir / "events.jsonl")
-        if prior_cost > 0:
-            self.tracker.add_usd(prior_cost)
-
     async def _gather_critic_council(
         self,
         *,
@@ -2573,34 +2563,6 @@ def _state_int(state: dict[str, Any] | None, key: str, default: int) -> int:
 
 def _review_resume_record(review: ACCritic.Outputs) -> dict[str, Any]:
     return review.model_dump(mode="json", exclude={"messages_after"})
-
-
-def _sum_logged_model_cost(events_path: Path) -> float:
-    total = 0.0
-    try:
-        lines = events_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return 0.0
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("kind") != "model.call":
-            continue
-        payload = event.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        try:
-            total += float(payload.get("cost_usd", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            continue
-    return total
-
-
-
 class ACDAGWorkflow(DAGWorkflow):
     description: ClassVar[str] = ACWorkflow.description
     execution_mode: ClassVar[str] = "workflow"
