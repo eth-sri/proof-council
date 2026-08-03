@@ -202,6 +202,20 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             return f"{hours} h"
         return f"{total_minutes} min"
 
+    @app.template_filter("monitor_markdown")
+    def monitor_markdown(value):
+        """Minimal safe markdown for monitor summaries: escape everything,
+        then allow **bold**, *italic*, `code`, and paragraph breaks. Dollar
+        math passes through untouched for MathJax."""
+        from markupsafe import Markup, escape
+
+        text = str(escape(str(value or "")))
+        text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text, flags=re.DOTALL)
+        text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", text)
+        text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+        paragraphs = [p.replace("\n", "<br>") for p in text.split("\n\n") if p.strip()]
+        return Markup("".join(f"<p>{p}</p>" for p in paragraphs))
+
     @app.template_filter("display_tokens")
     def display_tokens(value):
         if value is None:

@@ -596,6 +596,7 @@
             padding: 10px 12px 10px 14px;
         }
         .graph-node.graph-hidden { display: none; }
+        .monitor-summary.monitor-hidden { display: none; }
         .graph-node.status-ok { border-left-color: #16a34a; }
         .graph-node.status-error { border-left-color: #dc2626; }
         .graph-node.status-running { border-left-color: #f97316; }
@@ -2915,6 +2916,14 @@
             }
             window.setInterval(refreshGraph, 3000);
         }
+        function showOlderMonitorSummaries(button) {
+            const list = button.closest('.monitor-list');
+            if (!list) return;
+            list.querySelectorAll('.monitor-summary.monitor-older').forEach((item) => {
+                item.classList.remove('monitor-hidden');
+            });
+            button.remove();
+        }
         function startRunMonitorPolling(url) {
             const panel = document.getElementById('run-monitor-panel');
             if (!panel || !url) return;
@@ -2923,6 +2932,10 @@
             async function refreshMonitor() {
                 if (inFlight) return;
                 inFlight = true;
+                // If the operator expanded the older summaries, keep them
+                // expanded across live-update replacements.
+                const expanded = !panel.querySelector('[data-monitor-show-older]')
+                    && panel.querySelector('.monitor-summary.monitor-older') !== null;
                 try {
                     const response = await fetch(url, {cache: 'no-store'});
                     if (!response.ok) return;
@@ -2930,6 +2943,10 @@
                     if (html !== lastHtml) {
                         lastHtml = html;
                         panel.innerHTML = html;
+                        if (expanded) {
+                            const button = panel.querySelector('[data-monitor-show-older]');
+                            if (button) showOlderMonitorSummaries(button);
+                        }
                         renderLatexElements(panel);
                     }
                     const live = panel.querySelector('[data-live-status]');

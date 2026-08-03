@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,6 +13,8 @@ from proofstack.events import new_call_id
 
 
 DEFAULT_MONITOR_MODEL: ModelSpec = "models/openai/gpt-54-mini"
+
+_WRAPPER_BLOCK_RE = re.compile(r"AC\w*Block")
 
 
 @dataclass
@@ -42,6 +45,12 @@ class RunMonitor:
         status: str = "ok",
         error: dict[str, Any] | None = None,
     ) -> None:
+        # DAG wrapper blocks (ACAuthorBlock, ACReviewJoinBlock, …) re-expose
+        # the state their inner agent just produced; summarizing them yields
+        # a near-duplicate of the inner agent's summary and drowns the feed.
+        # Errors are still worth a summary regardless of the source.
+        if status == "ok" and _WRAPPER_BLOCK_RE.fullmatch(str(agent or "")):
+            return
         task = asyncio.create_task(
             self.record_agent_end(
                 call_id=call_id,
@@ -114,11 +123,22 @@ class RunMonitor:
             {
                 "role": "developer",
                 "content": (
-                    "You summarize an agentic math workflow for a human watching it live. "
-                    "Write exactly 3-4 concise sentences. Do not invent results; say what changed, "
-                    "what the finished node appears to have done, and what seems important next. "
-                    "Use user-facing node labels only; never mention internal identifiers, component names, "
-                    "file paths, or strings containing 'DAGWorkflow'."
+                    "You summarize one just-finished stage of an agentic math-research "
+                    "workflow for the researcher supervising it. Write 2-4 concise "
+                    "sentences reporting the CONCRETE CONTENT this stage contributed: "
+                    "the specific results, arguments, findings, objections, verdicts, "
+                    "or data it produced, with their key specifics (named statements, "
+                    "bounds, examples, references). You are shown the stage's actual "
+                    "input and output, so state directly what it did — never hedge "
+                    "with phrases like 'appears to have'. Do not narrate workflow "
+                    "mechanics (loops, nodes, gates, what runs next, how stages "
+                    "connect) unless the stage failed; the reader knows the pipeline. "
+                    "Do not repeat what previous summaries already said — report only "
+                    "what is new. Never invent results; if the output is empty or "
+                    "purely procedural, say so in one sentence. Use user-facing node "
+                    "labels only; never mention internal identifiers, component "
+                    "names, file paths, or strings containing 'DAGWorkflow'. Markdown "
+                    "emphasis and $...$ inline math are allowed."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -217,7 +237,9 @@ class RunMonitor:
             ],
         }
         return (
-            "Live monitor context follows as JSON. Summarize what the viewer should understand now.\n\n"
+            "Live monitor context follows as JSON. Summarize the concrete "
+            "contribution of the finished stage in `finished` — its output is "
+            "the substance to report.\n\n"
             f"{json.dumps(context, ensure_ascii=False, indent=2, default=str)}"
         )
 

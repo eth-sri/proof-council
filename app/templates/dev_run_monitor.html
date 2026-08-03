@@ -1,15 +1,22 @@
 {% if monitor_summaries %}
+    {% set newest_first = monitor_summaries | reverse | list %}
     <div class="monitor-list">
-        {% for item in monitor_summaries %}
-            <article class="monitor-summary">
+        {% for item in newest_first %}
+            <article class="monitor-summary{% if loop.index > 10 %} monitor-older monitor-hidden{% endif %}">
                 <div class="monitor-summary-header">
                     <strong>{{ item.display_label or item.agent or 'Monitor update' }}</strong>
                     <span class="pill" data-status="{{ item.status or 'ok' }}">{{ item.status or 'ok' }}</span>
                     {% if item.ts %}<span class="dim">{{ item.ts | display_time }}</span>{% endif %}
                 </div>
-                <div class="rendered-text latex-text">{{ item.summary }}</div>
+                <div class="rendered-text latex-text">{{ item.summary | monitor_markdown }}</div>
             </article>
         {% endfor %}
+        {% if newest_first | length > 10 %}
+            <button type="button" class="monitor-show-older" data-monitor-show-older
+                    onclick="showOlderMonitorSummaries(this)">
+                Show older summaries ({{ newest_first | length - 10 }})
+            </button>
+        {% endif %}
         <p class="dim" data-live-status></p>
     </div>
 {% else %}
