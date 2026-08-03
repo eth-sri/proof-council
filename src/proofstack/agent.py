@@ -277,6 +277,13 @@ class Agent(ABC):
         {"error", "timeout", "partial", "blocked"}
     )
 
+    # Input fields excluded from the resume-cache key: volatile display-only
+    # context (spend meters, pacing hints) whose drift across restarts must
+    # not re-key the node — browser task stems derive from this key, and a
+    # re-key orphans the pending human card (and any in-flight browser
+    # conversation bound to its token).
+    CACHE_KEY_EXCLUDE_INPUTS: ClassVar[frozenset[str]] = frozenset()
+
     def _output_cacheable(self, out_json: Any) -> bool:
         if not isinstance(out_json, dict):
             return True
@@ -286,11 +293,14 @@ class Agent(ABC):
         return status not in self.UNCACHEABLE_STATUSES
 
     def _cache_key(self, inp: BaseModel) -> str:
+        inputs = inp.model_dump(mode="json")
+        for field_name in self.CACHE_KEY_EXCLUDE_INPUTS:
+            inputs.pop(field_name, None)
         payload = {
             "agent_class": f"{type(self).__module__}.{type(self).__qualname__}",
             "agent_name": self.name,
             "agent_config": self._cache_config_snapshot(),
-            "inputs": inp.model_dump(mode="json"),
+            "inputs": inputs,
         }
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")

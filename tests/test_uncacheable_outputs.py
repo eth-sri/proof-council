@@ -62,5 +62,34 @@ class UncacheableOutputTests(unittest.TestCase):
         self.assertIsNone(cached)
 
 
+class ExcludedKeyFieldTests(unittest.TestCase):
+    def test_excluded_input_fields_do_not_change_the_key(self) -> None:
+        class Metered(Toy):
+            CACHE_KEY_EXCLUDE_INPUTS = frozenset({"budget"})
+
+            class Inputs(BaseModel):
+                x: int
+                budget: float = 0.0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = RunContext.create(
+                run_id="t", root_workdir=Path(tmp) / "run", flat=True
+            )
+            agent = Metered(ctx)
+            key_a = agent._cache_key(Metered.Inputs(x=1, budget=99.51))
+            key_b = agent._cache_key(Metered.Inputs(x=1, budget=131.90))
+            key_c = agent._cache_key(Metered.Inputs(x=2, budget=99.51))
+        self.assertEqual(key_a, key_b)
+        self.assertNotEqual(key_a, key_c)
+
+    def test_ac_author_excludes_budget_meter(self) -> None:
+        from proofstack.agents.ac.author import Author
+
+        self.assertEqual(
+            Author.CACHE_KEY_EXCLUDE_INPUTS,
+            frozenset({"budget_used_usd", "budget_max_usd"}),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

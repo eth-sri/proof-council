@@ -589,6 +589,12 @@ class Author(APICallAgent):
     # fenced ``file path=...`` blocks from the response. Saves output
     # tokens and lets Pro do natural in-place edits via Path.write_text.
     USE_CONTAINER_FILES: ClassVar[bool] = True
+    # The budget meter is display-only pacing context sourced from the live
+    # tracker; its drift across restarts (a monitor call costs fractions of
+    # a cent) must not re-key the Author and orphan a pending browser card.
+    CACHE_KEY_EXCLUDE_INPUTS: ClassVar[frozenset[str]] = frozenset(
+        {"budget_used_usd", "budget_max_usd"}
+    )
 
     class Inputs(BaseModel):
         problem: str
