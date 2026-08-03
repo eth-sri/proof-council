@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from proofstack.harness.chatgpt_share import canonical_workspace_name
+
 
 CANONICAL_FILES = ("answer.tex", "research_notes.tex", "references.bib")
 
@@ -93,12 +95,15 @@ def parse_author_output(raw_text: str) -> ParsedAuthorOutput:
     files: dict[str, str] = {}
     file_block_spans: list[tuple[int, int]] = []
     for m in _FILE_BLOCK_RE.finditer(raw_text):
-        path = m.group("path").strip()
+        # Canonicalize: browser-harness responses may tag paths with the
+        # task token (``answer___<token>.tex``) or prefix sandbox dirs
+        # (``/mnt/data/answer.tex``); both mean the canonical file.
+        path = canonical_workspace_name(m.group("path").strip())
         body = m.group("body")
         file_block_spans.append((m.start(), m.end()))
         if path not in CANONICAL_FILES:
             out.parse_warnings.append(
-                f"ignored non-canonical file block path={path!r}"
+                f"ignored non-canonical file block path={m.group('path').strip()!r}"
             )
             continue
         if path in files:

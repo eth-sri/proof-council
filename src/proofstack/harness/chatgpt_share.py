@@ -37,14 +37,21 @@ def _sandbox_paths(text: str) -> list[str]:
     """Sandbox link targets, tolerating parentheses in filenames.
 
     Links usually appear as markdown ``[x](sandbox:/mnt/data/f.pdf)``, so a
-    greedy match swallows the closing paren; trim trailing parens only while
-    they are unbalanced, so ``report_(final).pdf`` survives intact."""
+    greedy match swallows the closing paren — and in a comma-separated list
+    (``[a](sandbox:/x/a.tex), [b](...``) punctuation stacks *behind* it, so
+    a single trim pass leaves ``a.tex)``. Peel punctuation and unbalanced
+    parens until stable; ``report_(final).pdf`` survives intact."""
     out: list[str] = []
     for m in _SANDBOX_LINK_RE.finditer(text):
         path = m.group(1)
-        while path.endswith(")") and path.count("(") < path.count(")"):
-            path = path[:-1]
-        out.append(path.rstrip(".,;:"))
+        while True:
+            trimmed = path.rstrip(".,;:")
+            while trimmed.endswith(")") and trimmed.count("(") < trimmed.count(")"):
+                trimmed = trimmed[:-1]
+            if trimmed == path:
+                break
+            path = trimmed
+        out.append(path)
     return out
 
 
@@ -301,14 +308,17 @@ def extract_result(data: dict[str, Any]) -> dict[str, Any]:
     sandbox_artifacts: list[str] = []
     for m in answer_msgs:
         for att in m["attachments"]:
-            name = att.get("name") if isinstance(att, dict) else None
-            sandbox_artifacts.append(str(name or att))
+            name = str((att.get("name") if isinstance(att, dict) else None) or att)
+            if not _is_harness_input_name(name):
+                sandbox_artifacts.append(name)
         for ref in m["content_references"]:
             if not isinstance(ref, dict):
                 continue
             ref_type = str(ref.get("type") or "")
             if "file" in ref_type and "citation" not in ref_type and "cite" not in ref_type:
-                sandbox_artifacts.append(str(ref.get("name") or ref_type))
+                name = str(ref.get("name") or ref_type)
+                if not _is_harness_input_name(name):
+                    sandbox_artifacts.append(name)
     # Structured generated-file records: sandbox links paired with their own
     # message id, which is exactly what the stateless file resolver needs.
     # Keyed by path with later messages overwriting earlier ones: when the
@@ -408,6 +418,42 @@ _INSTRUCTION_MENTION_RE = re.compile(
     r"instruction_([A-Za-z0-9._-]+)\.txt(?![A-Za-z0-9_-])"
 )
 _PACKET_ZIP_TOKEN_RE = re.compile(r"^([A-Za-z0-9._-]+)\.packet\.zip$")
+# ChatGPT renames colliding uploads ``name.txt`` -> ``name(2).txt`` (or
+# ``name (2).txt``), e.g. after a failed upload attempt or a restarted
+# conversation; token matching must see through the rename.
+_DEDUP_RENAME_RE = re.compile(r"^(.*?) ?\(\d+\)(\.[A-Za-z0-9]+)$")
+
+
+def _canonical_upload_name(name: str) -> str:
+    m = _DEDUP_RENAME_RE.match(name)
+    return f"{m.group(1)}{m.group(2)}" if m else name
+
+
+# The Author's harness addendum asks for token-tagged download names
+# (``answer___<task-token>.tex``) so a file in the operator's Downloads
+# folder is unambiguous; strip the tag to recover the workspace name.
+_TOKEN_TAG_RE = re.compile(r"^(?P<stem>.+?)___[A-Za-z0-9._-]+(?P<ext>\.[A-Za-z0-9]+)$")
+
+
+def canonical_workspace_name(name: str) -> str:
+    """Workspace filename for an uploaded/downloaded/fenced file name.
+
+    Strips directories, ChatGPT's ``name(2).txt`` collision suffix, and the
+    harness's ``___<token>`` download tag, so ``/mnt/data/answer___Author__ab12
+    (1).tex`` maps back to ``answer.tex``."""
+    name = _canonical_upload_name(str(name).replace("\\", "/").rsplit("/", 1)[-1])
+    m = _TOKEN_TAG_RE.match(name)
+    return f"{m.group('stem')}{m.group('ext')}" if m else name
+
+
+def _is_harness_input_name(name: str) -> bool:
+    """Harness-provided packet files (instruction txt, packet zip) that the
+    model may cite back in its answer; never model-generated artifacts."""
+    canonical = _canonical_upload_name(name)
+    return bool(
+        _INSTRUCTION_FILE_TOKEN_RE.match(canonical)
+        or _PACKET_ZIP_TOKEN_RE.match(canonical)
+    )
 
 
 def latest_task_tokens(result: dict[str, Any]) -> set[str]:
@@ -418,8 +464,9 @@ def latest_task_tokens(result: dict[str, Any]) -> set[str]:
     against an *older* task in the same chat is refused even though that
     task's token still appears somewhere in the history. Steering messages
     that name no task never reset the binding. Tokens are recognized from
-    uploaded ``instruction_<token>.txt`` / ``<token>.packet.zip`` names,
-    the ``[ProofCouncil task <token>]`` marker, and typed
+    uploaded ``instruction_<token>.txt`` / ``<token>.packet.zip`` names
+    (including ChatGPT's ``name(2).txt`` collision renames), the
+    ``[ProofCouncil task <token>]`` marker, and typed
     ``instruction_<token>.txt`` mentions."""
     latest: set[str] = set()
     for m in result.get("messages") or []:
@@ -427,8 +474,8 @@ def latest_task_tokens(result: dict[str, Any]) -> set[str]:
             continue
         found: set[str] = set()
         for att in m.get("attachments") or []:
-            name = str(
-                (att.get("name") if isinstance(att, dict) else att) or ""
+            name = _canonical_upload_name(
+                str((att.get("name") if isinstance(att, dict) else att) or "")
             )
             mt = _INSTRUCTION_FILE_TOKEN_RE.match(name)
             if mt:
@@ -472,7 +519,18 @@ def validate_result(
     warnings: list[str] = []
 
     browser = task.get("browser") or {}
-    slug = result.get("model_slug") or result.get("default_model_slug")
+    # Verification uses ONLY the newest answer's own slug: falling back to
+    # the conversation-global default_model_slug could pair a default slug
+    # with the answer's effort and report a verified combination the final
+    # answer never ran on. A metadata-less answer warns instead.
+    slug = result.get("model_slug")
+    default_slug = result.get("default_model_slug")
+    no_slug_hint = (
+        f" (conversation default model: {default_slug!r} — unreliable for "
+        "the final answer, so not used for verification)"
+        if default_slug
+        else ""
+    )
     effort = result.get("effort")
     variants = [v for v in (browser.get("expected_model_variants") or []) if isinstance(v, dict)]
     if variants:
@@ -481,8 +539,8 @@ def validate_result(
         slugs = [str(v.get("slug") or "") for v in variants]
         if not slug:
             warnings.append(
-                "the share carried no model slug, so the model used cannot be "
-                f"verified (expected one of {slugs})"
+                "the answer carried no model slug, so the model used cannot be "
+                f"verified (expected one of {slugs}){no_slug_hint}"
             )
         else:
             # Exact slug match wins; among prefix matches prefer the most
@@ -517,8 +575,8 @@ def validate_result(
         if expected_slugs:
             if not slug:
                 warnings.append(
-                    "the share carried no model slug, so the model used cannot be "
-                    f"verified (expected one of {expected_slugs})"
+                    "the answer carried no model slug, so the model used cannot be "
+                    f"verified (expected one of {expected_slugs}){no_slug_hint}"
                 )
             elif not any(_slug_matches(str(slug), str(s)) for s in expected_slugs):
                 warnings.append(
@@ -544,15 +602,21 @@ def validate_result(
     if token:
         tokens = latest_task_tokens(result)
         if not tokens:
-            instruction_file = str(
-                task.get("instruction_file") or f"instruction_{token}.txt"
-            )
-            warnings.append(
-                "could not verify this share belongs to this task: no ProofCouncil "
-                f"task marker found ({instruction_file} was not uploaded and no "
-                "[ProofCouncil task ...] line appears in your messages) — "
-                "double-check you pasted the link into the right card"
-            )
+            # No user-side binding — fall back to answer-side evidence: the
+            # token appears in token-tagged download names or an echoed
+            # marker, which the model only knows from this task's
+            # instruction packet. Never overrides an explicit user-side
+            # binding to a different task (the elif below).
+            if token not in text:
+                instruction_file = str(
+                    task.get("instruction_file") or f"instruction_{token}.txt"
+                )
+                warnings.append(
+                    "could not verify this share belongs to this task: no ProofCouncil "
+                    f"task marker found ({instruction_file} was not uploaded and no "
+                    "[ProofCouncil task ...] line appears in your messages) — "
+                    "double-check you pasted the link into the right card"
+                )
         elif len(tokens) > 1:
             # Binding must be unambiguous: a message naming several tasks
             # could otherwise satisfy every one of their cards.
@@ -577,7 +641,9 @@ def validate_result(
         )
 
     expected = task.get("expected") or {}
-    present = set(_FILE_FENCE_RE.findall(text)) | {str(f) for f in provided_files}
+    present = {
+        canonical_workspace_name(p) for p in _FILE_FENCE_RE.findall(text)
+    } | {str(f) for f in provided_files}
     fenced = [str(f) for f in (expected.get("fenced_files") or [])]
     if fenced and not present.intersection(fenced):
         warnings.append(
@@ -618,4 +684,5 @@ __all__ = [
     "extract_result",
     "validate_result",
     "latest_task_tokens",
+    "canonical_workspace_name",
 ]

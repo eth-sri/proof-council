@@ -53,6 +53,11 @@ class EchoAgent(APICallAgent):
         text: str = ""
 
 
+class AddendumAgent(EchoAgent):
+    def render_harness_addendum(self, inp, *, task_token: str, default: str) -> str:
+        return f"DOWNLOAD AS answer___{task_token}.tex (default was: {default})"
+
+
 async def _fast_wait(path, **kwargs):
     kwargs["poll_interval_s"] = 0.01
     return await wait_for_response_file(path, **kwargs)
@@ -96,19 +101,18 @@ class AuthorPacketTests(unittest.TestCase):
         ctx = RunContext.create(run_id="t", root_workdir=tmp, flat=True)
         return Author(ctx)
 
-    def test_round0_ships_all_canonical_files_like_api_path(self) -> None:
-        # Mirrors _run_with_openai_container_files: round 0 uploads the
-        # three canonical files even when they are still empty.
+    def test_round0_omits_empty_canonical_files(self) -> None:
+        # ChatGPT rejects zero-byte uploads ("Something went wrong"), so
+        # empty round-0 files are noted in the instruction, not attached.
         with tempfile.TemporaryDirectory() as tmp:
             author = self._author(tmp)
             instruction, attachments = author.render_harness_packet(
                 Author.Inputs(problem="P?", round=0, n_rounds=3)
             )
-        self.assertEqual(
-            sorted(attachments),
-            ["answer.tex", "references.bib", "research_notes.tex"],
-        )
-        self.assertEqual(attachments["answer.tex"], "")
+        # The round-0 template has no per-file placeholders — it already
+        # instructs the model to produce all three files from scratch — so
+        # only the attachment suppression is observable here.
+        self.assertEqual(attachments, {})
         self.assertIn("P?", instruction)
 
     def test_loop_round_moves_files_to_attachments(self) -> None:
@@ -129,11 +133,13 @@ class AuthorPacketTests(unittest.TestCase):
             )
         self.assertEqual(attachments["answer.tex"], "ANSWER BODY")
         self.assertEqual(attachments["references.bib"], "BIB BODY")
-        self.assertEqual(attachments["research_notes.tex"], "")
+        self.assertNotIn("research_notes.tex", attachments)
         self.assertIsInstance(attachments["compute_workspace.zip"], bytes)
         self.assertIn("(attached as answer.tex)", instruction)
         self.assertIn("(attached as references.bib)", instruction)
-        self.assertIn("(attached as research_notes.tex — currently empty)", instruction)
+        self.assertIn(
+            "(research_notes.tex is currently empty; no attachment)", instruction
+        )
         self.assertNotIn("ANSWER BODY", instruction)
 
     def test_expectations(self) -> None:
@@ -208,6 +214,57 @@ class BrowserCallEndToEndTests(unittest.TestCase):
             self.assertIn("steer left", comments)
             commit_operator_comments(ctx.root_workdir, offset)
             self.assertEqual(peek_operator_comments(ctx.root_workdir)[0], "")
+
+    def test_addendum_override_hook_replaces_config_addendum(self) -> None:
+        # A code-level override must win over the YAML addendum (editing the
+        # YAML mid-run would re-key pending tasks) and receive the stem.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
+            ctx = _ctx(tmp, hdir)
+            agent = AddendumAgent(ctx, name="echo")
+            stem = task_stem(
+                ctx.run_id, "echo", agent._cache_key(AddendumAgent.Inputs(problem="P"))
+            )
+            inbox = ctx.root_workdir / "human_inbox"
+            inbox.mkdir(parents=True, exist_ok=True)
+            (inbox / f"{stem}.response.json").write_text(
+                json.dumps({"status": "done", "assistant_text": "HELLO"}),
+                encoding="utf-8",
+            )
+            asyncio.run(agent(problem="P"))
+            instruction = (
+                inbox / f"{stem}.packet" / f"instruction_{stem}.txt"
+            ).read_text(encoding="utf-8")
+        self.assertIn(f"DOWNLOAD AS answer___{stem}.tex", instruction)
+        self.assertIn("(default was: PRINT FILES INLINE.)", instruction)
+        self.assertNotIn("\nPRINT FILES INLINE.", instruction)
+
+    def test_token_tagged_uploads_merge_under_canonical_name(self) -> None:
+        # Auto-downloaded/hand-uploaded files arrive under token-tagged
+        # names; the fenced merge must map them back to answer.tex.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:
+            ctx = _ctx(tmp, hdir)
+            agent = EchoAgent(ctx, name="echo")
+            stem = task_stem(ctx.run_id, "echo", agent._cache_key(EchoAgent.Inputs(problem="P")))
+            inbox = ctx.root_workdir / "human_inbox"
+            uploads = inbox / f"{stem}.uploads"
+            uploads.mkdir(parents=True, exist_ok=True)
+            tagged = f"answer___{stem}.tex"
+            (uploads / tagged).write_text("TAGGED BODY", encoding="utf-8")
+            (inbox / f"{stem}.response.json").write_text(
+                json.dumps(
+                    {
+                        "status": "done",
+                        "assistant_text": "ok",
+                        "uploaded_files": {
+                            tagged: f"human_inbox/{stem}.uploads/{tagged}"
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            out = asyncio.run(agent(problem="P"))
+        parsed = parse_author_output(out.text)
+        self.assertEqual(parsed.files["answer.tex"], "TAGGED BODY")
 
     def test_second_call_replays_from_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as hdir:

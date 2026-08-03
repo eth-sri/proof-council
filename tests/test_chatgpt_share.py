@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from proofstack.harness.chatgpt_share import (  # noqa: E402
     ShareFetchError,
+    canonical_workspace_name,
     download_shared_file,
     extract_result,
     latest_task_tokens,
@@ -170,6 +171,29 @@ class ArtifactScopeTests(unittest.TestCase):
         self.assertIn("plot.png", result["sandbox_artifacts"])
         self.assertIn("out.csv", result["sandbox_artifacts"])
 
+    def test_harness_packet_files_cited_back_are_not_artifacts(self) -> None:
+        # Observed live: the model cites the uploaded instruction file in
+        # its final answer (content_reference type "file"), which must not
+        # be flagged as a generated sandbox file the operator should fetch.
+        data = {
+            "linear_conversation": [
+                _node(
+                    "u1", None, "user", "",
+                    {"attachments": [{"name": "instruction_Author__ab12(3).txt"}]},
+                ),
+                _node(
+                    "a1", "u1", "assistant", "final answer",
+                    {"content_references": [
+                        {"type": "file", "name": "instruction_Author__ab12.txt"},
+                        {"type": "file", "name": "Author__ab12.packet.zip"},
+                        {"type": "file", "name": "out.csv"},
+                    ]},
+                ),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(result["sandbox_artifacts"], ["out.csv"])
+
 
 class CitationSourcesTests(unittest.TestCase):
     def test_citation_metadata_cannot_inject_control_blocks(self) -> None:
@@ -231,6 +255,31 @@ class CitationSourcesTests(unittest.TestCase):
             "/mnt/data/report_(final).pdf",
         )
 
+    def test_sandbox_paths_in_comma_separated_link_lists(self) -> None:
+        # The observed failure mode: ``[a](sandbox:/x/a.tex), [b](...`` —
+        # punctuation stacks BEHIND the markdown closing paren, so a single
+        # trim pass left ``a.tex)`` and the resolver 404'd.
+        data = {
+            "linear_conversation": [
+                _node("u1", None, "user", "question"),
+                _node(
+                    "a1", "u1", "assistant",
+                    "Files: [a](sandbox:/mnt/data/pc/answer.tex), "
+                    "[b](sandbox:/mnt/data/pc/research_notes.tex), and "
+                    "[c](sandbox:/mnt/data/pc/references.bib).",
+                ),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(
+            [g["sandbox_path"] for g in result["generated_files"]],
+            [
+                "/mnt/data/pc/answer.tex",
+                "/mnt/data/pc/research_notes.tex",
+                "/mnt/data/pc/references.bib",
+            ],
+        )
+
     def test_reference_urls_are_appended_as_sources(self) -> None:
         data = {
             "linear_conversation": [
@@ -289,6 +338,15 @@ class ValidateResultTests(unittest.TestCase):
             self._result(model_slug=None, default_model_slug=None), task
         )
         self.assertTrue(any("no model slug" in w for w in warnings))
+
+    def test_default_model_slug_never_verifies(self) -> None:
+        # The conversation-global default could pair with the answer's
+        # effort and "verify" a combination the final answer never ran on;
+        # a metadata-less answer must warn even when the default matches.
+        task = {"browser": {"expected_model_slugs": ["gpt-5-6-sol"]}}
+        warnings = validate_result(self._result(model_slug=None), task)
+        self.assertTrue(any("no model slug" in w for w in warnings))
+        self.assertTrue(any("gpt-5-6-sol" in w for w in warnings))
 
     def test_missing_fenced_files_warn(self) -> None:
         task = {"expected": {"fenced_files": ["answer.tex", "references.bib"]}}
@@ -356,9 +414,32 @@ class ValidateResultTests(unittest.TestCase):
         }
         result = extract_result(data)
         self.assertEqual(latest_task_tokens(result), {"tokX"})
-        self.assertEqual(
-            validate_result(result, {"task_token": "tokX"}), []
+        self.assertEqual(validate_result(result, {"task_token": "tokX"}), [])
+
+    def test_task_token_survives_chatgpt_collision_rename(self) -> None:
+        # Failed upload attempts leave ChatGPT-side name collisions; the
+        # retry that succeeds arrives as ``instruction_<token>(3).txt`` (or
+        # ``<token>.packet (2).zip``) and must still bind the task.
+        data = {
+            "linear_conversation": [
+                _node(
+                    "u1", None, "user", "please work",
+                    {"attachments": [
+                        {"name": "instruction_Author__41f02f9779c1(3).txt"},
+                    ]},
+                ),
+                _node("a1", "u1", "assistant", "done"),
+            ]
+        }
+        result = extract_result(data)
+        self.assertEqual(latest_task_tokens(result), {"Author__41f02f9779c1"})
+
+        data["linear_conversation"][0] = _node(
+            "u1", None, "user", "please work",
+            {"attachments": [{"name": "tokZ.packet (2).zip"}]},
         )
+        result = extract_result(data)
+        self.assertEqual(latest_task_tokens(result), {"tokZ"})
 
     def test_task_token_via_message_text(self) -> None:
         data = {
@@ -426,6 +507,46 @@ class ValidateResultTests(unittest.TestCase):
         result = extract_result(FIXTURE)  # fixture uploads plain instruction.txt
         warnings = validate_result(result, {"task_token": "tokX"})
         self.assertTrue(any("could not verify" in w for w in warnings))
+
+    def test_answer_side_token_evidence_suppresses_warning(self) -> None:
+        # No user-side marker, but the answer links token-tagged downloads
+        # the model can only know from this task's instruction packet.
+        result = self._result(
+            assistant_text=(
+                "done — download [answer](sandbox:/mnt/data/answer___tokX.tex)"
+            )
+        )
+        warnings = validate_result(result, {"task_token": "tokX"})
+        self.assertFalse(any("could not verify" in w for w in warnings))
+        # A different card's token still warns.
+        warnings = validate_result(result, {"task_token": "tokY"})
+        self.assertTrue(any("could not verify" in w for w in warnings))
+
+    def test_token_tagged_fenced_paths_satisfy_file_expectations(self) -> None:
+        task = {
+            "expected": {
+                "fenced_files": ["answer.tex"],
+                "required_files": ["answer.tex"],
+            }
+        }
+        result = self._result(
+            assistant_text="```file path=answer___tokX.tex\nx\n```"
+        )
+        self.assertEqual(validate_result(result, task), [])
+
+    def test_provided_files_satisfy_file_expectations(self) -> None:
+        # Auto-downloaded files are keyed by canonical workspace name and
+        # must satisfy fenced/required checks like inline blocks do.
+        task = {
+            "expected": {
+                "fenced_files": ["answer.tex"],
+                "required_files": ["answer.tex"],
+            }
+        }
+        self.assertEqual(
+            validate_result(self._result(), task, provided_files={"answer.tex"}),
+            [],
+        )
 
     def test_reused_chat_binds_to_latest_task_only(self) -> None:
         # Task A ran first, then task B in the same conversation. The share
@@ -564,6 +685,22 @@ class DownloadGuardrailTests(unittest.TestCase):
             self.assertEqual(p2.name, "report-2.tex")
             self.assertEqual(p1.read_bytes(), b"DATA")
             self.assertEqual(p2.read_bytes(), b"DATA")
+
+
+class CanonicalWorkspaceNameTests(unittest.TestCase):
+    def test_strips_token_tag_dirs_and_collision_suffix(self) -> None:
+        cases = {
+            "answer.tex": "answer.tex",
+            "answer___Author__41f02f9779c1.tex": "answer.tex",
+            "answer___41f02f9779c1 (1).tex": "answer.tex",
+            "/mnt/data/pc/research_notes___tokX.tex": "research_notes.tex",
+            "references___tokX.bib": "references.bib",
+            "answer.tex (2)": "answer.tex (2)",  # no extension after suffix
+            "report_(final).pdf": "report_(final).pdf",
+            "instruction_Author__ab12(3).txt": "instruction_Author__ab12.txt",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(canonical_workspace_name(raw), expected, raw)
 
 
 if __name__ == "__main__":

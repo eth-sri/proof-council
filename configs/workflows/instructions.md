@@ -302,7 +302,15 @@ warnings only; legacy `expected_model_slugs`/`expected_efforts` validate the
 two fields independently), `instruction_addendum` (appended to every
 instruction file; the default
 tells the model to print changed files inline as fenced ```file path=...```
-blocks as the robust primary channel).
+blocks). An agent can override the addendum in code via
+`render_harness_addendum(inp, task_token=..., default=...)` — the Author
+does, asking for token-tagged sandbox downloads
+(`answer___<task-token>.tex`) as the primary channel for grown files, with
+inline fenced blocks as the short-file/fallback channel; tagged or
+collision-renamed names are mapped back to canonical workspace names on
+merge (`canonical_workspace_name`). Keep addendum edits out of the model
+YAML mid-run: the resolved model config is part of the resume-cache key,
+so a YAML edit re-keys (and orphans) pending tasks.
 
 Generated sandbox files are auto-downloaded from public shares through the
 stateless `file_from_message` resolver (undocumented endpoint; HTTPS +
@@ -314,10 +322,14 @@ degrades to a warning plus the manual-upload fallback.
 
 Each packet's instruction file is tokenized (`instruction_<task-token>.txt`,
 token also heads the instruction text). Share validation warns when a share
-carries no evidence of the task token, and if the share matches a *different*
-pending task, the confirm page offers to transfer it there. The Author packet
-ships all three canonical files even when empty, mirroring the
-container-files API path.
+carries no evidence of the task token — ChatGPT collision renames
+(`instruction_<token>(2).txt`) still bind, and token-tagged download names
+in the answer count as evidence — and if the share positively matches a
+*different* pending task, the confirm page offers to transfer it there
+(only that positive mismatch skips the auto-download). The Author packet
+attaches only non-empty canonical files: ChatGPT rejects zero-byte uploads
+("Something went wrong"), so empty round-0 files are noted in the
+instruction text instead.
 
 **Supported subset.** Interception happens in `APICallAgent.run` only: one-shot
 prompt→answer nodes (Author, ACCritic, council seats, `ConfigurablePromptAgent`

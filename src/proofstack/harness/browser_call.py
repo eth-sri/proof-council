@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from proofstack.agents.human_agent import wait_for_response_file
 from proofstack.events import new_call_id
+from proofstack.harness.chatgpt_share import canonical_workspace_name
 
 if TYPE_CHECKING:
     from proofstack.kinds.api_call import APICallAgent
@@ -84,6 +85,16 @@ async def run_browser_call(
     # of uploading).
     instruction = f"[ProofCouncil task {stem}]\n\n" + instruction
     addendum = str(browser_cfg.get("instruction_addendum") or "").strip()
+    # Agents whose files grow beyond paste size override the generic
+    # print-inline contract (e.g. the Author asks for token-tagged sandbox
+    # downloads). A code-level hook, not YAML: the model config is part of
+    # the resume-cache key, so an addendum edit there would re-key — and
+    # orphan — every pending task.
+    render_addendum = getattr(agent, "render_harness_addendum", None)
+    if render_addendum is not None:
+        addendum = str(
+            render_addendum(inp, task_token=stem, default=addendum) or ""
+        ).strip()
     if addendum:
         instruction = (
             instruction.rstrip()
@@ -227,7 +238,10 @@ async def run_browser_call(
                     await agent.events.emit(
                         "harness.upload_fence_conflict", {"name": str(name)}
                     )
-                raw_text += f"\n\n```file path={Path(str(name)).name}\n{body}\n```"
+                raw_text += (
+                    f"\n\n```file path={canonical_workspace_name(str(name))}\n"
+                    f"{body}\n```"
+                )
 
             comments = str(response.get("operator_comments") or "").strip()
             try:

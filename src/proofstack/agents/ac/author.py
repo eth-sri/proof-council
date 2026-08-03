@@ -172,6 +172,41 @@ AUTHOR_ROUND0_USER = """\
 """
 
 
+# Replaces the generic print-everything-inline browser addendum
+# (configs/models/browser/chatgpt.yaml): once answer.tex has grown to many
+# pages, re-printing full contents inline every round stops being viable.
+# Download names carry the task token so a file in the operator's
+# Downloads folder is unambiguous; the harness strips the tag when
+# merging (``canonical_workspace_name``).
+AUTHOR_HARNESS_ADDENDUM = """\
+You are being run through a browser chat; a human ferries your reply
+back to the workflow. Return each canonical file you created or
+changed this round through exactly ONE of two channels:
+
+1. **Sandbox download (preferred for long files).** Save a copy in
+   your Python sandbox under a token-tagged name and give a markdown
+   download link for it at the end of your reply:
+     /mnt/data/answer___{token}.tex
+     /mnt/data/research_notes___{token}.tex
+     /mnt/data/references___{token}.bib
+   The harness fetches these from the shared conversation and maps
+   them back to their canonical names automatically.
+
+2. **Inline fenced block (short files, or if the sandbox is
+   unavailable).** Print the full contents inline as:
+
+   ```file path=answer.tex
+   <full contents>
+   ```
+
+Files you neither link nor print are kept unchanged by the harness —
+never re-print a long unchanged file just to restate it.
+
+Any files mentioned as "(attached as ...)" in the instructions are
+uploaded to this conversation.
+"""
+
+
 AUTHOR_LOOP_SYSTEM = """\
 Act as a research-level mathematical proof author iterating on a
 written deliverable in an Author/Critic loop. You have already
@@ -667,9 +702,9 @@ class Author(APICallAgent):
     def render_harness_packet(self, inp: Inputs) -> tuple[str, dict[str, str | bytes]]:
         # Pull the workspace file bodies out of the prompt and into
         # attachments: the operator drags real files into the browser
-        # chat, and the instruction stays readable. All three canonical
-        # files ship even when empty — mirroring the container-files API
-        # path, which uploads empty round-0 files too.
+        # chat, and the instruction stays readable. Empty files are NOT
+        # attached — ChatGPT rejects zero-byte uploads ("Something went
+        # wrong") — the placeholder tells the model instead.
         attachments: dict[str, str | bytes] = {}
         update: dict[str, str] = {}
         for name, field in (
@@ -678,12 +713,11 @@ class Author(APICallAgent):
             ("references.bib", "references_bib"),
         ):
             body = getattr(inp, field) or ""
-            attachments[name] = body
-            update[field] = (
-                f"(attached as {name})"
-                if body.strip()
-                else f"(attached as {name} — currently empty)"
-            )
+            if body.strip():
+                attachments[name] = body
+                update[field] = f"(attached as {name})"
+            else:
+                update[field] = f"({name} is currently empty; no attachment)"
         if inp.compute_zip_path is not None:
             zip_path = Path(inp.compute_zip_path)
             if zip_path.exists():
@@ -691,6 +725,11 @@ class Author(APICallAgent):
         harness_inp = inp.model_copy(update=update) if update else inp
         instruction, _ = super().render_harness_packet(harness_inp)
         return instruction, attachments
+
+    def render_harness_addendum(
+        self, inp: Inputs, *, task_token: str, default: str
+    ) -> str:
+        return AUTHOR_HARNESS_ADDENDUM.format(token=task_token)
 
     def harness_expectations(self, inp: Inputs) -> dict[str, Any]:
         expected: dict[str, Any] = {"fenced_files": list(CANONICAL_FILES)}
