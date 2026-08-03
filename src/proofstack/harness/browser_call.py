@@ -239,7 +239,8 @@ async def run_browser_call(
                         "harness.upload_fence_conflict", {"name": str(name)}
                     )
                 raw_text += (
-                    f"\n\n```file path={canonical_workspace_name(str(name))}\n"
+                    "\n\n```file path="
+                    f"{canonical_workspace_name(str(name), task_token=stem)}\n"
                     f"{body}\n```"
                 )
 

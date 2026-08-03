@@ -432,18 +432,35 @@ def _canonical_upload_name(name: str) -> str:
 # The Author's harness addendum asks for token-tagged download names
 # (``answer___<task-token>.tex``) so a file in the operator's Downloads
 # folder is unambiguous; strip the tag to recover the workspace name.
-_TOKEN_TAG_RE = re.compile(r"^(?P<stem>.+?)___[A-Za-z0-9._-]+(?P<ext>\.[A-Za-z0-9]+)$")
+_TOKEN_TAG_RE = re.compile(
+    r"^(?P<stem>.+?)___(?P<token>[A-Za-z0-9._-]+)(?P<ext>\.[A-Za-z0-9]+)$"
+)
 
 
-def canonical_workspace_name(name: str) -> str:
+def canonical_workspace_name(name: str, task_token: str | None = None) -> str:
     """Workspace filename for an uploaded/downloaded/fenced file name.
 
     Strips directories, ChatGPT's ``name(2).txt`` collision suffix, and the
     harness's ``___<token>`` download tag, so ``/mnt/data/answer___Author__ab12
-    (1).tex`` maps back to ``answer.tex``."""
+    (1).tex`` maps back to ``answer.tex``.
+
+    When ``task_token`` is given, a name tagged for a DIFFERENT task keeps
+    its tag: it must stay distinct so it can never merge into (or satisfy a
+    requirement for) this task's canonical files."""
     name = _canonical_upload_name(str(name).replace("\\", "/").rsplit("/", 1)[-1])
     m = _TOKEN_TAG_RE.match(name)
-    return f"{m.group('stem')}{m.group('ext')}" if m else name
+    if not m:
+        return name
+    if task_token is not None and m.group("token") != task_token:
+        return name
+    return f"{m.group('stem')}{m.group('ext')}"
+
+
+def workspace_name_token(name: str) -> str | None:
+    """The ``___<token>`` download tag embedded in a filename, if any."""
+    name = _canonical_upload_name(str(name).replace("\\", "/").rsplit("/", 1)[-1])
+    m = _TOKEN_TAG_RE.match(name)
+    return m.group("token") if m else None
 
 
 def _is_harness_input_name(name: str) -> bool:
@@ -641,9 +658,24 @@ def validate_result(
         )
 
     expected = task.get("expected") or {}
+    fence_paths = _FILE_FENCE_RE.findall(text)
     present = {
-        canonical_workspace_name(p) for p in _FILE_FENCE_RE.findall(text)
+        canonical_workspace_name(p, task_token=token or None) for p in fence_paths
     } | {str(f) for f in provided_files}
+    if token:
+        foreign = sorted(
+            {
+                _canonical_upload_name(str(n).replace("\\", "/").rsplit("/", 1)[-1])
+                for n in [*fence_paths, *(str(f) for f in provided_files)]
+                if (workspace_name_token(n) or token) != token
+            }
+        )
+        if foreign:
+            warnings.append(
+                f"file(s) tagged for a different task: {foreign} (this card's "
+                f"token is {token}) — they will NOT be used as this task's "
+                "outputs; is this a stale or reused conversation?"
+            )
     fenced = [str(f) for f in (expected.get("fenced_files") or [])]
     if fenced and not present.intersection(fenced):
         warnings.append(
@@ -685,4 +717,5 @@ __all__ = [
     "validate_result",
     "latest_task_tokens",
     "canonical_workspace_name",
+    "workspace_name_token",
 ]

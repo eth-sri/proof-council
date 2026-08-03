@@ -837,6 +837,22 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description="no harness task for this response filename")
         if not isinstance(task, dict) or task.get("type") != "browser_call":
             abort(400, description="not a browser-harness task")
+        # A task file on disk is not enough: it must be pending in the CURRENT
+        # process attempt. Task files from earlier attempts (orphaned by
+        # re-keyed inputs) linger in the inbox, and publishing into one would
+        # plant a dormant answer no live waiter asked for.
+        pending = {
+            item.get("response_filename")
+            for item in load_pending_human_tasks(run.path)
+        }
+        if filename not in pending:
+            abort(
+                409,
+                description=(
+                    "this task is not pending in the current run attempt "
+                    "(already answered, or orphaned by a restart)"
+                ),
+            )
         return target, task
 
     # Serializes the mutating tail (verify -> stage -> publish) of every
@@ -973,7 +989,10 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
     def _save_harness_uploads(run, stem: str, uploads: list) -> dict[str, str]:
         """Validate + persist manual uploads; abort(400) with a specific
         message on anything the fenced-file consumer cannot represent."""
-        from proofstack.harness.chatgpt_share import canonical_workspace_name
+        from proofstack.harness.chatgpt_share import (
+            canonical_workspace_name,
+            workspace_name_token,
+        )
 
         if len(uploads) > _UPLOAD_MAX_FILES:
             abort(400, description=f"too many files (max {_UPLOAD_MAX_FILES})")
@@ -982,7 +1001,17 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         for f in uploads:
             # Canonicalize before validating: browser downloads arrive as
             # ``answer___<token>.tex`` or ``answer.tex (1)`` and must land
-            # under their workspace name.
+            # under their workspace name. A tag naming a DIFFERENT task is a
+            # hard error: the file was generated for another card.
+            tag = workspace_name_token(Path(f.filename).name)
+            if tag is not None and tag != stem:
+                abort(
+                    400,
+                    description=(
+                        f"upload {f.filename!r} is tagged for task {tag!r}, but "
+                        f"this card's task is {stem!r} — wrong file?"
+                    ),
+                )
             name = canonical_workspace_name(Path(f.filename).name)
             if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
                 abort(400, description=f"invalid upload filename: {f.filename!r}")
@@ -1035,7 +1064,12 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
     _DOWNLOAD_MAX_TOTAL_BYTES = 200 * 1024 * 1024
 
     def _auto_download_generated_files(
-        run, staging_dir: Path, share_url: str, result: dict[str, Any]
+        run,
+        staging_dir: Path,
+        share_url: str,
+        result: dict[str, Any],
+        *,
+        task_token: str | None = None,
     ) -> tuple[dict[str, str], list[dict[str, Any]], list[str]]:
         """Fetch the answer's sandbox files through the stateless resolver
         into ``staging_dir`` (a per-fetch nonce directory, so a later fetch
@@ -1108,8 +1142,14 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             if mergeable:
                 # Key by workspace name: token-tagged downloads
                 # (``answer___<token>.tex``) must satisfy required-file
-                # checks and merge back as their canonical file.
-                uploads[chatgpt_share.canonical_workspace_name(path.name)] = rel
+                # checks and merge back as their canonical file. A tag naming
+                # a DIFFERENT task keeps its tagged name, so it can never
+                # shadow this task's canonical outputs (validate_result warns).
+                uploads[
+                    chatgpt_share.canonical_workspace_name(
+                        path.name, task_token=task_token
+                    )
+                ] = rel
             downloaded.append(
                 {
                     "name": path.name,
@@ -1307,7 +1347,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                     # and must not lose the generated files.
                     auto_uploads, downloaded, download_failures = (
                         _auto_download_generated_files(
-                            run, staging_dir, share_url, result
+                            run, staging_dir, share_url, result, task_token=stem
                         )
                     )
                 else:

@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from proofstack.harness.chatgpt_share import (  # noqa: E402
     ShareFetchError,
     canonical_workspace_name,
+    workspace_name_token,
     download_shared_file,
     extract_result,
     latest_task_tokens,
@@ -534,6 +535,36 @@ class ValidateResultTests(unittest.TestCase):
         )
         self.assertEqual(validate_result(result, task), [])
 
+    def test_foreign_token_tag_neither_satisfies_nor_merges(self) -> None:
+        # A fenced file tagged for ANOTHER task must not count as this
+        # task's answer.tex, and must produce an explicit warning.
+        task = {
+            "task_token": "tokA",
+            "expected": {"required_files": ["answer.tex"]},
+        }
+        result = self._result(
+            assistant_text=(
+                "[ProofCouncil task tokA]\n"
+                "```file path=answer___tokB.tex\nstale\n```"
+            )
+        )
+        warnings = validate_result(result, task)
+        self.assertTrue(any("tagged for a different task" in w for w in warnings))
+        self.assertTrue(any("required file 'answer.tex'" in w for w in warnings))
+
+    def test_foreign_tagged_provided_file_warns(self) -> None:
+        task = {
+            "task_token": "tokA",
+            "expected": {"required_files": ["answer.tex"]},
+        }
+        warnings = validate_result(
+            self._result(assistant_text="[ProofCouncil task tokA]\nok"),
+            task,
+            provided_files={"answer___tokB.tex"},
+        )
+        self.assertTrue(any("tagged for a different task" in w for w in warnings))
+        self.assertTrue(any("required file 'answer.tex'" in w for w in warnings))
+
     def test_provided_files_satisfy_file_expectations(self) -> None:
         # Auto-downloaded files are keyed by canonical workspace name and
         # must satisfy fenced/required checks like inline blocks do.
@@ -701,6 +732,32 @@ class CanonicalWorkspaceNameTests(unittest.TestCase):
         }
         for raw, expected in cases.items():
             self.assertEqual(canonical_workspace_name(raw), expected, raw)
+
+    def test_task_token_gates_tag_stripping(self) -> None:
+        self.assertEqual(
+            canonical_workspace_name("answer___tokA.tex", task_token="tokA"),
+            "answer.tex",
+        )
+        self.assertEqual(
+            canonical_workspace_name("answer___tokA.tex", task_token="tokB"),
+            "answer___tokA.tex",
+        )
+        self.assertEqual(
+            canonical_workspace_name("answer___tokA (2).tex", task_token="tokB"),
+            "answer___tokA.tex",
+        )
+        self.assertEqual(
+            canonical_workspace_name("answer.tex", task_token="tokA"), "answer.tex"
+        )
+
+    def test_workspace_name_token_extraction(self) -> None:
+        self.assertEqual(
+            workspace_name_token("/mnt/data/answer___Critic__ab12cd.tex"),
+            "Critic__ab12cd",
+        )
+        self.assertEqual(workspace_name_token("answer___tokA (3).tex"), "tokA")
+        self.assertIsNone(workspace_name_token("answer.tex"))
+        self.assertIsNone(workspace_name_token("instruction_Author__ab12.txt"))
 
 
 if __name__ == "__main__":

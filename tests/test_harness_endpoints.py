@@ -233,6 +233,26 @@ class HarnessEndpointTests(unittest.TestCase):
             (self.run_dir / "human_inbox" / self.response_filename).exists()
         )
 
+    def test_orphaned_task_from_prior_attempt_is_409(self) -> None:
+        # A restart (run.start) with no re-emitted human.waiting orphans the
+        # task; its task.json still exists but every harness endpoint must
+        # refuse to publish into it.
+        with (self.run_dir / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": "run.start", "payload": {}}) + "\n")
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={"response_filename": self.response_filename, "assistant_text": "x"},
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertFalse(
+            (self.run_dir / "human_inbox" / self.response_filename).exists()
+        )
+        resp2 = self.client.post(
+            "/run/run1/harness/fetch-share",
+            data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+        )
+        self.assertEqual(resp2.status_code, 409)
+
     def test_double_submit_is_409(self) -> None:
         resp = self.client.post(
             "/run/run1/harness/manual",
