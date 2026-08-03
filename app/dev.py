@@ -871,6 +871,18 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                     return
                 except FileExistsError:
                     pass
+                except OSError:
+                    # A write/close fault can be reported AFTER the bytes
+                    # landed. If the target now holds exactly the intended
+                    # payload, publication SUCCEEDED — propagating failure
+                    # here would make the caller delete upload directories
+                    # a valid published response still references.
+                    try:
+                        if target.read_text(encoding="utf-8") == payload_text:
+                            return
+                    except OSError:
+                        pass
+                    raise
             # Target exists: only broken leftovers may be replaced.
             try:
                 text = target.read_text(encoding="utf-8")
@@ -916,12 +928,17 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
     def _save_harness_uploads(run, stem: str, uploads: list) -> dict[str, str]:
         """Validate + persist manual uploads; abort(400) with a specific
         message on anything the fenced-file consumer cannot represent."""
+        from proofstack.harness.chatgpt_share import canonical_workspace_name
+
         if len(uploads) > _UPLOAD_MAX_FILES:
             abort(400, description=f"too many files (max {_UPLOAD_MAX_FILES})")
         staged: dict[str, bytes] = {}
         total = 0
         for f in uploads:
-            name = Path(f.filename).name
+            # Canonicalize before validating: browser downloads arrive as
+            # ``answer___<token>.tex`` or ``answer.tex (1)`` and must land
+            # under their workspace name.
+            name = canonical_workspace_name(Path(f.filename).name)
             if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
                 abort(400, description=f"invalid upload filename: {f.filename!r}")
             if name in staged:
@@ -957,10 +974,16 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             # never leave its bytes under paths the winner's response
             # references.
             updir = run.path / "human_inbox" / f"{stem}.uploads-{uuid.uuid4().hex[:12]}"
-            updir.mkdir(parents=True, exist_ok=True)
-            for name, data in staged.items():
-                (updir / name).write_bytes(data)
-                uploaded_files[name] = str((updir / name).relative_to(run.path))
+            try:
+                updir.mkdir(parents=True, exist_ok=True)
+                for name, data in staged.items():
+                    (updir / name).write_bytes(data)
+                    uploaded_files[name] = str((updir / name).relative_to(run.path))
+            except OSError:
+                # A partial directory would never be referenced by any
+                # response; remove it instead of leaking it.
+                shutil.rmtree(updir, ignore_errors=True)
+                raise
         return uploaded_files
 
     _DOWNLOAD_MAX_FILES = 20
@@ -1038,7 +1061,10 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 pass
             rel = str(path.relative_to(run.path))
             if mergeable:
-                uploads[path.name] = rel
+                # Key by workspace name: token-tagged downloads
+                # (``answer___<token>.tex``) must satisfy required-file
+                # checks and merge back as their canonical file.
+                uploads[chatgpt_share.canonical_workspace_name(path.name)] = rel
             downloaded.append(
                 {
                     "name": path.name,
@@ -1119,12 +1145,63 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             if len(parts) > 1 and parts[0] == "human_inbox":
                 shutil.rmtree(inbox / parts[1], ignore_errors=True)
 
+    def _manifest_dirs(meta: Any) -> set[str]:
+        """Staging/upload directory names a manifest or response references
+        (via ``uploaded_files`` rels, ``stored_files`` paths, and staged
+        ``file_hashes`` keys)."""
+        if not isinstance(meta, dict):
+            return set()
+        rels = list((meta.get("uploaded_files") or {}).values())
+        rels += [
+            d.get("path")
+            for d in meta.get("stored_files") or []
+            if isinstance(d, dict)
+        ]
+        rels += list((meta.get("file_hashes") or {}).keys())
+        out: set[str] = set()
+        for rel in rels:
+            parts = Path(str(rel or "")).parts
+            if len(parts) > 1 and parts[0] == "human_inbox":
+                out.add(parts[1])
+        return out
+
+    def _remove_staging_dirs(run, names: set[str]) -> None:
+        inbox = run.path / "human_inbox"
+        for name in names:
+            # Only ever touch per-request staging/upload directories.
+            if ".staged-" in name or ".uploads-" in name:
+                shutil.rmtree(inbox / name, ignore_errors=True)
+
+    def _cleanup_published_staging(
+        run, stem: str, response_payload: dict[str, Any]
+    ) -> None:
+        """Terminal cleanup once a response is published for ``stem``.
+
+        Duplicate responses are refused before any later request reaches the
+        pruning code, so this is the LAST cleanup opportunity: the staged
+        manifest and every staging/upload directory the final response does
+        not reference are dead. Runs under the task lock; an in-flight fetch
+        for the same stem will 409 afterwards and removes its own directory
+        in its ``finally``."""
+        inbox = run.path / "human_inbox"
+        keep = _manifest_dirs(response_payload)
+        (inbox / f"{stem}.staged.json").unlink(missing_ok=True)
+        _remove_staging_dirs(
+            run,
+            {
+                d.name
+                for d in list(inbox.glob(f"{stem}.staged-*"))
+                + list(inbox.glob(f"{stem}.uploads-*"))
+                if d.name not in keep
+            },
+        )
+
     def _prune_stale_staging(run, stem: str) -> None:
-        # Conservative: never delete young directories (a concurrent
-        # fetch/confirm may hold one) nor any directory the published
-        # response or current staged metadata still references (binary
-        # stored_files live only there). Day-old unreferenced leftovers
-        # from abandoned fetches are dead.
+        # Conservative age-based sweep for crash leftovers: never delete
+        # young directories (a concurrent fetch/confirm may be filling one
+        # ahead of taking the lock) nor any directory the published response
+        # or current staged manifest still references (binary stored_files
+        # live only there).
         inbox = run.path / "human_inbox"
         keep: set[str] = set()
         for meta_name in (f"{stem}.response.json", f"{stem}.staged.json"):
@@ -1132,19 +1209,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 meta = json.loads((inbox / meta_name).read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
-            if not isinstance(meta, dict):
-                continue
-            rels = list((meta.get("uploaded_files") or {}).values())
-            rels += [
-                d.get("path")
-                for d in meta.get("stored_files") or []
-                if isinstance(d, dict)
-            ]
-            rels += list((meta.get("file_hashes") or {}).keys())
-            for rel in rels:
-                parts = Path(str(rel or "")).parts
-                if len(parts) > 1:
-                    keep.add(parts[1])
+            keep |= _manifest_dirs(meta)
         now = time.time()
         for d in list(inbox.glob(f"{stem}.staged-*")) + list(
             inbox.glob(f"{stem}.uploads-*")
@@ -1191,15 +1256,19 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 # Binding must be an unambiguous singleton: a message naming
                 # several tasks must not satisfy any of their cards.
                 token_ok = not token or tokens == {token}
-                if token_ok:
+                if token_ok or not tokens:
+                    # An *unverifiable* binding (no marker found) still
+                    # downloads: the operator can accept the answer anyway
+                    # and must not lose the generated files.
                     auto_uploads, downloaded, download_failures = (
                         _auto_download_generated_files(
                             run, staging_dir, share_url, result
                         )
                     )
                 else:
-                    # The share names a different task: don't spend downloads
-                    # on it — the transfer path re-fetches for the right card.
+                    # The share POSITIVELY names a different task: don't spend
+                    # downloads on it — the transfer path re-fetches for the
+                    # right card.
                     auto_uploads, downloaded, download_failures = {}, [], []
                 warnings = (
                     validate_result(result, task, provided_files=set(auto_uploads))
@@ -1259,35 +1328,59 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             ).hexdigest()
             staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
             with _locked_task(run_id, filename):
-                # Commit section: recheck, install the manifest, prune, and
-                # (on the warning-free path) publish — all serialized so a
-                # concurrent fetch can never prune files this manifest or
-                # response references.
+                # Commit section: recheck, install the manifest, clean up
+                # the superseded fetch, and (on the warning-free path)
+                # publish — all serialized so a concurrent fetch can never
+                # prune files this manifest or response references.
                 _refuse_duplicate_response(target)
-                staged_path.write_text(
+                try:
+                    superseded = json.loads(
+                        staged_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    superseded = None
+                staged_tmp = staged_path.with_name(
+                    f"{staged_path.name}.{nonce}.tmp"
+                )
+                staged_tmp.write_text(
                     json.dumps(
                         {**staged, "digest": digest}, ensure_ascii=False, indent=2
                     ),
                     encoding="utf-8",
                 )
+                os.replace(staged_tmp, staged_path)
                 claimed = True
+                # The replaced manifest can never be confirmed again (its
+                # digest no longer matches), so directories only it
+                # references are dead now — waiting for the age-based sweep
+                # would strand them permanently once a response is
+                # published.
+                _remove_staging_dirs(
+                    run, _manifest_dirs(superseded) - _manifest_dirs(staged)
+                )
                 _prune_stale_staging(run, stem)
                 if not warnings:
-                    _write_response_atomic(
-                        target,
-                        {
-                            "status": "done",
-                            "transport": "share_link",
-                            "assistant_text": result["assistant_text"],
-                            "share_url": share_url,
-                            "model_slug": result.get("model_slug"),
-                            "effort": result.get("effort"),
-                            "operator_comments": operator_comments,
-                            "uploaded_files": auto_uploads or None,
-                            "stored_files": staged["stored_files"] or None,
-                        },
-                    )
-                    staged_path.unlink(missing_ok=True)
+                    response_payload = {
+                        "status": "done",
+                        "transport": "share_link",
+                        "assistant_text": result["assistant_text"],
+                        "share_url": share_url,
+                        "model_slug": result.get("model_slug"),
+                        "effort": result.get("effort"),
+                        "operator_comments": operator_comments,
+                        "uploaded_files": auto_uploads or None,
+                        "stored_files": staged["stored_files"] or None,
+                    }
+                    try:
+                        _write_response_atomic(target, response_payload)
+                    except BaseException:
+                        # This fetch's manifest and staging must not outlive
+                        # its failed publication (409 = another submission
+                        # won; its state is authoritative, ours is trash).
+                        staged_path.unlink(missing_ok=True)
+                        claimed = False
+                        raise
+                    _cleanup_published_staging(run, stem, response_payload)
             if warnings:
                 return render_template(
                     "dev_harness_confirm.html",
@@ -1373,25 +1466,23 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             uploaded_files = dict(staged.get("uploaded_files") or {})
             manual_files = _save_harness_uploads(run, stem, uploads)
             uploaded_files.update(manual_files)
+            response_payload = {
+                "status": "done",
+                "transport": "share_link",
+                "assistant_text": str(staged.get("assistant_text") or ""),
+                "share_url": staged.get("share_url"),
+                "model_slug": staged.get("model_slug"),
+                "effort": staged.get("effort"),
+                "operator_comments": str(request.form.get("operator_comments") or ""),
+                "uploaded_files": uploaded_files or None,
+                "stored_files": staged.get("stored_files") or None,
+            }
             try:
-                _write_response_atomic(
-                    target,
-                    {
-                        "status": "done",
-                        "transport": "share_link",
-                        "assistant_text": str(staged.get("assistant_text") or ""),
-                        "share_url": staged.get("share_url"),
-                        "model_slug": staged.get("model_slug"),
-                        "effort": staged.get("effort"),
-                        "operator_comments": str(request.form.get("operator_comments") or ""),
-                        "uploaded_files": uploaded_files or None,
-                        "stored_files": staged.get("stored_files") or None,
-                    },
-                )
+                _write_response_atomic(target, response_payload)
             except BaseException:
                 _remove_upload_dirs(run, manual_files)
                 raise
-            staged_path.unlink(missing_ok=True)
+            _cleanup_published_staging(run, stem, response_payload)
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/harness/manual", methods=["POST"])
@@ -1413,23 +1504,25 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             # concurrent submission leaves no orphaned upload directory.
             _refuse_duplicate_response(target)
             uploaded_files = _save_harness_uploads(run, stem, uploads)
+            response_payload = {
+                "status": "done",
+                "transport": "manual",
+                "assistant_text": assistant_text,
+                "share_url": None,
+                "model_slug": None,
+                "effort": None,
+                "operator_comments": operator_comments,
+                "uploaded_files": uploaded_files or None,
+            }
             try:
-                _write_response_atomic(
-                    target,
-                    {
-                        "status": "done",
-                        "transport": "manual",
-                        "assistant_text": assistant_text,
-                        "share_url": None,
-                        "model_slug": None,
-                        "effort": None,
-                        "operator_comments": operator_comments,
-                        "uploaded_files": uploaded_files or None,
-                    },
-                )
+                _write_response_atomic(target, response_payload)
             except BaseException:
                 _remove_upload_dirs(run, uploaded_files)
                 raise
+            # An abandoned warning-page fetch may have left a staged
+            # manifest and its downloads; the manual publication makes them
+            # permanently unreachable — clean them now.
+            _cleanup_published_staging(run, stem, response_payload)
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/resume", methods=["POST"])

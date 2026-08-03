@@ -405,6 +405,23 @@ class PauseAccountingTests(unittest.TestCase):
             root.counters.wallclock_s(now=start + 100.0), 5.0
         )
 
+    def test_unbalanced_end_pause_never_touches_the_parent(self) -> None:
+        # A double-end on one child must not decrement the parent's
+        # reference count while a sibling's pause is active — that would
+        # end the sibling's span early and undercount the union.
+        from proofstack.budget import BudgetTracker
+
+        root = BudgetTracker(scope="run")
+        a = BudgetTracker(scope="a", parent=root)
+        b = BudgetTracker(scope="b", parent=root)
+        a.begin_pause(now=0.0)
+        a.end_pause(now=4.0)
+        b.begin_pause(now=10.0)
+        a.end_pause(now=11.0)  # unbalanced: must be a no-op everywhere
+        b.end_pause(now=20.0)
+        self.assertAlmostEqual(root.counters.paused_s, 14.0)
+        self.assertEqual(root.counters.active_pauses, 0)
+
 
 class TaskStemScopingTests(unittest.TestCase):
     def test_stem_is_stable_within_a_run_but_distinct_across_runs(self) -> None:

@@ -136,12 +136,17 @@ class BudgetTracker:
 
     def end_pause(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
-        if self.counters.active_pauses > 0:
-            self.counters.active_pauses -= 1
-            if self.counters.active_pauses == 0:
-                self.counters.paused_s += max(
-                    0.0, now - self.counters.pause_started_at
-                )
+        if self.counters.active_pauses <= 0:
+            # Unbalanced end (defensive): every begin_pause increments the
+            # whole ancestor chain, so propagating an unmatched end would
+            # decrement parent counters that were never incremented for it
+            # and desync the union accounting.
+            return
+        self.counters.active_pauses -= 1
+        if self.counters.active_pauses == 0:
+            self.counters.paused_s += max(
+                0.0, now - self.counters.pause_started_at
+            )
         if self.parent is not None:
             self.parent.end_pause(now)
 

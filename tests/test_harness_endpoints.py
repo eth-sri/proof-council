@@ -611,6 +611,162 @@ class HarnessEndpointTests(unittest.TestCase):
         self.assertEqual(payload["stored_files"][0]["name"], "report.pdf")
         self.assertFalse(payload["stored_files"][0]["merged"])
 
+    def _warning_fetch_with_downloads(self) -> None:
+        # A task token the fixture never names -> "could not verify" warning
+        # -> staged manifest + staged-* download directory are installed.
+        inbox = self.run_dir / "human_inbox"
+        task_path = inbox / f"{self.stem}.task.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["task_token"] = "tokA"
+        task["instruction_file"] = "instruction_tokA.txt"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        p1, p2 = self._mock_download(b"GENERATED TEXT")
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ), p1, p2:
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_manual_after_warning_fetch_cleans_abandoned_staging(self) -> None:
+        # Leak fix: warning-page fetch -> operator falls back to manual
+        # paste. The abandoned manifest and its downloads become unreachable
+        # at publication and must be removed then.
+        inbox = self.run_dir / "human_inbox"
+        self._warning_fetch_with_downloads()
+        self.assertTrue((inbox / f"{self.stem}.staged.json").exists())
+        self.assertTrue(list(inbox.glob(f"{self.stem}.staged-*")))
+        resp = self.client.post(
+            "/run/run1/harness/manual",
+            data={
+                "response_filename": self.response_filename,
+                "assistant_text": "manual answer instead",
+            },
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertFalse((inbox / f"{self.stem}.staged.json").exists())
+        self.assertEqual(list(inbox.glob(f"{self.stem}.staged-*")), [])
+
+    def test_refetch_removes_superseded_staging_dirs(self) -> None:
+        # Leak fix: warning fetch A -> warning fetch B. A's manifest can
+        # never be confirmed again (digest mismatch), so its download
+        # directory must be removed when B's manifest replaces it.
+        inbox = self.run_dir / "human_inbox"
+        self._warning_fetch_with_downloads()
+        dirs_a = {d.name for d in inbox.glob(f"{self.stem}.staged-*")}
+        self.assertEqual(len(dirs_a), 1)
+        self._warning_fetch_with_downloads()
+        dirs_b = {d.name for d in inbox.glob(f"{self.stem}.staged-*")}
+        self.assertEqual(len(dirs_b), 1)
+        self.assertTrue(dirs_a.isdisjoint(dirs_b))
+
+    def test_confirm_retains_only_response_referenced_dirs(self) -> None:
+        inbox = self.run_dir / "human_inbox"
+        self._warning_fetch_with_downloads()
+        staged = json.loads(
+            (inbox / f"{self.stem}.staged.json").read_text(encoding="utf-8")
+        )
+        referenced = {
+            Path(rel).parts[1] for rel in staged["uploaded_files"].values()
+        }
+        # Simulate an older crashed fetch whose directory no manifest
+        # references: publication is the last chance to remove it.
+        decoy = inbox / f"{self.stem}.staged-deadbeefcafe"
+        decoy.mkdir()
+        (decoy / "junk.txt").write_text("junk", encoding="utf-8")
+        resp = self.client.post(
+            "/run/run1/harness/confirm",
+            data={
+                "response_filename": self.response_filename,
+                "digest": staged["digest"],
+            },
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertFalse((inbox / f"{self.stem}.staged.json").exists())
+        self.assertFalse(decoy.exists())
+        remaining = {d.name for d in inbox.glob(f"{self.stem}.staged-*")}
+        self.assertEqual(remaining, referenced)
+        payload = json.loads(
+            (inbox / self.response_filename).read_text(encoding="utf-8")
+        )
+        for rel in payload["uploaded_files"].values():
+            self.assertTrue((self.run_dir / rel).exists())
+
+    def test_fallback_publish_write_fault_with_landed_bytes_succeeds(self) -> None:
+        # os.link unavailable AND the exclusive-create write reports an
+        # error after the bytes landed: publication must count as success —
+        # otherwise the caller deletes upload directories that the (valid,
+        # on-disk) response references.
+        inbox = self.run_dir / "human_inbox"
+        real_open = Path.open
+
+        def fake_open(path_self, mode="r", *args, **kwargs):
+            if str(path_self.name).endswith(".response.json") and mode == "x":
+                fh = real_open(path_self, mode, *args, **kwargs)
+
+                class FaultyCtx:
+                    def __enter__(self):
+                        return self
+
+                    def write(self, text):
+                        return fh.write(text)
+
+                    def __exit__(self, *exc):
+                        fh.close()
+                        raise OSError("deferred write fault at close")
+
+                return FaultyCtx()
+            return real_open(path_self, mode, *args, **kwargs)
+
+        with mock.patch("app.dev.os.link", side_effect=OSError("no hardlinks")), \
+                mock.patch.object(Path, "open", fake_open):
+            resp = self.client.post(
+                "/run/run1/harness/manual",
+                data={
+                    "response_filename": self.response_filename,
+                    "assistant_text": "answer body",
+                    "files": (io.BytesIO(b"UPLOAD BODY"), "answer.tex"),
+                },
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(resp.status_code, 302)
+        payload = json.loads(
+            (inbox / self.response_filename).read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["assistant_text"], "answer body")
+        rel = payload["uploaded_files"]["answer.tex"]
+        self.assertEqual((self.run_dir / rel).read_bytes(), b"UPLOAD BODY")
+
+    def test_unverifiable_token_still_auto_downloads(self) -> None:
+        # No task marker anywhere in the share: the binding is unverifiable
+        # (warning + confirm page), but downloads must still run so the
+        # accept-anyway path keeps the generated files. Only a POSITIVE
+        # binding to a different task skips downloads.
+        inbox = self.run_dir / "human_inbox"
+        task_path = inbox / f"{self.stem}.task.json"
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["task_token"] = "tokA"
+        task["instruction_file"] = "instruction_tokA.txt"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        p1, p2 = self._mock_download(b"GENERATED TEXT")
+        with mock.patch(
+            "proofstack.harness.chatgpt_share.fetch_share",
+            return_value=SHARE_FIXTURE,
+        ), p1, p2:
+            resp = self.client.post(
+                "/run/run1/harness/fetch-share",
+                data={"response_filename": self.response_filename, "share_url": SHARE_URL},
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("could not verify", resp.get_data(as_text=True))
+        staged = json.loads(
+            (inbox / f"{self.stem}.staged.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(staged["uploaded_files"])
+
     def test_wrong_task_share_offers_transfer(self) -> None:
         inbox = self.run_dir / "human_inbox"
         task_path = inbox / f"{self.stem}.task.json"
