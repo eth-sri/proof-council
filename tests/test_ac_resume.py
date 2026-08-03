@@ -1384,7 +1384,7 @@ class ACResumeTests(unittest.TestCase):
             )
             effective = (workspace / "problem-effective.txt").read_text(encoding="utf-8")
             self.assertIn("Original problem statement", effective)
-            self.assertIn("resumed from an earlier workflow", effective)
+            self.assertIn("resumes an earlier workflow session", effective)
             self.assertIn("focus on the prime case", effective)
 
 

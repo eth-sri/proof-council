@@ -1570,11 +1570,15 @@ class ACWorkflow(Agent):
     def _problem_with_run_notes(self, inp, *, resume_stop_round: int | None) -> str:
         parts = [str(inp.problem or "").rstrip()]
         if inp.resume_run and resume_stop_round is not None:
+            # Deliberately round-agnostic: the note flows into Author/Critic
+            # inputs and thus into their cache keys — naming the terminated
+            # round would re-key (and orphan) every pending browser card on
+            # the first restart after each completed round. The current
+            # round number is visible in the per-round prompt anyway.
             parts.append(
-                "This run is resumed from an earlier workflow that terminated "
-                f"at round {resume_stop_round}. The new upper round bound is "
-                f"round {inp.n_rounds}; continue the existing draft and "
-                "round history instead of restarting the solution."
+                "This run resumes an earlier workflow session. The upper "
+                f"round bound is round {inp.n_rounds}; continue the existing "
+                "draft and round history instead of restarting the solution."
             )
         extra = str(getattr(inp, "additional_instructions", "") or "").strip()
         if extra:
