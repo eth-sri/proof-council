@@ -1223,7 +1223,10 @@ def _sandbox_exposed(node_dir: Path) -> bool:
         text = (node_dir / "output.json").read_text(encoding="utf-8")
     except OSError:
         return True
-    return str(node_dir / "sandbox") in text
+    sandbox_str = str(node_dir / "sandbox")
+    # json.dumps escapes backslashes (Windows paths), so check the
+    # JSON-encoded form too; [1:-1] strips the surrounding quotes.
+    return sandbox_str in text or json.dumps(sandbox_str)[1:-1] in text
 
 
 def estimate_prunable_bytes(run_path: Path) -> int:
@@ -1233,13 +1236,15 @@ def estimate_prunable_bytes(run_path: Path) -> int:
         return 0
     total = 0
     for node_dir in agents_dir.iterdir():
-        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+        if node_dir.is_symlink() or not node_dir.is_dir():
+            continue
+        if not (node_dir / "output.json").exists():
             continue
         for name in _PRUNABLE_NODE_ARTIFACTS:
             if name == "sandbox" and _sandbox_exposed(node_dir):
                 continue
             target = node_dir / name
-            if target.exists():
+            if not target.is_symlink() and target.exists():
                 total += _path_size(target)
     return total
 
@@ -1260,15 +1265,27 @@ def prune_run_artifacts(run_path: Path) -> dict[str, int]:
     bytes_freed = 0
     if not agents_dir.exists():
         return {"pruned_nodes": 0, "bytes_freed": 0}
+    agents_root = agents_dir.resolve()
     for node_dir in agents_dir.iterdir():
-        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+        # A symlinked node dir (or artifact) would make the deletions below
+        # land OUTSIDE the run; refuse anything that is not a plain
+        # directory resolving under agents/.
+        if node_dir.is_symlink() or not node_dir.is_dir():
+            continue
+        if not (node_dir / "output.json").exists():
             continue
         node_freed = 0
         for name in _PRUNABLE_NODE_ARTIFACTS:
             if name == "sandbox" and _sandbox_exposed(node_dir):
                 continue
             target = node_dir / name
-            if not target.exists():
+            if target.is_symlink() or not target.exists():
+                continue
+            try:
+                resolved = target.resolve()
+            except OSError:
+                continue
+            if agents_root not in resolved.parents:
                 continue
             node_freed += _path_size(target)
             if target.is_dir():
