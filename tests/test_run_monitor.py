@@ -124,6 +124,131 @@ class RunMonitorTests(unittest.TestCase):
             self.assertEqual(len(summaries), 1)
             self.assertIn("background monitor", summaries[0]["payload"]["summary"].lower())
 
+    def test_monitor_history_in_prompt_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                api_client_factory=lambda _model: _FakeClient(),
+            )
+            monitor = RunMonitor(ctx, model="fake", problem="P", problem_id="p")
+            monitor.summaries = [
+                {"agent": f"a{i}", "display_label": f"A{i}", "status": "ok", "summary": f"s{i}"}
+                for i in range(40)
+            ]
+            prompt = monitor._prompt(
+                agent="solver",
+                agent_path="solver",
+                display_agent="Solver",
+                execution_mode="agent",
+                input_json={},
+                output_json={},
+                status="ok",
+                error=None,
+            )
+            context = json.loads(prompt.split("\n\n", 1)[1])
+            previous = context["previous_summaries"]
+            self.assertEqual(len(previous), 12)
+            self.assertEqual(previous[-1]["summary"], "s39")
+
+    def test_monitor_seeds_history_from_prior_attempt_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events_path = Path(temp_dir) / "events.jsonl"
+            events_path.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "kind": "monitor.summary",
+                            "payload": {
+                                "agent": "solver",
+                                "display_label": "Solver",
+                                "status": "ok",
+                                "summary": f"prior summary {i}",
+                            },
+                        }
+                    )
+                    for i in range(3)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                api_client_factory=lambda _model: _FakeClient(),
+            )
+            monitor = RunMonitor(ctx, model="fake", problem="P", problem_id="p")
+            self.assertEqual(len(monitor.summaries), 3)
+            self.assertEqual(monitor.summaries[-1]["summary"], "prior summary 2")
+
+    def test_monitor_skips_calls_when_budget_exhausted(self) -> None:
+        from proofstack.budget import BudgetSpec
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                api_client_factory=lambda _model: _FakeClient(),
+            )
+            root = ctx.budgets.root("run")
+            root.spec = BudgetSpec(max_usd=0.01)
+            root.add_usd(1.0)
+            ctx.monitor = RunMonitor(ctx, model="fake", problem="P", problem_id="p")
+
+            async def run_agent() -> None:
+                await _TinyAgent(ctx, name="solver")(problem="P")
+                await ctx.monitor.drain()
+
+            asyncio.run(run_agent())
+
+            events = [
+                json.loads(line)
+                for line in (Path(temp_dir) / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            kinds = [e.get("kind") for e in events]
+            self.assertIn("monitor.skipped", kinds)
+            self.assertNotIn("monitor.summary", kinds)
+            monitor_calls = [
+                e
+                for e in events
+                if e.get("kind") == "model.call"
+                and (e.get("payload") or {}).get("via") == "run_monitor"
+            ]
+            self.assertEqual(monitor_calls, [])
+
+    def test_monitor_makes_no_call_under_zero_usd_budget(self) -> None:
+        # max_usd == 0 declares "no paid spend at all": even the FIRST
+        # monitor call must be skipped (check() only trips after positive
+        # spending).
+        from proofstack.budget import BudgetSpec
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                api_client_factory=lambda _model: _FakeClient(),
+            )
+            ctx.budgets.root("run").spec = BudgetSpec(max_usd=0.0)
+            ctx.monitor = RunMonitor(ctx, model="fake", problem="P", problem_id="p")
+
+            async def run_agent() -> None:
+                await _TinyAgent(ctx, name="solver")(problem="P")
+                await ctx.monitor.drain()
+
+            asyncio.run(run_agent())
+
+            events = [
+                json.loads(line)
+                for line in (Path(temp_dir) / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            kinds = [e.get("kind") for e in events]
+            self.assertIn("monitor.skipped", kinds)
+            self.assertNotIn("monitor.summary", kinds)
+
     def test_monitor_prompt_uses_node_label_instead_of_internal_dag_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ctx = RunContext.create(

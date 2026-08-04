@@ -1,0 +1,73 @@
+{% extends "dev_base.html" %}
+{% block title %}Harness fetch — {{ run.run_id }}{% endblock %}
+{% block content %}
+    <div class="page-header-row">
+        <h1>🌐 Browser call — fetch result</h1>
+        <a class="button-action secondary" href="{{ url_for('run_detail', run_id=run.run_id) }}">← Back to run</a>
+    </div>
+
+    {% if error %}
+        <div class="card">
+            <h2>Fetch failed</h2>
+            <p class="input-warning">{{ error }}</p>
+            <p class="dim">Fix the link and try again from the run page, or use the manual paste fallback there.</p>
+        </div>
+    {% else %}
+        {% if transfer %}
+        <div class="card">
+            <h2>⚠ This share appears to belong to a different task</h2>
+            <p>The conversation contains the instruction file for
+                <strong>{{ transfer.agent }}</strong>{% if transfer.display_model %} ({{ transfer.display_model }}){% endif %},
+                not the task you chose.</p>
+            <form method="post" action="{{ url_for('run_harness_fetch_share', run_id=run.run_id) }}">
+                <input type="hidden" name="response_filename" value="{{ transfer.response_filename }}">
+                <input type="hidden" name="share_url" value="{{ share_url }}">
+                <input type="hidden" name="operator_comments" value="{{ operator_comments }}">
+                <button type="submit" class="btn-primary">Transfer: validate &amp; register for {{ transfer.agent }}</button>
+            </form>
+            <p class="dim">Or keep it for the originally chosen task with the form below.</p>
+        </div>
+        {% endif %}
+        <div class="card">
+            <h2>The fetched conversation has warnings</h2>
+            <ul>
+                {% for w in warnings %}
+                    <li class="input-warning">{{ w }}</li>
+                {% endfor %}
+            </ul>
+            {% if downloaded %}
+                <p>Generated files downloaded automatically from the share:</p>
+                <ul>
+                    {% for d in downloaded %}
+                        <li><code>{{ d.name }}</code> ({{ d.bytes }} bytes{% if d.merged %}, will be merged into the answer as a fenced file block{% else %}, kept on disk only — binary or fence-conflicting{% endif %})</li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+            <p class="dim">You can accept the fetched answer anyway — optionally adding any
+                generated files you downloaded from the chat by hand — or go back and fix the
+                conversation (e.g. ask the model to print missing files inline, share again,
+                and paste the new link). Confirming submits exactly the version fetched just
+                now; if the share changes in the meantime you will be asked to re-fetch.</p>
+            {% if answer_preview %}
+                <details>
+                    <summary>Preview of the fetched answer</summary>
+                    <pre class="human-task-prompt">{{ answer_preview }}</pre>
+                </details>
+            {% endif %}
+            <form method="post" enctype="multipart/form-data" action="{{ url_for('run_harness_confirm', run_id=run.run_id) }}">
+                <input type="hidden" name="response_filename" value="{{ response_filename }}">
+                <input type="hidden" name="digest" value="{{ digest }}">
+                <label class="human-task-field">
+                    <span class="key">generated files <span class="dim">(optional — anything the model produced that you downloaded by hand; overrides same-named inline files)</span></span>
+                    <input type="file" name="files" multiple>
+                </label>
+                <label class="human-task-field">
+                    <span class="key">operator comments <span class="dim">(optional — steering for the next Author round)</span></span>
+                    <textarea name="operator_comments" rows="2" spellcheck="false">{{ operator_comments }}</textarea>
+                </label>
+                <button type="submit" class="btn-primary">Use fetched answer &amp; Continue</button>
+                <a class="button-action secondary" href="{{ url_for('run_detail', run_id=run.run_id) }}">Cancel</a>
+            </form>
+        </div>
+    {% endif %}
+{% endblock %}

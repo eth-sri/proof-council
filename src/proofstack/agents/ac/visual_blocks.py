@@ -100,7 +100,8 @@ class ACInitBlock(ACWorkflow):
         )
         if resume_state is not None:
             self._restore_workspace_from_resume(workspace, resume_state)
-            self._apply_resume_budget_offset()
+            # Prior spend is re-seeded centrally by the launcher
+            # (run_workflow._seed_budget_from_prior_events), not here.
             await self.events.emit(
                 "ac.resume",
                 {
@@ -329,7 +330,7 @@ class ACAuthorBlock(_ACVisualStep):
                 prev_compute = str(state.get("pending_compute_text") or "")
                 compute_zip_path = self._decode_run_path(state.get("pending_compute_zip_path"))
 
-            author = await self.author(
+            author = await self._call_author_with_operator_comments(
                 **self._author_inputs(
                     inp=ac_inp,
                     workspace=workspace,
@@ -551,13 +552,19 @@ class ACCouncilBlock(_ACVisualStep):
         if not state.get("run_council") or author is None:
             return self.Outputs(state=state)
         ac_inp = self._inp(state)
+        k = int(state.get("current_round", 0) or 0)
+        member_models = await self._council_member_models(
+            round=k,
+            requested=list(author.council_to),
+            allowed=list(ac_inp.council_models),
+        )
         replies = await self._safe_council(
-            round=int(state.get("current_round", 0) or 0),
+            round=k,
             author_question=author.council_question or "",
             answer_tex=author.answer_tex,
             research_notes_tex=author.research_notes_tex,
             references_bib=author.references_bib,
-            member_models=author.council_to or list(ac_inp.council_models),
+            member_models=member_models,
         )
         state["council_replies"] = [reply.model_dump(mode="json") for reply in (replies.replies if replies else [])]
         text = render_council_replies_for_author(replies.replies) if replies and replies.replies else ""

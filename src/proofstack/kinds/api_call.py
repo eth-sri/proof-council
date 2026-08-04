@@ -12,6 +12,7 @@ richer behavior.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import time
@@ -69,9 +70,27 @@ class APICallAgent(Agent):
     def extra_client_kwargs(self) -> dict[str, Any]:
         return {}
 
+    def render_harness_packet(self, inp: BaseModel) -> tuple[str, dict[str, str | bytes]]:
+        """Instruction text + attachment files for a browser-harness call.
+
+        Subclasses that embed large file bodies in their prompt should
+        override this to pull those bodies out as attachments.
+        """
+        return _flatten_messages_for_harness(self.render_messages(inp)), {}
+
+    def harness_expectations(self, inp: BaseModel) -> dict[str, Any]:
+        """Validation hints for the dashboard (fenced_files, markers)."""
+        return {}
+
     # --- framework-managed ----------------------------------------------------
 
     async def run(self, inp: BaseModel) -> BaseModel:
+        browser_cfg = self._browser_model_config()
+        if browser_cfg is not None:
+            from proofstack.harness.browser_call import run_browser_call
+
+            return await run_browser_call(self, inp, browser_cfg)
+
         warnings = self.tracker.check()
         for scope, kind, used, limit in warnings:
             await self.events.emit(
@@ -146,6 +165,41 @@ class APICallAgent(Agent):
             )
         return self.parse_output(raw_text, inp)
 
+    def _cache_config_snapshot(self) -> dict[str, Any]:
+        # The resume-cache key must reflect the *effective* model
+        # configuration, not just the raw MODEL ref: a model_overrides swap
+        # (API <-> browser) or ANY edit to the referenced YAML (transport,
+        # slug, instruction addendum, generation params, …) must not replay
+        # the old configuration's cached answer. Hash the full sanitized
+        # resolved config — the price is that cosmetic YAML edits also
+        # invalidate, which is the safe direction.
+        snapshot = super()._cache_config_snapshot()
+        try:
+            resolved = self.ctx.model_for(self, self.MODEL)
+            snapshot["RESOLVED_MODEL"] = str(resolved)
+            from mathagents import load_solver_config
+
+            cfg = load_solver_config(resolved)
+            sanitized = {
+                k: v for k, v in cfg.items() if not str(k).startswith("__")
+            }
+            snapshot["MODEL_CONFIG_HASH"] = hashlib.sha256(
+                json.dumps(
+                    sanitized, sort_keys=True, ensure_ascii=False, default=str
+                ).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            pass
+        return snapshot
+
+    def _browser_model_config(self) -> dict[str, Any] | None:
+        from mathagents import load_solver_config
+
+        cfg = load_solver_config(self.ctx.model_for(self, self.MODEL))
+        if str(cfg.get("api") or "").lower() != "browser":
+            return None
+        return {k: v for k, v in cfg.items() if not str(k).startswith("__")}
+
     async def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
@@ -190,6 +244,38 @@ def _one_shot_query(client: Any, messages: list[Message]) -> tuple[int, list[Mes
     """Drain a single APIClient.run_queries iteration."""
     iterator = client.run_queries([messages], no_tqdm=True)
     return next(iter(iterator))
+
+
+def _message_text(msg: Message) -> str:
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                if "text" in block:
+                    parts.append(str(block["text"]))
+                elif block.get("type") == "output_text":
+                    parts.append(str(block.get("text", "")))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _flatten_messages_for_harness(messages: list[Message]) -> str:
+    """Render a message list as one browser prompt.
+
+    The common system+user pair concatenates without ceremony; anything
+    longer (e.g. a stateful conversation) becomes a role-labelled
+    transcript so the browser model sees the full history.
+    """
+    roles = [str(m.get("role", "")) for m in messages]
+    if len(messages) == 1:
+        return _message_text(messages[0])
+    if len(messages) == 2 and roles[0] in ("system", "developer") and roles[1] == "user":
+        return _message_text(messages[0]) + "\n\n" + _message_text(messages[1])
+    chunks = [f"### {role or 'message'} ###\n{_message_text(m)}" for role, m in zip(roles, messages)]
+    return "\n\n".join(chunks)
 
 
 def _assistant_text(conversation: list[Message]) -> str:

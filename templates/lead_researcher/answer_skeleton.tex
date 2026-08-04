@@ -1,0 +1,71 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.05in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage[colorlinks=true,allcolors=blue]{hyperref}
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{conjecture}[theorem]{Conjecture}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\title{[Problem name]: results of an AI-led investigation}
+\author{[Claude model] (lead researcher), with [human] (harness/PI)%
+\thanks{Produced in CLI lead-researcher mode; see the provenance
+appendix for the division of labor and the verification record.}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+[What was asked; what is proved; what is numerical; what is
+conjectured. No claim in the abstract stronger than its label in the
+trust boundary.]
+\end{abstract}
+
+\section{Introduction}
+\subsection{The problem}
+% Verbatim or faithfully restated, with provenance.
+\subsection{Prior work}
+\subsection{Main results}
+% One paragraph or theorem box per result, each labelled:
+% proved / proved conditional on X / quoted from [ref] / numerical /
+% conjectural.
+\subsection{Trust boundary}\label{sec:trust}
+% THE contract with the reader. Exhaustive lists:
+% - Proved in full in this document: ...
+% - Proved modulo precisely cited external inputs: ...
+% - Numerical (with methodology pointer): ...
+% - Conjectural/heuristic: ...
+% Update this subsection with every integration.
+
+\section{Preliminaries and exact benchmarks}
+
+% ... body sections: identities/theory, bounds, numerics-informed
+% sections (each claim labelled), phase/structure results ...
+
+\section{Answers to the submitted questions}
+% Q-by-Q, each answer split into proved / evidence / open.
+
+\section{What to prove next}
+% Ordered by expected tractability, with pointers to the tools built.
+
+\appendix
+\section{Simulation methodology and validation}
+% Implementation, exact-benchmark gate, equilibration protocol, error
+% bars, seeds; enough for independent reproduction.
+\section{Provenance and process}
+% Division of labor (which agent/tool produced what), consultation
+% rounds with verification statistics, corrections applied, and the
+% supplementary-material manifest (code, notes, raw outputs).
+
+\begin{thebibliography}{9}
+% Cited literature + consultation-round records (filed as
+% prompts/<ID>_answer.md) + prescreen/referee reports.
+\end{thebibliography}
+\end{document}

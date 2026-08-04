@@ -1137,10 +1137,14 @@ class ACResumeTests(unittest.TestCase):
             self.assertTrue(state.get("terminal_outputs", {}).get("compiled"))
 
     def test_resume_extension_replays_pending_context_and_budget_offset_once(self) -> None:
+        # Budget seeding is now the LAUNCHER's job (run_workflow seeds the
+        # root tracker from prior events); the workflow itself must not
+        # re-add prior cost, only pass the tracker value through.
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             ctx = RunContext.create(run_id="run", root_workdir=root, flat=True)
             _disable_event_writes(ctx)
+            ctx.budgets.root("run").add_usd(2.75)
             workflow = ACWorkflow(ctx)
             workspace = _workspace(ctx.root_workdir)
             workspace.mkdir(parents=True)
@@ -1380,7 +1384,7 @@ class ACResumeTests(unittest.TestCase):
             )
             effective = (workspace / "problem-effective.txt").read_text(encoding="utf-8")
             self.assertIn("Original problem statement", effective)
-            self.assertIn("resumed from an earlier workflow", effective)
+            self.assertIn("resumes an earlier workflow session", effective)
             self.assertIn("focus on the prime case", effective)
 
 

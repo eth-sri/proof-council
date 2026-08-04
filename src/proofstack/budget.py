@@ -110,13 +110,22 @@ class _Counters:
     tokens: int = 0
     tool_calls: int = 0
     paused_s: float = 0.0
+    # Reference count of waiters currently pausing this scope, plus when the
+    # count last went 0 -> 1. The union of overlapping waits is computed in
+    # O(1) state: while any waiter is active the whole span counts once.
+    active_pauses: int = 0
+    pause_started_at: float = 0.0
     started_at: float = field(default_factory=time.monotonic)
 
-    def wallclock_s(self) -> float:
-        # Time spent waiting on a human (paused_s) does not count as compute
-        # wallclock, so a node that waits hours/days for input never trips the
-        # run's wallclock budget.
-        return max(0.0, time.monotonic() - self.started_at - self.paused_s)
+    def wallclock_s(self, now: float | None = None) -> float:
+        # Time spent waiting on a human (paused_s, plus any pause still in
+        # progress) does not count as compute wallclock, so a node that waits
+        # hours/days for input never trips the run's wallclock budget.
+        now = time.monotonic() if now is None else now
+        paused = self.paused_s
+        if self.active_pauses > 0:
+            paused += max(0.0, now - self.pause_started_at)
+        return max(0.0, now - self.started_at - paused)
 
 
 @dataclass
@@ -144,15 +153,37 @@ class BudgetTracker:
         if self.parent is not None:
             self.parent.add_tool_call(n)
 
-    def add_paused(self, seconds: float) -> None:
-        """Exclude ``seconds`` from wallclock at this scope and all parents.
+    def begin_pause(self, now: float | None = None) -> None:
+        """Mark a human wait as active at this scope and all parents.
 
-        Used by human-in-the-loop nodes so time spent waiting for a person is
-        not charged against the run's compute wallclock budget.
-        """
-        self.counters.paused_s += seconds
+        Paired with ``end_pause`` (call in ``finally``). Reference counting
+        makes N overlapping waiters credit exactly the *union* of their wait
+        spans at shared ancestors — never N times the wall time — in O(1)
+        state. Compute that runs concurrently with a human wait is
+        deliberately not re-charged: the span counts as paused. ``now`` is
+        injectable for tests."""
+        now = time.monotonic() if now is None else now
+        if self.counters.active_pauses == 0:
+            self.counters.pause_started_at = now
+        self.counters.active_pauses += 1
         if self.parent is not None:
-            self.parent.add_paused(seconds)
+            self.parent.begin_pause(now)
+
+    def end_pause(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        if self.counters.active_pauses <= 0:
+            # Unbalanced end (defensive): every begin_pause increments the
+            # whole ancestor chain, so propagating an unmatched end would
+            # decrement parent counters that were never incremented for it
+            # and desync the union accounting.
+            return
+        self.counters.active_pauses -= 1
+        if self.counters.active_pauses == 0:
+            self.counters.paused_s += max(
+                0.0, now - self.counters.pause_started_at
+            )
+        if self.parent is not None:
+            self.parent.end_pause(now)
 
     def chain(self) -> Iterable["BudgetTracker"]:
         node: BudgetTracker | None = self

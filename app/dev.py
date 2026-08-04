@@ -11,16 +11,20 @@ Run::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
 import re
+import uuid
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -55,6 +59,7 @@ from app.dev_data import (
     find_preset,
     find_run,
     find_runs_awaiting_human,
+    find_runs_with_busy_compute,
     run_process_alive,
     stop_run_process,
     write_stopped_marker,
@@ -143,6 +148,9 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         static_folder=str(Path(__file__).parent / "static"),
     )
     app.config["RUNS_ROOTS"] = list(runs_roots)
+    # Reject oversized multipart bodies before request handlers read them
+    # into memory (upload validation itself allows 40 MB of files).
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
 
     @app.context_processor
     def inject_human_waiting_runs():
@@ -153,7 +161,11 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             waiting = find_runs_awaiting_human(app.config["RUNS_ROOTS"])
         except Exception:
             waiting = []
-        return {"human_waiting_runs": waiting}
+        try:
+            compute_busy = find_runs_with_busy_compute(app.config["RUNS_ROOTS"])
+        except Exception:
+            compute_busy = []
+        return {"human_waiting_runs": waiting, "compute_busy_runs": compute_busy}
 
     @app.template_filter("display_scalar")
     def display_scalar(value):
@@ -197,6 +209,20 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         if hours:
             return f"{hours} h"
         return f"{total_minutes} min"
+
+    @app.template_filter("monitor_markdown")
+    def monitor_markdown(value):
+        """Minimal safe markdown for monitor summaries: escape everything,
+        then allow **bold**, *italic*, `code`, and paragraph breaks. Dollar
+        math passes through untouched for MathJax."""
+        from markupsafe import Markup, escape
+
+        text = str(escape(str(value or "")))
+        text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text, flags=re.DOTALL)
+        text = re.sub(r"(?<![\w*])\*([^*\n]+)\*(?![\w*])", r"<em>\1</em>", text)
+        text = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", text)
+        paragraphs = [p.replace("\n", "<br>") for p in text.split("\n\n") if p.strip()]
+        return Markup("".join(f"<p>{p}</p>" for p in paragraphs))
 
     @app.template_filter("display_tokens")
     def display_tokens(value):
@@ -280,6 +306,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
     @app.route("/run-agent/start", methods=["POST"])
     def run_agent_start():
         payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({"ok": False, "errors": ["request body must be a JSON object"]}), 400
         preset_name = str(payload.get("preset") or "").strip()
         preset = find_preset(preset_name)
         if preset is None:
@@ -300,8 +328,37 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         if not problems:
             return jsonify({"ok": False, "errors": ["Select or create at least one problem."]}), 400
 
+        api_keys = payload.get("api_keys") or {}
+        raw_inputs = payload.get("inputs") or {}
+        if not isinstance(api_keys, dict) or not isinstance(raw_inputs, dict):
+            return jsonify(
+                {"ok": False, "errors": ["api_keys and inputs must be objects"]}
+            ), 400
+        # Validate input overrides BEFORE any run directory exists, so a bad
+        # value can't leave an orphaned run behind. Structured values arrive
+        # as `@<json>` (the runner's convention).
+        input_args: list[str] = []
+        for key, value in raw_inputs.items():
+            clean_key = str(key or "").strip()
+            clean_value = str("" if value is None else value).strip()
+            if not clean_key or not clean_value:
+                continue
+            if clean_value.startswith("@"):
+                try:
+                    json.loads(clean_value[1:])
+                except json.JSONDecodeError as e:
+                    return jsonify(
+                        {
+                            "ok": False,
+                            "errors": [
+                                f"Input {clean_key!r} is not valid JSON after '@': {e.msg}"
+                            ],
+                        }
+                    ), 400
+            input_args.extend(["--input", f"{clean_key}={clean_value}"])
+
         env = _dashboard_subprocess_env()
-        for key, value in (payload.get("api_keys") or {}).items():
+        for key, value in api_keys.items():
             clean_key = str(key or "").strip()
             clean_value = str(value or "").strip()
             if clean_key and clean_value:
@@ -379,13 +436,9 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         ]
         if monitor_enabled:
             cmd.extend(["--monitor", "--monitor-model", monitor_model])
-        # Per-run workflow input overrides (e.g. claude_model=haiku). Only
-        # non-empty values are forwarded; blanks fall back to the preset default.
-        for key, value in (payload.get("inputs") or {}).items():
-            clean_key = str(key or "").strip()
-            clean_value = str("" if value is None else value).strip()
-            if clean_key and clean_value:
-                cmd.extend(["--input", f"{clean_key}={clean_value}"])
+        # Per-run workflow input overrides, validated above before the run
+        # directory was created.
+        cmd.extend(input_args)
         with log_path.open("a", encoding="utf-8") as log:
             subprocess.Popen(
                 cmd,
@@ -701,6 +754,7 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             can_resume=(run.path / "resume.json").exists(),
             prunable_bytes=estimate_prunable_bytes(run.path),
             pruned_kb=request.args.get("pruned_kb", type=int),
+            stored_files_notice=request.args.get("stored", type=int),
         )
 
     @app.route("/run/<run_id>/human", methods=["POST"])
@@ -728,6 +782,17 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
         )
         if task is None:
             abort(409, description="unknown or already-answered human task")
+        # This endpoint serves plain HumanAgent tasks only. A browser-harness
+        # response must go through its own endpoints, which enforce share,
+        # task-token, and upload validation.
+        if task.get("type") == "browser_call":
+            abort(
+                400,
+                description=(
+                    "this is a browser-harness task — submit it through its own "
+                    "card, not the generic human-response form"
+                ),
+            )
         declared = task.get("output_fields") or {}
         values: dict[str, Any] = {}
         for key, value in request.form.items():
@@ -742,16 +807,832 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             if err:
                 abort(400, description=f"field {field!r} {err}")
         values.setdefault("status", "done")
-        inbox.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(values, ensure_ascii=False)
-        if task.get("response_error"):
-            target.write_text(payload, encoding="utf-8")
-        else:
+        with _locked_task(run_id, filename):
+            if task.get("response_error"):
+                # A response the workflow already rejected may be corrected in
+                # place — deliberate publish-over, still serialized under the
+                # task lock.
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    json.dumps(values, ensure_ascii=False), encoding="utf-8"
+                )
+            else:
+                _refuse_duplicate_response(target)
+                _write_response_atomic(target, values)
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    def _harness_task_for(run, filename: str) -> tuple[Path, dict]:
+        # Same write-back safety rules as run_human_submit, plus the task
+        # on disk must actually be a browser-harness one.
+        if "/" in filename or "\\" in filename or not filename.endswith(".response.json"):
+            abort(400, description="invalid response filename")
+        inbox = (run.path / "human_inbox").resolve()
+        target = (inbox / filename).resolve()
+        if target.parent != inbox:
+            abort(400, description="response path escapes inbox")
+        stem = filename[: -len(".response.json")]
+        try:
+            task = json.loads((inbox / f"{stem}.task.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            abort(400, description="no harness task for this response filename")
+        if not isinstance(task, dict) or task.get("type") != "browser_call":
+            abort(400, description="not a browser-harness task")
+        # A task file on disk is not enough: it must be pending in the CURRENT
+        # process attempt. Task files from earlier attempts (orphaned by
+        # re-keyed inputs) linger in the inbox, and publishing into one would
+        # plant a dormant answer no live waiter asked for.
+        pending = {
+            item.get("response_filename")
+            for item in load_pending_human_tasks(run.path)
+        }
+        if filename not in pending:
+            abort(
+                409,
+                description=(
+                    "this task is not pending in the current run attempt "
+                    "(already answered, or orphaned by a restart)"
+                ),
+            )
+        return target, task
+
+    def _ensure_task_still_pending(run, filename: str) -> None:
+        # Re-checked INSIDE the locked commit section: a slow share fetch (or
+        # a form left open) can span a run restart, after which the task may
+        # have been orphaned by the new attempt. Publishing then would plant
+        # an answer no live waiter asked for.
+        pending = {
+            item.get("response_filename")
+            for item in load_pending_human_tasks(run.path)
+        }
+        if filename not in pending:
+            abort(
+                409,
+                description=(
+                    "the run was restarted while this submission was in "
+                    "flight and the task is no longer pending — reload the "
+                    "run page and use the current card"
+                ),
+            )
+
+    # Serializes the mutating tail (verify -> stage -> publish) of every
+    # submission endpoint per task, so concurrent requests cannot interleave
+    # hash checks, upload writes, and publication. Process-local: the
+    # dashboard is a single-process localhost dev server. Running two
+    # dashboard instances against the same run directory keeps the
+    # absent-target publication safe (hard-link no-clobber) but not the
+    # broken/aged-file repair branches.
+    _task_locks: dict[str, threading.Lock] = {}
+    _task_locks_guard = threading.Lock()
+
+    @contextmanager
+    def _locked_task(run_id: str, filename: str):
+        key = f"{run_id}:{filename}"
+        with _task_locks_guard:
+            lock = _task_locks.setdefault(key, threading.Lock())
+        if not lock.acquire(timeout=30):
+            abort(409, description="another submission for this task is in progress")
+        try:
+            yield
+        finally:
+            lock.release()
+
+    def _refuse_duplicate_response(target: Path) -> None:
+        # Fast-path courtesy check; `_write_response_atomic` holds the
+        # authoritative reservation. A *valid* response on disk means another
+        # tab already submitted; an empty file is a reservation in progress;
+        # only a broken/partial file may be replaced.
+        if not target.exists():
+            return
+        try:
+            text = target.read_text(encoding="utf-8")
+            json.loads(text)
+        except json.JSONDecodeError:
+            if text.strip():
+                return  # broken response: replaceable via the repair path
             try:
-                with target.open("x", encoding="utf-8") as f:
-                    f.write(payload)
+                if time.time() - target.stat().st_mtime > 60:
+                    return  # aged-out crashed reservation: replaceable
+            except OSError:
+                pass
+        except OSError:
+            pass
+        abort(
+            409,
+            description=(
+                "a response for this task was already submitted (another tab "
+                "or a stale page?) — go back to the run page for the current state"
+            ),
+        )
+
+    def _write_response_atomic(target: Path, payload: dict[str, Any]) -> None:
+        """Publish a response as a complete-file atomic no-clobber operation.
+
+        The complete payload is written to a request-unique temp file and
+        published via ``os.link`` (atomic: succeeds only if ``target`` is
+        absent, and the target is never observable in a partial state).
+        Filesystems without hard links fall back to exclusive-create +
+        write; a crash there can leave an empty/partial target, which is
+        recoverable — empty files older than a minute and non-empty
+        invalid-JSON files may be replaced. A valid response always 409s."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(payload_text, encoding="utf-8")
+            try:
+                os.link(tmp, target)
+                return
             except FileExistsError:
-                abort(409, description="human task was already answered")
+                pass
+            except OSError:
+                try:
+                    with target.open("x", encoding="utf-8") as fh:
+                        fh.write(payload_text)
+                    return
+                except FileExistsError:
+                    pass
+                except OSError:
+                    # A write/close fault can be reported AFTER the bytes
+                    # landed. If the target now holds exactly the intended
+                    # payload, publication SUCCEEDED — propagating failure
+                    # here would make the caller delete upload directories
+                    # a valid published response still references.
+                    try:
+                        if target.read_text(encoding="utf-8") == payload_text:
+                            return
+                    except OSError:
+                        pass
+                    raise
+            # Target exists: only broken leftovers may be replaced.
+            try:
+                text = target.read_text(encoding="utf-8")
+            except OSError:
+                abort(409, description="could not inspect the existing response")
+            if not text.strip():
+                try:
+                    age = time.time() - target.stat().st_mtime
+                except OSError:
+                    age = 0.0
+                if age <= 60:
+                    abort(
+                        409,
+                        description="another submission for this task is in progress",
+                    )
+                os.replace(tmp, target)  # crashed fallback write, aged out
+                tmp = None
+                return
+            try:
+                json.loads(text)
+            except json.JSONDecodeError:
+                os.replace(tmp, target)  # documented broken-file repair
+                tmp = None
+                return
+            abort(
+                409,
+                description=(
+                    "a response for this task was already submitted (another "
+                    "tab or a stale page?) — go back to the run page"
+                ),
+            )
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    _UPLOAD_MAX_FILES = 20
+    _UPLOAD_MAX_FILE_BYTES = 8 * 1024 * 1024
+    _UPLOAD_MAX_TOTAL_BYTES = 40 * 1024 * 1024
+
+    def _save_harness_uploads(run, stem: str, uploads: list) -> dict[str, str]:
+        """Validate + persist manual uploads; abort(400) with a specific
+        message on anything the fenced-file consumer cannot represent."""
+        from proofstack.harness.chatgpt_share import (
+            canonical_workspace_name,
+            workspace_name_token,
+        )
+
+        if len(uploads) > _UPLOAD_MAX_FILES:
+            abort(400, description=f"too many files (max {_UPLOAD_MAX_FILES})")
+        staged: dict[str, bytes] = {}
+        total = 0
+        for f in uploads:
+            # Canonicalize before validating: browser downloads arrive as
+            # ``answer___<token>.tex`` or ``answer.tex (1)`` and must land
+            # under their workspace name. A tag naming a DIFFERENT task is a
+            # hard error: the file was generated for another card.
+            tag = workspace_name_token(Path(f.filename).name)
+            if tag is not None and tag != stem:
+                abort(
+                    400,
+                    description=(
+                        f"upload {f.filename!r} is tagged for task {tag!r}, but "
+                        f"this card's task is {stem!r} — wrong file?"
+                    ),
+                )
+            name = canonical_workspace_name(Path(f.filename).name)
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+                abort(400, description=f"invalid upload filename: {f.filename!r}")
+            if name in staged:
+                abort(400, description=f"duplicate upload filename: {name!r}")
+            data = f.read()
+            total += len(data)
+            if len(data) > _UPLOAD_MAX_FILE_BYTES or total > _UPLOAD_MAX_TOTAL_BYTES:
+                abort(400, description=f"upload too large: {name!r}")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                abort(
+                    400,
+                    description=(
+                        f"upload {name!r} is binary or not UTF-8 — the harness can "
+                        "only pass text files back to the workflow; ask the model "
+                        "to print the content inline instead"
+                    ),
+                )
+            if "\n```" in text or text.startswith("```"):
+                abort(
+                    400,
+                    description=(
+                        f"upload {name!r} contains a ``` fence line, which would "
+                        "corrupt the fenced-file format the workflow parses — "
+                        "paste its content via the answer text instead"
+                    ),
+                )
+            staged[name] = data
+        uploaded_files: dict[str, str] = {}
+        if staged:
+            # Request-unique directory: a losing concurrent submission must
+            # never leave its bytes under paths the winner's response
+            # references.
+            updir = run.path / "human_inbox" / f"{stem}.uploads-{uuid.uuid4().hex[:12]}"
+            try:
+                updir.mkdir(parents=True, exist_ok=True)
+                for name, data in staged.items():
+                    (updir / name).write_bytes(data)
+                    uploaded_files[name] = str((updir / name).relative_to(run.path))
+            except OSError:
+                # A partial directory would never be referenced by any
+                # response; remove it instead of leaking it.
+                shutil.rmtree(updir, ignore_errors=True)
+                raise
+        return uploaded_files
+
+    _DOWNLOAD_MAX_FILES = 20
+    _DOWNLOAD_MAX_TOTAL_BYTES = 200 * 1024 * 1024
+
+    def _auto_download_generated_files(
+        run,
+        staging_dir: Path,
+        share_url: str,
+        result: dict[str, Any],
+        *,
+        task_token: str | None = None,
+    ) -> tuple[dict[str, str], list[dict[str, Any]], list[str]]:
+        """Fetch the answer's sandbox files through the stateless resolver
+        into ``staging_dir`` (a per-fetch nonce directory, so a later fetch
+        can never mutate bytes an earlier confirm page refers to).
+
+        Returns (uploads_to_merge, downloaded_info, failure_warnings).
+        Text files without fence conflicts are merged into the model text
+        like manual uploads; binaries stay on disk for the operator.
+        Undocumented endpoint — every failure degrades to a warning that
+        points at the manual-upload fallback.
+        """
+        from proofstack.harness import chatgpt_share
+
+        generated = result.get("generated_files") or []
+        if not generated:
+            return {}, [], []
+        sid = chatgpt_share.share_id(share_url)
+        uploads: dict[str, str] = {}
+        downloaded: list[dict[str, Any]] = []
+        failures: list[str] = []
+        total = 0
+        if len(generated) > _DOWNLOAD_MAX_FILES:
+            failures.append(
+                f"the answer references {len(generated)} generated files; only "
+                f"the first {_DOWNLOAD_MAX_FILES} were auto-downloaded — fetch "
+                "the rest from the chat by hand if you need them"
+            )
+        for gf in generated[:_DOWNLOAD_MAX_FILES]:
+            name = str(gf.get("name") or "file")
+            if total >= _DOWNLOAD_MAX_TOTAL_BYTES:
+                failures.append(
+                    "aggregate auto-download limit reached — remaining generated "
+                    "files must be downloaded from the chat by hand"
+                )
+                break
+            try:
+                info = chatgpt_share.resolve_shared_file(
+                    sid, str(gf.get("message_id")), str(gf.get("sandbox_path"))
+                )
+                path = chatgpt_share.download_shared_file(
+                    info,
+                    staging_dir,
+                    fallback_name=name,
+                    max_bytes=min(
+                        chatgpt_share.MAX_SHARED_FILE_BYTES,
+                        _DOWNLOAD_MAX_TOTAL_BYTES - total,
+                    ),
+                )
+            except chatgpt_share.ShareFetchError as e:
+                failures.append(
+                    f"could not auto-download {name!r} ({e}) — download it from "
+                    "the chat and add it via the file upload"
+                )
+                continue
+            except Exception as e:
+                failures.append(
+                    f"could not auto-download {name!r} ({type(e).__name__}) — "
+                    "download it from the chat and add it via the file upload"
+                )
+                continue
+            data = path.read_bytes()
+            total += len(data)
+            mergeable = False
+            try:
+                text = data.decode("utf-8")
+                mergeable = not (text.startswith("```") or "\n```" in text)
+            except UnicodeDecodeError:
+                pass
+            rel = str(path.relative_to(run.path))
+            if mergeable:
+                # Key by workspace name: token-tagged downloads
+                # (``answer___<token>.tex``) must satisfy required-file
+                # checks and merge back as their canonical file. A tag naming
+                # a DIFFERENT task keeps its tagged name, so it can never
+                # shadow this task's canonical outputs (validate_result warns).
+                uploads[
+                    chatgpt_share.canonical_workspace_name(
+                        path.name, task_token=task_token
+                    )
+                ] = rel
+            downloaded.append(
+                {
+                    "name": path.name,
+                    "source_name": name,
+                    "bytes": len(data),
+                    "merged": mergeable,
+                    "path": rel,
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+        if downloaded:
+            got = {d["name"] for d in downloaded} | {d["source_name"] for d in downloaded}
+            result["sandbox_artifacts"] = [
+                a
+                for a in result.get("sandbox_artifacts") or []
+                if str(a).removeprefix("sandbox:").rsplit("/", 1)[-1] not in got
+            ]
+        return uploads, downloaded, failures
+
+    def _transfer_candidate(run, current_filename: str, tokens: set[str]):
+        """Find the pending browser task the share's newest task marker
+        actually names — the card the operator probably meant."""
+        inbox = run.path / "human_inbox"
+        if not tokens or not inbox.exists():
+            return None
+        for task_path in sorted(inbox.glob("*.task.json")):
+            stem2 = task_path.name[: -len(".task.json")]
+            fname2 = f"{stem2}.response.json"
+            if fname2 == current_filename or (inbox / fname2).exists():
+                continue
+            try:
+                t2 = json.loads(task_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(t2, dict) or t2.get("type") != "browser_call":
+                continue
+            token2 = str(t2.get("task_token") or "")
+            if token2 and token2 in tokens:
+                return {
+                    "response_filename": fname2,
+                    "agent": t2.get("agent") or stem2,
+                    "task_token": token2,
+                    "display_model": (t2.get("browser") or {}).get("display_model") or "",
+                }
+        return None
+
+    def _share_reuse_warning(run, filename: str, share_url: str) -> str | None:
+        from proofstack.harness.chatgpt_share import share_id as _canonical_share_id
+
+        inbox = run.path / "human_inbox"
+        sid = _canonical_share_id(share_url) if share_url else None
+        if not sid or not inbox.exists():
+            return None
+        # Only live responses count: a rejected submission's share may be
+        # legitimately resubmitted (typically for the same task).
+        for f in inbox.glob("*.response.json"):
+            if f.name == filename:
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if _canonical_share_id(str(data.get("share_url") or "")) == sid:
+                return (
+                    f"this share link was already submitted for another task "
+                    f"({f.name}) — double-check it belongs to this card"
+                )
+        return None
+
+    _STAGING_MAX_AGE_S = 24 * 3600
+
+    def _remove_upload_dirs(run, uploaded_files: dict[str, str]) -> None:
+        inbox = run.path / "human_inbox"
+        for rel in uploaded_files.values():
+            parts = Path(str(rel)).parts
+            if len(parts) > 1 and parts[0] == "human_inbox":
+                shutil.rmtree(inbox / parts[1], ignore_errors=True)
+
+    def _manifest_dirs(meta: Any) -> set[str]:
+        """Staging/upload directory names a manifest or response references
+        (via ``uploaded_files`` rels, ``stored_files`` paths, and staged
+        ``file_hashes`` keys)."""
+        if not isinstance(meta, dict):
+            return set()
+        rels = list((meta.get("uploaded_files") or {}).values())
+        rels += [
+            d.get("path")
+            for d in meta.get("stored_files") or []
+            if isinstance(d, dict)
+        ]
+        rels += list((meta.get("file_hashes") or {}).keys())
+        out: set[str] = set()
+        for rel in rels:
+            parts = Path(str(rel or "")).parts
+            if len(parts) > 1 and parts[0] == "human_inbox":
+                out.add(parts[1])
+        return out
+
+    def _remove_staging_dirs(run, names: set[str]) -> None:
+        inbox = run.path / "human_inbox"
+        for name in names:
+            # Only ever touch per-request staging/upload directories.
+            if ".staged-" in name or ".uploads-" in name:
+                shutil.rmtree(inbox / name, ignore_errors=True)
+
+    def _cleanup_published_staging(
+        run, stem: str, response_payload: dict[str, Any]
+    ) -> None:
+        """Terminal cleanup once a response is published for ``stem``.
+
+        Duplicate responses are refused before any later request reaches the
+        pruning code, so this is the LAST cleanup opportunity: the staged
+        manifest and every staging/upload directory the final response does
+        not reference are dead. Runs under the task lock; an in-flight fetch
+        for the same stem will 409 afterwards and removes its own directory
+        in its ``finally``."""
+        inbox = run.path / "human_inbox"
+        keep = _manifest_dirs(response_payload)
+        (inbox / f"{stem}.staged.json").unlink(missing_ok=True)
+        _remove_staging_dirs(
+            run,
+            {
+                d.name
+                for d in list(inbox.glob(f"{stem}.staged-*"))
+                + list(inbox.glob(f"{stem}.uploads-*"))
+                if d.name not in keep
+            },
+        )
+
+    def _prune_stale_staging(run, stem: str) -> None:
+        # Conservative age-based sweep for crash leftovers: never delete
+        # young directories (a concurrent fetch/confirm may be filling one
+        # ahead of taking the lock) nor any directory the published response
+        # or current staged manifest still references (binary stored_files
+        # live only there).
+        inbox = run.path / "human_inbox"
+        keep: set[str] = set()
+        for meta_name in (f"{stem}.response.json", f"{stem}.staged.json"):
+            try:
+                meta = json.loads((inbox / meta_name).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            keep |= _manifest_dirs(meta)
+        now = time.time()
+        for d in list(inbox.glob(f"{stem}.staged-*")) + list(
+            inbox.glob(f"{stem}.uploads-*")
+        ):
+            if d.name in keep:
+                continue
+            try:
+                if now - d.stat().st_mtime > _STAGING_MAX_AGE_S:
+                    shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                continue
+
+    @app.route("/run/<run_id>/harness/fetch-share", methods=["POST"])
+    def run_harness_fetch_share(run_id: str):
+        from proofstack.harness.chatgpt_share import (
+            ShareFetchError,
+            extract_result,
+            fetch_share,
+            validate_result,
+        )
+
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        target, task = _harness_task_for(run, filename)
+        _refuse_duplicate_response(target)
+        share_url = str(request.form.get("share_url") or "").strip()
+        operator_comments = str(request.form.get("operator_comments") or "")
+        from proofstack.harness.chatgpt_share import latest_task_tokens
+
+        stem = filename[: -len(".response.json")]
+        nonce = uuid.uuid4().hex[:12]
+        staging_dir = run.path / "human_inbox" / f"{stem}.staged-{nonce}"
+        # Ownership: this request's staging directory is deleted on every
+        # exit path unless the staged manifest or the published response
+        # took ownership of it inside the locked commit section.
+        claimed = False
+        try:
+            try:
+                result = extract_result(fetch_share(share_url))
+                token = str(task.get("task_token") or "")
+                tokens = latest_task_tokens(result)
+                # Binding must be an unambiguous singleton: a message naming
+                # several tasks must not satisfy any of their cards.
+                token_ok = not token or tokens == {token}
+                if token_ok or not tokens:
+                    # An *unverifiable* binding (no marker found) still
+                    # downloads: the operator can accept the answer anyway
+                    # and must not lose the generated files.
+                    auto_uploads, downloaded, download_failures = (
+                        _auto_download_generated_files(
+                            run, staging_dir, share_url, result, task_token=stem
+                        )
+                    )
+                else:
+                    # The share POSITIVELY names a different task: don't spend
+                    # downloads on it — the transfer path re-fetches for the
+                    # right card.
+                    auto_uploads, downloaded, download_failures = {}, [], []
+                warnings = (
+                    validate_result(result, task, provided_files=set(auto_uploads))
+                    + download_failures
+                )
+            except ShareFetchError as e:
+                fetch_error = str(e)
+            except Exception as e:
+                # Endpoint/schema drift must degrade to the manual fallback
+                # page, never to a bare 500.
+                fetch_error = (
+                    f"unexpected error extracting the share ({type(e).__name__}: {e}) "
+                    "— the endpoint may have changed; use the manual paste fallback"
+                )
+            else:
+                fetch_error = None
+            if fetch_error is not None:
+                return (
+                    render_template(
+                        "dev_harness_confirm.html",
+                        run=run,
+                        task=task,
+                        error=fetch_error,
+                        warnings=[],
+                        share_url=share_url,
+                        operator_comments=operator_comments,
+                        response_filename=filename,
+                        digest=None,
+                    ),
+                    422,
+                )
+            reuse = _share_reuse_warning(run, filename, share_url)
+            if reuse:
+                warnings.append(reuse)
+            transfer = (
+                None
+                if token_ok or len(tokens) != 1
+                else _transfer_candidate(run, filename, tokens)
+            )
+            # Stage the extracted answer so that confirming applies exactly
+            # this version — never a re-fetch that may silently differ. File
+            # hashes bind the digest to the staged bytes, not just metadata.
+            staged = {
+                "share_url": share_url,
+                "assistant_text": result["assistant_text"],
+                "model_slug": result.get("model_slug"),
+                "effort": result.get("effort"),
+                "sandbox_artifacts": [
+                    str(a) for a in result.get("sandbox_artifacts") or []
+                ],
+                "uploaded_files": auto_uploads,
+                "stored_files": [d for d in downloaded if not d["merged"]],
+                "file_hashes": {d["path"]: d["sha256"] for d in downloaded},
+            }
+            digest = hashlib.sha256(
+                json.dumps(staged, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
+            with _locked_task(run_id, filename):
+                # Commit section: recheck, install the manifest, clean up
+                # the superseded fetch, and (on the warning-free path)
+                # publish — all serialized so a concurrent fetch can never
+                # prune files this manifest or response references.
+                _ensure_task_still_pending(run, filename)
+                _refuse_duplicate_response(target)
+                try:
+                    superseded = json.loads(
+                        staged_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    superseded = None
+                staged_tmp = staged_path.with_name(
+                    f"{staged_path.name}.{nonce}.tmp"
+                )
+                try:
+                    staged_tmp.write_text(
+                        json.dumps(
+                            {**staged, "digest": digest}, ensure_ascii=False, indent=2
+                        ),
+                        encoding="utf-8",
+                    )
+                    os.replace(staged_tmp, staged_path)
+                finally:
+                    staged_tmp.unlink(missing_ok=True)
+                claimed = True
+                # The replaced manifest can never be confirmed again (its
+                # digest no longer matches), so directories only it
+                # references are dead now — waiting for the age-based sweep
+                # would strand them permanently once a response is
+                # published.
+                _remove_staging_dirs(
+                    run, _manifest_dirs(superseded) - _manifest_dirs(staged)
+                )
+                _prune_stale_staging(run, stem)
+                if not warnings:
+                    response_payload = {
+                        "status": "done",
+                        "transport": "share_link",
+                        "assistant_text": result["assistant_text"],
+                        "share_url": share_url,
+                        "model_slug": result.get("model_slug"),
+                        "effort": result.get("effort"),
+                        "operator_comments": operator_comments,
+                        "uploaded_files": auto_uploads or None,
+                        "stored_files": staged["stored_files"] or None,
+                    }
+                    try:
+                        _write_response_atomic(target, response_payload)
+                    except BaseException:
+                        # This fetch's manifest and staging must not outlive
+                        # its failed publication (409 = another submission
+                        # won; its state is authoritative, ours is trash).
+                        staged_path.unlink(missing_ok=True)
+                        claimed = False
+                        raise
+                    _cleanup_published_staging(run, stem, response_payload)
+            if warnings:
+                return render_template(
+                    "dev_harness_confirm.html",
+                    run=run,
+                    task=task,
+                    error=None,
+                    warnings=warnings,
+                    share_url=share_url,
+                    operator_comments=operator_comments,
+                    response_filename=filename,
+                    digest=digest,
+                    answer_preview=result["assistant_text"][:2000],
+                    downloaded=downloaded,
+                    transfer=transfer,
+                )
+            if staged["stored_files"]:
+                # Surface non-merged (binary) downloads even on the
+                # warning-free path — the operator would otherwise never
+                # learn they exist.
+                return redirect(
+                    url_for(
+                        "run_detail", run_id=run_id, stored=len(staged["stored_files"])
+                    )
+                )
+            return redirect(url_for("run_detail", run_id=run_id))
+        finally:
+            if not claimed:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+    @app.route("/run/<run_id>/harness/confirm", methods=["POST"])
+    def run_harness_confirm(run_id: str):
+        # Apply a previously staged share fetch (optionally merging manually
+        # downloaded generated files), verified by digest so a stale confirm
+        # page can never submit content the operator did not review.
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        target, task = _harness_task_for(run, filename)
+        _refuse_duplicate_response(target)
+        stem = filename[: -len(".response.json")]
+        staged_path = run.path / "human_inbox" / f"{stem}.staged.json"
+        with _locked_task(run_id, filename):
+            # The entire read-verify-publish sequence runs under the task
+            # lock: the manifest read, the digest check, the byte
+            # verification, and publication cannot interleave with a
+            # concurrent fetch's manifest replacement or pruning.
+            _ensure_task_still_pending(run, filename)
+            _refuse_duplicate_response(target)
+            try:
+                staged = json.loads(staged_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                abort(
+                    409,
+                    description="no staged fetch result for this task — fetch the share link again",
+                )
+            digest = str(request.form.get("digest") or "")
+            if not digest or staged.get("digest") != digest:
+                abort(
+                    409,
+                    description=(
+                        "the staged fetch result changed since this page was rendered "
+                        "— fetch the share link again"
+                    ),
+                )
+            for rel, expected_hash in (staged.get("file_hashes") or {}).items():
+                try:
+                    p = (run.path / rel).resolve()
+                    p.relative_to(run.path.resolve())
+                    actual = hashlib.sha256(p.read_bytes()).hexdigest()
+                except (OSError, ValueError):
+                    actual = None
+                if actual != expected_hash:
+                    abort(
+                        409,
+                        description=(
+                            "staged downloaded files changed since this page was "
+                            "rendered — fetch the share link again"
+                        ),
+                    )
+            uploads = [f for f in request.files.getlist("files") if f and f.filename]
+            # Auto-downloaded share files first; a manual upload of the same
+            # name deliberately overrides it.
+            uploaded_files = dict(staged.get("uploaded_files") or {})
+            manual_files = _save_harness_uploads(run, stem, uploads)
+            uploaded_files.update(manual_files)
+            response_payload = {
+                "status": "done",
+                "transport": "share_link",
+                "assistant_text": str(staged.get("assistant_text") or ""),
+                "share_url": staged.get("share_url"),
+                "model_slug": staged.get("model_slug"),
+                "effort": staged.get("effort"),
+                "operator_comments": str(request.form.get("operator_comments") or ""),
+                "uploaded_files": uploaded_files or None,
+                "stored_files": staged.get("stored_files") or None,
+            }
+            try:
+                _write_response_atomic(target, response_payload)
+            except BaseException:
+                _remove_upload_dirs(run, manual_files)
+                raise
+            _cleanup_published_staging(run, stem, response_payload)
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    @app.route("/run/<run_id>/harness/manual", methods=["POST"])
+    def run_harness_manual(run_id: str):
+        run = find_run(app.config["RUNS_ROOTS"], run_id)
+        if run is None:
+            abort(404)
+        filename = str(request.form.get("response_filename") or "")
+        target, task = _harness_task_for(run, filename)
+        _refuse_duplicate_response(target)
+        assistant_text = str(request.form.get("assistant_text") or "")
+        operator_comments = str(request.form.get("operator_comments") or "")
+        uploads = [f for f in request.files.getlist("files") if f and f.filename]
+        if not assistant_text.strip() and not uploads:
+            abort(400, description="provide pasted answer text and/or uploaded files")
+        stem = filename[: -len(".response.json")]
+        with _locked_task(run_id, filename):
+            # Recheck under the lock BEFORE writing any bytes, so a losing
+            # concurrent submission leaves no orphaned upload directory.
+            _ensure_task_still_pending(run, filename)
+            _refuse_duplicate_response(target)
+            uploaded_files = _save_harness_uploads(run, stem, uploads)
+            response_payload = {
+                "status": "done",
+                "transport": "manual",
+                "assistant_text": assistant_text,
+                "share_url": None,
+                "model_slug": None,
+                "effort": None,
+                "operator_comments": operator_comments,
+                "uploaded_files": uploaded_files or None,
+            }
+            try:
+                _write_response_atomic(target, response_payload)
+            except BaseException:
+                _remove_upload_dirs(run, uploaded_files)
+                raise
+            # An abandoned warning-page fetch may have left a staged
+            # manifest and its downloads; the manual publication makes them
+            # permanently unreachable — clean them now.
+            _cleanup_published_staging(run, stem, response_payload)
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/resume", methods=["POST"])
@@ -772,10 +1653,33 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             abort(400, description="invalid resume spec")
         if not argv:
             abort(400, description="empty resume spec")
+        # One live worker per run: refuse while the recorded PID is alive, and
+        # take a cross-process launch reservation so two tabs (or a double
+        # POST) cannot Popen two workers into the same run dir. A reservation
+        # older than a minute is a crashed launch and may be replaced.
+        if run_process_alive(run.path):
+            abort(409, description="this run's worker is already alive")
+        lock_path = run.path / "resume.launch.lock"
+        fd = None
+        for _attempt in (1, 2):
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:
+                    age = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    age = 0.0
+                if age < 60:
+                    abort(409, description="a resume for this run is already in progress")
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+        if fd is None:
+            abort(409, description="a resume for this run is already in progress")
+        os.close(fd)
         cmd = [sys.executable, *[str(a) for a in argv], "--resume-from", run_id]
-        # Drop any "stopped" marker so the relaunched run reads as running again,
-        # not as the stopped run it was a moment ago.
-        clear_stopped_marker(run.path)
         env = _dashboard_subprocess_env()
         spec_env = spec.get("env")
         if isinstance(spec_env, dict):
@@ -790,15 +1694,26 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
                 }
             )
         log_path = run.path / "dashboard-resume.log"
-        with log_path.open("a", encoding="utf-8") as log:
-            subprocess.Popen(
-                cmd,
-                cwd=REPO_ROOT,
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+        launched = False
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                subprocess.Popen(
+                    cmd,
+                    cwd=REPO_ROOT,
+                    env=env,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            launched = True
+        finally:
+            if not launched:
+                # A failed launch must not consume the reservation or the
+                # run's valid stopped state.
+                lock_path.unlink(missing_ok=True)
+        # Only now drop the "stopped" marker: the relaunched run reads as
+        # running again, and a launch failure above kept the stopped state.
+        clear_stopped_marker(run.path)
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.route("/run/<run_id>/stop", methods=["POST"])
@@ -908,6 +1823,8 @@ def create_app(runs_roots: tuple[Path, ...] = DEFAULT_RUNS_ROOTS) -> Flask:
             path = safe_blob_path(run.path, ref)
         except ValueError as e:
             abort(400, description=str(e))
+        if request.args.get("download"):
+            return send_file(path, as_attachment=True, download_name=path.name)
         return send_file(path, mimetype="text/plain")
 
     @app.route("/run/<run_id>/output/<field>/download")
@@ -1429,13 +2346,17 @@ def _next_preset_name(base: str) -> str:
 
 
 def _next_run_id(base: str, outputs_root: Path) -> str:
+    """Allocate AND claim a fresh run directory in one atomic mkdir, so two
+    simultaneous launch requests can never share a run dir."""
     safe = _slug(base).lower()
-    if not (outputs_root / safe).exists():
-        return safe
-    idx = 2
-    while (outputs_root / f"{safe}-{idx}").exists():
-        idx += 1
-    return f"{safe}-{idx}"
+    outputs_root.mkdir(parents=True, exist_ok=True)
+    for candidate in (safe, *(f"{safe}-{i}" for i in range(2, 10_000))):
+        try:
+            (outputs_root / candidate).mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"could not allocate a run id for {safe!r} under {outputs_root}")
 
 
 def _random_agent_label() -> str:

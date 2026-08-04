@@ -454,7 +454,6 @@ class ACWorkflow(Agent):
         self.critic = ACCritic(ctx, parent_budget_scope=self.tracker.scope)
         self.council = Council(ctx, parent_budget_scope=self.tracker.scope)
         self.compute = Compute(ctx, parent_budget_scope=self.tracker.scope)
-        self._resume_cost_offset_applied = False
         # No sub-agent for latex compile any more — ``_simple_compile_latex``
         # is a plain helper. Cost-tracked as part of the workflow's own
         # wallclock; no separate budget bucket needed.
@@ -501,7 +500,6 @@ class ACWorkflow(Agent):
         )
         if resume_state is not None:
             self._restore_workspace_from_resume(workspace, resume_state)
-            self._apply_resume_budget_offset()
             await self.events.emit(
                 "ac.resume",
                 {
@@ -721,7 +719,7 @@ class ACWorkflow(Agent):
                 await self.events.emit(
                     "ac.round_start", {"round": 0, "n_rounds": inp.n_rounds}
                 )
-                author_0 = await self.author(
+                author_0 = await self._call_author_with_operator_comments(
                     **self._author_inputs(
                         inp=inp, workspace=workspace,
                         prev_critique="", prev_council="",
@@ -807,7 +805,7 @@ class ACWorkflow(Agent):
                 )
                 pending_critique = ""
 
-                author_k = await self.author(
+                author_k = await self._call_author_with_operator_comments(
                     **self._author_inputs(
                         inp=inp, workspace=workspace,
                         prev_critique=prev_critique_for_author,
@@ -1356,6 +1354,27 @@ class ACWorkflow(Agent):
         except OSError:
             pass
 
+    async def _call_author_with_operator_comments(self, **author_inputs):
+        """Fold pending browser-harness operator comments into the Author's
+        workflow_feedback; mark them consumed only after the call succeeds
+        so a crashed round re-reads the same comments (stable cache key)."""
+        from proofstack.harness.browser_call import (
+            commit_operator_comments,
+            peek_operator_comments,
+        )
+
+        comments, mark = peek_operator_comments(self.ctx.root_workdir)
+        if comments:
+            feedback = str(author_inputs.get("workflow_feedback") or "")
+            author_inputs["workflow_feedback"] = (
+                (feedback + "\n\n" if feedback.strip() else "")
+                + "### Operator comments ###\n"
+                + comments
+            )
+        out = await self.author(**author_inputs)
+        commit_operator_comments(self.ctx.root_workdir, mark)
+        return out
+
     def _author_inputs(
         self, *, inp, workspace: Path,
         prev_critique: str, prev_council: str,
@@ -1551,11 +1570,15 @@ class ACWorkflow(Agent):
     def _problem_with_run_notes(self, inp, *, resume_stop_round: int | None) -> str:
         parts = [str(inp.problem or "").rstrip()]
         if inp.resume_run and resume_stop_round is not None:
+            # Deliberately round-agnostic: the note flows into Author/Critic
+            # inputs and thus into their cache keys — naming the terminated
+            # round would re-key (and orphan) every pending browser card on
+            # the first restart after each completed round. The current
+            # round number is visible in the per-round prompt anyway.
             parts.append(
-                "This run is resumed from an earlier workflow that terminated "
-                f"at round {resume_stop_round}. The new upper round bound is "
-                f"round {inp.n_rounds}; continue the existing draft and "
-                "round history instead of restarting the solution."
+                "This run resumes an earlier workflow session. The upper "
+                f"round bound is round {inp.n_rounds}; continue the existing "
+                "draft and round history instead of restarting the solution."
             )
         extra = str(getattr(inp, "additional_instructions", "") or "").strip()
         if extra:
@@ -1857,14 +1880,6 @@ class ACWorkflow(Agent):
             return path
         return self.ctx.root_workdir / path
 
-    def _apply_resume_budget_offset(self) -> None:
-        if self._resume_cost_offset_applied:
-            return
-        self._resume_cost_offset_applied = True
-        prior_cost = _sum_logged_model_cost(self.ctx.root_workdir / "events.jsonl")
-        if prior_cost > 0:
-            self.tracker.add_usd(prior_cost)
-
     async def _gather_critic_council(
         self,
         *,
@@ -1890,6 +1905,21 @@ class ACWorkflow(Agent):
         startup error (e.g. missing docker image, missing codex binary)
         from cancelling the Critic and aborting the whole round.
         """
+        # Everything that can await or raise happens BEFORE the first
+        # create_task: a cancellation or setup error must not orphan an
+        # already-started Critic/Council outside the cleanup scope below.
+        member_models: list[str] = []
+        if run_council:
+            member_models = await self._council_member_models(
+                round=round,
+                requested=list(author_k.council_to),
+                allowed=list(inp.council_models),
+            )
+        compute_workspace: Path | None = None
+        if run_compute:
+            compute_workspace = workspace / "compute"
+            compute_workspace.mkdir(parents=True, exist_ok=True)
+
         critic_task = asyncio.create_task(
             self.critic(
                 **self._critic_inputs(
@@ -1905,9 +1935,6 @@ class ACWorkflow(Agent):
         )
         council_task: asyncio.Task | None = None
         if run_council:
-            member_models = (
-                author_k.council_to or list(inp.council_models)
-            )
             council_task = asyncio.create_task(
                 self._safe_council(
                     round=round,
@@ -1920,9 +1947,7 @@ class ACWorkflow(Agent):
                 name=f"Council-r{round}",
             )
         compute_task: asyncio.Task | None = None
-        if run_compute:
-            compute_workspace = workspace / "compute"
-            compute_workspace.mkdir(parents=True, exist_ok=True)
+        if run_compute and compute_workspace is not None:
             compute_task = asyncio.create_task(
                 self._safe_compute(
                     inp=inp,
@@ -1944,11 +1969,20 @@ class ACWorkflow(Agent):
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         except BaseException:
-            # Defensive: asyncio.wait itself shouldn't raise here, but
-            # if it does, cancel everything.
+            # External cancellation (runner shutdown, parent cancel) lands
+            # here: cancel AND drain the children before re-raising, or
+            # browser waiters keep emitting heartbeats/pause credits and
+            # compute cleanup never runs.
             for t in tasks:
                 if not t.done():
                     t.cancel()
+            for t in tasks:
+                if t.cancelled():
+                    continue
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
             raise
 
         # Cancel anything still pending. With the safe wrappers above,
@@ -2007,6 +2041,41 @@ class ACWorkflow(Agent):
                 # without a compute reply.
                 compute_out = None
         return review_k, council_replies, compute_out
+
+    async def _council_member_models(
+        self, *, round: int, requested: list[str], allowed: list[str]
+    ) -> list[str]:
+        """Resolve the Author's ``<council to=...>`` against the configured
+        allowlist. The Author must never be able to authorize models outside
+        ``council_models`` (e.g. redirect a subscription-covered browser
+        council to paid API refs, or fan out to extra seats). Requested
+        entries match a configured ref exactly or by its short label;
+        anything else is dropped. No match at all falls back to the full
+        configured list so the question still goes out."""
+        allowed = [str(m) for m in allowed]
+        if not requested:
+            return allowed
+        by_label = {ref.rsplit("/", 1)[-1].lower(): ref for ref in reversed(allowed)}
+        used: list[str] = []
+        dropped: list[str] = []
+        for req in requested:
+            key = str(req).strip()
+            ref = key if key in allowed else by_label.get(key.rsplit("/", 1)[-1].lower())
+            if ref is None:
+                dropped.append(key)
+            elif ref not in used:
+                used.append(ref)
+        if dropped or not used:
+            await self.events.emit(
+                "ac.council_to_filtered",
+                {
+                    "round": round,
+                    "requested": [str(r) for r in requested],
+                    "used": used or allowed,
+                    "dropped": dropped,
+                },
+            )
+        return used or allowed
 
     async def _safe_council(
         self,
@@ -2498,34 +2567,6 @@ def _state_int(state: dict[str, Any] | None, key: str, default: int) -> int:
 
 def _review_resume_record(review: ACCritic.Outputs) -> dict[str, Any]:
     return review.model_dump(mode="json", exclude={"messages_after"})
-
-
-def _sum_logged_model_cost(events_path: Path) -> float:
-    total = 0.0
-    try:
-        lines = events_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return 0.0
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("kind") != "model.call":
-            continue
-        payload = event.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        try:
-            total += float(payload.get("cost_usd", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            continue
-    return total
-
-
-
 class ACDAGWorkflow(DAGWorkflow):
     description: ClassVar[str] = ACWorkflow.description
     execution_mode: ClassVar[str] = "workflow"

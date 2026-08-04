@@ -31,6 +31,7 @@ overridden per call through ``Inputs``.
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import zipfile
@@ -44,6 +45,7 @@ from proofstack.cli_usage import (
     load_cost_rates,
     parse_codex_jsonl,
 )
+from proofstack.codex_auth import classify_codex_auth
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
@@ -283,6 +285,8 @@ class Compute(CLIAgent):
     def __init__(self, ctx: Any, **kw: Any) -> None:
         super().__init__(ctx, **kw)
         self._copied_codex_auth = False
+        self._subscription_codex_auth = False
+        self._host_codex_auth_text: str | None = None
         self._last_model: str | None = None
         self._last_cost_config: str | None = None
         self._codex_home_host: Path | None = None
@@ -306,6 +310,17 @@ class Compute(CLIAgent):
         self._codex_home_env = codex_home_env
         # Build per-call SandboxSpec so callers can switch between
         # docker and subprocess without subclassing.
+        # ONE read + classification drives BOTH the sandbox env decision and
+        # the billing decision. Re-reading the file later would reopen the
+        # absent->present race in which ChatGPT auth and a paid env key
+        # reach codex simultaneously while accounting says subscription/$0.
+        try:
+            self._host_codex_auth_text = (
+                Path.home() / ".codex" / "auth.json"
+            ).read_text(encoding="utf-8")
+        except OSError:
+            self._host_codex_auth_text = None
+        auth_class = classify_codex_auth(self._host_codex_auth_text)
         self.SANDBOX = SandboxSpec(
             cpu_limit=4,
             memory_gb=8,
@@ -314,6 +329,16 @@ class Compute(CLIAgent):
             docker_image=str(inp.docker_image or DEFAULT_DOCKER_IMAGE),  # type: ignore[attr-defined]
             docker_no_new_privileges=False,
             docker_extra_args=docker_extra_args,
+            # When a codex login exists, auth travels ONLY via the copied
+            # auth.json in CODEX_HOME — passing provider keys through as
+            # well would let codex silently bill a paid key while the
+            # accounting reports the call as subscription-covered $0. With
+            # no login, the env-key fallback stays (and bills as paid).
+            provider_keys=(
+                SandboxSpec.provider_keys
+                if auth_class == "absent"
+                else ()
+            ),
         )
         self.CLI_CMD = _build_codex_cmd(
             model=inp.model,  # type: ignore[attr-defined]
@@ -359,16 +384,23 @@ class Compute(CLIAgent):
             pass
 
         # Copy codex auth — same approach as PWC worker's
-        # ``copy_codex_auth``. Scrubbed in teardown.
-        host_auth = Path.home() / ".codex" / "auth.json"
-        if host_auth.exists():
+        # ``copy_codex_auth``. Scrubbed in teardown. Uses the text captured
+        # (and classified) once in run(); never re-reads the host file.
+        auth_text = self._host_codex_auth_text
+        if auth_text is not None:
             auth_path = codex_home / "auth.json"
-            auth_path.write_text(host_auth.read_text(encoding="utf-8"), encoding="utf-8")
+            auth_path.write_text(auth_text, encoding="utf-8")
             try:
                 auth_path.chmod(0o600)
             except OSError:
                 pass
             self._copied_codex_auth = True
+            # A ChatGPT-login auth.json runs the worker on the subscription:
+            # no API spend. Anything else (embedded API key, unknown schema)
+            # is treated as paid so real spend is never hidden.
+            self._subscription_codex_auth = (
+                classify_codex_auth(auth_text) == "subscription"
+            )
 
     async def teardown(self, sandbox: Sandbox, inp: BaseModel) -> None:
         if self._codex_home_host is not None:
@@ -377,6 +409,8 @@ class Compute(CLIAgent):
         self._codex_home_host = None
         self._codex_home_env = None
         self._copied_codex_auth = False
+        self._subscription_codex_auth = False
+        self._host_codex_auth_text = None
 
     def extra_env(self, sandbox: Sandbox, inp: BaseModel) -> dict[str, str]:
         self._ensure_codex_home(inp)
@@ -464,7 +498,11 @@ class Compute(CLIAgent):
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
             return
-        cfg_ref = self._last_cost_config or DEFAULT_COST_CONFIG
+        cost = 0.0
+        nominal: float | None = None
+        billing_unknown = False
+        subscription = self._subscription_codex_auth
+        cfg_ref: str | None = self._last_cost_config or DEFAULT_COST_CONFIG
         try:
             rates = load_cost_rates(cfg_ref)
         except (KeyError, FileNotFoundError, ValueError) as e:
@@ -472,9 +510,19 @@ class Compute(CLIAgent):
                 "cli.cost_lookup_failed",
                 {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
             )
-            return
-        cost = cost_for_codex_usage(usage, **rates)
-        self.tracker.add_usd(cost)
+            # A paid call whose price cannot be determined must not vanish
+            # from accounting: tokens and the call are still recorded, with
+            # billing_unknown marking the unpriced spend.
+            billing_unknown = not subscription
+            cfg_ref = None
+        else:
+            nominal = cost_for_codex_usage(usage, **rates)
+            if not subscription:
+                # Subscription-auth runs have no API spend: the price book
+                # yields an API-equivalent estimate for display, never a
+                # budget charge.
+                cost = nominal
+                self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
         await self.events.emit(
             "model.call",
@@ -486,6 +534,9 @@ class Compute(CLIAgent):
                 "out_tokens": usage.output_tokens,
                 "reasoning_out_tokens": usage.reasoning_output_tokens,
                 "cost_usd": cost,
+                "api_equivalent_usd": nominal,
+                "subscription": subscription,
+                "billing_unknown": billing_unknown,
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,

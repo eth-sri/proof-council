@@ -239,6 +239,14 @@
         };
 
         function inputFieldControl(key, value) {
+            // Lists/mappings must survive the round-trip to the CLI intact:
+            // serialize them with the runner's `@<json>` convention instead of
+            // letting Array#toString flatten them to a comma-joined scalar.
+            const isScalar = value === null || ['string', 'number', 'boolean'].includes(typeof value);
+            if (!isScalar) {
+                const json = '@' + JSON.stringify(value);
+                return `<input type="text" data-input-key="${escapeAttr(key)}" value="${escapeAttr(json)}" title="JSON value — keep the leading @">`;
+            }
             const current = String(value ?? '');
             const choices = workflowInputChoices[key];
             if (!choices) {

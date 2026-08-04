@@ -219,5 +219,62 @@ class DashboardResumeEnvAllowlistTests(unittest.TestCase):
         self.assertIsNone(captured["env"].get("LD_PRELOAD"))
 
 
+class DashboardResumeLaunchLockTests(unittest.TestCase):
+    def _make_run(self, root: Path) -> Path:
+        run_dir = root / "myrun"
+        run_dir.mkdir()
+        (run_dir / "run-metadata.json").write_text(
+            json.dumps({"status": "stopped", "preset": "author_critic"}),
+            encoding="utf-8",
+        )
+        (run_dir / "resume.json").write_text(
+            json.dumps({"run_id": "myrun", "argv": ["scripts/run_workflow.py"]}),
+            encoding="utf-8",
+        )
+        return run_dir
+
+    def test_second_resume_post_is_409_and_launches_once(self) -> None:
+        dev = _load_module("app_dev_resume_lock", "app/dev.py")
+        launches: list[list] = []
+
+        class FakePopen:
+            def __init__(self, cmd, **kw):
+                launches.append(cmd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_run(root)
+            with mock.patch.object(dev.subprocess, "Popen", FakePopen):
+                app = dev.create_app(runs_roots=(root,))
+                client = app.test_client()
+                first = client.post("/run/myrun/resume")
+                second = client.post("/run/myrun/resume")
+
+        self.assertEqual(first.status_code, 302)
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(len(launches), 1)
+
+    def test_failed_launch_releases_lock_and_keeps_stopped_marker(self) -> None:
+        dev = _load_module("app_dev_resume_lock2", "app/dev.py")
+
+        class ExplodingPopen:
+            def __init__(self, cmd, **kw):
+                raise OSError("no such executable")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = self._make_run(root)
+            (run_dir / "run-control.json").write_text(
+                json.dumps({"status": "stopped"}), encoding="utf-8"
+            )
+            with mock.patch.object(dev.subprocess, "Popen", ExplodingPopen):
+                app = dev.create_app(runs_roots=(root,))
+                client = app.test_client()
+                resp = client.post("/run/myrun/resume")
+            self.assertEqual(resp.status_code, 500)
+            self.assertFalse((run_dir / "resume.launch.lock").exists())
+            self.assertTrue((run_dir / "run-control.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

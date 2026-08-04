@@ -477,6 +477,76 @@ class RunDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(runs[0].status, "error")
 
+    def test_resumed_run_sheds_stale_terminal_metadata(self) -> None:
+        # Attempt 1 errored (metadata snapshot says error); attempt 2's
+        # run.start has no terminal run.end, so the run is live again.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "resumed-run"
+            run_dir.mkdir()
+            _write_json(run_dir / "run-metadata.json", {"status": "error"})
+            events_path = run_dir / "events.jsonl"
+            _write_event(events_path, ts="1", kind="run.start", payload={})
+            _write_event(
+                events_path,
+                ts="2",
+                kind="workflow.last_gasp",
+                payload={"type": "KeyError", "msg": "x"},
+            )
+            _write_event(events_path, ts="3", kind="run.end", payload={"status": "error"})
+            _write_event(events_path, ts="4", kind="run.start", payload={})
+
+            runs = discover_runs([root])
+
+        self.assertEqual(runs[0].status, "running")
+
+    def test_extension_resume_makes_finished_run_running_again(self) -> None:
+        # A clean finish followed by an extension relaunch (higher n_rounds):
+        # the newest run.start has no run.end, so the run is live again and
+        # its pending cards must surface.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "extended-run"
+            run_dir.mkdir()
+            _write_json(run_dir / "run-metadata.json", {"status": "ok"})
+            events_path = run_dir / "events.jsonl"
+            _write_event(events_path, ts="1", kind="run.start", payload={})
+            _write_event(events_path, ts="2", kind="run.end", payload={"status": "ok"})
+            _write_event(events_path, ts="3", kind="run.start", payload={})
+
+            runs = discover_runs([root])
+
+        self.assertEqual(runs[0].status, "running")
+
+    def test_event_tree_does_not_mark_new_attempt_calls_with_old_error(self) -> None:
+        # Attempt 1 ends in error; attempt 2 starts a fresh call that is
+        # still running. The IncompleteCall sweep must not touch it.
+        from app.dev_data import load_event_tree
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "r"
+            run_dir.mkdir()
+            events_path = run_dir / "events.jsonl"
+            _write_event(events_path, ts="1", kind="run.start", payload={})
+            _write_event(
+                events_path, ts="2", kind="agent.start", call_id="c1",
+                agent="solver", payload={"input": {}},
+            )
+            _write_event(events_path, ts="3", kind="run.end", payload={"status": "error"})
+            _write_event(events_path, ts="4", kind="run.start", payload={})
+            _write_event(
+                events_path, ts="5", kind="agent.start", call_id="c2",
+                agent="solver", payload={"input": {}},
+            )
+
+            tree = load_event_tree(run_dir)
+
+        self.assertEqual(tree.by_id["c2"].status, "running")
+        # The attempt-1 call that never completed is closed as interrupted,
+        # not left "running" forever.
+        self.assertEqual(tree.by_id["c1"].status, "error")
+        self.assertEqual((tree.by_id["c1"].error or {}).get("type"), "Interrupted")
+
     def test_discover_runs_hides_batch_children_and_sums_child_costs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

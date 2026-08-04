@@ -220,17 +220,22 @@ class Council(Agent):
             )
             for ref in inp.member_models
         ]
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        for t in tasks:
-            if t.cancelled():
-                continue
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):
-                pass
+        # try/finally so external cancellation (e.g. a failing sibling in the
+        # workflow) also cancels and drains the seats — otherwise browser
+        # waiters keep emitting heartbeats and pause credits until shutdown.
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            for t in tasks:
+                if t.cancelled():
+                    continue
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         replies: list[CouncilReply] = []
         for t in tasks:

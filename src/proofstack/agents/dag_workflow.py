@@ -236,7 +236,10 @@ class DAGWorkflow(Agent):
                             payload,
                         )
             return terminal
-        except Exception:
+        except BaseException:
+            # BaseException: an external CancelledError must also cancel and
+            # drain the sibling node tasks, or they keep running (and
+            # spending) past the workflow's death.
             await _cancel_and_drain(running)
             raise
 
@@ -366,7 +369,9 @@ class DAGWorkflow(Agent):
         except BudgetExhausted:
             await _cancel_and_drain({task: "map_item" for task in tasks})
             raise
-        except Exception:
+        except BaseException:
+            # Includes external CancelledError — map items must not outlive
+            # the cancelled map_chain.
             await _cancel_and_drain({task: "map_item" for task in tasks})
             raise
 
@@ -1302,7 +1307,17 @@ async def _cancel_and_drain(tasks: dict[asyncio.Task, str]) -> None:
     for task in tasks:
         if not task.done():
             task.cancel()
-    await asyncio.gather(*tasks.keys(), return_exceptions=True)
+    # Shield + retry: this runs from BaseException handlers, so a SECOND
+    # external cancellation may land mid-drain. Abandoning the gather would
+    # leak still-running children past the workflow's cleanup.
+    gathered = asyncio.gather(*tasks.keys(), return_exceptions=True)
+    while not gathered.done():
+        try:
+            await asyncio.shield(gathered)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
 
 
 _REF_RE = re.compile(r"\$node\.([A-Za-z_][A-Za-z0-9_-]*)")

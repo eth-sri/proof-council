@@ -30,6 +30,7 @@ from proofstack.cli_usage import (
     parse_claude_json,
     parse_codex_jsonl,
 )
+from proofstack.codex_auth import classify_codex_auth
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
@@ -84,6 +85,9 @@ class ConfigurableCLIAgent(CLIAgent):
             raise ValueError(
                 "component completion_signal must be 'finish', 'file', or 'exit'"
             )
+        # Enforced by the CLI layer: 'finish'/'file' require the completion
+        # record; 'exit' opts into exit-code-as-done.
+        self.COMPLETION_SIGNAL = completion_signal
 
         sandbox_spec = self.SANDBOX
         blocked_keys = self._subscription_api_key_envs()
@@ -221,27 +225,15 @@ class ConfigurableCLIAgent(CLIAgent):
                 )
             try:
                 auth_text = host_auth.read_text(encoding="utf-8")
-                auth_data = json.loads(auth_text)
             except OSError as e:
                 raise RuntimeError(
                     f"could not read Codex subscription authentication from {host_auth}: {e}"
                 ) from e
-            except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"Codex authentication at {host_auth} is not valid JSON. "
-                    "Run `codex login` again."
-                ) from e
-            auth_mode = (
-                str(auth_data.get("auth_mode") or "").lower()
-                if isinstance(auth_data, dict)
-                else ""
-            )
-            api_key = auth_data.get("OPENAI_API_KEY") if isinstance(auth_data, dict) else None
-            if auth_mode != "chatgpt" or (isinstance(api_key, str) and api_key.strip()):
+            if classify_codex_auth(auth_text) != "subscription":
                 raise RuntimeError(
                     "Codex subscription authentication is unavailable: "
-                    f"{host_auth} is not a ChatGPT login. Run `codex login` "
-                    "with a ChatGPT subscription."
+                    f"{host_auth} is not a ChatGPT login (or embeds an API "
+                    "key). Run `codex login` with a ChatGPT subscription."
                 )
             auth_home, auth_home_env = self._new_codex_home(sandbox)
             auth_path = auth_home / "auth.json"
@@ -388,6 +380,12 @@ class ConfigurableCLIAgent(CLIAgent):
         data.update(self._constant_outputs(inp, sandbox))
         data.update(self._done_outputs(done))
         await self._collect_file_outputs(sandbox, data)
+        # A failed completion must survive the configured projection: with a
+        # done_outputs that omits status, the error would vanish and the DAG
+        # would report the node as a success (Outputs allows extra fields).
+        if str(done.status or "").lower() in ("error", "timeout", "partial", "blocked"):
+            data["status"] = done.status
+            data.setdefault("error", done.summary or done.status)
         return self.Outputs.model_validate(data)
 
     async def record_cli_usage(
@@ -409,21 +407,31 @@ class ConfigurableCLIAgent(CLIAgent):
         if usage.n_turns == 0:
             return
         cost = 0.0
-        cfg_ref = None
+        nominal: float | None = None
+        billing_unknown = False
         # Only observed copied subscription auth suppresses USD accounting.
         # A declarative bill:false flag must never hide a paid-key fallback.
-        if not self._copied_codex_auth:
-            cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
-            try:
-                rates = load_cost_rates(cfg_ref)
-            except (KeyError, FileNotFoundError, ValueError) as e:
-                await self.events.emit(
-                    "cli.cost_lookup_failed",
-                    {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
-                )
-                return
-            cost = cost_for_codex_usage(usage, **rates)
-            self.tracker.add_usd(cost)
+        subscription = self._copied_codex_auth
+        cfg_ref: str | None = str(
+            usage_cfg.get("cost_config") or "models/openai/gpt-54-mini"
+        )
+        try:
+            rates = load_cost_rates(cfg_ref)
+        except (KeyError, FileNotFoundError, ValueError) as e:
+            await self.events.emit(
+                "cli.cost_lookup_failed",
+                {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
+            )
+            # A paid call whose price cannot be determined must not vanish
+            # from accounting: record tokens and the call, marked
+            # billing_unknown, instead of silently dropping the spend.
+            billing_unknown = not subscription
+            cfg_ref = None
+        else:
+            nominal = cost_for_codex_usage(usage, **rates)
+            if not subscription:
+                cost = nominal
+                self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
         await self.events.emit(
             "model.call",
@@ -434,6 +442,9 @@ class ConfigurableCLIAgent(CLIAgent):
                 "out_tokens": usage.output_tokens,
                 "reasoning_out_tokens": usage.reasoning_output_tokens,
                 "cost_usd": cost,
+                "api_equivalent_usd": nominal,
+                "subscription": subscription,
+                "billing_unknown": billing_unknown,
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
@@ -477,7 +488,12 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cached_in_tokens": usage.cache_read_input_tokens,
                 "out_tokens": usage.output_tokens,
                 "metered_tokens": usage.metered_tokens,
-                "cost_usd": usage.total_cost_usd,
+                # The CLI reports its nominal API-equivalent price; a
+                # subscription run's actual spend is $0 and must display as
+                # such — the estimate stays visible under its own key.
+                "cost_usd": 0.0,
+                "api_equivalent_usd": usage.total_cost_usd,
+                "subscription": True,
                 "n_turns": usage.num_turns,
                 "via": "claude_exec_json",
             },
@@ -493,14 +509,16 @@ class ConfigurableCLIAgent(CLIAgent):
             reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
             if reasoning_effort:
                 cmd = _with_codex_reasoning_effort(cmd, reasoning_effort)
-        else:
-            # Per-node model override for non-codex CLIs (e.g. claude): a node can
-            # use a stronger model than the global {claude_model} default.
+        elif _is_claude_cmd(cmd):
+            # Per-node model override for the claude CLI: a node can use a
+            # stronger model than the global {claude_model} default. Other
+            # custom commands are never mutated — --model flags mean
+            # different things (or nothing) to them.
             model = str(self.component_config.get("model") or "").strip()
             if model:
                 cmd = _with_claude_model(cmd, model)
             reasoning_effort = str(self.component_config.get("model_reasoning_effort") or "").strip()
-            if reasoning_effort and _is_claude_cmd(cmd):
+            if reasoning_effort:
                 cmd = _with_claude_effort(cmd, reasoning_effort)
         if self.component_config.get("prompt") and _is_codex_exec_cmd(cmd) and _codex_prompt_arg_index(cmd) is None:
             cmd = [*cmd, "-"]

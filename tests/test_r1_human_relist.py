@@ -100,6 +100,33 @@ class HumanRelistTests(unittest.TestCase):
             tasks = load_pending_human_tasks(Path(tmp) / "r")
         self.assertEqual(len(tasks), 1)
 
+    def test_run_start_orphans_prior_attempt_waits(self) -> None:
+        # A wait from a previous process attempt that the new attempt does not
+        # re-emit (e.g. its cache key changed) must drop off the pending list.
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_run(
+                Path(tmp),
+                [
+                    {"kind": "human.waiting"},
+                    {"kind": "run.start"},
+                ],
+            )
+            tasks = load_pending_human_tasks(Path(tmp) / "r")
+        self.assertEqual(tasks, [])
+
+    def test_wait_re_emitted_after_run_start_stays_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_run(
+                Path(tmp),
+                [
+                    {"kind": "human.waiting"},
+                    {"kind": "run.start"},
+                    {"kind": "human.waiting"},
+                ],
+            )
+            tasks = load_pending_human_tasks(Path(tmp) / "r")
+        self.assertEqual(len(tasks), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

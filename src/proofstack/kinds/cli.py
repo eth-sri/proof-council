@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from proofstack.agent import Agent
 from proofstack.budget import BudgetExhausted
+from proofstack.child_registry import pid_alive, register_child, unregister_child
 from proofstack.context import RunContext
 from proofstack.events import new_call_id
 from proofstack.sandbox import make_sandbox, resolve_backend
@@ -78,6 +79,12 @@ class CLIAgent(Agent):
     CLEANUP_GRACE_S: ClassVar[float] = 30.0
     DONE_DRAIN_GRACE_S: ClassVar[float] = 30.0
     SOFT_TIMEOUT_S: ClassVar[int] = 0
+    # 'finish'/'file': the completion record (done.json) is REQUIRED — a CLI
+    # exit without it (or with an unparseable one) is an error even on rc 0.
+    # 'exit': the exit code is the completion signal (codex-style CLIs that
+    # never call finish). Plain subclasses keep the legacy 'exit' semantics;
+    # ConfigurableCLIAgent sets this from its completion_signal config.
+    COMPLETION_SIGNAL: ClassVar[str] = "exit"
 
     def __init__(
         self,
@@ -226,6 +233,17 @@ class CLIAgent(Agent):
                 extra_path=[bin_dir],
                 timeout_s=timeout_s,
             )
+            # The child runs in its own session/process group, out of reach
+            # of a kill on the worker's group. Register it durably so the
+            # dashboard's Stop can hard-clean what a dead worker left.
+            child_pid = getattr(stream.proc, "pid", None)
+            if child_pid:
+                register_child(
+                    self.ctx.root_workdir,
+                    pid=int(child_pid),
+                    cmd0=str((self.CLI_CMD or ["?"])[0]),
+                    label=self.name,
+                )
             # Pipe the initial message to stdin if the process accepts it.
             if stream.proc.stdin is not None:
                 payload = self.cli_input(inp).encode("utf-8")
@@ -289,10 +307,25 @@ class CLIAgent(Agent):
             # us here. Done before metering so the transcript is complete
             # when we meter partial usage.
             if stream is not None:
-                try:
-                    await asyncio.shield(stream.terminate())
-                except (asyncio.CancelledError, Exception):
-                    pass
+                # Retained + re-awaited under REPEATED cancellation (same
+                # pattern as metering below): a second cancel while awaiting
+                # the shield would otherwise abandon a mid-escalation
+                # terminate (TERM -> wait -> KILL) and leave a
+                # SIGTERM-ignoring CLI child alive.
+                terminate_task = asyncio.ensure_future(stream.terminate())
+                while not terminate_task.done():
+                    try:
+                        await asyncio.shield(terminate_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                child_pid = getattr(stream.proc, "pid", None)
+                if child_pid and not pid_alive(int(child_pid)):
+                    # Only drop the registry entry once the child is actually
+                    # dead; a failed termination must stay visible so the
+                    # dashboard's hard cleanup can finish the job.
+                    unregister_child(self.ctx.root_workdir, int(child_pid))
             # Meter exactly once, even under cancellation — else the run loses
             # real token/cost accounting. If the run reached a done record,
             # metering was already dispatched as meter_task; await that same task
@@ -369,14 +402,22 @@ class CLIAgent(Agent):
                 await stream.terminate()
                 return self._read_done(done_path, fallback_status="done")
             if stream.done:
-                # CLI exited without calling finish. Use the exit
-                # code as the done signal: 0 == clean termination == done,
-                # non-zero == failure == error. This is a pragmatic
-                # default for agents that don't (yet) wire finish
-                # reliably. TODO(SPEC §13): harden the explicit
-                # finish handshake and make exit-as-done opt-in.
+                # CLI exited without calling finish. With an enforced
+                # completion signal ('finish'/'file'), a missing record is a
+                # failed handshake even on exit code 0 — treating it as done
+                # let failed calls masquerade as successes. 'exit' opts into
+                # the pragmatic exit-code-as-done behavior (codex-style CLIs
+                # that never call finish).
                 rc = stream.proc.returncode
-                fallback = "done" if rc == 0 else "error"
+                if self._strict_completion():
+                    fallback = "error"
+                    fallback_summary = (
+                        f"CLI exited (rc={rc}) without writing the required "
+                        "completion record"
+                    )
+                else:
+                    fallback = "done" if rc == 0 else "error"
+                    fallback_summary = None
                 try:
                     await stream.terminate()
                 except Exception:
@@ -395,7 +436,11 @@ class CLIAgent(Agent):
                     },
                     call_id=spawn_call_id,
                 )
-                return self._read_done(done_path, fallback_status=fallback)
+                return self._read_done(
+                    done_path,
+                    fallback_status=fallback,
+                    fallback_summary=fallback_summary,
+                )
             if (
                 not cleanup_warned
                 and self.CLEANUP_GRACE_S > 0
@@ -472,6 +517,13 @@ class CLIAgent(Agent):
                 data = json.loads(done_path.read_text(encoding="utf-8"))
                 return CLIDoneRecord.model_validate(data)
             except (json.JSONDecodeError, Exception):
+                if self._strict_completion():
+                    # An enforced completion record that does not parse is a
+                    # failed handshake, never an implicit success.
+                    return CLIDoneRecord(
+                        status="error",
+                        summary="completion record exists but is invalid JSON/schema",
+                    )
                 return CLIDoneRecord(
                     status=fallback_status,
                     summary=fallback_summary or "(invalid done.json)",
@@ -480,6 +532,9 @@ class CLIAgent(Agent):
             status=fallback_status,
             summary=fallback_summary or "(no done.json written)",
         )
+
+    def _strict_completion(self) -> bool:
+        return str(self.COMPLETION_SIGNAL).lower() in ("finish", "file")
 
     async def _emit_budget_warnings(
         self,

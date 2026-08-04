@@ -420,6 +420,41 @@ class RunExecutionGraphTests(unittest.TestCase):
             any(n.status == "running" for n in graph.by_id.values() if n.raw_id == "solver")
         )
 
+    def test_old_error_run_end_does_not_fail_new_attempt_nodes(self) -> None:
+        # Attempt 1 ends in run.end error; a resume starts attempt 2 whose
+        # solver is genuinely running. The graph's error sweep must reset on
+        # the new run.start instead of repainting the live node as failed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            preset_root = root / "presets"
+            preset_root.mkdir()
+            (preset_root / "demo.yaml").write_text(
+                textwrap.dedent(
+                    """
+                    workflow: proofstack.agents.dag_workflow.DAGWorkflow
+                    dag:
+                      nodes:
+                        - id: solver
+                          kind: agent
+                          name: cfg_solver
+                    """
+                ),
+                encoding="utf-8",
+            )
+            run_path = root / "run"
+            run_path.mkdir()
+            events_path = run_path / "events.jsonl"
+            _write_event(events_path, ts="2026-05-08T09:00:00.000Z", kind="run.start", payload={"preset": "demo"})
+            _write_event(events_path, ts="2026-05-08T09:00:01.000Z", kind="run.end", payload={"status": "error"})
+            _write_event(events_path, ts="2026-05-08T09:05:00.000Z", kind="run.start", payload={"preset": "demo"})
+            _write_event(events_path, ts="2026-05-08T09:05:01.000Z", kind="agent.start", call_id="w2", parent_call_id=None, agent="DAGWorkflow", agent_path="DAGWorkflow", execution_mode="workflow", payload={})
+            _write_event(events_path, ts="2026-05-08T09:05:02.000Z", kind="dag.node_started", parent_call_id="w2", payload={"node": "solver", "kind": "agent"})
+
+            graph = load_execution_graph(run_path, preset_root=preset_root)
+
+        running = [n for n in graph.by_id.values() if n.raw_id == "solver" and n.status == "running"]
+        self.assertEqual(len(running), 1)
+
     def test_execution_graph_uses_editor_labels_and_pending_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

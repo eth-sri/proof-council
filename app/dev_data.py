@@ -33,12 +33,26 @@ from proofstack.registry import (
     list_presets,
     load_preset,
 )
+from proofstack.child_registry import kill_registered_children
 from proofstack.transient_auth import remove_codex_auth_for_run
 
 DEFAULT_TOOL_ROOT = CONFIGS_ROOT / "tools"
 WORKFLOW_OUTPUT_NODE_ID = "__workflow_outputs"
 TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REPEAT_KINDS = {"repeat"}
+
+# DAG node ids that are mechanical plumbing rather than AI-agent work; the
+# graph view hides them (plus every if_else gate) unless "Show procedural
+# nodes" is ticked. Errors are always shown regardless.
+_PROCEDURAL_RAW_IDS = {
+    "problem",
+    "init",
+    "review_join",
+    "ready_gate",
+    "compile_gate",
+    "compile_latex",
+    "return",
+}
 REPEAT_BODY_MARKER = "::body::"
 REPEAT_INPUT_SUFFIX = "::repeat_input"
 REPEAT_OUTPUT_SUFFIX = "::repeat_output"
@@ -439,6 +453,8 @@ class RunInfo:
     preset: str | None = None
     problem_summary: str | None = None
     cost_usd: float | None = None
+    # API-equivalent price of subscription-covered CLI work (not real spend).
+    subscription_equiv_usd: float | None = None
     tokens: int | None = None    # total tokens processed (the subscription dial)
     wallclock_s: float | None = None
     n_problems: int | None = None
@@ -598,8 +614,10 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
         if not info.problems:
             continue
         total_cost = 0.0
+        total_sub_equiv = 0.0
         total_tokens = 0
         saw_cost = False
+        saw_sub_equiv = False
         saw_tokens = False
         for problem in info.problems.values():
             if not isinstance(problem, dict):
@@ -611,6 +629,9 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
             if child.cost_usd is not None:
                 total_cost += float(child.cost_usd)
                 saw_cost = True
+            if child.subscription_equiv_usd is not None:
+                total_sub_equiv += float(child.subscription_equiv_usd)
+                saw_sub_equiv = True
             if child.tokens is not None:
                 total_tokens += int(child.tokens)
                 saw_tokens = True
@@ -624,6 +645,8 @@ def _aggregate_batch_runs(seen: dict[str, RunInfo]) -> None:
                 info.process_dead = True
         if saw_cost:
             info.cost_usd = total_cost
+        if saw_sub_equiv:
+            info.subscription_equiv_usd = total_sub_equiv
         if saw_tokens:
             info.tokens = total_tokens
         # Recompute the parent status from the children's REAL statuses (just
@@ -689,11 +712,13 @@ def _dashboard_subprocess_failure_message(path: Path) -> str:
 
 def _enrich_from_events(info: RunInfo) -> None:
     cost = 0.0
+    sub_equiv = 0.0
     tokens = 0
     saw_tokens = False
     first_ts: str | None = None
     last_ts: str | None = None
     saw_workflow_failure = False
+    status_from_events: str | None = None
     try:
         with (info.path / "events.jsonl").open("r", encoding="utf-8") as f:
             for line in f:
@@ -708,6 +733,9 @@ def _enrich_from_events(info: RunInfo) -> None:
                 if e.get("kind") == "run.start":
                     if info.status is None:
                         info.status = "running"
+                    # Attempt-local state: a resumed attempt starts clean.
+                    status_from_events = "running"
+                    saw_workflow_failure = False
                     payload = e.get("payload") or {}
                     if isinstance(payload, dict):
                         info.preset = info.preset or str(payload.get("preset") or "").strip() or None
@@ -725,11 +753,17 @@ def _enrich_from_events(info: RunInfo) -> None:
                     payload = e.get("payload") or {}
                     if isinstance(payload, dict):
                         info.status = _normalize_run_status(payload.get("status")) or info.status
+                        status_from_events = (
+                            _normalize_run_status(payload.get("status"))
+                            or status_from_events
+                        )
                 if e.get("kind") == "workflow.last_gasp":
                     saw_workflow_failure = True
                 if e.get("kind") == "model.call":
                     p = e.get("payload") or {}
                     cost += float(p.get("cost_usd") or 0.0)
+                    if p.get("subscription"):
+                        sub_equiv += float(p.get("api_equivalent_usd") or 0.0)
                     if "metered_tokens" in p or "in_tokens" in p or "out_tokens" in p:
                         saw_tokens = True
                         if p.get("metered_tokens") is not None:
@@ -742,12 +776,25 @@ def _enrich_from_events(info: RunInfo) -> None:
         info.started_at = first_ts
     if info.cost_usd is None and cost:
         info.cost_usd = cost
+    if info.subscription_equiv_usd is None and sub_equiv:
+        info.subscription_equiv_usd = sub_equiv
     if info.tokens is None and saw_tokens:
         info.tokens = tokens
     if info.wallclock_s is None and first_ts and last_ts:
         info.wallclock_s = _duration(first_ts, last_ts)
     if saw_workflow_failure:
         info.status = "error"
+    elif status_from_events == "running" and info.status in {
+        "error",
+        "parked",
+        "finished",
+    }:
+        # The metadata snapshot is from an EARLIER attempt: the newest
+        # run.start has no terminal run.end, so a resumed worker is live
+        # (or _apply_process_liveness will flag its PID as dead). This
+        # includes "finished" — an extension resume (higher n_rounds after
+        # a clean finish) makes a finished run genuinely running again.
+        info.status = "running"
 
 
 def _finalize_run_info(info: RunInfo) -> None:
@@ -965,13 +1012,20 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                     e = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                kind = e.get("kind")
+                if kind == "run.start":
+                    # A new process attempt. Only waits the new attempt
+                    # re-emits are live; anything else is an orphan from a
+                    # previous attempt (e.g. re-keyed by changed inputs) whose
+                    # answer no waiter would ever consume in this attempt.
+                    pending.clear()
+                    continue
                 payload = e.get("payload") or {}
                 if not isinstance(payload, dict):
                     continue
                 response_path = str(payload.get("response_path") or "")
                 if not response_path:
                     continue
-                kind = e.get("kind")
                 if kind == "human.waiting":
                     waiting[response_path] = {**payload, "agent": e.get("agent")}
                     pending[response_path] = None
@@ -1026,6 +1080,16 @@ def load_pending_human_tasks(run_path: Path) -> list[dict[str, Any]]:
                 "inputs": full.get("inputs") or {},
                 "response_filename": filename,
                 "response_error": response_error,
+                "type": full.get("type") or payload.get("type") or "human",
+                "browser": full.get("browser") or {},
+                "packet_dir": full.get("packet_dir"),
+                "packet_zip": full.get("packet_zip"),
+                "harness_copy_dir": full.get("harness_copy_dir"),
+                "files": full.get("files") or [],
+                "expected": full.get("expected") or {},
+                "instruction_file": full.get("instruction_file"),
+                "task_token": full.get("task_token"),
+                "rejected_error": payload.get("rejected_error"),
             }
         )
     return tasks
@@ -1056,6 +1120,80 @@ def find_runs_awaiting_human(roots: Iterable[Path]) -> list[dict[str, Any]]:
     return out
 
 
+# CLI worker processes are recognized by command line; attribution to a run
+# happens via /proc/<pid>/cwd containment, so the dashboard's own processes
+# (cwd = repo root) never match. Docker-backend children are not visible this
+# way — the indicator covers the subprocess sandbox backend only.
+_CLI_WORKER_CMD_MARKERS = ("codex", "claude")
+_WORKER_SCAN_TTL_S = 3.0
+_worker_scan_cache: tuple[float, list[Path]] = (0.0, [])
+
+
+def _cli_worker_cwds() -> list[Path]:
+    """Distinct cwds of live CLI worker processes (codex/claude), cached
+    briefly because the nav indicator triggers this on every page render."""
+    global _worker_scan_cache
+    now = time.monotonic()
+    cached_at, cached = _worker_scan_cache
+    if now - cached_at < _WORKER_SCAN_TTL_S:
+        return cached
+    cwds: set[Path] = set()
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cmdline = (
+                (entry / "cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")
+            )
+            head = cmdline.split(" ", 3)[:3]
+            if not any(m in part for m in _CLI_WORKER_CMD_MARKERS for part in head):
+                continue
+            cwds.add(Path(os.readlink(entry / "cwd")))
+        except OSError:
+            continue
+    result = sorted(cwds)
+    _worker_scan_cache = (now, result)
+    return result
+
+
+def find_runs_with_busy_compute(roots: Iterable[Path]) -> list[dict[str, Any]]:
+    """Every non-terminal run with a live CLI worker child (codex/claude)
+    whose cwd sits inside the run directory.
+
+    Powers the nav "waiting on compute worker" indicator. Distinct worker
+    cwds are counted so a wrapper + its child binary count once.
+    """
+    workers = _cli_worker_cwds()
+    if not workers:
+        return []
+    out: list[dict[str, Any]] = []
+    for run in discover_runs(roots, include_batch_children=True):
+        if (run.status or "running") in {"finished", "error", "stopped"}:
+            continue
+        try:
+            run_path = run.path.resolve()
+        except OSError:
+            continue
+        count = sum(1 for cwd in workers if cwd == run_path or run_path in cwd.parents)
+        if count:
+            out.append(
+                {
+                    "run_id": run.run_id,
+                    "display_name": run.display_name or run.run_id,
+                    "count": count,
+                }
+            )
+    return out
+
+
 def _path_size(path: Path) -> int:
     """Total bytes under ``path`` (a file or a directory tree)."""
     try:
@@ -1080,18 +1218,40 @@ def _path_size(path: Path) -> int:
 _PRUNABLE_NODE_ARTIFACTS = ("sandbox", "cli_stdout.log", "cli_stderr.log")
 
 
+def _sandbox_exposed(node_dir: Path) -> bool:
+    """True when the node's output references its own sandbox path.
+
+    A CLI node that exposes ``workspace`` hands that path to downstream
+    consumers, and the resume cache stores the path rather than the files —
+    pruning such a sandbox would break a later resume. When in doubt
+    (unreadable output), keep the sandbox.
+    """
+    try:
+        text = (node_dir / "output.json").read_text(encoding="utf-8")
+    except OSError:
+        return True
+    sandbox_str = str(node_dir / "sandbox")
+    # json.dumps escapes backslashes (Windows paths), so check the
+    # JSON-encoded form too; [1:-1] strips the surrounding quotes.
+    return sandbox_str in text or json.dumps(sandbox_str)[1:-1] in text
+
+
 def estimate_prunable_bytes(run_path: Path) -> int:
     """Bytes reclaimable by prune_run_artifacts without actually deleting."""
     agents_dir = run_path / "agents"
-    if not agents_dir.exists():
+    if agents_dir.is_symlink() or not agents_dir.is_dir():
         return 0
     total = 0
     for node_dir in agents_dir.iterdir():
-        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+        if node_dir.is_symlink() or not node_dir.is_dir():
+            continue
+        if not (node_dir / "output.json").exists():
             continue
         for name in _PRUNABLE_NODE_ARTIFACTS:
+            if name == "sandbox" and _sandbox_exposed(node_dir):
+                continue
             target = node_dir / name
-            if target.exists():
+            if not target.is_symlink() and target.exists():
                 total += _path_size(target)
     return total
 
@@ -1110,15 +1270,31 @@ def prune_run_artifacts(run_path: Path) -> dict[str, int]:
     agents_dir = run_path / "agents"
     pruned_nodes = 0
     bytes_freed = 0
-    if not agents_dir.exists():
+    # agents/ itself must be a real directory: a symlinked agents/ would
+    # bless its external target as the containment root below.
+    if agents_dir.is_symlink() or not agents_dir.is_dir():
         return {"pruned_nodes": 0, "bytes_freed": 0}
+    agents_root = agents_dir.resolve()
     for node_dir in agents_dir.iterdir():
-        if not node_dir.is_dir() or not (node_dir / "output.json").exists():
+        # A symlinked node dir (or artifact) would make the deletions below
+        # land OUTSIDE the run; refuse anything that is not a plain
+        # directory resolving under agents/.
+        if node_dir.is_symlink() or not node_dir.is_dir():
+            continue
+        if not (node_dir / "output.json").exists():
             continue
         node_freed = 0
         for name in _PRUNABLE_NODE_ARTIFACTS:
+            if name == "sandbox" and _sandbox_exposed(node_dir):
+                continue
             target = node_dir / name
-            if not target.exists():
+            if target.is_symlink() or not target.exists():
+                continue
+            try:
+                resolved = target.resolve()
+            except OSError:
+                continue
+            if agents_root not in resolved.parents:
                 continue
             node_freed += _path_size(target)
             if target.is_dir():
@@ -1198,30 +1374,43 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
     wait briefly for a clean exit, then SIGKILL anything still alive. ``signalled``
     is False when there was no live process to stop (already crashed/finished) —
     the caller still marks the run stopped so Resume appears.
+
+    Sandbox CLI children run in their OWN sessions, out of killpg's reach;
+    ``stop_run_process`` returns via ``_stop_result`` so every exit path also
+    hard-kills the groups registered in ``run-children.json``.
     """
     pid = read_run_pid(run_path)
     if pid is None:
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
     if not _pid_alive(pid):
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
     # Only signal the GROUP if this PID is genuinely its own group leader, else
     # killpg would hit an unrelated group; otherwise signal just the process.
     try:
         use_group = os.getpgid(pid) == pid
     except ProcessLookupError:
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
 
     def send(sig: int) -> None:
         if use_group:
@@ -1232,13 +1421,18 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
     try:
         send(signal.SIGTERM)
     except ProcessLookupError:
-        return {
-            "signalled": False,
-            "pid": pid,
-            "credentials_scrubbed": _scrub_transient_credentials(run_path),
-        }
+        return _stop_result(
+            run_path,
+            {
+                "signalled": False,
+                "pid": pid,
+                "credentials_scrubbed": _scrub_transient_credentials(run_path),
+            },
+        )
     except PermissionError:
-        return {"signalled": False, "pid": pid, "credentials_scrubbed": 0}
+        return _stop_result(
+            run_path, {"signalled": False, "pid": pid, "credentials_scrubbed": 0}
+        )
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline and _pid_alive(pid):
         time.sleep(0.1)
@@ -1251,11 +1445,25 @@ def stop_run_process(run_path: Path, *, grace_s: float = 3.0) -> dict[str, Any]:
         (run_path / "run.pid").unlink()
     except OSError:
         pass
-    return {
-        "signalled": True,
-        "pid": pid,
-        "credentials_scrubbed": _scrub_transient_credentials(run_path),
-    }
+    return _stop_result(
+        run_path,
+        {
+            "signalled": True,
+            "pid": pid,
+            "credentials_scrubbed": _scrub_transient_credentials(run_path),
+        },
+    )
+
+
+def _stop_result(run_path: Path, base: dict[str, Any]) -> dict[str, Any]:
+    # Hard cleanup of session-detached CLI children happens on EVERY stop
+    # path — including "worker already dead", which is exactly the case
+    # where orphans exist.
+    try:
+        base.update(kill_registered_children(run_path))
+    except Exception:
+        base.setdefault("children_signalled", [])
+    return base
 
 
 def run_process_alive(run_path: Path) -> bool:
@@ -1357,6 +1565,9 @@ class ExecutionGraphNode:
     cache_hit: bool = False
     execution_index: int = 1
     parent_node_id: str = ""
+    # Mechanical plumbing (init/join/gate/compile/return nodes) rather than
+    # an AI agent doing work — the graph view hides these by default.
+    procedural: bool = False
     children: list["ExecutionGraphNode"] = field(default_factory=list)
 
 
@@ -1382,6 +1593,7 @@ def load_event_tree(run_path: Path) -> RunEventTree:
     by_id: dict[str, CallNode] = {}
     run_status = ""
     run_end_ts: str | None = None
+    latest_run_start_ts: str | None = None
     if not events_path.exists():
         return RunEventTree(
             run_id=run_path.name,
@@ -1402,6 +1614,14 @@ def load_event_tree(run_path: Path) -> RunEventTree:
             kind = evt.get("kind")
             call_id = evt.get("call_id")
             parent_id = evt.get("parent_call_id")
+
+            if kind == "run.start":
+                # A new process attempt: the previous attempt's terminal
+                # state must not bleed onto calls the resumed worker runs.
+                run_status = ""
+                run_end_ts = None
+                if evt.get("ts"):
+                    latest_run_start_ts = str(evt.get("ts"))
 
             if kind == "run.end":
                 payload = evt.get("payload") or {}
@@ -1499,6 +1719,24 @@ def load_event_tree(run_path: Path) -> RunEventTree:
                 "type": "IncompleteCall",
                 "msg": "Run ended with an error before this call emitted a completion event.",
             }
+
+    # A call started before the newest attempt that never completed was
+    # killed with its attempt — a later attempt re-ran or replayed it under
+    # a new call id. Without this it renders as "running" forever.
+    if latest_run_start_ts:
+        for node in by_id.values():
+            if (
+                node.status == "running"
+                and node.start_ts
+                and node.start_ts < latest_run_start_ts
+            ):
+                node.status = "error"
+                node.end_ts = node.end_ts or latest_run_start_ts
+                node.duration_s = _duration(node.start_ts, node.end_ts)
+                node.error = node.error or {
+                    "type": "Interrupted",
+                    "msg": "Call was in flight when the run was restarted; a later attempt re-ran or replayed it.",
+                }
 
     # Build parent->children links (sorted by start_ts so the tree is stable)
     roots: list[CallNode] = []
@@ -1721,8 +1959,12 @@ def load_execution_graph(
         payload = evt.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
-        if kind == "run.start" and evt.get("ts"):
-            run_start_ts.append(str(evt.get("ts")))
+        if kind == "run.start":
+            if evt.get("ts"):
+                run_start_ts.append(str(evt.get("ts")))
+            # New attempt: an old run.end error must not repaint this
+            # attempt's running nodes as failures.
+            run_status = None
         if kind == "run.end":
             run_status = str(payload.get("status") or "")
         if not str(kind or "").startswith("dag.node_"):
@@ -1832,14 +2074,17 @@ def load_execution_graph(
                 node.reason = node.reason or "Run ended before this node finished."
 
     # A resume appends a fresh run.start; a stop leaves no clean terminal
-    # event, so nodes interrupted by the stop stay "running" forever. Any agent
-    # node still "running" that started before the latest run.start belongs to
-    # the superseded attempt (it was re-run on resume), so mark it interrupted.
+    # event, so nodes interrupted by the stop stay "running" forever. Any
+    # non-repeat node still "running" that started before the latest
+    # run.start belongs to the superseded attempt (it was re-run on resume),
+    # so mark it interrupted. Repeat loops are excluded: the resumed
+    # iterations keep attaching to the original loop node, which therefore
+    # genuinely continues.
     if len(run_start_ts) >= 2:
         latest_start = max(run_start_ts)
         for node in by_id.values():
             if (
-                node.kind == "agent"
+                node.kind not in REPEAT_KINDS
                 and node.status == "running"
                 and node.start_ts
                 and node.start_ts < latest_start
@@ -1860,10 +2105,18 @@ def load_execution_graph(
             node.cost_usd = float(getattr(call, "cost_usd_subtree", call.cost_usd) or 0.0)
             if node.duration_s is None:
                 node.duration_s = call.duration_s
-            if call.status == "error":
+            if call.status == "error" and node.status != "skipped":
+                # A "skipped" graph node was interrupted and superseded by a
+                # resume; the tree closes its call as Interrupted, which must
+                # not repaint the graph node as a failure.
                 node.status = "error"
                 node.end_ts = node.end_ts or call.end_ts
                 node.reason = node.reason or _call_error_message(call)
+
+    for node in by_id.values():
+        node.procedural = (
+            node.kind == "if_else" or node.raw_id in _PROCEDURAL_RAW_IDS
+        )
 
     return ExecutionGraph(
         run_id=run_path.name,
@@ -2297,6 +2550,11 @@ def _runtime_execution_node(
     execution_counts: dict[tuple[str, str], int] | None,
 ) -> ExecutionGraphNode:
     if not for_start:
+        return node
+    if node.kind in REPEAT_KINDS:
+        # A resumed run re-emits node.started for its repeat loop, but the
+        # loop's iterations keep attaching to the ORIGINAL node — a fresh
+        # "#2" instance would sit empty and "running" forever.
         return node
     key = ((parent_node.node_id if parent_node else node.parent_node_id), node.node_id)
     if execution_counts is None:

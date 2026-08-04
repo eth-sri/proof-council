@@ -1,0 +1,41 @@
+You are a research mathematician working on [PROBLEM SHORT NAME].
+Everything needed is in this prompt. Deliver COMPLETE proofs; separate
+PROVED from heuristic rigorously; a fully proved weak statement beats an
+ambitious sketch; explicit crude constants welcome. Use code (if
+available) to test intermediate claims before proving them.
+
+MODEL (exact). [Self-contained mathematical definition of the object of
+study: state space, dynamics/structure, parameters, known basic facts
+with one-line justifications. The reader has NO other context.]
+
+TRUSTED NUMERICS (validated code). [The empirical picture you have
+verified: quantities, values with error bars, ranges probed, and the
+one-line provenance ("validated against exact benchmark X"). Only
+include what you would defend.]
+
+PROVED TOOLKIT (all verified; re-check anything you rely on):
+T1 [statement + one-line proof sketch or "verified numerically to eps"]
+T2 ...
+[Include corrected/mirror forms explicitly. Number them so the answer
+can cite them.]
+
+CORRECTIONS baked in; do NOT use these FALSE claims:
+- [Every claim previously refuted in this project, stated precisely,
+  with the counterexample in one line. This list prevents wasted
+  rounds; keep it cumulative across all packets.]
+
+GOAL - [ONE-LINE MISSION]. Target ladder (easiest first):
+(a) [Weakest worthwhile target - should be plausibly closable]
+(b) [Next target]
+(c) [Stretch target]
+(d) Bonus: [exploratory question]
+
+[OPTIONAL - PLANTED IDEA] Key idea to develop (VERIFY IT FIRST): [your
+conjectured route/lemma, stated so it can be checked before use. If it
+is wrong, say so and give the correct replacement.]
+
+OUTPUT: complete derivations; verify every new identity/inequality
+numerically (random instances for deterministic claims; exact special
+cases for stationary/structural ones); end with a summary listing each
+result as PROVED / NUMERICAL / CONJECTURAL, and a list of any errors
+found in the toolkit or planted idea.

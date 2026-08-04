@@ -225,6 +225,115 @@ def test_compute_always_uses_scrubbed_codex_home() -> None:
         assert not codex_home.exists()
 
 
+def test_compute_sandbox_passes_no_provider_keys_alongside_codex_login() -> None:
+    from unittest import mock
+
+    from proofstack.kinds.cli import CLIAgent
+    from proofstack.sandbox.base import SandboxSpec as Spec
+
+    async def fake_super_run(self, inp):
+        return Compute.Outputs()
+
+    def spec_for(home: Path) -> Spec:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test", root_workdir=Path(temp_dir) / "run", flat=True
+            )
+            agent = Compute(ctx)
+            inp = Compute.Inputs(
+                problem="P",
+                problem_id="p",
+                round=1,
+                instructions="compute",
+                compute_workspace=Path(temp_dir) / "ws",
+                sandbox_backend="subprocess",
+            )
+            with mock.patch.object(Path, "home", return_value=home), mock.patch.object(
+                CLIAgent, "run", fake_super_run
+            ):
+                asyncio.run(agent.run(inp))
+            return agent.SANDBOX
+
+    with tempfile.TemporaryDirectory() as home_dir:
+        home = Path(home_dir)
+        assert spec_for(home).provider_keys == Spec.provider_keys  # no login: paid fallback
+        (home / ".codex").mkdir()
+        (home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+        assert spec_for(home).provider_keys == ()  # login present: keys stripped
+
+
+def test_compute_recognizes_token_schema_auth_as_subscription() -> None:
+    import json as _json
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        root = temp / "compute"
+        root.mkdir()
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="prob-001",
+            round=1,
+            instructions="compute",
+            compute_workspace=root,
+        )
+        # What run() captures from the CURRENT codex login schema.
+        agent._host_codex_auth_text = _json.dumps(
+            {"OPENAI_API_KEY": None, "tokens": {"access_token": "t"}}
+        )
+        asyncio.run(agent.setup(FakeSandbox(root=root), inp))
+        assert agent._copied_codex_auth is True
+        assert agent._subscription_codex_auth is True
+        asyncio.run(agent.teardown(FakeSandbox(root=root), inp))
+        assert agent._subscription_codex_auth is False
+
+
+def test_compute_usage_subscription_auth_charges_no_usd() -> None:
+    import json as _json
+
+    stdout = _json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {"input_tokens": 1000, "output_tokens": 100},
+        }
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test", root_workdir=Path(temp_dir) / "run", flat=True
+        )
+        agent = Compute(ctx)
+        agent._last_cost_config = DEFAULT_COST_CONFIG
+        calls: list[dict] = []
+
+        async def emit(kind, payload):
+            calls.append({"kind": kind, **payload})
+
+        agent.events = SimpleNamespace(emit=emit)
+        agent.tracker = SimpleNamespace(
+            usd=0.0,
+            tokens=0,
+            add_usd=lambda a: setattr(agent.tracker, "usd", agent.tracker.usd + a),
+            add_tokens=lambda n: setattr(
+                agent.tracker, "tokens", agent.tracker.tokens + n
+            ),
+        )
+
+        agent._subscription_codex_auth = True
+        asyncio.run(agent.record_cli_usage(stdout, "", CLIDoneRecord(status="done")))
+        assert agent.tracker.usd == 0.0
+        assert agent.tracker.tokens == 1100
+        assert calls[-1]["cost_usd"] == 0.0
+        assert calls[-1]["subscription"] is True
+        assert calls[-1]["api_equivalent_usd"] > 0
+
+        agent._subscription_codex_auth = False
+        asyncio.run(agent.record_cli_usage(stdout, "", CLIDoneRecord(status="done")))
+        assert agent.tracker.usd > 0.0
+        assert calls[-1]["cost_usd"] == calls[-1]["api_equivalent_usd"] > 0
+        assert calls[-1]["subscription"] is False
+
+
 def test_compute_utils_serializes_numpy_and_complex_values() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)

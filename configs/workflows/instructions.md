@@ -312,6 +312,70 @@ reasoning:
 
 The `--high` suffix is parsed by `APIClient` into `reasoning_effort`.
 
+### Browser-harness models
+
+A model config with `api: browser` (see `configs/models/browser/`) turns any
+`APICallAgent`-based node into a human-executed browser call: the run writes a
+packet (`instruction_<task-token>.txt` + attachments) into
+`<run>/human_inbox/` and a mirror
+under `harness_packages/<run_id>/`, surfaces a TODO card on the dashboard's run
+page, and blocks (wallclock-paused, like `HumanAgent`) until the operator
+returns a ChatGPT share link or pastes the answer manually. Cost is $0; the
+`model.call` event carries `via: browser_harness`.
+
+Config keys: `service` (chatgpt enables the share-link fetch; anything else is
+manual-paste only), `chat_url`, `display_model`, `settings_hint`,
+`expected_model_variants` (share-link validation as slug+effort pairs,
+warnings only; legacy `expected_model_slugs`/`expected_efforts` validate the
+two fields independently), `instruction_addendum` (appended to every
+instruction file; the default
+tells the model to print changed files inline as fenced ```file path=...```
+blocks). An agent can override the addendum in code via
+`render_harness_addendum(inp, task_token=..., default=...)` — the Author
+does, asking for token-tagged sandbox downloads
+(`answer___<task-token>.tex`) as the primary channel for grown files, with
+inline fenced blocks as the short-file/fallback channel; tagged or
+collision-renamed names are mapped back to canonical workspace names on
+merge (`canonical_workspace_name`). Keep addendum edits out of the model
+YAML mid-run: the resolved model config is part of the resume-cache key,
+so a YAML edit re-keys (and orphans) pending tasks.
+
+Generated sandbox files are auto-downloaded from public shares through the
+stateless `file_from_message` resolver (undocumented endpoint; HTTPS +
+`*.oaiusercontent.com` allowlist, size-capped, signed URLs never persisted).
+Text files merge into the answer as fenced file blocks; binaries are kept
+in per-fetch staging directories (`<stem>.staged-<nonce>/`) and listed as
+`stored_files`. Any resolver failure
+degrades to a warning plus the manual-upload fallback.
+
+Each packet's instruction file is tokenized (`instruction_<task-token>.txt`,
+token also heads the instruction text). Share validation warns when a share
+carries no evidence of the task token — ChatGPT collision renames
+(`instruction_<token>(2).txt`) still bind, and token-tagged download names
+in the answer count as evidence — and if the share positively matches a
+*different* pending task, the confirm page offers to transfer it there
+(only that positive mismatch skips the auto-download). The Author packet
+attaches only non-empty canonical files: ChatGPT rejects zero-byte uploads
+("Something went wrong"), so empty round-0 files are noted in the
+instruction text instead.
+
+**Supported subset.** Interception happens in `APICallAgent.run` only: one-shot
+prompt→answer nodes (Author, ACCritic, council seats, `ConfigurablePromptAgent`
+one-shots). Not intercepted: API-backed `MultiTurnAgent` conversations,
+provider-side tool loops (`code_interpreter`, `web_search` configs are simply
+absent in the browser chat), and `CLIAgent` nodes. System/developer + user
+messages are concatenated into a single browser prompt (role labels are added
+only for longer histories), so strict instruction-hierarchy behavior is not
+preserved. Substituting a browser model on an unsupported node fails at call
+time with an unknown-api error rather than silently degrading.
+
+Browser models may be substituted through the component `model:` key, a
+model-ref input like `council_models`, or `model_overrides` (the resume-cache
+key includes the resolved transport). Presets: `browser_consult` (one-shot
+demo), `author_critic_browser` (Author/Critic/council harnessed;
+`full_critic_interval: 1` because a browser chat cannot replay a stateful API
+conversation; Author needs `USE_CONTAINER_FILES: false`).
+
 ## If / else branches
 
 Use Python expressions with `inputs.get(...)`; avoid mixing Python mode with `equals`, `min_len`, or `max_len`.

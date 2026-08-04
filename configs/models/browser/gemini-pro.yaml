@@ -1,0 +1,8 @@
+# No share-link fetcher for gemini.google.com yet: manual paste/upload only.
+base: models/browser/chatgpt
+service: gemini
+model: gemini-pro-browser
+display_model: Gemini Pro (gemini.google.com)
+chat_url: https://gemini.google.com/app
+settings_hint: 'Model picker: the strongest available Pro / Deep Think tier.'
+expected_model_slugs: []

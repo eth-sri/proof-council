@@ -172,6 +172,49 @@ AUTHOR_ROUND0_USER = """\
 """
 
 
+# Replaces the generic print-everything-inline browser addendum
+# (configs/models/browser/chatgpt.yaml): once answer.tex has grown to many
+# pages, re-printing full contents inline every round stops being viable.
+# Download names carry the task token so a file in the operator's
+# Downloads folder is unambiguous; the harness strips the tag when
+# merging (``canonical_workspace_name``).
+AUTHOR_HARNESS_ADDENDUM = """\
+You are being run through a browser chat; a human ferries your reply
+back to the workflow. Return each canonical file you created or
+changed this round through exactly ONE of two channels:
+
+1. **Sandbox download (preferred for long files).** Save a copy in
+   your Python sandbox under a token-tagged name and give a markdown
+   download link for it at the end of your reply:
+     /mnt/data/answer___{token}.tex
+     /mnt/data/research_notes___{token}.tex
+     /mnt/data/references___{token}.bib
+   Use these file names EXACTLY as printed — three underscores and the
+   full token, never shortened or reformatted. The harness fetches
+   these from the shared conversation and maps them back to their
+   canonical names automatically.
+
+2. **Inline fenced block (short files, or if the sandbox is
+   unavailable).** Print the full contents inline as:
+
+   ```file path=answer.tex
+   <full contents>
+   ```
+
+Files you neither link nor print are kept unchanged by the harness —
+never re-print a long unchanged file just to restate it.
+
+ONLY your final message is parsed. It must be self-contained: any
+<council>...</council> or <compute_agent>...</compute_agent> request
+and the READY line must appear in that final message — a request made
+in an earlier message and not repeated there is silently lost. If you
+are asked to continue or re-confirm, restate them.
+
+Any files mentioned as "(attached as ...)" in the instructions are
+uploaded to this conversation.
+"""
+
+
 AUTHOR_LOOP_SYSTEM = """\
 Act as a research-level mathematical proof author iterating on a
 written deliverable in an Author/Critic loop. You have already
@@ -554,6 +597,12 @@ class Author(APICallAgent):
     # fenced ``file path=...`` blocks from the response. Saves output
     # tokens and lets Pro do natural in-place edits via Path.write_text.
     USE_CONTAINER_FILES: ClassVar[bool] = True
+    # The budget meter is display-only pacing context sourced from the live
+    # tracker; its drift across restarts (a monitor call costs fractions of
+    # a cent) must not re-key the Author and orphan a pending browser card.
+    CACHE_KEY_EXCLUDE_INPUTS: ClassVar[frozenset[str]] = frozenset(
+        {"budget_used_usd", "budget_max_usd"}
+    )
 
     class Inputs(BaseModel):
         problem: str
@@ -629,7 +678,12 @@ class Author(APICallAgent):
         ]
 
     def parse_output(self, raw_text: str, inp: Inputs) -> Outputs:
-        parsed = parse_author_output(raw_text)
+        # The browser transport pins the active task token around this call
+        # so a fenced file tagged for another task can never canonicalize
+        # into this task's answer.tex.
+        parsed = parse_author_output(
+            raw_text, task_token=getattr(self, "_harness_task_token", None)
+        )
         # Carry forward existing file contents for any file the Author
         # did not re-emit. Round 0 has no prior contents, so omitted
         # files default to empty.
@@ -661,6 +715,48 @@ class Author(APICallAgent):
             raw_text=raw_text,
             via="inline_blocks",
         )
+
+    # ---- browser-harness packet ------------------------------------------
+
+    def render_harness_packet(self, inp: Inputs) -> tuple[str, dict[str, str | bytes]]:
+        # Pull the workspace file bodies out of the prompt and into
+        # attachments: the operator drags real files into the browser
+        # chat, and the instruction stays readable. Empty files are NOT
+        # attached — ChatGPT rejects zero-byte uploads ("Something went
+        # wrong") — the placeholder tells the model instead.
+        attachments: dict[str, str | bytes] = {}
+        update: dict[str, str] = {}
+        for name, field in (
+            ("answer.tex", "answer_tex"),
+            ("research_notes.tex", "research_notes_tex"),
+            ("references.bib", "references_bib"),
+        ):
+            body = getattr(inp, field) or ""
+            if body.strip():
+                attachments[name] = body
+                update[field] = f"(attached as {name})"
+            else:
+                update[field] = f"({name} is currently empty; no attachment)"
+        if inp.compute_zip_path is not None:
+            zip_path = Path(inp.compute_zip_path)
+            if zip_path.exists():
+                attachments["compute_workspace.zip"] = zip_path.read_bytes()
+        harness_inp = inp.model_copy(update=update) if update else inp
+        instruction, _ = super().render_harness_packet(harness_inp)
+        return instruction, attachments
+
+    def render_harness_addendum(
+        self, inp: Inputs, *, task_token: str, default: str
+    ) -> str:
+        return AUTHOR_HARNESS_ADDENDUM.format(token=task_token)
+
+    def harness_expectations(self, inp: Inputs) -> dict[str, Any]:
+        expected: dict[str, Any] = {"fenced_files": list(CANONICAL_FILES)}
+        # Round 0 has no prior contents to fall back on: an answer without
+        # answer.tex would leave the round with no usable output at all.
+        if inp.round == 0:
+            expected["required_files"] = ["answer.tex"]
+        return expected
 
     # ---- container-files run path ---------------------------------------
 

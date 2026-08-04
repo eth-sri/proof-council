@@ -64,6 +64,32 @@ class EditorTemplateContractTests(unittest.TestCase):
         self.assertIn("function startRunMonitorPolling", base)
         self.assertIn(".monitor-summary", base)
 
+    def test_run_detail_has_browser_harness_card(self) -> None:
+        template = (ROOT / "app" / "templates" / "dev_run_detail.html").read_text()
+        confirm = (ROOT / "app" / "templates" / "dev_harness_confirm.html").read_text()
+
+        self.assertIn("task.type == 'browser_call'", template)
+        self.assertIn("run_harness_fetch_share", template)
+        self.assertIn("run_harness_manual", template)
+        self.assertIn("enctype=\"multipart/form-data\"", template)
+        self.assertIn("harness-copy-path", template)
+        self.assertIn("harness-drag-chip", template)
+        # The 5s poller must not reload while the operator is pasting a share
+        # link into an <input> or has picked upload files.
+        self.assertIn(".human-task-card textarea, .human-task-card input", template)
+        self.assertIn("t.files && t.files.length > 0", template)
+        # Confirming applies the staged fetch (digest-bound), optionally
+        # merging manually downloaded generated files.
+        self.assertIn("Use fetched answer", confirm)
+        self.assertIn('name="digest"', confirm)
+        self.assertIn("run_harness_confirm", confirm)
+        self.assertIn('enctype="multipart/form-data"', confirm)
+        self.assertIn('type="file"', confirm)
+        # Structured preset inputs (lists/mappings) must survive the trip to
+        # the CLI via the runner's @<json> convention.
+        run_agent = (ROOT / "app" / "templates" / "dev_run_agent.html").read_text()
+        self.assertIn("'@' + JSON.stringify(value)", run_agent)
+
     def test_workflow_output_edges_from_repeat_nodes_are_mapped_before_output_target(self) -> None:
         template = (ROOT / "app" / "templates" / "dev_preset_editor.html").read_text()
         start = template.index("function buildCanvasEdges")

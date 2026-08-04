@@ -3,15 +3,54 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from proofstack.budget import BudgetExhausted
 from proofstack.context import ModelSpec, RunContext
 from proofstack.events import new_call_id
 
 
 DEFAULT_MONITOR_MODEL: ModelSpec = "models/openai/gpt-54-mini"
+
+_WRAPPER_BLOCK_RE = re.compile(r"AC\w*Block")
+
+# Prior summaries shown to the model for dedup context. A full history grows
+# the prompt quadratically over a long run; the recent window is what "do not
+# repeat" actually needs.
+_HISTORY_LIMIT = 12
+
+
+def _load_prior_summaries(events_path: Path, limit: int = _HISTORY_LIMIT) -> list[dict[str, Any]]:
+    """Seed dedup context from a previous attempt's monitor.summary events,
+    so a resumed run does not re-narrate everything it already reported."""
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("kind") != "monitor.summary":
+            continue
+        p = e.get("payload") or {}
+        if isinstance(p, dict) and p.get("summary"):
+            out.append(
+                {
+                    "agent": p.get("agent"),
+                    "display_label": p.get("display_label"),
+                    "call_id": p.get("call_id"),
+                    "status": p.get("status"),
+                    "summary": p.get("summary"),
+                }
+            )
+    return out[-limit:]
 
 
 @dataclass
@@ -29,6 +68,10 @@ class RunMonitor:
 
     def __post_init__(self) -> None:
         self.model = normalize_monitor_model_spec(self.model)
+        if not self.summaries:
+            self.summaries = _load_prior_summaries(
+                self.ctx.root_workdir / "events.jsonl"
+            )
 
     def schedule_agent_end(
         self,
@@ -42,6 +85,12 @@ class RunMonitor:
         status: str = "ok",
         error: dict[str, Any] | None = None,
     ) -> None:
+        # DAG wrapper blocks (ACAuthorBlock, ACReviewJoinBlock, …) re-expose
+        # the state their inner agent just produced; summarizing them yields
+        # a near-duplicate of the inner agent's summary and drowns the feed.
+        # Errors are still worth a summary regardless of the source.
+        if status == "ok" and _WRAPPER_BLOCK_RE.fullmatch(str(agent or "")):
+            return
         task = asyncio.create_task(
             self.record_agent_end(
                 call_id=call_id,
@@ -99,6 +148,28 @@ class RunMonitor:
         error: dict[str, Any] | None,
     ) -> None:
         monitor_call_id = new_call_id()
+        # The monitor spends real API money; once the run's budget is gone it
+        # must stop adding to the overrun instead of racing the cooperative
+        # agent-side checks. A max_usd of exactly 0 declares "no paid spend
+        # at all" — check() only trips AFTER positive spending, which would
+        # still allow one free call.
+        root = self.ctx.budgets.root("run")
+        zero_usd = any(
+            node.spec is not None and node.spec.max_usd == 0
+            for node in root.chain()
+        )
+        try:
+            if zero_usd:
+                raise BudgetExhausted("run", "usd", 0.0, root.counters.usd)
+            root.check()
+        except BudgetExhausted as e:
+            await self.ctx.events.emit(
+                "monitor.skipped",
+                {"agent": agent, "reason": f"budget exhausted: {e}"},
+                call_id=monitor_call_id,
+                parent_call_id=call_id,
+            )
+            return
         display_agent = self._display_agent(agent=agent, agent_path=agent_path)
         prompt = self._prompt(
             agent=agent,
@@ -114,11 +185,22 @@ class RunMonitor:
             {
                 "role": "developer",
                 "content": (
-                    "You summarize an agentic math workflow for a human watching it live. "
-                    "Write exactly 3-4 concise sentences. Do not invent results; say what changed, "
-                    "what the finished node appears to have done, and what seems important next. "
-                    "Use user-facing node labels only; never mention internal identifiers, component names, "
-                    "file paths, or strings containing 'DAGWorkflow'."
+                    "You summarize one just-finished stage of an agentic math-research "
+                    "workflow for the researcher supervising it. Write 2-4 concise "
+                    "sentences reporting the CONCRETE CONTENT this stage contributed: "
+                    "the specific results, arguments, findings, objections, verdicts, "
+                    "or data it produced, with their key specifics (named statements, "
+                    "bounds, examples, references). You are shown the stage's actual "
+                    "input and output, so state directly what it did — never hedge "
+                    "with phrases like 'appears to have'. Do not narrate workflow "
+                    "mechanics (loops, nodes, gates, what runs next, how stages "
+                    "connect) unless the stage failed; the reader knows the pipeline. "
+                    "Do not repeat what previous summaries already said — report only "
+                    "what is new. Never invent results; if the output is empty or "
+                    "purely procedural, say so in one sentence. Use user-facing node "
+                    "labels only; never mention internal identifiers, component "
+                    "names, file paths, or strings containing 'DAGWorkflow'. Markdown "
+                    "emphasis and $...$ inline math are allowed."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -213,11 +295,13 @@ class RunMonitor:
                     "status": item.get("status"),
                     "summary": item.get("summary"),
                 }
-                for item in self.summaries
+                for item in self.summaries[-_HISTORY_LIMIT:]
             ],
         }
         return (
-            "Live monitor context follows as JSON. Summarize what the viewer should understand now.\n\n"
+            "Live monitor context follows as JSON. Summarize the concrete "
+            "contribution of the finished stage in `finished` — its output is "
+            "the substance to report.\n\n"
             f"{json.dumps(context, ensure_ascii=False, indent=2, default=str)}"
         )
 

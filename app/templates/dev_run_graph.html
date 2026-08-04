@@ -1,7 +1,8 @@
 {% macro render_graph_node(node, run_id) %}
     <div class="graph-node status-{{ node.status }}{% if node.cache_hit %} graph-node-cached{% endif %}"
          data-agent="{{ (node.label ~ ' ' ~ node.node_id ~ ' ' ~ node.status)|lower }}"
-         data-status="{{ node.status }}">
+         data-status="{{ node.status }}"
+         data-procedural="{{ '1' if node.procedural else '0' }}">
         <div class="graph-node-main">
             <div class="graph-node-copy">
                 {% if node.call_ref %}
@@ -45,6 +46,10 @@
             <option value="skipped">Skipped</option>
             <option value="error">Error</option>
         </select>
+        <label class="dim" title="Compile gates, joins, branch gates, init/return plumbing">
+            <input type="checkbox" id="graph-procedural" onchange="filterExecutionGraph()">
+            Show procedural nodes
+        </label>
         <span class="dim" data-live-status>Live updates enabled</span>
     </div>
     <div class="execution-graph">
