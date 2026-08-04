@@ -189,8 +189,10 @@ changed this round through exactly ONE of two channels:
      /mnt/data/answer___{token}.tex
      /mnt/data/research_notes___{token}.tex
      /mnt/data/references___{token}.bib
-   The harness fetches these from the shared conversation and maps
-   them back to their canonical names automatically.
+   Use these file names EXACTLY as printed — three underscores and the
+   full token, never shortened or reformatted. The harness fetches
+   these from the shared conversation and maps them back to their
+   canonical names automatically.
 
 2. **Inline fenced block (short files, or if the sandbox is
    unavailable).** Print the full contents inline as:

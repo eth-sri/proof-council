@@ -750,6 +750,47 @@ class CanonicalWorkspaceNameTests(unittest.TestCase):
             canonical_workspace_name("answer.tex", task_token="tokA"), "answer.tex"
         )
 
+    def test_near_miss_names_canonicalize_for_the_active_task_only(self) -> None:
+        # Observed live: the model wrote answer_6afa2809fc47.tex instead of
+        # answer___Author__6afa2809fc47.tex. Hash matches the active task ->
+        # accept; anything else stays distinct.
+        tok = "Author__6afa2809fc47"
+        self.assertEqual(
+            canonical_workspace_name("answer_6afa2809fc47.tex", task_token=tok),
+            "answer.tex",
+        )
+        self.assertEqual(
+            canonical_workspace_name(
+                "research_notes_6afa2809fc47.tex", task_token=tok
+            ),
+            "research_notes.tex",
+        )
+        self.assertEqual(
+            canonical_workspace_name("references_6afa2809fc47.bib", task_token=tok),
+            "references.bib",
+        )
+        self.assertEqual(
+            canonical_workspace_name(
+                "answer_Author__6afa2809fc47.tex", task_token=tok
+            ),
+            "answer.tex",
+        )
+        # Wrong hash: stays distinct (a DIFFERENT task's near-miss).
+        self.assertEqual(
+            canonical_workspace_name("answer_deadbeef0000.tex", task_token=tok),
+            "answer_deadbeef0000.tex",
+        )
+        # No token context: no blind stripping of single-underscore names.
+        self.assertEqual(
+            canonical_workspace_name("answer_6afa2809fc47.tex"),
+            "answer_6afa2809fc47.tex",
+        )
+        # A bare token filename never collapses to an empty stem.
+        self.assertEqual(
+            canonical_workspace_name("6afa2809fc47.tex", task_token=tok),
+            "6afa2809fc47.tex",
+        )
+
     def test_workspace_name_token_extraction(self) -> None:
         self.assertEqual(
             workspace_name_token("/mnt/data/answer___Critic__ab12cd.tex"),

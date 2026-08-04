@@ -449,11 +449,28 @@ def canonical_workspace_name(name: str, task_token: str | None = None) -> str:
     requirement for) this task's canonical files."""
     name = _canonical_upload_name(str(name).replace("\\", "/").rsplit("/", 1)[-1])
     m = _TOKEN_TAG_RE.match(name)
-    if not m:
-        return name
-    if task_token is not None and m.group("token") != task_token:
-        return name
-    return f"{m.group('stem')}{m.group('ext')}"
+    if m:
+        if task_token is not None and m.group("token") != task_token:
+            return name
+        return f"{m.group('stem')}{m.group('ext')}"
+    if task_token:
+        # Near-miss tolerance, ACTIVE task only: models sometimes shorten
+        # ``answer___<full-token>.tex`` to ``answer_<hash>.tex`` (observed
+        # live). A 1-3 underscore separator followed by the full token or
+        # its trailing hash segment still positively identifies THIS task,
+        # so stripping it cannot admit another task's file.
+        variants = {task_token}
+        tail = task_token.rsplit("__", 1)[-1]
+        if tail:
+            variants.add(tail)
+        base, dot, ext = name.rpartition(".")
+        if dot:
+            for tok in sorted(variants, key=len, reverse=True):
+                for sep in ("___", "__", "_"):
+                    suffix = f"{sep}{tok}"
+                    if base.endswith(suffix) and len(base) > len(suffix):
+                        return f"{base[: -len(suffix)]}.{ext}"
+    return name
 
 
 def workspace_name_token(name: str) -> str | None:
