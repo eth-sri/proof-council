@@ -500,6 +500,24 @@ class RunDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(runs[0].status, "running")
 
+    def test_extension_resume_makes_finished_run_running_again(self) -> None:
+        # A clean finish followed by an extension relaunch (higher n_rounds):
+        # the newest run.start has no run.end, so the run is live again and
+        # its pending cards must surface.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "extended-run"
+            run_dir.mkdir()
+            _write_json(run_dir / "run-metadata.json", {"status": "ok"})
+            events_path = run_dir / "events.jsonl"
+            _write_event(events_path, ts="1", kind="run.start", payload={})
+            _write_event(events_path, ts="2", kind="run.end", payload={"status": "ok"})
+            _write_event(events_path, ts="3", kind="run.start", payload={})
+
+            runs = discover_runs([root])
+
+        self.assertEqual(runs[0].status, "running")
+
     def test_event_tree_does_not_mark_new_attempt_calls_with_old_error(self) -> None:
         # Attempt 1 ends in error; attempt 2 starts a fresh call that is
         # still running. The IncompleteCall sweep must not touch it.

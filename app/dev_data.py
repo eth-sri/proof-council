@@ -784,10 +784,16 @@ def _enrich_from_events(info: RunInfo) -> None:
         info.wallclock_s = _duration(first_ts, last_ts)
     if saw_workflow_failure:
         info.status = "error"
-    elif status_from_events == "running" and info.status in {"error", "parked"}:
+    elif status_from_events == "running" and info.status in {
+        "error",
+        "parked",
+        "finished",
+    }:
         # The metadata snapshot is from an EARLIER attempt: the newest
         # run.start has no terminal run.end, so a resumed worker is live
-        # (or _apply_process_liveness will flag its PID as dead).
+        # (or _apply_process_liveness will flag its PID as dead). This
+        # includes "finished" — an extension resume (higher n_rounds after
+        # a clean finish) makes a finished run genuinely running again.
         info.status = "running"
 
 
