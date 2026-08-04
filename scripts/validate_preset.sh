@@ -3,6 +3,7 @@
 # Usage: scripts/validate_preset.sh PRESET_YAML
 #   scripts/validate_preset.sh configs/workflows/claude_subscription_min.yaml
 set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
 PRESET="${1:?usage: validate_preset.sh PRESET_YAML}"
 cd "$(dirname "$0")/.."
 PYTHONPATH=src uv run python -c '

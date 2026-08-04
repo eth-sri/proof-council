@@ -1,0 +1,5 @@
+base: models/openai/gpt-56-sol
+model: gpt-5.6-sol--max
+background_timeout_downgrade_after: 1
+background_timeout_reasoning_efforts:
+  - high

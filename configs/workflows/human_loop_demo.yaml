@@ -50,12 +50,16 @@ components:
       - "{claude_model}"
       - --permission-mode
       - acceptEdits
-      - --allowedTools
-      - Bash(finish:*)
+      - --safe-mode
+      - --strict-mcp-config
+      - --no-session-persistence
+      - --tools
+      - Write
     soft_timeout_s: 780
     sandbox:
       backend: subprocess
       timeout_s: 900
+      provider_keys: []
     env:
       HOME: "{env:HOME}"
     prompt: |
@@ -68,11 +72,6 @@ components:
       Human's idea:
       {hint}
 
-      Instructions:
-      1. Write your attempt as a self-contained LaTeX document to a file named
-         answer.tex  in the current directory.
-      2. Then run:  finish '{"status":"done","summary":"attempt written"}'
-      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       hint: string
@@ -87,6 +86,8 @@ components:
       status: status
     usage:
       type: claude_json
+    contract: auto
+    completion_signal: file
 
   human_refine:
     prompt: |
@@ -118,12 +119,16 @@ components:
       - "{claude_model}"
       - --permission-mode
       - acceptEdits
-      - --allowedTools
-      - Bash(finish:*)
+      - --safe-mode
+      - --strict-mcp-config
+      - --no-session-persistence
+      - --tools
+      - Write
     soft_timeout_s: 780
     sandbox:
       backend: subprocess
       timeout_s: 900
+      provider_keys: []
     env:
       HOME: "{env:HOME}"
     prompt: |
@@ -143,10 +148,6 @@ components:
       Human's refinement feedback:
       {feedback}
 
-      Instructions:
-      1. Write the final proof as a self-contained LaTeX document to  best.tex .
-      2. Then run:  finish '{"status":"done","summary":"final proof written"}'
-      Work autonomously; do not ask questions.
     input_schema:
       problem: string
       proof: string
@@ -163,6 +164,8 @@ components:
       status: status
     usage:
       type: claude_json
+    contract: auto
+    completion_signal: file
 
 dag:
   nodes:

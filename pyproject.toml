@@ -40,3 +40,9 @@ packages = ["src/mathagents", "src/proofstack"]
 #   require ``env PYTHONPATH=.:src`` to find it.
 pythonpath = [".", "src"]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "playwright>=1.61.0",
+    "pytest>=8.3.0",
+]

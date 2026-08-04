@@ -18,7 +18,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from proofstack.agent import Agent
-from proofstack.budget import BudgetExhausted, allow_budget_overrun
+from proofstack.budget import BudgetExhausted, SubscriptionParked, allow_budget_overrun
 
 
 class DAGConfigError(ValueError):
@@ -76,6 +76,12 @@ class DAGWorkflow(Agent):
             await self._run_nodes(self.dag.get("nodes") or [], state, run_on="normal")
             outputs = self._build_outputs(self.dag.get("outputs") or {}, state)
             return self.Outputs(**outputs)
+        except SubscriptionParked:
+            # A park is "come back when the window resets", NOT exhaustion:
+            # salvaging a last-gasp answer here would mark the problem done
+            # and silently discard the resume opportunity. Propagate so the
+            # run exits as a resumable error instead.
+            raise
         except BudgetExhausted as e:
             fallback_outputs = await self._run_budget_fallback(inp, state, e)
             if fallback_outputs is not None:
@@ -317,7 +323,9 @@ class DAGWorkflow(Agent):
                 retry_delay_s=float(node.get("retry_delay_s", 0.0) or 0.0),
             )
         except BudgetExhausted as e:
-            if e.scope == "run" or not node.get("soft_fail"):
+            # soft_fail never swallows a park: substituting the default would
+            # silently degrade the run instead of waiting for the window.
+            if isinstance(e, SubscriptionParked) or e.scope == "run" or not node.get("soft_fail"):
                 raise
             await self.events.emit(
                 "dag.node_budget_exhausted",
@@ -591,7 +599,7 @@ class DAGWorkflow(Agent):
                         retry_delay_s=float(step.get("retry_delay_s", 0.0) or 0.0),
                     )
                 except BudgetExhausted as e:
-                    if e.scope == "run":
+                    if isinstance(e, SubscriptionParked) or e.scope == "run":
                         raise
                     if step.get("on_error") == "skip_item":
                         return None

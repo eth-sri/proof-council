@@ -33,7 +33,6 @@ class HumanAgent(Agent):
 
     description: ClassVar[str] = "Hand a task to a human and wait for their response."
     execution_mode: ClassVar[str] = "human_assisted"
-    # A human's answer is not reproducible and is not captured by config, so
     # A human's answer is expensive and irreplaceable, so cache it: on resume the
     # prior answer is replayed instead of re-asked. (Opt out per component with
     # cache_enabled: false if you ever want to force a fresh ask on resume.)
@@ -81,13 +80,15 @@ class HumanAgent(Agent):
 
         inbox = self.ctx.root_workdir / "human_inbox"
         inbox.mkdir(parents=True, exist_ok=True)
-        stem = f"{self.name}__{self.workdir.name}"
+        # Cached asks use the resume-stable key so an answer submitted while the
+        # run is stopped is consumed after resume. Opting out of caching means
+        # every invocation is a genuinely fresh ask, so use its unique workdir.
+        if self.cache_enabled:
+            stem = f"{self.name}__{self._cache_key(inp)[:16]}"
+        else:
+            stem = f"{self.name}__{self.workdir.name}"
         task_path = inbox / f"{stem}.task.json"
         response_path = inbox / f"{stem}.response.json"
-        try:
-            response_path.unlink()
-        except FileNotFoundError:
-            pass
 
         task = {
             "agent": self.name,
@@ -158,7 +159,15 @@ class HumanAgent(Agent):
             for key, spec in schema.items():
                 if key == "workspace":
                     continue
-                fields[str(key)] = spec if isinstance(spec, str) else "string"
+                if isinstance(spec, str):
+                    fields[str(key)] = spec
+                elif isinstance(spec, dict) and isinstance(spec.get("type"), str):
+                    # JSON-schema form ({type: array}); keep the declared type so
+                    # the form-post coercion can rebuild it instead of flattening
+                    # every structured field to a raw string
+                    fields[str(key)] = spec["type"]
+                else:
+                    fields[str(key)] = "string"
         if not fields:
             fields = {"response": "string"}
         return fields

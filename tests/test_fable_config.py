@@ -47,10 +47,10 @@ class FableModelConfigTests(unittest.TestCase):
 
         self._assert_common_fable_fields(cfg)
         # Reasoning summaries visible for the Author, matching the
-        # gpt-55-pro Author's `reasoning: {summary: auto}`.
+        # gpt-56-sol-pro Author's `reasoning: {summary: auto}`.
         self.assertEqual(cfg["thinking"]["display"], "summarized")
         self.assertEqual(cfg["output_config"]["effort"], "max")
-        # Author-role leash at parity with gpt-55-pro.
+        # Author-role leash at parity with gpt-56-sol-pro.
         self.assertEqual(cfg["timeout"], 11400)
         self.assertEqual(cfg["max_wallclock_per_call_s"], 14000)
         self.assertEqual(cfg["max_retries"], 2)
@@ -77,12 +77,12 @@ class FablePresetTests(unittest.TestCase):
 
         self.assertEqual(
             preset.component_configs["Author"]["model"],
-            "models/openai/gpt-55-pro",
+            "models/openai/gpt-56-sol-pro",
         )
         self.assertEqual(
             preset.inputs["council_models"],
             [
-                "models/openai/gpt-55-pro",
+                "models/openai/gpt-56-sol-pro",
                 "models/anthropic/fable_5",
                 "models/gemini/gemini-31-pro",
             ],

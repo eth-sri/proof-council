@@ -15,8 +15,14 @@ from proofstack.agents.ac.compute import (  # noqa: E402
     _CODEX_LAST_MESSAGE_REL,
     _ZIP_EXCLUDE_TOP,
     _build_codex_cmd,
+    _require_codex_cli_version,
     _zip_workspace,
     Compute,
+    DEFAULT_COST_CONFIG,
+    DEFAULT_HARD_TIMEOUT_S,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    DEFAULT_SOFT_TIMEOUT_S,
 )
 from proofstack.context import RunContext  # noqa: E402
 from proofstack.kinds.cli import CLIDoneRecord  # noqa: E402
@@ -24,6 +30,13 @@ from proofstack.sandbox.base import SandboxSpec  # noqa: E402
 
 
 class FakeSandbox(SimpleNamespace):
+    async def run_command(self, cmd, **kwargs):
+        return SimpleNamespace(
+            returncode=getattr(self, "version_returncode", 0),
+            stdout=getattr(self, "version_stdout", "codex-cli 0.144.0"),
+            stderr="",
+        )
+
     async def write_file(self, relpath: str, content: str) -> Path:
         path = Path(self.root) / relpath
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -33,13 +46,15 @@ class FakeSandbox(SimpleNamespace):
 
 def test_compute_codex_command_uses_current_exec_flags() -> None:
     cmd = _build_codex_cmd(
-        model="gpt-5.5",
-        reasoning_effort="xhigh",
+        model=DEFAULT_MODEL,
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
         sandbox=SandboxSpec(backend="subprocess"),
         codex_sandbox="docker-bypass",
     )
 
     assert cmd[:2] == ["codex", "exec"]
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-sol"
+    assert cmd[cmd.index("-c") + 1] == 'model_reasoning_effort="max"'
     assert "--ignore-user-config" not in cmd
     assert "--ephemeral" not in cmd
     assert "--output-last-message" in cmd
@@ -50,19 +65,93 @@ def test_compute_codex_command_uses_current_exec_flags() -> None:
     assert "--sandbox" not in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" in cmd
     assert cmd[-1] == "-"
+
+
+def test_compute_inputs_default_to_sol_max_with_matching_cost_config() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="p",
+            round=1,
+            instructions="compute",
+            compute_workspace=Path(temp_dir),
+        )
+
+    assert inp.model == "gpt-5.6-sol"
+    assert inp.reasoning_effort == "max"
+    assert inp.cost_config == "models/openai/gpt-56-sol-pro"
+    assert inp.model == DEFAULT_MODEL
+    assert inp.reasoning_effort == DEFAULT_REASONING_EFFORT
+    assert inp.cost_config == DEFAULT_COST_CONFIG
+    assert inp.soft_timeout_s == DEFAULT_SOFT_TIMEOUT_S == 7200
+    assert inp.hard_timeout_s == DEFAULT_HARD_TIMEOUT_S == 9000
+
+
+def test_compute_rejects_soft_timeout_at_or_after_hard_timeout() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        try:
+            Compute.Inputs(
+                problem="P",
+                problem_id="p",
+                round=1,
+                instructions="compute",
+                compute_workspace=temp / "compute",
+                soft_timeout_s=100,
+                hard_timeout_s=100,
+            )
+        except ValueError as e:
+            assert "soft_timeout_s must be less than hard_timeout_s" in str(e)
+        else:
+            raise AssertionError("invalid timeout ordering was accepted")
+
+
+def test_compute_soft_timeout_is_capped_below_remaining_workflow_budget() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(run_id="test", root_workdir=Path(temp_dir), flat=True)
+        agent = Compute(ctx)
+
+        assert agent._effective_soft_timeout_s(9000) == 7200
+        assert agent._effective_soft_timeout_s(3600) == 1800
+
+
+def test_compute_rejects_old_codex_cli_before_starting_worker() -> None:
+    sandbox = FakeSandbox(
+        root=Path("."),
+        version_stdout="codex-cli 0.143.0",
+    )
+
+    try:
+        asyncio.run(_require_codex_cli_version(sandbox))
+    except RuntimeError as e:
+        assert "0.144.0 or newer" in str(e)
+        assert "0.143.0" in str(e)
+    else:
+        raise AssertionError("old Codex CLI version was accepted")
+
+
 def test_dockerfile_pins_and_smokes_codex_cli() -> None:
     text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    deploy_text = (ROOT / "deploy" / "Dockerfile").read_text(encoding="utf-8")
+    sandbox_text = (ROOT / "deploy" / "sandbox" / "Dockerfile").read_text(
+        encoding="utf-8"
+    )
     pwc_text = (ROOT / "deploy" / "sandbox" / "Dockerfile.pwc").read_text(
         encoding="utf-8"
     )
 
     assert "@openai/codex@${OPENAI_CODEX_VERSION}" in text
-    assert "OPENAI_CODEX_VERSION=" in text
+    assert "ARG OPENAI_CODEX_VERSION=0.144.0" in text
+    assert 'codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"' in text
     assert "codex exec --help | grep -q -- '--output-last-message'" in text
     assert "gmpy2 python-flint z3-solver cvxpy" in text
     assert "git file column time" in text
     assert "> /usr/local/bin/finish" in text
     assert "FINISH_DONE_PATH" in text
+    for runtime_text in (deploy_text, sandbox_text):
+        assert "ARG OPENAI_CODEX_VERSION=0.144.0" in runtime_text
+        assert "@openai/codex@${OPENAI_CODEX_VERSION}" in runtime_text
+        assert 'codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"' in runtime_text
     assert "> /usr/local/bin/finish" in pwc_text
     assert "FINISH_DONE_PATH" in pwc_text
 
@@ -208,6 +297,10 @@ def test_compute_run_captures_codex_last_message_on_clean_cli_exit() -> None:
         fake_codex = fake_bin / "codex"
         fake_codex.write_text(
             """#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  printf 'codex-cli 0.144.0\n'
+  exit 0
+fi
 out=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--output-last-message" ]; then
@@ -257,6 +350,10 @@ def test_compute_finish_survives_nested_login_shell_path_reset() -> None:
         fake_codex = fake_bin / "codex"
         fake_codex.write_text(
             """#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  printf 'codex-cli 0.144.0\n'
+  exit 0
+fi
 cat >/dev/null
 printf '{"status":"done","summary":"via login shell"}' > "$HOME/finish-body.json"
 /usr/bin/env -i HOME="$HOME" FINISH_DONE_PATH="$FINISH_DONE_PATH" /bin/bash -lc 'finish "$HOME/finish-body.json"'
@@ -297,6 +394,10 @@ def test_compute_setup_removes_stale_codex_last_message() -> None:
         fake_codex = fake_bin / "codex"
         fake_codex.write_text(
             """#!/bin/sh
+if [ "${1:-}" = "--version" ]; then
+  printf 'codex-cli 0.144.0\n'
+  exit 0
+fi
 cat >/dev/null
 exit 0
 """,

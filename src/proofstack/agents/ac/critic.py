@@ -224,7 +224,7 @@ class ACCritic(APICallAgent):
         "ending in <answer_ready>true|false</answer_ready>. Two modes: "
         "fresh (new instance) and stateful (continuation via prior_messages)."
     )
-    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-55-pro"
+    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-56-sol-pro"
     MAX_TOOL_CALLS: ClassVar[int] = 12
 
     class Inputs(BaseModel):

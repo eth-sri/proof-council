@@ -1,0 +1,22 @@
+model: gpt-5.6-sol
+api: openai
+max_tokens: 128000
+cache_read_cost: 0.5
+cache_write_cost: 6.25
+cache_write_tokens_in_input: true
+read_cost: 5
+write_cost: 30
+long_context_threshold_tokens: 272000
+long_context_input_multiplier: 2
+long_context_output_multiplier: 1.5
+concurrent_requests: 16
+temperature: null
+top_p: null
+batch_processing: false
+background: true
+use_openai_responses_api: true
+timeout: 11400
+throw_error_on_failure: true
+max_wallclock_per_call_s: 14000
+reasoning:
+  summary: "auto"

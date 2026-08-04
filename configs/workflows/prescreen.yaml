@@ -1,5 +1,5 @@
 workflow: proofstack.agents.dag_workflow.DAGWorkflow
-description: 'One-shot pre-screen for a submitted research problem. Runs gpt-5.5-pro--xhigh with web_search
+description: 'One-shot pre-screen for a submitted research problem. Runs GPT-5.6 Sol Pro at maximum reasoning effort with web_search
   + code_interpreter to (a) check that the statement is well-defined, well-posed, and free of obvious
   issues, (b) do a brief literature / sanity-check pass for known or easy answers, and (c) emit a cleaned
   standalone LaTeX version plus a structured verdict the filing script can merge into metadata.yaml.
@@ -12,7 +12,7 @@ budget:
   max_wallclock_s: 3600
 components:
   cfg_prescreen:
-    model: models/openai/gpt-55-pro
+    model: models/openai/gpt-56-sol-pro
     tool_refs:
     - code_interpreter
     - web_search_preview
