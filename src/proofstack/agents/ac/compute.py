@@ -108,6 +108,14 @@ _ZIP_EXCLUDE_ANY_DEPTH = {
     "__pycache__",
 }
 
+# Above this many members, say so. The zip is attached to the next Author
+# call: an OpenAI ``code_interpreter`` container rejected a ~5k-member archive
+# with "Expected at most 1000 files", and Anthropic ``code_execution``
+# containers have their own separate limits. This is a conservative proxy for
+# "this archive is big enough to be a problem", not a provider limit that the
+# code enforces.
+_ZIP_ENTRY_WARN: Final[int] = 900
+
 _CODEX_LAST_MESSAGE_REL: Final[str] = ".pwc/runtime/codex-last-message.md"
 _DOCKER_CODEX_HOME: Final[str] = "/codex-home"
 _COMPUTE_UTILS = """\
@@ -492,6 +500,20 @@ class Compute(CLIAgent):
                 {"type": type(e).__name__, "msg": str(e)},
             )
             zip_path = None  # type: ignore[assignment]
+        else:
+            # Name an oversized archive where it is produced, rather than
+            # leaving a downstream container rejection to be diagnosed two
+            # nodes away in the next Author call.
+            n_entries = _count_zip_entries(zip_path)
+            if n_entries > _ZIP_ENTRY_WARN:
+                await self.events.emit(
+                    "ac.compute.zip_large",
+                    {
+                        "entries": n_entries,
+                        "threshold": _ZIP_ENTRY_WARN,
+                        "path": str(zip_path),
+                    },
+                )
         return self.Outputs(
             response_md=response_md,
             zip_path=zip_path,
@@ -673,6 +695,15 @@ def _zip_workspace(
                 # Skip files we cannot read (e.g. transient lock files);
                 # the zip is best-effort.
                 continue
+
+
+def _count_zip_entries(path: Path) -> int:
+    """Number of non-directory members in ``path``, or 0 if it cannot be read."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return sum(1 for info in zf.infolist() if not info.is_dir())
+    except (OSError, zipfile.BadZipFile):
+        return 0
 
 
 def _write_helper_if_missing(path: Path, content: str) -> None:

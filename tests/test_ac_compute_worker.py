@@ -13,10 +13,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from proofstack.agents.ac.compute import (  # noqa: E402
     _CODEX_LAST_MESSAGE_REL,
+    _ZIP_ENTRY_WARN,
     _ZIP_EXCLUDE_ANY_DEPTH,
     _ZIP_EXCLUDE_TOP,
     _ZIP_EXCLUDE_TOP_DIRS,
     _build_codex_cmd,
+    _count_zip_entries,
     _require_codex_cli_version,
     _zip_workspace,
     Compute,
@@ -407,6 +409,72 @@ def test_compute_workspace_zip_symlink_cannot_smuggle_in_a_nested_cache() -> Non
             names = set(zf.namelist())
 
         assert names == {"code/result.txt", "notes/ok.txt"}
+
+
+def test_compute_collect_warns_only_when_the_zip_is_large() -> None:
+    def _collect_with(n_files: int) -> list[tuple[str, dict]]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+            agent = Compute(ctx)
+            recorded: list[tuple[str, dict]] = []
+
+            class _Recorder:
+                async def emit(self, kind: str, payload: dict) -> None:
+                    recorded.append((kind, payload))
+
+            agent.events = _Recorder()  # type: ignore[assignment]
+            root = temp / "compute"
+            (root / "code").mkdir(parents=True)
+            for i in range(n_files):
+                (root / "code" / f"f{i}.py").write_text("x", encoding="utf-8")
+            (root / "responses").mkdir()
+            (root / "responses" / "response_round_1.md").write_text(
+                "done", encoding="utf-8"
+            )
+
+            inp = Compute.Inputs(
+                problem="P",
+                problem_id="prob-001",
+                round=1,
+                instructions="do the computation",
+                compute_workspace=root,
+            )
+            asyncio.run(
+                agent.collect(
+                    SimpleNamespace(root=root),
+                    inp,
+                    CLIDoneRecord(status="done", summary=""),
+                )
+            )
+            return recorded
+
+    quiet = _collect_with(10)
+    assert not [kind for kind, _ in quiet if kind == "ac.compute.zip_large"]
+
+    loud = [(k, p) for k, p in _collect_with(950) if k == "ac.compute.zip_large"]
+    assert len(loud) == 1
+    assert loud[0][1]["entries"] > _ZIP_ENTRY_WARN
+    assert loud[0][1]["threshold"] == _ZIP_ENTRY_WARN
+
+
+def test_count_zip_entries_ignores_directories_and_bad_archives() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        import zipfile
+
+        good = temp / "good.zip"
+        with zipfile.ZipFile(good, "w") as zf:
+            zf.writestr("code/", "")
+            zf.writestr("code/a.py", "x")
+            zf.writestr("code/b.py", "x")
+        assert _count_zip_entries(good) == 2
+
+        bad = temp / "bad.zip"
+        bad.write_text("not a zip", encoding="utf-8")
+        assert _count_zip_entries(bad) == 0
+
+        assert _count_zip_entries(temp / "absent.zip") == 0
 
 
 def test_compute_run_captures_codex_last_message_on_clean_cli_exit() -> None:
