@@ -13,7 +13,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from proofstack.agents.ac.compute import (  # noqa: E402
     _CODEX_LAST_MESSAGE_REL,
+    _ZIP_EXCLUDE_ANY_DEPTH,
     _ZIP_EXCLUDE_TOP,
+    _ZIP_EXCLUDE_TOP_DIRS,
     _build_codex_cmd,
     _require_codex_cli_version,
     _zip_workspace,
@@ -287,6 +289,124 @@ def test_compute_workspace_zip_excludes_codex_runtime_dirs() -> None:
         assert not any(name.startswith(".codex/") for name in names)
         assert not any(name.startswith(".codex-home/") for name in names)
         assert ".bash_profile" not in names
+
+
+def test_compute_workspace_zip_excludes_package_caches_at_any_depth() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        # HOME is the sandbox root, so package caches land beside the work.
+        (root / ".cache" / "uv" / "wheels").mkdir(parents=True)
+        (root / ".cache" / "uv" / "wheels" / "numpy.whl").write_text("x", encoding="utf-8")
+        (root / ".local" / "lib" / "python3.14").mkdir(parents=True)
+        (root / ".local" / "lib" / "python3.14" / "scipy.py").write_text("x", encoding="utf-8")
+        (root / ".sage" / "cache").mkdir(parents=True)
+        (root / ".sage" / "cache" / "gap.sobj").write_text("x", encoding="utf-8")
+        (root / ".npm" / "_cacache").mkdir(parents=True)
+        (root / ".npm" / "_cacache" / "index").write_text("x", encoding="utf-8")
+        # A venv created from inside a work directory evades a top-level filter.
+        (root / "code" / ".venv" / "lib").mkdir(parents=True)
+        (root / "code" / ".venv" / "lib" / "sympy.py").write_text("x", encoding="utf-8")
+        (root / "code" / "__pycache__").mkdir(parents=True)
+        (root / "code" / "__pycache__" / "verify.pyc").write_text("x", encoding="utf-8")
+        (root / "code" / "verify.py").write_text("keep", encoding="utf-8")
+        (root / "data").mkdir()
+        (root / "data" / "table.csv").write_text("keep", encoding="utf-8")
+        # A regular file that merely shares a cache directory's name is the
+        # worker's own output and must survive.
+        (root / "notes").mkdir()
+        (root / "notes" / ".cache").write_text("keep", encoding="utf-8")
+        (root / "notes" / ".sage").write_text("keep", encoding="utf-8")
+
+        out_zip = temp / "workspace.zip"
+        _zip_workspace(
+            root,
+            out_zip,
+            exclude_top=_ZIP_EXCLUDE_TOP,
+            exclude_top_dirs=_ZIP_EXCLUDE_TOP_DIRS,
+            exclude_any_depth=_ZIP_EXCLUDE_ANY_DEPTH,
+        )
+
+        import zipfile
+
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+
+        assert names == {
+            "code/verify.py",
+            "data/table.csv",
+            "notes/.cache",
+            "notes/.sage",
+        }
+
+
+
+def test_compute_workspace_zip_keeps_regular_files_named_like_caches() -> None:
+    """An exclusion names a directory; a file that shares the name is output."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        (root / "notes").mkdir(parents=True)
+        for name in (".cache", ".venv", ".npm", ".sage", "__pycache__", ".local"):
+            (root / name).write_text("keep", encoding="utf-8")
+            (root / "notes" / name).write_text("keep", encoding="utf-8")
+        # The framework shims are regular files and stay excluded by name.
+        (root / ".bashrc").write_text("shim", encoding="utf-8")
+
+        out_zip = temp / "workspace.zip"
+        _zip_workspace(
+            root,
+            out_zip,
+            exclude_top=_ZIP_EXCLUDE_TOP,
+            exclude_top_dirs=_ZIP_EXCLUDE_TOP_DIRS,
+            exclude_any_depth=_ZIP_EXCLUDE_ANY_DEPTH,
+        )
+
+        import zipfile
+
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+
+        assert ".bashrc" not in names
+        assert names == {
+            ".cache", ".venv", ".npm", ".sage", "__pycache__", ".local",
+            "notes/.cache", "notes/.venv", "notes/.npm", "notes/.sage",
+            "notes/__pycache__", "notes/.local",
+        }
+
+def test_compute_workspace_zip_symlink_cannot_smuggle_in_a_nested_cache() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        (root / "code" / ".venv").mkdir(parents=True)
+        (root / "code" / ".venv" / "big.bin").write_text("x", encoding="utf-8")
+        (root / ".codex-home").mkdir(parents=True)
+        (root / ".codex-home" / "auth.json").write_text("secret", encoding="utf-8")
+        (root / "code" / "result.txt").write_text("keep", encoding="utf-8")
+        (root / "notes").mkdir()
+        (root / "notes" / "leak.bin").symlink_to(root / "code" / ".venv" / "big.bin")
+        # A link whose own leaf name is now permitted must still be judged on
+        # its target: this one points at the host's Codex credentials.
+        (root / "notes" / ".cache").symlink_to(root / ".codex-home" / "auth.json")
+        # Control: a link to an ordinary file is still followed and shipped, so
+        # an empty archive below could not be explained by dropping all links.
+        (root / "notes" / "ok.txt").symlink_to(root / "code" / "result.txt")
+
+        out_zip = temp / "workspace.zip"
+        _zip_workspace(
+            root,
+            out_zip,
+            exclude_top=_ZIP_EXCLUDE_TOP,
+            exclude_top_dirs=_ZIP_EXCLUDE_TOP_DIRS,
+            exclude_any_depth=_ZIP_EXCLUDE_ANY_DEPTH,
+        )
+
+        import zipfile
+
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+
+        assert names == {"code/result.txt", "notes/ok.txt"}
 
 
 def test_compute_run_captures_codex_last_message_on_clean_cli_exit() -> None:

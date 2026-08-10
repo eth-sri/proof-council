@@ -35,6 +35,7 @@ import re
 import shutil
 import zipfile
 from pathlib import Path
+from collections.abc import Set as AbstractSet
 from typing import Any, ClassVar, Final, Self
 
 from pydantic import BaseModel, Field, model_validator
@@ -78,6 +79,35 @@ _ZIP_EXCLUDE_TOP = {
     ".profile",
     ".bashrc",
 }
+
+# Top-level *directories* that exist only because HOME is the sandbox root:
+# ``.local`` is where ``pip install --user`` and friends land. Treating it as
+# disposable is a policy rather than a guarantee, so the worker prompt names it
+# as omitted and directs durable output to code/, data/, papers/, notes/ and
+# responses/. Matched as a path ancestor, so a regular file the worker happens
+# to name ``.local`` is still shipped.
+_ZIP_EXCLUDE_TOP_DIRS = {
+    ".local",
+}
+
+# Cache *directories*, excluded wherever they occur rather than only at the top
+# level. ``sandbox/base.py`` sets HOME to the sandbox root, so a worker that
+# runs ``uv pip install numpy scipy`` writes thousands of files to
+# ``<workspace>/.cache/uv`` — but a worker that runs ``uv venv`` from inside
+# code/ puts just as many under ``code/.venv``, which a top-level-only filter
+# would miss. ``.sage`` is here because the worker prompt actively encourages
+# SageMath, which keeps a DOT_SAGE cache under HOME.
+#
+# These match path *ancestors* only: a regular file that happens to be named
+# ``notes/.cache`` is the worker's own and is kept.
+_ZIP_EXCLUDE_ANY_DEPTH = {
+    ".cache",
+    ".venv",
+    ".npm",
+    ".sage",
+    "__pycache__",
+}
+
 _CODEX_LAST_MESSAGE_REL: Final[str] = ".pwc/runtime/codex-last-message.md"
 _DOCKER_CODEX_HOME: Final[str] = "/codex-home"
 _COMPUTE_UTILS = """\
@@ -152,14 +182,23 @@ worker call.
   will see this file's contents pasted verbatim into its next-turn
   prompt. Keep it focused (under ~4000 words). Include concrete
   outputs: tables of numbers, code excerpts, file pointers under your
-  workspace, citations of papers you found. The whole workspace is
-  also zipped and attached to the next Author call, so you can refer
-  to ``code/``, ``data/``, ``papers/``, etc. paths and the Author can
+  workspace, citations of papers you found. Your workspace is also
+  zipped and attached to the next Author call, so you can refer to
+  ``code/``, ``data/``, ``papers/``, etc. paths and the Author can
   inspect them via its own code_interpreter.
 
 - Everything else (``code/``, ``data/``, ``papers/``, ``notes/``, …)
   is yours to organize freely. Files persist across invocations, so
   later rounds can build on prior compute artifacts.
+
+**Anything the Author must see has to live outside a cache directory.**
+The attached zip omits ``.cache/``, ``.venv/``, ``.npm/``, ``.sage/``
+and ``__pycache__/`` wherever they occur, and ``.local/`` at the top
+level — HOME is set to your workspace root, so package installs land
+there and would otherwise bury your actual output in thousands of
+files. Keep durable artifacts under ``code/``, ``data/``, ``papers/``,
+``notes/`` or ``responses/``. The omitted directories are still on
+disk for your own later rounds; they simply are not shipped.
 
 ## Tools
 
@@ -440,7 +479,13 @@ class Compute(CLIAgent):
             )
         zip_path = self.workdir / f"compute_workspace_round_{inp.round}.zip"  # type: ignore[attr-defined]
         try:
-            _zip_workspace(root, zip_path, exclude_top=_ZIP_EXCLUDE_TOP)
+            _zip_workspace(
+                root,
+                zip_path,
+                exclude_top=_ZIP_EXCLUDE_TOP,
+                exclude_top_dirs=_ZIP_EXCLUDE_TOP_DIRS,
+                exclude_any_depth=_ZIP_EXCLUDE_ANY_DEPTH,
+            )
         except OSError as e:
             await self.events.emit(
                 "ac.compute.zip_failed",
@@ -545,10 +590,24 @@ def _build_codex_cmd(
     ]
 
 
-def _zip_workspace(root: Path, out_zip: Path, *, exclude_top: set[str]) -> None:
-    """Zip everything under ``root`` except top-level directories in
-    ``exclude_top``. Symlinks are dropped unless their resolved target
-    stays inside ``root`` and outside any excluded top-level directory.
+def _zip_workspace(
+    root: Path,
+    out_zip: Path,
+    *,
+    exclude_top: set[str],
+    exclude_top_dirs: AbstractSet[str] = frozenset(),
+    exclude_any_depth: AbstractSet[str] = frozenset(),
+) -> None:
+    """Zip everything under ``root`` except top-level entries named in
+    ``exclude_top``, top-level directories named in ``exclude_top_dirs``, and
+    directories named in ``exclude_any_depth`` wherever they occur. Symlinks
+    are dropped unless their resolved target stays inside ``root`` and outside
+    every excluded directory.
+
+    ``exclude_top`` matches an entry of any kind, because it holds framework
+    shims that are themselves regular files. The other two match path
+    *ancestors*, so a regular file the worker happens to name ``notes/.cache``
+    or ``.local`` is its own output and is kept.
 
     Why: the worker can create symlinks inside its workspace. Without
     this check, a path like ``notes/auth.json -> ../.codex-home/auth.json``
@@ -556,6 +615,18 @@ def _zip_workspace(root: Path, out_zip: Path, *, exclude_top: set[str]) -> None:
     ``_ZIP_EXCLUDE_TOP`` because ``zipfile.ZipFile.write`` follows
     symlinks by default and stores the resolved file's contents.
     """
+
+    def _excluded(rel: Path) -> bool:
+        parts = rel.parts
+        if not parts:
+            return False
+        if parts[0] in exclude_top:
+            return True
+        ancestors = parts[:-1]
+        if ancestors and ancestors[0] in exclude_top_dirs:
+            return True
+        return any(part in exclude_any_depth for part in ancestors)
+
     out_zip.parent.mkdir(parents=True, exist_ok=True)
     if out_zip.exists():
         try:
@@ -572,12 +643,11 @@ def _zip_workspace(root: Path, out_zip: Path, *, exclude_top: set[str]) -> None:
                 rel = path.relative_to(root)
             except ValueError:
                 continue
-            top = rel.parts[0] if rel.parts else ""
-            if top in exclude_top:
+            if _excluded(rel):
                 continue
             if path.is_symlink():
                 # Resolve the target and require it to stay inside
-                # ``root`` and outside any excluded top-level dir.
+                # ``root`` and outside every excluded directory.
                 try:
                     target = path.resolve(strict=True)
                 except (OSError, RuntimeError):
@@ -586,8 +656,7 @@ def _zip_workspace(root: Path, out_zip: Path, *, exclude_top: set[str]) -> None:
                     target_rel = target.relative_to(root_resolved)
                 except ValueError:
                     continue
-                target_top = target_rel.parts[0] if target_rel.parts else ""
-                if target_top in exclude_top:
+                if _excluded(target_rel):
                     continue
                 if not target.is_file():
                     continue

@@ -234,8 +234,8 @@ You may additionally emit three control blocks:
     ``sympy``, or deeper literature retrieval (downloading actual
     PDFs / TeX sources from arXiv etc.). Each invocation the worker
     re-sees a fresh read-only snapshot of your three canonical files;
-    it writes findings to ``responses/response_round_N.md`` and the
-    whole workspace is zipped and attached to your *next* turn so
+    it writes findings to ``responses/response_round_N.md`` and its
+    workspace is zipped and attached to your *next* turn so
     you can inspect logs, data, and downloaded papers via
     code_interpreter. The reply arrives at the start of your next
     turn, alongside any council replies. Give it specific, ordered,
@@ -471,7 +471,7 @@ You may also emit three control blocks in your reply text:
     PDFs / TeX sources from arXiv etc.). Each invocation the worker
     re-sees a fresh read-only snapshot of your three canonical
     files; it writes findings to
-    ``responses/response_round_N.md`` and the whole workspace is
+    ``responses/response_round_N.md`` and its workspace is
     zipped and attached to your *next* turn as a read-only file you
     can ``unzip`` via code_interpreter to inspect logs, data, and
     downloaded papers. The reply arrives at the start of your next
