@@ -1,0 +1,652 @@
+workflow: proofstack.agents.proof_cleanup.ProofCleanupDAGWorkflow
+description: Two scholarship audit-write rounds followed by a fidelity-gated organization pass.
+
+budget:
+  max_usd: 0.0
+  max_wallclock_s: 14400
+
+inputs:
+  problem: ''
+
+components:
+  ProofCleanupDAGWorkflow:
+    unsafe_bypass_codex_sandbox: true
+
+  scholarship_auditor:
+    cache_enabled: false
+    cmd:
+      - codex
+      - --search
+      - --ask-for-approval
+      - never
+      - exec
+      - --ignore-user-config
+      - --skip-git-repo-check
+      - --ephemeral
+      - --json
+    model: gpt-5.6-sol
+    model_reasoning_effort: high
+    codex_sandbox: auto
+    copy_codex_auth: true
+    workspace_root: cleanup_workspace
+    usage:
+      type: codex_jsonl
+      model: gpt-5.6-sol
+      bill: false
+    soft_timeout_s: 1800
+    sandbox:
+      backend: subprocess
+      timeout_s: 2100
+      provider_keys: []
+    contract: auto
+    completion_signal: file
+    prompt: |
+      Audit source_proof.tex against cleaned_proof.tex. Use only these files and
+      previous_audit.md when it is nonempty, and public primary or authoritative
+      sources. Do not read local assessments, benchmark material, other
+      solutions, or revisions not supplied in this workspace. Do not edit the
+      manuscript.
+
+      Work through the following audit in full. Do not stop after finding the
+      first defect.
+
+      1. Inventory and fidelity. Read both TeX files completely. Inventory the
+         main claims and their proved, conditional, conjectural, heuristic, or
+         computational status; numbered statements; citations; nonstandard terms
+         and notation; central reductions and constructions; case splits; and
+         external artifacts. Also inventory every top-level section and its
+         stated purpose, every displayed decomposition of a total into selected
+         and residual terms, and every auxiliary/normalized model that changes
+         notation. These inventories must be complete rather than sampled.
+         Compare the draft with the source and flag any
+         unsupported alteration to a hypothesis, quantifier, formula, constant,
+         inequality, endpoint, implication, proof step, or claim status, and any
+         deletion that weakens an argument. An explicit derivation of a
+         consequence already contained in the source's ingredients is permitted
+         when it is verified and does not change the strategy or result.
+
+      2. Provenance. For every citation, named result or framework, nonstandard
+         term, and central proof device, determine whether local credit is needed.
+         Search by mathematical statement, distinctive terminology or notation,
+         proof architecture, and important special cases; inspect relevant
+         sources and their references rather than relying on keyword overlap.
+         Require a citation at the first dependent use of each imported result,
+         definition, construction, strategy, or notation. Similar subject matter
+         alone is not evidence of dependence. Describe a relationship only as
+         strongly as the sources and chronology support, and make no priority or
+         borrowing claim when the manuscript's date or direction of influence is
+         unknown. In the audit, give a provenance matrix with one row for every
+         inventoried citation, named framework, nonstandard term, and central
+         proof device. Classify each row as locally derived, standard, or
+         imported, and record the source or search evidence; no inventoried row
+         may be silently omitted.
+
+      3. Source accuracy and literature logic. Verify bibliographic metadata,
+         cited statements, pinpoints, hypotheses, conventions, and scope in the
+         primary source. Prefer a definitive version and distinguish later work
+         from antecedents. When a reported conclusion is assembled from an
+         earlier theorem and a later reduction, cite and verify the earlier
+         theorem itself rather than using the later summary as its sole support.
+         For every claimed implication, equivalence,
+         normalization, or comparison with a named framework, check every stated
+         direction, admissibility condition, boundary case, and parameter range.
+         Require the manuscript to display the actual transformation or
+         correspondence, identify any additional restrictions on its image, and
+         say whether it proves an implication or a genuine equivalence.
+         For the audit itself, record each transformation as a
+         domain-to-image signature with its hypotheses and image restrictions;
+         do not mark the comparison checked without that signature. For an
+         affine, centered, normalized, or rescaled change of variables,
+         explicitly translate every source-domain constraint into the equations
+         or inequalities that characterize its image; listing only the source
+         domain is not sufficient. The audit must include a constraint-translation
+         table for each such map, with one row per source constraint and its
+         algebraic image, including coordinatewise bounds. An absent row is a
+         defect even when the surrounding implication is described correctly.
+         Translate every literature theorem, conjecture, or conditional
+         hypothesis back into the manuscript's variables and state each
+         immediate consequence for the main claim, explicitly distinguishing
+         conditional from unconditional consequences.
+         For every main theorem, conjectural frontier, or stated limitation,
+         search backward through its references and forward through recent work
+         for a stronger theorem or reduction chain, and record the search outcome.
+         Require the draft to state any resulting scope accurately, without
+         turning a sufficient condition into an equivalence.
+
+      4. Self-containment and proof communication. Read the draft in order and
+         check that every symbol, term, abbreviation, derived object, and compact
+         syntax is defined before use. For punctuation-based notation such as a
+         hyphenated chain, slash, arrow, or concatenation, require a sentence
+         saying which relation or operation each separator denotes. Each
+         statement must bind its ambient objects. For every inventoried
+         decomposition, including a displayed assignment of the form
+         total = remainder + selected term, require the selected index or indices
+         and formulas for the selected summand, remainder, and remaining total.
+         Record all such locations in the logic coverage entry. Whenever an
+         auxiliary, normalized, or isomorphic model relabels objects, require
+         an explicit notation dictionary at the point where the new labels are
+         introduced, before any dependent calculation, and a sentence that
+         transfers the conclusion back to the original objects.
+         Before combining inequalities or defining derived bounds, solve every
+         available premise inequality separately for the original theorem target.
+         Every case split must then list what each branch proves in terms of that
+         same target. If one branch proves a stronger version of a bound available
+         in another branch, retain the weaker shared form. Preserve simultaneous
+         bounds as their corresponding maximum or minimum; flag an addition or
+         average that hides a strictly sharper common bound. Across genuine
+         alternatives, intersect only the conclusions established in every
+         branch. In the audit report, include for every nontrivial case split a
+         compact branch table giving each premise's location, its consequence
+         after isolating the original target in each branch, and the strongest
+         common intersection. A bare statement that the split was checked is not
+         coverage. Before a non-obvious map, auxiliary quantity, or construction,
+         require enough explanation to say why it is introduced, what its
+         components detect, and how its output advances the proof. In the audit,
+         include a first-use table for every such object, listing its definition
+         location, the pre-definition motivation, each component's meaning, and
+         its downstream use. If motivation appears only after the formula or a
+         table entry is absent, report a defect.
+
+      5. Usability and typesetting. Check that the title, abstract, introduction,
+         and conclusion describe the actual scope and limitations. Check that
+         each section and major result states its purpose and dependency, and
+         that transitions explain why the next result is needed. Record the
+         section-by-section outcome in the communication coverage entry; a list
+         of headings alone is not evidence that flow was checked. Require a
+         compact visual only when multi-part spatial or incidence information
+         would otherwise have to be reconstructed from coordinates or prose; for
+         a non-obvious piecewise map, it must show the source decomposition, the
+         target arrangement, and their matching labels.
+         Compile at least twice and continue until cross-references stabilize,
+         inspect the PDF, and check labels, punctuation, unresolved references,
+         bibliography output, and legibility. Internal equation,
+         theorem, citation, and URL references must be clickable when the document
+         format supports hyperlinks.
+
+      If previous_audit.md is nonempty, verify every earlier issue identifier and
+      report which were resolved, remain open, or were superseded. This does not
+      replace a complete new scan for regressions and previously missed defects.
+
+      Write scholarship_audit.md only after the audit is complete. Do not begin
+      it with a verdict, approval, or rejection label. Give each actionable
+      defect a stable identifier, precise location, required smallest complete
+      correction, and supporting source or internal evidence. If no actionable
+      defect is found, say so explicitly. A correction may add a definition,
+      derivation, or explanation already supported by the manuscript's
+      ingredients, but it may not invent a claim or proof strategy. If an
+      external artifact cannot be checked, require an honest limitation or
+      reproducibility disclosure. List defects, not optional preferences.
+
+      End the report with the heading exactly `## Coverage ledger`. Under it use
+      these six labels exactly: `- Fidelity:`, `- Provenance:`,
+      `- Citations:`, `- Logic and first uses:`,
+      `- Communication and visuals:`, and `- TeX and PDF:`. For each category,
+      name the items or locations checked and the outcome; sampling is not enough.
+      Leave the completed report in place and never delete or rename it.
+    input_schema:
+      proof: string
+      draft: string
+      prior_audit: string
+      workspace: string
+    input_files:
+      source_proof.tex:
+        from_input: proof
+      cleaned_proof.tex:
+        from_input: draft
+      previous_audit.md:
+        from_input: prior_audit
+      scholarship_audit.md: ''
+    output_schema:
+      workspace: string
+      audit: string
+      status: string
+      completion_receipt:
+        type: object
+    output_files:
+      audit: scholarship_audit.md
+      completion_receipt:
+        path: .pwc/runtime/done.json
+        type: json
+        default:
+          status: missing
+    done_outputs:
+      status: status
+
+  proof_editor:
+    cache_enabled: false
+    cmd:
+      - codex
+      - --search
+      - --ask-for-approval
+      - never
+      - exec
+      - --ignore-user-config
+      - --skip-git-repo-check
+      - --ephemeral
+      - --json
+    model: gpt-5.6-sol
+    model_reasoning_effort: high
+    codex_sandbox: auto
+    copy_codex_auth: true
+    workspace_root: cleanup_workspace
+    usage:
+      type: codex_jsonl
+      model: gpt-5.6-sol
+      bill: false
+    soft_timeout_s: 1500
+    sandbox:
+      backend: subprocess
+      timeout_s: 1800
+      provider_keys: []
+    contract: auto
+    completion_signal: file
+    prompt: |
+      Shared rules
+
+      1. Use only source_proof.tex, cleaned_proof.tex, the supplied audit when
+         present, and public primary or authoritative sources. Do not read local
+         reviews, benchmark reports, other solutions, or earlier revisions.
+
+      2. Preserve the mathematical content and its status. Do not change a
+         hypothesis, quantifier, formula, constant, inequality, endpoint,
+         implication, case, proof step, or proved/conjectural/heuristic status.
+         You may add a definition, derivation, or explanation already supported
+         by the source's ingredients. Do not introduce a new claim, proof
+         strategy, or unsupported interpretation.
+
+      3. Write only a standalone UTF-8 cleaned_proof.tex. Compile it at least
+         twice and continue until cross-references stabilize, then inspect the
+         PDF. Remove TeX errors, unresolved references, broken links, and
+         misleading or unreadable output. Do not include an audit, checklist,
+         TODO, or editorial note in the manuscript.
+
+      Current role
+
+      {phase}
+    input_schema:
+      proof: string
+      phase: string
+      workspace: string
+    input_files:
+      source_proof.tex:
+        from_input: proof
+    output_schema:
+      workspace: string
+      cleaned_proof: string
+      status: string
+      completion_receipt:
+        type: object
+    output_files:
+      cleaned_proof: cleaned_proof.tex
+      completion_receipt:
+        path: .pwc/runtime/done.json
+        type: json
+        default:
+          status: missing
+    done_outputs:
+      status: status
+
+  organization_editor:
+    cache_enabled: false
+    cmd:
+      - codex
+      - --ask-for-approval
+      - never
+      - exec
+      - --ignore-user-config
+      - --skip-git-repo-check
+      - --ephemeral
+      - --json
+    model: gpt-5.6-sol
+    model_reasoning_effort: high
+    codex_sandbox: auto
+    copy_codex_auth: true
+    workspace_root: cleanup_workspace
+    usage:
+      type: codex_jsonl
+      model: gpt-5.6-sol
+      bill: false
+    soft_timeout_s: 1500
+    sandbox:
+      backend: subprocess
+      timeout_s: 1800
+      provider_keys: []
+    contract: auto
+    completion_signal: file
+    prompt: |
+      Edit cleaned_proof.tex into a clear, economical research paper. Treat
+      scholarship_proof.tex as the immutable mathematical and scholarly
+      baseline. Read both files completely. Use only these supplied files. Do
+      not search for or read local reviews, benchmark material, other solutions,
+      or unsupplied revisions.
+
+      You are a copy editor, not a coauthor. Before editing, inventory every
+      claim and formal statement with its hypotheses, quantifiers, constants,
+      formulas, inequalities, cases, dependencies, boundary conditions, and
+      proved, conditional, conjectural, heuristic, or computational status.
+      Also inventory every proof step, citation and pinpoint, local credit,
+      named comparison, limitation, definition, motivating explanation,
+      example, figure, notation dictionary, hyperlink, and external-artifact
+      disclosure. Preserve every inventoried item and its role.
+
+      Mathematical and scholarship invariants
+
+      1. Do not add, delete, repair, replace, strengthen, weaken, or silently
+         reinterpret mathematics. Preserve theorem statements, formulas, proof
+         steps, cases, examples, dependency order, implication directions,
+         simultaneous bounds, and claim status. Treat logic-bearing connective
+         prose as mathematics. If a stylistic improvement could alter meaning,
+         leave the passage unchanged.
+
+         As a mechanical invariant, keep every TeX math fragment, custom command
+         or theorem definition, formal statement environment, citation or
+         cross-reference command, bibliography, figure, and table intact apart
+         from whitespace or comments. You may relocate a complete intact unit
+         with its dependencies, but do not rewrite its protected contents.
+         Keep the complete sentence containing each citation command unchanged;
+         the publication gate compares those source-support links exactly.
+
+      2. Preserve all scholarship work. Keep citations, pinpoints, hyperlinks,
+         attribution, terminology, limitations, notation dictionaries, first-use
+         explanations, and visuals attached to the ideas they support. Add no
+         motivation, history, significance, priority, citation, claim, or proof
+         idea not already supported by the baseline. An apparent gap requiring
+         new mathematics or scholarship is outside this role and must remain
+         unchanged.
+
+      Organization and prose pass
+
+      3. Maintain reader orientation. A mathematically strong reader outside
+         the immediate subproblem should always know what is being done, why it
+         is being done, and what each symbol and nonstandard term means.
+         Introduce before use, recall notation after a long gap, and use a
+         forward reference only with a sufficient black-box summary. When a
+         class, quotient, or partition is first named, state both its carrier and
+         the relation that identifies its members.
+
+      4. Put the destination before the journey. State the precise result or
+         honest partial status early. Keep the abstract short and above the
+         apparatus: contribution, scope, and broad mechanism, without
+         unexplained notation. Give a genuine proof overview identifying the
+         main difficulty, key mechanism, three to seven major moves, and the
+         purpose of the sections, but only when the baseline supports it.
+
+      5. Make the route follow dependencies. Keep definitions near first use.
+         Open each section and long proof with its purpose; connect blocks by
+         saying what the preceding result supplies and why the next object is
+         needed. Use headings, lemmas, and named steps only when they expose the
+         real hierarchy. Mark cases and say what a long calculation achieved.
+
+      6. Explain ideas before verification. For each non-obvious choice or
+         construction, preserve or move forward the baseline explanation of why
+         it is introduced, what its components detect, how it advances the
+         proof, and where important hypotheses enter. Interpret important
+         displays in prose without duplicating them.
+
+      7. Match detail to novelty and difficulty. Compress routine material only
+         when its argument remains recoverable. Remove generic openings,
+         ceremony, praise, proof-diary narration, repeated previews or
+         conclusions, signposting spam, unearned adverbs, and redundant notation.
+         Remove filler, never substance, credit, a limitation, or a logical
+         bridge. Do not atomize the proof into decorative lemmas or sections.
+
+      8. Keep notation minimal, local, and stable. Use complete punctuated
+         sentences, anchored references, concrete verbs, and logical connectives
+         that say exactly what follows. Keep definitions clean, formal statements
+         independently usable, and qualified or conditional claims visibly so.
+         If technical shorthand has another established mathematical reading,
+         replace it with the literal quantified property already proved in the
+         baseline; context that merely makes the intended meaning recoverable is
+         not sufficient.
+
+      Verification and output
+
+      Reread the result using the one-sentence, five-minute, skim, theorem-only,
+      formula-blind, three-to-seven-step proof-compression, notation-recall,
+      adversarial-ambiguity, and read-aloud tests. Compare it against both
+      pre-edit inventories. Compile at least twice until references stabilize,
+      render the PDF, and inspect every page for broken links, floats, clipping,
+      typography, and unreadable figures or tables.
+
+      Before finishing, search the complete candidate for every occurrence of
+      “class”, “quotient”, and “partition”. At each first use, verify that the
+      surrounding prose literally identifies the carrier and the relation that
+      groups two members; repair any label whose meaning must still be inferred.
+      Likewise, search for technical shorthand and replace it with the exact
+      quantified statement whenever its conventional reading could differ from
+      the property actually proved.
+
+      Write only the complete standalone UTF-8 cleaned_proof.tex. Do not put an
+      audit, checklist, TODO, change log, or editorial note in the manuscript.
+      Report status done only after every preservation and rendering check passes.
+    input_schema:
+      baseline: string
+      draft: string
+      workspace: string
+    input_files:
+      scholarship_proof.tex:
+        from_input: baseline
+      cleaned_proof.tex:
+        from_input: draft
+    output_schema:
+      workspace: string
+      cleaned_proof: string
+      status: string
+      completion_receipt:
+        type: object
+    output_files:
+      cleaned_proof: cleaned_proof.tex
+      completion_receipt:
+        path: .pwc/runtime/done.json
+        type: json
+        default:
+          status: missing
+    done_outputs:
+      status: status
+
+dag:
+  nodes:
+    - id: proof_input
+      kind: agent
+      agent: proofstack.agents.proof_cleanup.CleanupInputBlock
+      inputs:
+        problem: $input.problem
+        solution: $input.solution
+      ui:
+        label: Proof input
+        subtitle: direct or prior workflow
+        x: -1080
+        y: 80
+
+    - id: scholarship_loop
+      kind: repeat
+      needs: [proof_input]
+      max_iterations: 2
+      condition:
+        python_code: |
+          result = True
+      initial_state:
+        draft: $node.proof_input.proof
+        workspace: ''
+        prior_audit: ''
+        audit: ''
+        audit_status: not_run
+        write_status: not_run
+        audit_completion_receipt:
+          status: not_run
+        write_completion_receipt:
+          status: not_run
+      body:
+        nodes:
+          - id: audit
+            kind: agent
+            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+            name: scholarship_auditor
+            inputs:
+              proof: $parent.node.proof_input.proof
+              draft: $state.draft
+              prior_audit: $state.prior_audit
+              workspace: $state.workspace
+            ui:
+              label: Scholarship auditor
+              subtitle: inspect current draft
+              x: -40
+              y: 25
+
+          - id: write
+            kind: agent
+            needs: [audit_gate]
+            agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+            name: proof_editor
+            inputs:
+              proof: $parent.node.proof_input.proof
+              workspace: $node.audit_gate.workspace
+              phase: |
+                Scholarship repair
+
+                1. Read scholarship_audit.md and repair every actionable issue.
+                   Before editing, map each stable issue identifier to the
+                   manuscript locations it affects. Make the smallest complete
+                   correction for each item. If the audit reports no actionable
+                   defect, preserve the current manuscript unchanged.
+
+                2. Verify cited sources and logical reductions yourself. Do not
+                   copy an audit claim that the source does not support.
+
+                3. Make no unrelated organizational rewrite. Recheck the source
+                   after editing so formulas and claim status remain unchanged.
+
+                4. Compile and inspect the draft, then reread the audit and
+                   confirm every issue identifier is resolved before writing the
+                   completion record. Keep the issue map out of the manuscript.
+            ui:
+              label: Scholarship writer
+              subtitle: repair current audit
+              x: 390
+              y: 25
+
+          - id: audit_gate
+            kind: agent
+            needs: [audit]
+            agent: proofstack.agents.proof_cleanup.CleanupAuditCompletionBlock
+            inputs:
+              workspace: $node.audit.workspace
+              audit: $node.audit.audit
+              status: $node.audit.status
+              completion_receipt: $node.audit.completion_receipt
+
+          - id: write_gate
+            kind: agent
+            needs: [write]
+            agent: proofstack.agents.proof_cleanup.CleanupEditCompletionBlock
+            inputs:
+              workspace: $node.write.workspace
+              cleaned_proof: $node.write.cleaned_proof
+              status: $node.write.status
+              completion_receipt: $node.write.completion_receipt
+
+        state_updates:
+          draft: $node.write_gate.cleaned_proof
+          workspace: $node.write_gate.workspace
+          prior_audit: $node.audit_gate.audit
+          audit: $node.audit_gate.audit
+          audit_status: $node.audit.status
+          write_status: $node.write.status
+          audit_completion_receipt:
+            coalesce:
+              - $node.audit.completion_receipt
+              - status: missing
+          write_completion_receipt:
+            coalesce:
+              - $node.write.completion_receipt
+              - status: missing
+      outputs:
+        cleaned_proof: $state.draft
+        workspace: $state.workspace
+        audit: $state.audit
+        audit_status: $state.audit_status
+        write_status: $state.write_status
+        audit_completion_receipt: $state.audit_completion_receipt
+        write_completion_receipt: $state.write_completion_receipt
+      ui:
+        label: Scholarship audit-write loop
+        x: -390
+        y: 80
+        repeat_input:
+          x: -560
+          y: 80
+        repeat_output:
+          x: 800
+          y: 80
+
+    - id: organization
+      kind: agent
+      needs: [scholarship_loop]
+      agent: proofstack.agents.configurable_cli.ConfigurableCLIAgent
+      name: organization_editor
+      inputs:
+        baseline: $node.scholarship_loop.cleaned_proof
+        draft: $node.scholarship_loop.cleaned_proof
+        workspace: $node.scholarship_loop.workspace
+      ui:
+        label: Organization writer
+        subtitle: single prose-only pass
+        x: 1030
+        y: 80
+
+    - id: publication_gate
+      kind: if_else
+      needs: [organization]
+      inputs:
+        organization_edit_status: $node.organization.status
+        organization_edit_completion_receipt: $node.organization.completion_receipt
+        cleaned_proof: $node.organization.cleaned_proof
+      condition:
+        python_code: |
+          edit_receipt = inputs.get("organization_edit_completion_receipt") or {}
+          edit_receipt_valid = (
+              edit_receipt == dict(edit_receipt)
+              and edit_receipt.get("status") == "done"
+          )
+          result = (
+              str(inputs.get("organization_edit_status", "")) == "done"
+              and edit_receipt_valid
+              and bool(str(inputs.get("cleaned_proof", "")).strip())
+          )
+      then:
+        cleaned_proof: $node.organization.cleaned_proof
+      else:
+        cleaned_proof: ''
+      ui:
+        label: Completion gate
+        subtitle: organization writer receipt
+        x: 1400
+        y: 80
+
+    - id: publish
+      kind: agent
+      needs: [scholarship_loop, publication_gate]
+      agent: proofstack.agents.proof_cleanup.CleanupPublicationBlock
+      inputs:
+        problem_id: $input.problem_id
+        scholarship_tex: $node.scholarship_loop.cleaned_proof
+        cleaned_proof: $node.publication_gate.cleaned_proof
+        organization_completed: $node.publication_gate.condition
+      ui:
+        label: Publication checks
+        subtitle: preserve, compile, publish
+        x: 1770
+        y: 80
+
+  outputs:
+    problem_id: $node.publish.problem_id
+    cleaned_proof: $node.publish.cleaned_proof
+    solution_tex: $node.publish.solution_tex
+    compiled: $node.publish.compiled
+  ui:
+    workflow_output:
+      x: 2530
+      y: 80
+
+export:
+  label: Proof Cleanup

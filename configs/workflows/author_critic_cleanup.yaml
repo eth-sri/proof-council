@@ -1,0 +1,57 @@
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: Run the reusable Author/Critic workflow, then clean its final proof with the reusable Proof Cleanup workflow.
+
+inputs:
+  problem: ''
+  unsafe_bypass_codex_sandbox: false
+
+budget:
+  max_usd: 1000.0
+  max_wallclock_s: 100000
+
+dag:
+  nodes:
+    - id: author_critic
+      kind: workflow_ref
+      preset: author_critic
+      inputs:
+        problem: $input.problem
+        problem_id: $input.problem_id
+      ui:
+        label: Author/Critic
+        subtitle: write and verify proof
+        x: -500
+        y: 80
+
+    - id: proof_cleanup
+      kind: workflow_ref
+      needs: [author_critic]
+      preset: proof_cleanup
+      inputs:
+        problem: $input.problem
+        problem_id: $input.problem_id
+        solution: $node.author_critic.answer_tex
+      component_overrides:
+        ProofCleanupDAGWorkflow:
+          unsafe_bypass_codex_sandbox: $input.unsafe_bypass_codex_sandbox
+      ui:
+        label: Proof Cleanup
+        subtitle: scholarship + prose pass
+        x: 40
+        y: 80
+
+  outputs:
+    problem_id: $node.proof_cleanup.problem_id
+    cleaned_proof: $node.proof_cleanup.cleaned_proof
+    solution_tex: $node.proof_cleanup.solution_tex
+    compiled: $node.proof_cleanup.compiled
+    author_critic_rounds_completed: $node.author_critic.rounds_completed
+    author_critic_early_stopped: $node.author_critic.early_stopped
+    author_critic_accepted: $node.author_critic.last_critic_accepted
+  ui:
+    workflow_output:
+      x: 580
+      y: 80
+
+export:
+  label: Author Critic Cleanup
