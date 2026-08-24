@@ -154,6 +154,7 @@ class Sandbox:
         timeout_s: int | None = None,
         env_extra: Mapping[str, str] | None = None,
         extra_path: Iterable[Path] = (),
+        input_data: str | bytes | None = None,
     ) -> CommandResult:
         raise NotImplementedError
 

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from proofstack.agents.ac.ac_workflow import (
     ACWorkflow,
     _CompileResult,
+    _compute_requested,
     _problem_hash,
     _resume_stop_round,
     _safe_read,
@@ -377,7 +378,10 @@ class ACAuthorBlock(_ACVisualStep):
             omit_thinking = False
 
         requested_council = ac_inp.enable_council and author.council_question and bool(ac_inp.council_models)
-        requested_compute = ac_inp.enable_compute and bool(author.compute_instructions)
+        requested_compute = _compute_requested(
+            ac_inp.enable_compute,
+            author.compute_instructions,
+        )
         terminal_auxiliary_blocked, kinds, pending_terminal_auxiliary = self._terminal_auxiliary_decision(
             inp=ac_inp,
             round=k,

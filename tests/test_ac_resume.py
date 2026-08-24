@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import sys
 import tempfile
 import types
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,11 +20,16 @@ from proofstack.agents.ac.ac_workflow import (  # noqa: E402
     ACWorkflow,
     _CompileResult,
     _problem_hash,
+    _snapshot_compute_handoff,
 )
 from proofstack.agents.ac.visual_blocks import ACInitBlock, ACReturnBlock  # noqa: E402
 from proofstack.agents.ac.author import Author  # noqa: E402
 from proofstack.agents.ac.council import CouncilReply  # noqa: E402
 from proofstack.agents.ac.critic import ACCritic  # noqa: E402
+from proofstack.agents.ac.compute import (  # noqa: E402
+    inspect_compute_handoff,
+    mark_compute_handoff_local_only,
+)
 from proofstack.context import RunContext  # noqa: E402
 from proofstack.registry import load_preset  # noqa: E402
 from scripts import run_workflow  # noqa: E402
@@ -38,6 +45,66 @@ def _workspace(root: Path, problem_id: str = "p", problem: str = "P") -> Path:
 
 
 class ACResumeTests(unittest.TestCase):
+    def test_compute_handoff_snapshot_uses_one_physical_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "compute_workspace_round_2.zip"
+            source.write_bytes(b"bounded handoff")
+            snapshot = root / ".ac" / "round-2"
+            snapshot.mkdir(parents=True)
+
+            _snapshot_compute_handoff(source, snapshot)
+
+            retained = snapshot / source.name
+            metadata = json.loads(
+                (snapshot / "compute_handoff_ref.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(retained.is_file())
+            self.assertEqual(retained.read_bytes(), b"bounded handoff")
+            self.assertEqual(source.stat().st_ino, retained.stat().st_ino)
+            self.assertEqual(metadata["mode"], "hardlink")
+            self.assertEqual(
+                metadata["sha256"],
+                "7a62bca86c85e878c0682777149684546b6416d5c29cc16851401d4959cf37cf",
+            )
+            source.unlink()
+            self.assertEqual(retained.read_bytes(), b"bounded handoff")
+
+    def test_compute_handoff_quarantine_survives_snapshot_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "compute_workspace_round_2.zip"
+            with zipfile.ZipFile(source, "w") as zf:
+                zf.writestr("notes/result.txt", "result")
+            snapshot = root / ".ac" / "round-2"
+            snapshot.mkdir(parents=True)
+            _snapshot_compute_handoff(source, snapshot)
+
+            retained = snapshot / source.name
+            digest_before = hashlib.sha256(source.read_bytes()).hexdigest()
+            size_before = source.stat().st_size
+            with patch(
+                "proofstack.agents.ac.compute.os.setxattr",
+                side_effect=OSError,
+                create=True,
+            ):
+                mark_compute_handoff_local_only(
+                    source,
+                    reason="provider rejected the attachment",
+                )
+
+            self.assertFalse(inspect_compute_handoff(source).attachable)
+            self.assertFalse(inspect_compute_handoff(retained).attachable)
+            self.assertEqual(source.stat().st_size, size_before)
+            self.assertEqual(
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+                digest_before,
+            )
+            metadata = json.loads(
+                (snapshot / "compute_handoff_ref.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("source_relative", metadata)
+
     def test_visual_author_critic_preset_runs_real_loop_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

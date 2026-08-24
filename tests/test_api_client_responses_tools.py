@@ -63,7 +63,11 @@ if "loguru" not in sys.modules:
     sys.modules["loguru"] = loguru
 
 from mathagents import api_client as api_client_module  # noqa: E402
-from mathagents.api_client import APIClient, _ClientTerminated  # noqa: E402
+from mathagents.api_client import (  # noqa: E402
+    APIClient,
+    ProviderAttachmentRejectedError,
+    _ClientTerminated,
+)
 
 
 def _function_tool(name: str = "list_persisted_files") -> dict:
@@ -627,6 +631,57 @@ class SalvagePrefersOutputTests(unittest.TestCase):
             result.conversation[-1]["content"].strip(),
             "recovered on retry",
         )
+
+    def test_container_file_limit_is_terminal_even_with_partial_output(self) -> None:
+        queued = SimpleNamespace(id="resp_file_limit", status="queued")
+        failed = SimpleNamespace(
+            id="resp_file_limit",
+            status="failed",
+            error=SimpleNamespace(
+                code="array_above_max_length",
+                message="The container has too many files; maximum of 1000 files.",
+            ),
+            output=[_message("partial tool chatter is not a usable answer")],
+            usage=None,
+            model_dump=lambda: {"output": ["message"], "status": "failed"},
+        )
+
+        class _BackgroundResponses:
+            def __init__(self):
+                self.create_calls = 0
+
+            def create(self, **payload):
+                self.create_calls += 1
+                return queued
+
+            def retrieve(self, response_id):
+                return failed
+
+        responses = _BackgroundResponses()
+        api = APIClient(
+            model="fake-pro",
+            api="custom",
+            use_openai_responses_api=True,
+            background=True,
+        )
+
+        with patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ), patch("mathagents.api_client.time.sleep"):
+            with self.assertRaisesRegex(
+                ProviderAttachmentRejectedError,
+                "array_above_max_length",
+            ) as raised:
+                api._openai_query_responses_api(
+                    SimpleNamespace(responses=responses),
+                    0,
+                    [{"role": "user", "content": "hi"}],
+                )
+
+        self.assertEqual(responses.create_calls, 1)
+        self.assertGreaterEqual(raised.exception.cost["input_tokens"], 0)
+        self.assertGreater(raised.exception.cost["output_tokens"], 0)
+        self.assertGreater(raised.exception.cost["cost"], 0.0)
 
 
 class BackgroundTimeoutRetryTests(unittest.TestCase):

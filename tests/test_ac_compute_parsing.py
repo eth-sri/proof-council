@@ -19,6 +19,11 @@ from proofstack.agents.ac.blocks import (  # noqa: E402
     CouncilRequest,
     parse_author_output,
 )
+from proofstack.agents.ac.ac_workflow import _compute_requested  # noqa: E402
+from proofstack.agents.ac.author import (  # noqa: E402
+    AUTHOR_LOOP_SYSTEM,
+    AUTHOR_LOOP_SYSTEM_CONTAINER,
+)
 
 
 def test_compute_alongside_council_and_files():
@@ -78,6 +83,21 @@ def test_absent_compute_does_not_affect_other_fields():
     assert p.compute is None
     assert p.council is not None and p.council.question == "q"
     assert p.ready is True
+
+
+def test_compute_worker_requires_an_explicit_nonblank_request():
+    assert _compute_requested(True, "run a focused calculation") is True
+    assert _compute_requested(True, None) is False
+    assert _compute_requested(True, "   \n") is False
+    assert _compute_requested(False, "run a focused calculation") is False
+
+
+def test_author_prompts_make_compute_opt_in():
+    for prompt in (AUTHOR_LOOP_SYSTEM, AUTHOR_LOOP_SYSTEM_CONTAINER):
+        normalized = " ".join(prompt.split())
+        assert "worker is opt-in" in normalized
+        assert "default is to omit this block" in normalized
+        assert "never unpack the entire archive" in normalized
 
 
 def test_ready_tag_inside_inline_code_is_ignored():

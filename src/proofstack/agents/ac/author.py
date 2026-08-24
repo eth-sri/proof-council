@@ -48,12 +48,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
+
+from mathagents.api_client import ProviderAttachmentRejectedError
 
 from proofstack.agents.ac.blocks import (
     CANONICAL_FILES,
@@ -63,9 +66,14 @@ from proofstack.agents.ac.blocks import (
 )
 from proofstack.agents.ac.container_files import (
     ANTHROPIC_FILES_BETA,
+    AttachmentUploadFailure,
     AnthropicContainerFileBridge,
     ContainerFileBridge,
     find_container_id,
+)
+from proofstack.agents.ac.compute import (
+    inspect_compute_handoff,
+    mark_compute_handoff_local_only,
 )
 from proofstack.context import ModelSpec
 from proofstack.events import new_call_id
@@ -220,7 +228,11 @@ You may additionally emit three control blocks:
 
   - **<compute_agent>...instructions...</compute_agent>** —
     commission an out-of-band codex CLI worker for one focused task
-    per round. Up to one such block per round. Soft timeout 60 min,
+    per round. Up to one such block per round. The worker is opt-in:
+    the default is to omit this block. Request it only for a concrete
+    task that cannot reasonably be completed with your own tools; do
+    not invoke it for routine continuation or merely to keep it busy.
+    Soft timeout 120 min,
     full network access, a persistent workspace where ``code/``,
     ``data/``, ``papers/``, ``notes/`` survive across rounds, and —
     depending on the sandbox image — possibly a richer CAS toolchain
@@ -234,14 +246,14 @@ You may additionally emit three control blocks:
     ``sympy``, or deeper literature retrieval (downloading actual
     PDFs / TeX sources from arXiv etc.). Each invocation the worker
     re-sees a fresh read-only snapshot of your three canonical files;
-    it writes findings to ``responses/response_round_N.md`` and the
-    whole workspace is zipped and attached to your *next* turn so
-    you can inspect logs, data, and downloaded papers via
-    code_interpreter. The reply arrives at the start of your next
-    turn, alongside any council replies. Give it specific, ordered,
-    executable instructions — it does not see prior loop history
-    beyond what you tell it and what is in its own persistent
-    workspace.
+    it writes findings to ``responses/response_round_N.md``. A bounded,
+    curated handoff archive is attached to your *next* turn. Inspect
+    its member list with Python's ``zipfile`` module and read or extract
+    only the specific files needed; never unpack the entire archive.
+    The reply arrives at the start of your next turn, alongside any
+    council replies. Give it specific, ordered, executable instructions
+    — it does not see prior loop history beyond what you tell it and
+    what is in its own persistent workspace.
 
   - **<ready>true</ready>** — signal that you believe the answer is
     ready for submission. See the readiness rules below.
@@ -304,8 +316,9 @@ Budget used so far: ${budget_used_usd:.2f} / ${budget_max_usd:.2f}
 
 Refine the three files. Emit fenced ``file path=...`` blocks for any
 file you change. Optionally invoke ``<council>`` on at most one
-specific sub-question, and/or ``<compute_agent>`` on at most one
-focused computation/code/literature task. Optionally set
+specific sub-question. Invoke ``<compute_agent>`` only when you have
+a concrete focused computation/code/literature task that requires the
+worker; otherwise omit it. Optionally set
 ``<ready>true</ready>`` if you believe the answer is ready for
 submission.
 """
@@ -456,7 +469,11 @@ You may also emit three control blocks in your reply text:
 
   - **<compute_agent>...instructions...</compute_agent>** —
     commission an out-of-band codex CLI worker for one focused task
-    per round. At most one per round. Soft timeout 60 min, full
+    per round. At most one per round. The worker is opt-in: the default
+    is to omit this block. Request it only for a concrete task that
+    cannot reasonably be completed with your own tools; do not invoke
+    it for routine continuation or merely to keep it busy. Soft timeout
+    120 min, full
     network access, persistent workspace where ``code/``, ``data/``,
     ``papers/``, ``notes/`` survive across rounds, and — depending
     on the sandbox image — possibly a richer CAS toolchain (e.g.
@@ -470,15 +487,14 @@ You may also emit three control blocks in your reply text:
     ``sympy``, or deeper literature retrieval (downloading actual
     PDFs / TeX sources from arXiv etc.). Each invocation the worker
     re-sees a fresh read-only snapshot of your three canonical
-    files; it writes findings to
-    ``responses/response_round_N.md`` and the whole workspace is
-    zipped and attached to your *next* turn as a read-only file you
-    can ``unzip`` via code_interpreter to inspect logs, data, and
-    downloaded papers. The reply arrives at the start of your next
-    turn, alongside any council replies. Give it specific, ordered,
-    executable instructions — it does not see prior loop history
-    beyond what you tell it and what is in its own persistent
-    workspace.
+    files; it writes findings to ``responses/response_round_N.md``.
+    A bounded, curated handoff archive is attached to your *next* turn.
+    Inspect its member list with Python's ``zipfile`` module and read or
+    extract only the specific files needed; never unpack the entire
+    archive. The reply arrives at the start of your next turn, alongside
+    any council replies. Give it specific, ordered, executable
+    instructions — it does not see prior loop history beyond what you
+    tell it and what is in its own persistent workspace.
 
   - **<ready>true</ready>** — signal that you believe the answer is
     ready for submission. See the readiness rules below.
@@ -529,8 +545,9 @@ Budget used so far: ${budget_used_usd:.2f} / ${budget_max_usd:.2f}
 
 Edit the canonical files via code_interpreter cells as described in
 the system prompt. Optionally invoke ``<council>`` on at most one
-specific sub-question, and/or ``<compute_agent>`` on at most one
-focused computation/code/literature task, or set
+specific sub-question. Invoke ``<compute_agent>`` only for a concrete
+focused computation/code/literature task that requires the worker;
+otherwise omit it. Optionally set
 ``<ready>true</ready>`` if you believe the answer is ready for
 submission. Do NOT paste the canonical files in your reply.
 """
@@ -708,9 +725,17 @@ class Author(APICallAgent):
                 names=CANONICAL_FILES,
                 extra_attachments=self._extra_attachments(inp),
             )
+            await self._emit_compute_handoff_preflight(inp, provider="openai")
             try:
                 file_ids = bridge.upload()
+                await self._emit_attachment_upload_failures(
+                    bridge.extra_upload_failures,
+                    provider="openai",
+                )
                 workspace_listing = bridge.render_workspace_listing()
+                workspace_listing += self._attachment_failure_notice(
+                    bridge.extra_upload_failures
+                )
 
                 messages = self._render_container_messages(inp, workspace_listing)
                 try:
@@ -730,9 +755,56 @@ class Author(APICallAgent):
                     call_id=call_id,
                 )
                 start = time.monotonic()
-                _idx, conversation, cost = await asyncio.to_thread(
-                    _one_shot_query, api_client, messages
-                )
+                try:
+                    _idx, conversation, cost = await asyncio.to_thread(
+                        _one_shot_query, api_client, messages
+                    )
+                except Exception as attachment_error:
+                    optional_uploads = [
+                        upload for upload in bridge.uploaded if not upload.is_canonical
+                    ]
+                    if not optional_uploads or not _is_attachment_rejection(
+                        attachment_error
+                    ):
+                        raise
+                    await self._emit_model_attachment_fallback(
+                        optional_uploads,
+                        provider="openai",
+                        error=attachment_error,
+                    )
+                    await self._record_rejected_attachment_call(
+                        api_client=api_client,
+                        call_id=call_id,
+                        started_at=start,
+                        error=attachment_error,
+                    )
+                    canonical_ids = [
+                        upload.platform_file_id
+                        for upload in bridge.uploaded
+                        if upload.is_canonical
+                    ]
+                    workspace_listing = bridge.render_workspace_listing(
+                        include_extras=False
+                    )
+                    workspace_listing += self._unavailable_uploaded_attachment_notice(
+                        [upload.name for upload in optional_uploads]
+                    )
+                    messages = self._render_container_messages(inp, workspace_listing)
+                    self._write_container_messages(messages)
+                    api_client = self._build_api_client_with_file_ids(canonical_ids)
+                    call_id = new_call_id()
+                    await self.events.emit(
+                        "model.call.start",
+                        {
+                            "model": getattr(api_client, "model", str(self.MODEL)),
+                            "retry_without_optional_attachments": True,
+                        },
+                        call_id=call_id,
+                    )
+                    start = time.monotonic()
+                    _idx, conversation, cost = await asyncio.to_thread(
+                        _one_shot_query, api_client, messages
+                    )
                 elapsed = time.monotonic() - start
 
                 usd = float(cost.get("cost", 0.0))
@@ -840,9 +912,17 @@ class Author(APICallAgent):
                 names=CANONICAL_FILES,
                 extra_attachments=self._extra_attachments(inp),
             )
+            await self._emit_compute_handoff_preflight(inp, provider="anthropic")
             try:
                 bridge.upload()
+                await self._emit_attachment_upload_failures(
+                    bridge.extra_upload_failures,
+                    provider="anthropic",
+                )
                 workspace_listing = bridge.render_workspace_listing()
+                workspace_listing += self._attachment_failure_notice(
+                    bridge.extra_upload_failures
+                )
                 upload_blocks = bridge.render_container_upload_blocks()
                 messages = self._render_anthropic_container_messages(
                     inp, workspace_listing, upload_blocks
@@ -864,9 +944,56 @@ class Author(APICallAgent):
                     call_id=call_id,
                 )
                 start = time.monotonic()
-                _idx, conversation, cost = await asyncio.to_thread(
-                    _one_shot_query, api_client, messages
-                )
+                try:
+                    _idx, conversation, cost = await asyncio.to_thread(
+                        _one_shot_query, api_client, messages
+                    )
+                except Exception as attachment_error:
+                    optional_uploads = [
+                        upload for upload in bridge.uploaded if not upload.is_canonical
+                    ]
+                    if not optional_uploads or not _is_attachment_rejection(
+                        attachment_error
+                    ):
+                        raise
+                    await self._emit_model_attachment_fallback(
+                        optional_uploads,
+                        provider="anthropic",
+                        error=attachment_error,
+                    )
+                    await self._record_rejected_attachment_call(
+                        api_client=api_client,
+                        call_id=call_id,
+                        started_at=start,
+                        error=attachment_error,
+                    )
+                    workspace_listing = bridge.render_workspace_listing(
+                        include_extras=False
+                    )
+                    workspace_listing += self._unavailable_uploaded_attachment_notice(
+                        [upload.name for upload in optional_uploads]
+                    )
+                    upload_blocks = bridge.render_container_upload_blocks(
+                        include_extras=False
+                    )
+                    messages = self._render_anthropic_container_messages(
+                        inp, workspace_listing, upload_blocks
+                    )
+                    self._write_container_messages(messages)
+                    api_client = self._build_anthropic_api_client_with_files()
+                    call_id = new_call_id()
+                    await self.events.emit(
+                        "model.call.start",
+                        {
+                            "model": getattr(api_client, "model", str(self.MODEL)),
+                            "retry_without_optional_attachments": True,
+                        },
+                        call_id=call_id,
+                    )
+                    start = time.monotonic()
+                    _idx, conversation, cost = await asyncio.to_thread(
+                        _one_shot_query, api_client, messages
+                    )
                 elapsed = time.monotonic() - start
 
                 usd = float(cost.get("cost", 0.0))
@@ -935,18 +1062,192 @@ class Author(APICallAgent):
         extra_attachments: list[tuple[Path, str]] = []
         if inp.compute_zip_path is not None:
             zip_path = Path(inp.compute_zip_path)
-            if zip_path.exists():
+            if inspect_compute_handoff(zip_path).attachable:
                 extra_attachments.append(
                     (
                         zip_path,
                         (
-                            "Zip of the previous round's compute-worker "
-                            "workspace. Unzip via code_interpreter/code_execution "
-                            "to inspect responses/, code/, data/, papers/, notes/, etc."
+                            "Bounded handoff from the previous round's compute "
+                            "worker. Inspect names with Python zipfile and read or "
+                            "extract only specific needed files; never unpack the "
+                            "whole archive."
                         ),
                     )
                 )
         return extra_attachments
+
+    async def _emit_compute_handoff_preflight(
+        self, inp: Inputs, *, provider: str
+    ) -> None:
+        if inp.compute_zip_path is None:
+            return
+        zip_path = Path(inp.compute_zip_path)
+        inspection = inspect_compute_handoff(zip_path)
+        if inspection.attachable:
+            return
+        await self.events.emit(
+            "ac.author.attachment_rejected",
+            {
+                "provider": provider,
+                "phase": "preflight",
+                "name": zip_path.name,
+                "path": str(zip_path),
+                "reason": inspection.reason,
+                "file_count": inspection.file_count,
+                "compressed_bytes": inspection.compressed_bytes,
+                "uncompressed_bytes": inspection.uncompressed_bytes,
+                "largest_member_bytes": inspection.largest_member_bytes,
+            },
+        )
+
+    async def _emit_attachment_upload_failures(
+        self,
+        failures: list[AttachmentUploadFailure],
+        *,
+        provider: str,
+    ) -> None:
+        for failure in failures:
+            mark_compute_handoff_local_only(
+                failure.path,
+                reason=(
+                    f"{provider} upload rejected {failure.name}: "
+                    f"{failure.error_type}: {failure.message}"
+                ),
+            )
+            await self.events.emit(
+                "ac.author.attachment_rejected",
+                {
+                    "provider": provider,
+                    "phase": "upload",
+                    "name": failure.name,
+                    "path": str(failure.path),
+                    "size_bytes": failure.size_bytes,
+                    "type": failure.error_type,
+                    "msg": failure.message,
+                },
+            )
+
+    async def _emit_model_attachment_fallback(
+        self,
+        uploads: list[Any],
+        *,
+        provider: str,
+        error: Exception,
+    ) -> None:
+        for upload in uploads:
+            source_path = Path(upload.source_path)
+            try:
+                size_bytes = source_path.stat().st_size
+            except OSError:
+                size_bytes = None
+            mark_compute_handoff_local_only(
+                source_path,
+                reason=(
+                    f"{provider} model call rejected {upload.name}: "
+                    f"{type(error).__name__}: {str(error)[:800]}"
+                ),
+            )
+            await self.events.emit(
+                "ac.author.attachment_rejected",
+                {
+                    "provider": provider,
+                    "phase": "model_call",
+                    "name": upload.name,
+                    "path": str(source_path),
+                    "size_bytes": size_bytes,
+                    "platform_file_id": upload.platform_file_id,
+                    "type": type(error).__name__,
+                    "msg": str(error)[:1000],
+                    "retry_without_optional_attachments": True,
+                },
+            )
+
+    async def _record_rejected_attachment_call(
+        self,
+        *,
+        api_client: Any,
+        call_id: str,
+        started_at: float,
+        error: Exception,
+    ) -> None:
+        """Close and, when available, bill the rejected first model call."""
+        elapsed = time.monotonic() - started_at
+        cost = getattr(error, "cost", None)
+        if not isinstance(cost, dict):
+            await self.events.emit(
+                "model.call.failed",
+                {
+                    "model": getattr(api_client, "model", str(self.MODEL)),
+                    "duration_s": elapsed,
+                    "type": type(error).__name__,
+                    "msg": str(error)[:1000],
+                    "reason": "attachment_rejected",
+                },
+                call_id=call_id,
+            )
+            return
+
+        usd = float(cost.get("cost", 0.0) or 0.0)
+        in_tok = int(cost.get("input_tokens", 0) or 0)
+        out_tok = int(cost.get("output_tokens", 0) or 0)
+        reasoning_tok = int(cost.get("reasoning_tokens", 0) or 0)
+        self.tracker.add_usd(usd)
+        self.tracker.add_tokens(in_tok + out_tok)
+        await self.events.emit(
+            "model.call",
+            {
+                "model": getattr(api_client, "model", str(self.MODEL)),
+                "in_tokens": in_tok,
+                "cached_in_tokens": int(
+                    cost.get("cached_input_tokens", 0) or 0
+                ),
+                "cache_write_in_tokens": int(
+                    cost.get("cached_write_tokens", 0) or 0
+                ),
+                "out_tokens": out_tok,
+                "reasoning_tokens": reasoning_tok,
+                "cost_usd": usd,
+                "duration_s": elapsed,
+                "via": "container_files",
+                "status": "failed",
+                "reason": "attachment_rejected",
+            },
+            call_id=call_id,
+        )
+        for scope, kind, used, limit in self.tracker.check():
+            await self.events.emit(
+                "budget.warn",
+                {"scope": scope, "kind": kind, "used": used, "limit": limit},
+            )
+
+    @staticmethod
+    def _attachment_failure_notice(
+        failures: list[AttachmentUploadFailure],
+    ) -> str:
+        if not failures:
+            return ""
+        names = ", ".join(failure.name for failure in failures)
+        return (
+            "\n- Optional attachment unavailable: "
+            f"{names}. Rely on the textual Compute reply and continue the turn."
+        )
+
+    @staticmethod
+    def _unavailable_uploaded_attachment_notice(names: list[str]) -> str:
+        return (
+            "\n- Optional attachment unavailable after provider rejection: "
+            f"{', '.join(names)}. Rely on the textual Compute reply and continue "
+            "the turn."
+        )
+
+    def _write_container_messages(self, messages: list[dict[str, Any]]) -> None:
+        try:
+            (self.workdir / "messages.json").write_text(
+                json.dumps(messages, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
 
     def _render_container_messages(
         self, inp: Inputs, workspace_listing: str
@@ -1111,6 +1412,46 @@ class Author(APICallAgent):
             container_id=container_id,
             via=via,
         )
+
+
+def _is_attachment_rejection(error: Exception) -> bool:
+    """Conservatively identify provider errors caused by optional files."""
+    if isinstance(error, ProviderAttachmentRejectedError):
+        return True
+
+    status_code = getattr(error, "status_code", None)
+    if status_code == 413:
+        return True
+
+    known_codes = {
+        "array_above_max_length",
+        "container_file_limit",
+        "file_too_large",
+        "payload_too_large",
+        "request_too_large",
+        "too_many_files",
+    }
+    values: list[Any] = [
+        getattr(error, "code", None),
+        getattr(error, "body", None),
+    ]
+    while values:
+        value = values.pop()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).lower() in {"code", "type"} and isinstance(child, str):
+                    normalized = re.sub(r"[^a-z0-9]+", "_", child.lower()).strip("_")
+                    if normalized in known_codes:
+                        return True
+                if isinstance(child, (dict, list, tuple)):
+                    values.append(child)
+        elif isinstance(value, (list, tuple)):
+            values.extend(value)
+        elif isinstance(value, str):
+            normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+            if normalized in known_codes:
+                return True
+    return False
 
 
 __all__ = ["Author"]

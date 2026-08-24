@@ -83,14 +83,18 @@ class DockerSandbox(Sandbox):
         timeout_s: int | None = None,
         env_extra: Mapping[str, str] | None = None,
         extra_path: Iterable[Path] = (),
+        input_data: str | bytes | None = None,
     ) -> CommandResult:
+        input_bytes = (
+            input_data.encode("utf-8") if isinstance(input_data, str) else input_data
+        )
         container_name = _new_container_name()
         docker_cmd = self._build_docker_cmd(
             cmd,
             env_extra=env_extra,
             extra_path=list(extra_path),
             cwd=cwd,
-            interactive=False,
+            interactive=input_bytes is not None,
             container_name=container_name,
         )
         timeout = timeout_s if timeout_s is not None else self.spec.timeout_s
@@ -98,6 +102,7 @@ class DockerSandbox(Sandbox):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *docker_cmd,
+                stdin=(asyncio.subprocess.PIPE if input_bytes is not None else None),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -109,7 +114,7 @@ class DockerSandbox(Sandbox):
             ) from e
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
+                proc.communicate(input=input_bytes), timeout=timeout
             )
             returncode = proc.returncode if proc.returncode is not None else -1
         except asyncio.TimeoutError:

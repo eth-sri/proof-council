@@ -116,12 +116,16 @@ class SubprocessSandbox(Sandbox):
         timeout_s: int | None = None,
         env_extra: Mapping[str, str] | None = None,
         extra_path: Iterable[Path] = (),
+        input_data: str | bytes | None = None,
     ) -> CommandResult:
         cwd_path = self.root / cwd if cwd else self.root
         env = self.spec.build_env(sandbox_root=self.root, extra_path=extra_path)
         if env_extra:
             env.update(env_extra)
         timeout = timeout_s if timeout_s is not None else self.spec.timeout_s
+        input_bytes = (
+            input_data.encode("utf-8") if isinstance(input_data, str) else input_data
+        )
 
         start = time.monotonic()
         try:
@@ -129,6 +133,7 @@ class SubprocessSandbox(Sandbox):
                 *cmd,
                 cwd=str(cwd_path),
                 env=env,
+                stdin=(asyncio.subprocess.PIPE if input_bytes is not None else None),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 preexec_fn=_make_preexec(self.spec.memory_gb, self.spec.cpu_limit, int(timeout)),
@@ -138,7 +143,9 @@ class SubprocessSandbox(Sandbox):
             return CommandResult(cmd=cmd, returncode=127, stdout="", stderr=str(e), duration_s=0.0)
 
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(input=input_bytes), timeout=timeout
+            )
             returncode = proc.returncode if proc.returncode is not None else -1
         except asyncio.TimeoutError:
             await _terminate_process_group(proc, grace_s=5.0)

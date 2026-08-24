@@ -191,6 +191,29 @@ class AnthropicContainerFileBridgeTests(unittest.TestCase):
             all(betas == [ANTHROPIC_FILES_BETA] for _file_id, betas in fake_client.files.delete_calls)
         )
 
+    def test_optional_compute_upload_failure_keeps_canonical_files(self) -> None:
+        fake_client = _FakeAnthropicClient()
+        fake_client.files.fail_upload_after = len(CANONICAL_FILES)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name in CANONICAL_FILES:
+                (root / name).write_text(name, encoding="utf-8")
+            compute_zip = root / "compute.zip"
+            compute_zip.write_bytes(b"zip")
+            bridge = AnthropicContainerFileBridge(
+                anthropic_client=fake_client,
+                workspace=root,
+                names=CANONICAL_FILES,
+                extra_attachments=[(compute_zip, "compute artifact")],
+            )
+
+            uploaded_ids = bridge.upload()
+
+        self.assertEqual(len(uploaded_ids), len(CANONICAL_FILES))
+        self.assertEqual(len(bridge.uploaded), len(CANONICAL_FILES))
+        self.assertEqual(len(bridge.extra_upload_failures), 1)
+        self.assertEqual(bridge.extra_upload_failures[0].name, "compute.zip")
+
 
 class AuthorAnthropicFilesTests(unittest.TestCase):
     def _input(self) -> Author.Inputs:

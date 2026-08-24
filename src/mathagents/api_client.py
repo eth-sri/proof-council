@@ -93,6 +93,19 @@ class _SalvageUsage:
         }
 
 
+class ProviderAttachmentRejectedError(ValueError):
+    """Terminal provider rejection carrying usage from the failed call.
+
+    Attachment failures are retried by the Author without the optional
+    artifact. The first attempt may nevertheless have completed substantial
+    reasoning or tool work, so callers must charge ``cost`` before retrying.
+    """
+
+    def __init__(self, message: str, *, cost: dict):
+        super().__init__(message)
+        self.cost = dict(cost)
+
+
 class _BackgroundResponseTimeout(TimeoutError):
     pass
 
@@ -191,6 +204,9 @@ _TERMINAL_API_ERROR_HINTS: tuple[str, ...] = (
     "permission_denied",
     "permission denied",
     "unauthorized",
+    "array_above_max_length",
+    "container has too many files",
+    "maximum of 1000 files",
 )
 
 
@@ -2329,6 +2345,59 @@ class APIClient:
                             err_code = getattr(err, "code", None) if err else None
                             err_msg = getattr(err, "message", "") if err else ""
                             output_items = getattr(response, "output", None) or []
+                            file_limit_error = (
+                                str(err_code or "").lower() == "array_above_max_length"
+                                or "container has too many files" in err_msg.lower()
+                                or "maximum of 1000 files" in err_msg.lower()
+                            )
+                            if file_limit_error:
+                                failed_usage = response.usage
+                                if failed_usage is None:
+                                    est_in, est_out = _estimate_salvaged_usage(
+                                        payload,
+                                        output_items,
+                                    )
+                                    failed_usage = _SalvageUsage(est_in, est_out)
+                                (
+                                    step_input,
+                                    step_output,
+                                    step_cached_input,
+                                    step_cached_write,
+                                ) = self._extract_usage_tokens(failed_usage)
+                                step_reasoning = self._extract_reasoning_tokens(
+                                    failed_usage
+                                )
+                                failed_cost = self._get_cost(
+                                    step_input,
+                                    step_output,
+                                    step_cached_input,
+                                    step_cached_write,
+                                )
+                                # Partial tool output cannot make an overfull
+                                # container usable. Carry all usage accumulated
+                                # by this APIClient call so the Author can bill
+                                # the failed attempt before retrying without the
+                                # optional attachment.
+                                raise ProviderAttachmentRejectedError(
+                                    "OpenAI container file limit rejected the request. "
+                                    f"Error: {err_code} {err_msg[:200]}",
+                                    cost={
+                                        "cost": cost_usd + failed_cost,
+                                        "input_tokens": input_tokens + step_input,
+                                        "cached_input_tokens": (
+                                            cached_input_tokens + step_cached_input
+                                        ),
+                                        "cached_write_tokens": (
+                                            cached_write_tokens + step_cached_write
+                                        ),
+                                        "output_tokens": output_tokens + step_output,
+                                        "reasoning_tokens": (
+                                            reasoning_tokens + step_reasoning
+                                        ),
+                                        "time": time.time() - inner_start,
+                                        "n_retries": total_retries,
+                                    },
+                                )
                             if output_items:
                                 # The downstream code reads response.usage
                                 # to bill the call. The failed response

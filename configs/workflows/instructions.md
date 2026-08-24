@@ -50,6 +50,29 @@ inputs:
   page_limit: 12
 ```
 
+For Author/Critic runs with Compute enabled, storage policy is also a run
+input. `compute_workspace_hard_limit_bytes` caps one worker's workspace;
+`compute_filesystem_min_free_bytes` keeps a global emergency floor; and
+`compute_filesystem_reservation_bytes` cooperatively reserves growth headroom
+for each active Compute worker. Concurrent runs sharing a filesystem must use
+the same `compute_filesystem_reservation_dir` (the default is shared by runs
+under the same outputs root; an explicit relative path is resolved there).
+The registry must remain outside the worker workspace. For example, to admit
+each worker only when 100 GiB plus a 20 GiB emergency floor is available:
+
+```yaml
+inputs:
+  enable_compute: true
+  compute_workspace_hard_limit_bytes: 107374182400
+  compute_filesystem_reservation_bytes: 107374182400
+  compute_filesystem_min_free_bytes: 21474836480
+```
+
+Reservations are admission control among ProofCouncil workers, not filesystem
+quotas. Keep the hard workspace limit enabled for runtime enforcement. A zero
+reservation disables coordinated admission, which is the portable default for
+hosts that do not have 100 GiB available.
+
 ## Prompt components
 
 `components.<name>` defines the prompt/model/output parser. A DAG node uses it through `name: <name>`.

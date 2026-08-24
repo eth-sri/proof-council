@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
+import shutil
 import time
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -16,6 +18,10 @@ from proofstack.context import RunContext
 from proofstack.events import new_call_id
 from proofstack.sandbox import make_sandbox, resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
+from proofstack.storage_reservation import (
+    StorageReservationError,
+    StorageReservationLease,
+)
 
 
 FINISH_SCRIPT = """\
@@ -44,6 +50,123 @@ _SHELL_START_BLOCK_END = "# proofstack finish shim end"
 
 
 DoneStatus = Literal["done", "partial", "blocked", "timeout", "error"]
+
+
+def measure_workspace_usage(
+    root: Path,
+    *,
+    largest_count: int = 10,
+    stop_after_bytes: int = 0,
+    stop_after_entries: int = 0,
+) -> dict[str, Any]:
+    """Measure workspace storage without reading contents or following links.
+
+    Optional stop thresholds bound the monitor's own work when a runaway CLI
+    creates an extreme number of entries. Reaching either threshold is enough
+    for callers enforcing the corresponding hard limit.
+    """
+    total_bytes = 0
+    allocated_bytes = 0
+    files = 0
+    directories = 0
+    errors = 0
+    broken_symlinks = 0
+    files_over_100_mib = 0
+    files_over_1_gib = 0
+    largest: list[tuple[int, str]] = []
+    scan_truncated = False
+    root = Path(root)
+    stack = [Path(root)]
+    while stack and not scan_truncated:
+        directory = stack.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            errors += 1
+            continue
+        with entries:
+            iterator = iter(entries)
+            while True:
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                except OSError:
+                    errors += 1
+                    break
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        directories += 1
+                        stack.append(Path(entry.path))
+                        if (
+                            stop_after_entries > 0
+                            and files + directories >= stop_after_entries
+                        ):
+                            scan_truncated = True
+                            stack.clear()
+                            break
+                        continue
+                    stat_result = entry.stat(follow_symlinks=False)
+                except OSError:
+                    errors += 1
+                    continue
+                files += 1
+                size = max(0, stat_result.st_size)
+                total_bytes += size
+                allocated_bytes += max(0, getattr(stat_result, "st_blocks", 0)) * 512
+                if size >= 100 * 1024 * 1024:
+                    files_over_100_mib += 1
+                if size >= 1024 * 1024 * 1024:
+                    files_over_1_gib += 1
+                path = Path(entry.path)
+                if entry.is_symlink() and not path.exists():
+                    broken_symlinks += 1
+                if largest_count > 0:
+                    try:
+                        relative = path.relative_to(root).as_posix()
+                    except ValueError:
+                        relative = path.name
+                    largest.append((size, relative))
+                    largest.sort(reverse=True)
+                    del largest[largest_count:]
+                if (
+                    (stop_after_bytes > 0 and total_bytes >= stop_after_bytes)
+                    or (
+                        stop_after_entries > 0
+                        and files + directories >= stop_after_entries
+                    )
+                ):
+                    scan_truncated = True
+                    stack.clear()
+                    break
+    try:
+        filesystem_free_bytes = shutil.disk_usage(root).free
+    except OSError:
+        filesystem_free_bytes = None
+    try:
+        filesystem_stats = os.statvfs(root)
+        filesystem_free_inodes = (
+            filesystem_stats.f_favail if filesystem_stats.f_files > 0 else None
+        )
+    except (AttributeError, OSError):
+        filesystem_free_inodes = None
+    return {
+        "bytes": total_bytes,
+        "allocated_bytes": allocated_bytes,
+        "files": files,
+        "directories": directories,
+        "entries": files + directories,
+        "scan_truncated": scan_truncated,
+        "errors": errors,
+        "broken_symlinks": broken_symlinks,
+        "files_over_100_mib": files_over_100_mib,
+        "files_over_1_gib": files_over_1_gib,
+        "filesystem_free_bytes": filesystem_free_bytes,
+        "filesystem_free_inodes": filesystem_free_inodes,
+        "largest_files": [
+            {"path": path, "bytes": size} for size, path in largest
+        ],
+    }
 
 
 class CLIDoneRecord(BaseModel):
@@ -78,6 +201,21 @@ class CLIAgent(Agent):
     CLEANUP_GRACE_S: ClassVar[float] = 30.0
     DONE_DRAIN_GRACE_S: ClassVar[float] = 30.0
     SOFT_TIMEOUT_S: ClassVar[int] = 0
+    WORKSPACE_SOFT_LIMIT_BYTES: ClassVar[int] = 0
+    WORKSPACE_HARD_LIMIT_BYTES: ClassVar[int] = 0
+    WORKSPACE_SOFT_LIMIT_ENTRIES: ClassVar[int] = 0
+    WORKSPACE_HARD_LIMIT_ENTRIES: ClassVar[int] = 0
+    WORKSPACE_MIN_FREE_BYTES: ClassVar[int] = 0
+    WORKSPACE_MIN_FREE_INODES: ClassVar[int] = 0
+    WORKSPACE_RESERVATION_BYTES: ClassVar[int] = 0
+    WORKSPACE_RESERVATION_DIR: ClassVar[Path | None] = None
+    WORKSPACE_CHECK_INTERVAL_S: ClassVar[float] = 5.0
+    # 'finish'/'file': the completion record (done.json) is REQUIRED — a CLI
+    # exit without it (or with an unparseable one) is an error even on rc 0.
+    # 'exit': the exit code is the completion signal (codex-style CLIs that
+    # never call finish). Plain subclasses keep the legacy 'exit' semantics;
+    # ConfigurableCLIAgent sets this from its completion_signal config.
+    COMPLETION_SIGNAL: ClassVar[str] = "exit"
 
     def __init__(
         self,
@@ -133,9 +271,88 @@ class CLIAgent(Agent):
         """
         return {}
 
+    def sanitize_cli_output(self, text: str) -> str:
+        """Remove subclass-owned secrets before transcripts reach artifacts/events."""
+        return text
+
     def sandbox_root_for(self, inp: BaseModel) -> Path | None:
         """Return a persistent sandbox root for this invocation, if any."""
         return self.sandbox_root
+
+    def workspace_reservation_dir_for(self, root: Path) -> Path:
+        """Return the shared lease registry used for this filesystem."""
+        configured = self.WORKSPACE_RESERVATION_DIR
+        if configured is not None:
+            configured_path = Path(configured)
+            if not configured_path.is_absolute():
+                configured_path = self.ctx.root_workdir.parent / configured_path
+            return configured_path
+        return self.ctx.root_workdir.parent / ".proofcouncil-storage-reservations"
+
+    def _workspace_monitor_enabled(self) -> bool:
+        return any(
+            value > 0
+            for value in (
+                self.WORKSPACE_HARD_LIMIT_BYTES,
+                self.WORKSPACE_HARD_LIMIT_ENTRIES,
+                self.WORKSPACE_MIN_FREE_BYTES,
+                self.WORKSPACE_MIN_FREE_INODES,
+            )
+        )
+
+    def _measure_workspace(self, root: Path) -> dict[str, Any]:
+        return measure_workspace_usage(
+            root,
+            stop_after_bytes=self.WORKSPACE_HARD_LIMIT_BYTES,
+            stop_after_entries=self.WORKSPACE_HARD_LIMIT_ENTRIES,
+        )
+
+    def _workspace_limit_failure(
+        self,
+        usage: dict[str, Any],
+    ) -> tuple[str, str] | None:
+        entries = int(usage.get("entries", usage.get("files", 0)) or 0)
+        free_bytes = usage.get("filesystem_free_bytes")
+        free_inodes = usage.get("filesystem_free_inodes")
+        if (
+            self.WORKSPACE_HARD_LIMIT_BYTES > 0
+            and int(usage.get("bytes", 0) or 0) >= self.WORKSPACE_HARD_LIMIT_BYTES
+        ):
+            return (
+                "workspace_hard_limit",
+                f"workspace size {usage['bytes']} is at or above hard limit "
+                f"{self.WORKSPACE_HARD_LIMIT_BYTES} bytes",
+            )
+        if (
+            self.WORKSPACE_HARD_LIMIT_ENTRIES > 0
+            and entries >= self.WORKSPACE_HARD_LIMIT_ENTRIES
+        ):
+            return (
+                "workspace_entry_limit",
+                f"workspace entry count {entries} is at or above hard limit "
+                f"{self.WORKSPACE_HARD_LIMIT_ENTRIES}",
+            )
+        if (
+            self.WORKSPACE_MIN_FREE_BYTES > 0
+            and isinstance(free_bytes, int)
+            and free_bytes < self.WORKSPACE_MIN_FREE_BYTES
+        ):
+            return (
+                "filesystem_min_free",
+                f"filesystem free space {free_bytes} is below required reserve "
+                f"{self.WORKSPACE_MIN_FREE_BYTES} bytes",
+            )
+        if (
+            self.WORKSPACE_MIN_FREE_INODES > 0
+            and isinstance(free_inodes, int)
+            and free_inodes < self.WORKSPACE_MIN_FREE_INODES
+        ):
+            return (
+                "filesystem_min_free_inodes",
+                f"filesystem free inodes {free_inodes} are below required reserve "
+                f"{self.WORKSPACE_MIN_FREE_INODES}",
+            )
+        return None
 
     # --- framework-managed -----------------------------------------------------
 
@@ -162,6 +379,7 @@ class CLIAgent(Agent):
         # landing mid-metering neither loses it nor double-counts it (A7).
         meter_task: asyncio.Task | None = None
         sandbox: Sandbox | None = None
+        storage_lease: StorageReservationLease | None = None
         try:
             root = self.sandbox_root_for(inp)
             if root is not None:
@@ -189,7 +407,76 @@ class CLIAgent(Agent):
                 done_path = sandbox.root / "done.json"
                 wrap_up_path = None
 
+            if persistent and self.WORKSPACE_RESERVATION_BYTES > 0:
+                reservation_dir = self.workspace_reservation_dir_for(sandbox.root)
+                storage_lease = StorageReservationLease(
+                    registry_dir=reservation_dir,
+                    workspace_root=sandbox.root,
+                    requested_bytes=self.WORKSPACE_RESERVATION_BYTES,
+                    minimum_free_bytes=self.WORKSPACE_MIN_FREE_BYTES,
+                    owner=f"{self.ctx.run_id}:{self.name}",
+                )
+                try:
+                    reservation = await asyncio.to_thread(storage_lease.acquire)
+                except StorageReservationError as e:
+                    await self.events.emit(
+                        "cli.storage_reservation_denied",
+                        {
+                            "workspace": str(sandbox.root),
+                            "registry": str(reservation_dir),
+                            "requested_bytes": self.WORKSPACE_RESERVATION_BYTES,
+                            "minimum_free_bytes": self.WORKSPACE_MIN_FREE_BYTES,
+                            "msg": str(e),
+                        },
+                    )
+                    raise RuntimeError(str(e)) from e
+                await self.events.emit(
+                    "cli.storage_reserved",
+                    {
+                        "workspace": str(sandbox.root),
+                        "registry": str(reservation_dir),
+                        **reservation.__dict__,
+                    },
+                )
+
             await self.setup(sandbox, inp)
+
+            if persistent and self._workspace_monitor_enabled():
+                usage = await asyncio.to_thread(
+                    self._measure_workspace,
+                    sandbox.root,
+                )
+                await self.events.emit(
+                    "cli.workspace_usage",
+                    {
+                        **usage,
+                        "phase": "pre_spawn",
+                        "soft_limit_bytes": self.WORKSPACE_SOFT_LIMIT_BYTES or None,
+                        "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
+                        "soft_limit_entries": self.WORKSPACE_SOFT_LIMIT_ENTRIES or None,
+                        "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
+                        "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
+                        "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
+                    },
+                )
+                failure = self._workspace_limit_failure(usage)
+                if failure is not None:
+                    reason, detail = failure
+                    await self.events.emit(
+                        "cli.workspace_limit_exceeded",
+                        {
+                            **usage,
+                            "phase": "pre_spawn",
+                            "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
+                            "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
+                            "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
+                            "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
+                            "reason": reason,
+                        },
+                    )
+                    raise RuntimeError(
+                        f"persistent CLI workspace cannot start: {detail}"
+                    )
 
             # Install the finish shim into a private bin dir inside
             # the sandbox root. Both backends expose this dir to the CLI.
@@ -216,6 +503,28 @@ class CLIAgent(Agent):
                     "timeout_s": timeout_s,
                     "soft_timeout_s": soft_timeout_s or None,
                     "persistent_workspace": persistent,
+                    "workspace_soft_limit_bytes": (
+                        self.WORKSPACE_SOFT_LIMIT_BYTES or None
+                    ),
+                    "workspace_hard_limit_bytes": (
+                        self.WORKSPACE_HARD_LIMIT_BYTES or None
+                    ),
+                    "workspace_soft_limit_entries": (
+                        self.WORKSPACE_SOFT_LIMIT_ENTRIES or None
+                    ),
+                    "workspace_hard_limit_entries": (
+                        self.WORKSPACE_HARD_LIMIT_ENTRIES or None
+                    ),
+                    "workspace_min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
+                    "workspace_min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
+                    "workspace_reservation_bytes": (
+                        self.WORKSPACE_RESERVATION_BYTES or None
+                    ),
+                    "workspace_reservation_dir": (
+                        str(self.workspace_reservation_dir_for(sandbox.root))
+                        if self.WORKSPACE_RESERVATION_BYTES > 0
+                        else None
+                    ),
                 },
                 call_id=spawn_call_id,
             )
@@ -246,6 +555,7 @@ class CLIAgent(Agent):
                 spawn_call_id=spawn_call_id,
                 wrap_up_path=wrap_up_path,
                 soft_timeout_s=soft_timeout_s,
+                workspace_root=sandbox.root if persistent else None,
             )
             # Meter as a retained, shielded task. A cancellation landing while
             # record_cli_usage runs must not skip it (that loses a detected
@@ -324,8 +634,12 @@ class CLIAgent(Agent):
                 except (asyncio.CancelledError, Exception):
                     pass
             try:
-                stdout_text = stream.stdout if stream is not None else ""
-                stderr_text = stream.stderr if stream is not None else ""
+                stdout_text = self.sanitize_cli_output(
+                    stream.stdout if stream is not None else ""
+                )
+                stderr_text = self.sanitize_cli_output(
+                    stream.stderr if stream is not None else ""
+                )
                 if stdout_text:
                     (self.workdir / "cli_stdout.log").write_text(stdout_text, encoding="utf-8")
                 if stderr_text:
@@ -335,14 +649,43 @@ class CLIAgent(Agent):
             # Keep the sandbox dir on disk so the workdir captures artifacts.
             # teardown() still runs so subclasses can scrub per-invocation
             # secrets such as copied CLI credentials.
-            if sandbox is not None:
-                try:
-                    await self.teardown(sandbox, inp)
-                except Exception as e:
-                    await self.events.emit(
-                        "cli.teardown_error",
-                        {"type": type(e).__name__, "msg": str(e)},
-                    )
+            try:
+                if sandbox is not None:
+                    try:
+                        await self.teardown(sandbox, inp)
+                    except Exception as e:
+                        await self.events.emit(
+                            "cli.teardown_error",
+                            {"type": type(e).__name__, "msg": str(e)},
+                        )
+            finally:
+                if storage_lease is not None and storage_lease.status is not None:
+                    reservation_status = storage_lease.status
+                    try:
+                        storage_lease.release()
+                    except Exception as e:
+                        try:
+                            await self.events.emit(
+                                "cli.storage_release_failed",
+                                {
+                                    "workspace": str(sandbox.root) if sandbox else None,
+                                    "type": type(e).__name__,
+                                    "msg": str(e),
+                                },
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await self.events.emit(
+                                "cli.storage_released",
+                                {
+                                    "workspace": str(sandbox.root) if sandbox else None,
+                                    "reserved_bytes": reservation_status.requested_bytes,
+                                },
+                            )
+                        except Exception:
+                            pass
 
     async def _wait_for_done(
         self,
@@ -352,12 +695,89 @@ class CLIAgent(Agent):
         spawn_call_id: str,
         wrap_up_path: Path | None = None,
         soft_timeout_s: int = 0,
+        workspace_root: Path | None = None,
     ) -> CLIDoneRecord:
         spawn_t = time.monotonic()
         last_heartbeat = spawn_t
+        last_workspace_check = 0.0
         cleanup_warned = False
         wrap_up_signaled = False
+        workspace_soft_warned = False
         while True:
+            now = time.monotonic()
+            if (
+                workspace_root is not None
+                and self._workspace_monitor_enabled()
+                and now - last_workspace_check >= self.WORKSPACE_CHECK_INTERVAL_S
+            ):
+                last_workspace_check = now
+                usage = await asyncio.to_thread(
+                    self._measure_workspace,
+                    workspace_root,
+                )
+                await self.events.emit(
+                    "cli.workspace_usage",
+                    {
+                        **usage,
+                        "phase": "running",
+                        "soft_limit_bytes": self.WORKSPACE_SOFT_LIMIT_BYTES or None,
+                        "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
+                        "soft_limit_entries": self.WORKSPACE_SOFT_LIMIT_ENTRIES or None,
+                        "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
+                        "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
+                        "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
+                    },
+                    call_id=spawn_call_id,
+                )
+                failure = self._workspace_limit_failure(usage)
+                if failure is not None:
+                    await stream.terminate()
+                    reason, detail = failure
+                    await self.events.emit(
+                        "cli.workspace_limit_exceeded",
+                        {
+                            **usage,
+                            "phase": "running",
+                            "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
+                            "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
+                            "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
+                            "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
+                            "reason": reason,
+                        },
+                        call_id=spawn_call_id,
+                    )
+                    return CLIDoneRecord(
+                        status="error",
+                        summary=f"workspace safety limit reached; stopped CLI: {detail}",
+                    )
+                if (
+                    not workspace_soft_warned
+                    and (
+                        (
+                            self.WORKSPACE_SOFT_LIMIT_BYTES > 0
+                            and usage["bytes"] >= self.WORKSPACE_SOFT_LIMIT_BYTES
+                        )
+                        or (
+                            self.WORKSPACE_SOFT_LIMIT_ENTRIES > 0
+                            and int(
+                                usage.get("entries", usage.get("files", 0)) or 0
+                            )
+                            >= self.WORKSPACE_SOFT_LIMIT_ENTRIES
+                        )
+                    )
+                ):
+                    workspace_soft_warned = True
+                    await self.events.emit(
+                        "cli.workspace_limit_warning",
+                        {
+                            **usage,
+                            "soft_limit_bytes": self.WORKSPACE_SOFT_LIMIT_BYTES,
+                            "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
+                            "soft_limit_entries": self.WORKSPACE_SOFT_LIMIT_ENTRIES or None,
+                            "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
+                        },
+                        call_id=spawn_call_id,
+                    )
             if done_path.exists():
                 grace_deadline = time.monotonic() + float(self.DONE_DRAIN_GRACE_S)
                 while (
@@ -381,8 +801,8 @@ class CLIAgent(Agent):
                     await stream.terminate()
                 except Exception:
                     pass
-                stderr_tail = (stream.stderr or "")[-2000:]
-                stdout_tail = (stream.stdout or "")[-1000:]
+                stderr_tail = self.sanitize_cli_output(stream.stderr or "")[-2000:]
+                stdout_tail = self.sanitize_cli_output(stream.stdout or "")[-1000:]
                 await self.events.emit(
                     "cli.exit",
                     {
@@ -560,4 +980,9 @@ class CLIAgent(Agent):
         return str(path)
 
 
-__all__ = ["CLIAgent", "CLIDoneRecord", "FINISH_SCRIPT"]
+__all__ = [
+    "CLIAgent",
+    "CLIDoneRecord",
+    "FINISH_SCRIPT",
+    "measure_workspace_usage",
+]
