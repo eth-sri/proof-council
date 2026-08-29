@@ -27,7 +27,26 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from proofstack.sandbox.base import CommandResult, Sandbox
+import functools as _functools
 from proofstack.sandbox.subprocess import _StreamingProcess
+
+
+@_functools.lru_cache(maxsize=1)
+def _docker_is_podman() -> bool:
+    """Return True if the local ``docker`` binary is the podman docker-CLI shim.
+
+    Rootless podman + ``--user host_uid:gid`` triggers
+    ``setgroups: Invalid argument`` in the container unless
+    ``--userns=keep-id`` is also passed; real docker has no such flag.
+    """
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["docker", "--version"], text=True, stderr=subprocess.DEVNULL, timeout=2
+        )
+        return "podman" in out.lower()
+    except Exception:
+        return False
 
 
 async def _docker_kill(container_name: str) -> None:
@@ -206,6 +225,11 @@ class DockerSandbox(Sandbox):
         ]
         if self.spec.docker_no_new_privileges:
             args += ["--security-opt", "no-new-privileges"]
+        # Rootless podman + --user host_uid:gid triggers setgroups EINVAL
+        # inside the container unless --userns=keep-id is also passed.
+        # Real docker does not accept this flag, so guard the addition.
+        if _docker_is_podman():
+            args += ["--userns=keep-id"]
 
         # --- Env forwarding -------------------------------------------
         # Pinned container env (HOME, TMPDIR, PATH) — the host's values
