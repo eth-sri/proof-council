@@ -107,8 +107,12 @@ _ZIP_EXCLUDE_TOP = {
     "scratch",
     "archive",
 }
-_ZIP_EXCLUDE_PARTS: Final[frozenset[str]] = frozenset(
+_ZIP_EXCLUDE_TOP_DIRS: Final[frozenset[str]] = frozenset({".local"})
+_ZIP_EXCLUDE_DIRECTORY_PARTS: Final[frozenset[str]] = frozenset(
     {
+        ".cache",
+        ".npm",
+        ".sage",
         "__pycache__",
         ".pytest_cache",
         ".mypy_cache",
@@ -119,7 +123,7 @@ _ZIP_EXCLUDE_PARTS: Final[frozenset[str]] = frozenset(
         "node_modules",
     }
 )
-_ZIP_EXCLUDE_PREFIXES: Final[tuple[str, ...]] = ("gaptempdir",)
+_ZIP_EXCLUDE_DIRECTORY_PREFIXES: Final[tuple[str, ...]] = ("gaptempdir",)
 _HANDOFF_LOCAL_ONLY_SUFFIXES: Final[tuple[str, ...]] = (
     ".zip",
     ".tar",
@@ -225,7 +229,10 @@ worker call.
   workspace is attached to the next Author call, so put every essential
   conclusion in this response and keep important artifacts in
   ``code/``, ``data/``, ``papers/``, or ``notes/``. Runtime caches and
-  excess files are intentionally omitted from the handoff.
+  excess files are intentionally omitted from the handoff. In particular,
+  ``.cache/``, ``.npm/``, ``.sage/``, virtual environments, Python caches,
+  and the top-level ``.local/`` directory remain available to later worker
+  rounds but are never attached to the Author.
 
 - Everything else (``code/``, ``data/``, ``papers/``, ``notes/``, …)
   is yours to organize freely. Files persist across invocations, so
@@ -1135,7 +1142,8 @@ def _zip_workspace(
     Responses, notes, and root-level files are retained first. Remaining
     capacity is shared across code, data, and papers before logs and other
     files. Within each group, newer files win. Transient dependency/build
-    trees are omitted entirely.
+    trees are omitted entirely. Cache exclusions apply to directories and
+    ancestors, so a regular output file named ``.cache`` remains eligible.
 
     Symlinks are dropped unless their resolved target stays inside ``root``
     and outside every excluded path.
@@ -1188,15 +1196,21 @@ def _zip_workspace(
     credential_bytes = 0
     credential_scan_bytes = 0
 
-    def excluded(rel: Path) -> bool:
+    def excluded(rel: Path, *, is_directory: bool) -> bool:
         if not rel.parts:
             return True
         if rel.parts[0] in exclude_top:
             return True
+        directory_parts = rel.parts if is_directory else rel.parts[:-1]
+        if directory_parts and directory_parts[0] in _ZIP_EXCLUDE_TOP_DIRS:
+            return True
         return any(
-            part in _ZIP_EXCLUDE_PARTS
-            or any(part.startswith(prefix) for prefix in _ZIP_EXCLUDE_PREFIXES)
-            for part in rel.parts
+            part in _ZIP_EXCLUDE_DIRECTORY_PARTS
+            or any(
+                part.startswith(prefix)
+                for prefix in _ZIP_EXCLUDE_DIRECTORY_PREFIXES
+            )
+            for part in directory_parts
         )
 
     walk_errors = 0
@@ -1230,12 +1244,12 @@ def _zip_workspace(
                         walk_errors += 1
                         continue
                     if is_dir:
-                        if excluded(rel) or entry.is_symlink():
+                        if excluded(rel, is_directory=True) or entry.is_symlink():
                             excluded_files += 1
                             continue
                         directories.append(path)
                         continue
-                    if excluded(rel):
+                    if excluded(rel, is_directory=False):
                         excluded_files += 1
                         try:
                             excluded_bytes += max(0, path.stat().st_size)
@@ -1250,7 +1264,10 @@ def _zip_workspace(
                         except (OSError, RuntimeError, ValueError):
                             excluded_files += 1
                             continue
-                        if excluded(target_rel) or not source.is_file():
+                        if not source.is_file() or excluded(
+                            target_rel,
+                            is_directory=False,
+                        ):
                             excluded_files += 1
                             continue
                     try:

@@ -740,6 +740,92 @@ def test_compute_workspace_zip_excludes_codex_runtime_dirs() -> None:
         assert ".bash_profile" not in names
 
 
+def test_compute_handoff_excludes_package_cache_directories() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        cache_files = (
+            root / ".cache" / "uv" / "wheels" / "numpy.whl",
+            root / ".local" / "lib" / "python3.14" / "scipy.py",
+            root / ".sage" / "cache" / "gap.sobj",
+            root / ".npm" / "_cacache" / "index",
+            root / "code" / ".venv" / "lib" / "sympy.py",
+            root / "code" / "__pycache__" / "verify.pyc",
+        )
+        for path in cache_files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("cache", encoding="utf-8")
+        (root / "code" / "verify.py").write_text("keep", encoding="utf-8")
+        (root / "data").mkdir()
+        (root / "data" / "table.csv").write_text("keep", encoding="utf-8")
+        (root / "notes").mkdir()
+        (root / "notes" / ".cache").write_text("keep", encoding="utf-8")
+        (root / "notes" / ".sage").write_text("keep", encoding="utf-8")
+
+        out_zip = temp / "workspace.zip"
+        _zip_workspace(root, out_zip, exclude_top=_ZIP_EXCLUDE_TOP)
+
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+
+        assert names == {
+            COMPUTE_HANDOFF_MANIFEST,
+            "code/verify.py",
+            "data/table.csv",
+            "notes/.cache",
+            "notes/.sage",
+        }
+
+
+def test_compute_handoff_keeps_regular_files_named_like_cache_dirs() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        (root / "notes").mkdir(parents=True)
+        cache_names = (".cache", ".venv", ".npm", ".sage", "__pycache__", ".local")
+        for name in cache_names:
+            (root / name).write_text("keep", encoding="utf-8")
+            (root / "notes" / name).write_text("keep", encoding="utf-8")
+
+        out_zip = temp / "workspace.zip"
+        _zip_workspace(root, out_zip, exclude_top=_ZIP_EXCLUDE_TOP)
+
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+
+        expected = {COMPUTE_HANDOFF_MANIFEST}
+        expected.update(cache_names)
+        expected.update(f"notes/{name}" for name in cache_names)
+        assert names == expected
+
+
+def test_compute_handoff_symlink_cannot_smuggle_cache_content() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        (root / "code" / ".venv").mkdir(parents=True)
+        (root / "code" / ".venv" / "big.bin").write_text("cache", encoding="utf-8")
+        (root / ".codex-home").mkdir(parents=True)
+        (root / ".codex-home" / "auth.json").write_text("secret", encoding="utf-8")
+        (root / "code" / "result.txt").write_text("keep", encoding="utf-8")
+        (root / "notes").mkdir()
+        (root / "notes" / "leak.bin").symlink_to(root / "code" / ".venv" / "big.bin")
+        (root / "notes" / ".cache").symlink_to(root / ".codex-home" / "auth.json")
+        (root / "notes" / "ok.txt").symlink_to(root / "code" / "result.txt")
+
+        out_zip = temp / "workspace.zip"
+        _zip_workspace(root, out_zip, exclude_top=_ZIP_EXCLUDE_TOP)
+
+        with zipfile.ZipFile(out_zip) as zf:
+            names = set(zf.namelist())
+
+        assert names == {
+            COMPUTE_HANDOFF_MANIFEST,
+            "code/result.txt",
+            "notes/ok.txt",
+        }
+
+
 def test_compute_handoff_omits_copied_credentials_without_naming_them() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
