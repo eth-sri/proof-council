@@ -1397,6 +1397,14 @@ class APIClient:
                 time.sleep(self.sleep_after_request)
                 return result
             except Exception as e:
+                # These are control-flow outcomes, not retryable provider
+                # failures.  Retrying a terminated client delays shutdown, and
+                # wrapping an attachment rejection loses the partial-call cost
+                # carried by ProviderAttachmentRejectedError.
+                if isinstance(e, _ClientTerminated):
+                    return None
+                if isinstance(e, ProviderAttachmentRejectedError):
+                    raise
                 if "Max inner retries reached." in str(e):
                     total_retries += self.max_retries_inner
                 elif "rate limit" not in str(e).lower() and "429" not in str(e):
@@ -2439,7 +2447,10 @@ class APIClient:
                     else:
                         request_logger.log_response(ts=ts, batch_idx=idx, response=response.model_dump())
                 except Exception as e:
-                    if isinstance(e, _ClientTerminated):
+                    if isinstance(
+                        e,
+                        (_ClientTerminated, ProviderAttachmentRejectedError),
+                    ):
                         raise
                     if isinstance(e, _BackgroundResponseTimeout):
                         background_timeout_count += 1

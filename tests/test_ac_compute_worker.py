@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -42,9 +44,20 @@ from proofstack.agents.ac.compute import (  # noqa: E402
     inspect_compute_handoff,
 )
 from proofstack.context import RunContext  # noqa: E402
-from proofstack.kinds.cli import CLIDoneRecord, measure_workspace_usage  # noqa: E402
+from proofstack.cli_usage import parse_claude_json, parse_codex_jsonl  # noqa: E402
+from proofstack.kinds.cli import (  # noqa: E402
+    CLIDoneRecord,
+    _mark_sensitive_workspace_untrusted,
+    _write_sensitive_quarantine_marker,
+    measure_workspace_usage,
+)
 from proofstack.sandbox.base import SandboxSpec  # noqa: E402
-from proofstack.sandbox.subprocess import SubprocessSandbox  # noqa: E402
+from proofstack.sandbox.subprocess import (  # noqa: E402
+    SubprocessSandbox,
+    _BoundedTextBuffer,
+    _JsonUsageCapture,
+    _StreamingProcess,
+)
 
 
 class FakeSandbox(SimpleNamespace):
@@ -392,6 +405,7 @@ def test_compute_always_uses_scrubbed_codex_home() -> None:
         assert env == {"CODEX_HOME": "/codex-home"}
         assert codex_home.is_dir()
         assert root.resolve() not in codex_home.parents
+        assert ctx.root_workdir.resolve() not in codex_home.parents
         assert not (root / ".codex-home").exists()
         assert (root / "code" / "__init__.py").exists()
         assert (root / "data").is_dir()
@@ -408,6 +422,52 @@ def test_compute_always_uses_scrubbed_codex_home() -> None:
         asyncio.run(agent.teardown(sandbox, inp))
         assert not codex_home.exists()
         assert list((root / "scratch").iterdir()) == []
+
+
+def test_compute_reports_unverified_transient_auth_cleanup() -> None:
+    from proofstack.kinds.cli import CLIAgent
+    from proofstack.transient_auth import remove_codex_auth_parent
+
+    async def fake_super_run(self, inp):
+        return Compute.Outputs()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        home = _fake_subscription_home(temp)
+        ctx = RunContext.create(
+            run_id="test", root_workdir=temp / "run", flat=True
+        )
+        agent = Compute(ctx)
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="p",
+            round=1,
+            instructions="compute",
+            compute_workspace=temp / "compute",
+            sandbox_backend="subprocess",
+        )
+        cleanup_calls: list[tuple[Path, Path]] = []
+
+        def fail_cleanup(parent: Path, run_path: Path) -> None:
+            cleanup_calls.append((parent, Path(run_path)))
+            raise RuntimeError("transient Codex authentication cleanup failed")
+
+        with mock.patch.object(Path, "home", return_value=home), mock.patch.object(
+            CLIAgent, "run", fake_super_run
+        ), mock.patch(
+            "proofstack.agents.ac.compute.require_codex_auth_parent_removed",
+            side_effect=fail_cleanup,
+        ), pytest.raises(
+            RuntimeError,
+            match="transient Codex authentication cleanup failed",
+        ):
+            asyncio.run(agent.run(inp))
+
+        assert len(cleanup_calls) == 1
+        parent, run_path = cleanup_calls[0]
+        assert ctx.root_workdir.resolve() not in parent.parents
+        assert agent._codex_auth_parent is None
+        assert remove_codex_auth_parent(parent, run_path)
 
 
 def test_compute_never_forwards_provider_keys_to_codex_exec() -> None:
@@ -675,6 +735,72 @@ def test_compute_usage_subscription_auth_charges_no_usd() -> None:
         assert calls[-1]["subscription"] is False
 
 
+def test_compute_paid_usage_fails_closed_without_a_completed_turn() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test", root_workdir=Path(temp_dir) / "run", flat=True
+        )
+        agent = Compute(ctx)
+        agent._subscription_codex_auth = False
+
+        with pytest.raises(
+            RuntimeError,
+            match="paid Codex call produced no parseable usage record",
+        ):
+            asyncio.run(
+                agent.record_cli_usage(
+                    '{"type":"thread.started"}\n',
+                    "",
+                    CLIDoneRecord(status="timeout"),
+                )
+            )
+
+        agent._subscription_codex_auth = True
+        asyncio.run(
+            agent.record_cli_usage(
+                '{"type":"thread.started"}\n',
+                "",
+                CLIDoneRecord(status="timeout"),
+            )
+        )
+
+
+def test_compute_rejects_invalid_paid_cost_config_before_spawn() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        home = temp / "home"
+        home.mkdir()
+        ctx = RunContext.create(
+            run_id="test", root_workdir=temp / "run", flat=True
+        )
+        agent = Compute(ctx)
+
+        with mock.patch(
+            "proofstack.agents.ac.compute.Path.home", return_value=home
+        ), mock.patch.dict(os.environ, {"OPENAI_API_KEY": "paid-test-key"}):
+            try:
+                asyncio.run(
+                    agent(
+                        problem="P",
+                        problem_id="prob-001",
+                        round=1,
+                        instructions="compute",
+                        compute_workspace=temp / "compute",
+                        cost_config="models/openai/does-not-exist",
+                        sandbox_backend="subprocess",
+                    )
+                )
+            except RuntimeError as e:
+                assert "Paid Codex cost configuration must be valid" in str(e)
+            else:
+                raise AssertionError("invalid paid cost configuration was accepted")
+
+        events_path = temp / "run" / "events.jsonl"
+        events = events_path.read_text(encoding="utf-8")
+        assert "cli.spawn" not in events
+        assert agent._paid_codex_api_key is None
+
+
 def test_compute_utils_serializes_numpy_and_complex_values() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
@@ -824,6 +950,26 @@ def test_compute_handoff_symlink_cannot_smuggle_cache_content() -> None:
             "code/result.txt",
             "notes/ok.txt",
         }
+
+
+def test_compute_handoff_checks_credential_sensitive_symlink_target_name() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        (root / "code").mkdir(parents=True)
+        (root / "notes").mkdir()
+        (root / "code" / "auth.json").write_text(
+            "credential-shaped but not a currently known token",
+            encoding="utf-8",
+        )
+        (root / "notes" / "innocent.txt").symlink_to(root / "code" / "auth.json")
+
+        out_zip = temp / "workspace.zip"
+        stats = _zip_workspace(root, out_zip, exclude_top=_ZIP_EXCLUDE_TOP)
+
+        with zipfile.ZipFile(out_zip) as zf:
+            assert set(zf.namelist()) == {COMPUTE_HANDOFF_MANIFEST}
+        assert stats["credential_files"] == 2
 
 
 def test_compute_handoff_omits_copied_credentials_without_naming_them() -> None:
@@ -1070,7 +1216,7 @@ def test_workspace_usage_and_hard_limit_stop_are_enforced() -> None:
 
         assert done.status == "error"
         assert "workspace safety limit reached" in done.summary
-        assert "workspace size" in done.summary
+        assert "workspace allocated size" in done.summary
         assert stream.terminated is True
         assert any(kind == "cli.workspace_limit_exceeded" for kind, _ in events)
 
@@ -1210,6 +1356,156 @@ def test_workspace_usage_tolerates_scandir_iteration_errors() -> None:
     assert usage["filesystem_free_inodes"] is None
 
 
+def test_workspace_scan_errors_fail_closed() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test",
+            root_workdir=Path(temp_dir) / "run",
+            flat=True,
+        )
+        agent = Compute(ctx)
+        failure = agent._workspace_limit_failure(
+            {
+                "bytes": 0,
+                "allocated_bytes": 0,
+                "allocated_bytes_supported": True,
+                "entries": 0,
+                "errors": 1,
+                "filesystem_free_bytes": 1_000_000,
+                "filesystem_free_inodes": 1_000_000,
+            }
+        )
+
+    assert failure is not None
+    assert failure[0] == "workspace_scan_error"
+
+
+def test_workspace_scan_deletion_races_do_not_stop_worker() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test",
+            root_workdir=Path(temp_dir) / "run",
+            flat=True,
+        )
+        agent = Compute(ctx)
+        agent.WORKSPACE_HARD_LIMIT_BYTES = 100
+        agent.WORKSPACE_HARD_LIMIT_ENTRIES = 100
+        agent.WORKSPACE_MIN_FREE_BYTES = 0
+        agent.WORKSPACE_MIN_FREE_INODES = 0
+        failure = agent._workspace_limit_failure(
+            {
+                "bytes": 0,
+                "allocated_bytes": 0,
+                "allocated_bytes_supported": True,
+                "entries": 0,
+                "errors": 0,
+                "transient_errors": 1,
+                "filesystem_free_bytes": 1_000_000,
+                "filesystem_free_inodes": 1_000_000,
+            }
+        )
+
+    assert failure is None
+
+
+def test_sparse_file_is_limited_by_allocated_not_apparent_size() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "workspace"
+        workspace.mkdir()
+        sparse = workspace / "sparse.bin"
+        with sparse.open("wb") as handle:
+            handle.truncate(1024 * 1024 * 1024)
+        usage = measure_workspace_usage(workspace)
+        if not usage["allocated_bytes_supported"]:
+            return
+
+        assert usage["bytes"] == 1024 * 1024 * 1024
+        assert usage["allocated_bytes"] < usage["bytes"]
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.WORKSPACE_HARD_LIMIT_BYTES = 128 * 1024 * 1024
+        agent.WORKSPACE_HARD_LIMIT_ENTRIES = 10
+        agent.WORKSPACE_MIN_FREE_BYTES = 0
+        agent.WORKSPACE_MIN_FREE_INODES = 0
+        assert agent._workspace_limit_failure(usage) is None
+
+
+def test_workspace_recovery_prompt_and_completion_require_soft_target() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        (root / ".pwc" / "runtime").mkdir(parents=True)
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.WORKSPACE_SOFT_LIMIT_BYTES = 80
+        agent.WORKSPACE_HARD_LIMIT_BYTES = 100
+        agent.WORKSPACE_SOFT_LIMIT_ENTRIES = 8
+        agent.WORKSPACE_HARD_LIMIT_ENTRIES = 10
+        over = {
+            "bytes": 110,
+            "allocated_bytes": 110,
+            "allocated_bytes_supported": True,
+            "entries": 9,
+            "errors": 0,
+            "filesystem_free_bytes": 1_000_000,
+            "filesystem_free_inodes": 1_000_000,
+        }
+        agent._start_workspace_recovery(over)
+        agent._write_workspace_pressure(root, over, reason="workspace_hard_limit")
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="p",
+            round=1,
+            instructions="launch another enumeration",
+            compute_workspace=root,
+            workspace_soft_limit_bytes=80,
+            workspace_hard_limit_bytes=100,
+            workspace_soft_limit_entries=8,
+            workspace_hard_limit_entries=10,
+        )
+
+        prompt = agent.cli_input(inp)
+        assert "STORAGE-RECOVERY INVOCATION" in prompt
+        assert "launch another enumeration" not in prompt
+        assert (root / ".pwc" / "runtime" / "STORAGE_PRESSURE").exists()
+
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        agent._measure_workspace = lambda _root: dict(over)
+        incomplete = asyncio.run(
+            agent._finalize_workspace_recovery(
+                CLIDoneRecord(status="done", summary="cleanup attempted"),
+                root,
+                spawn_call_id="call",
+            )
+        )
+        assert incomplete.status == "partial"
+        assert "storage recovery incomplete" in incomplete.summary
+
+        below = {
+            **over,
+            "bytes": 40,
+            "allocated_bytes": 40,
+            "entries": 4,
+        }
+        agent._measure_workspace = lambda _root: dict(below)
+        complete = asyncio.run(
+            agent._finalize_workspace_recovery(
+                CLIDoneRecord(status="done", summary="clean"),
+                root,
+                spawn_call_id="call",
+            )
+        )
+        assert complete.status == "done"
+        assert not (root / ".pwc" / "runtime" / "STORAGE_PRESSURE").exists()
+        assert any(kind == "cli.workspace_recovery_completed" for kind, _ in events)
+
+
 def test_filesystem_free_inode_guard_stops_compute_worker() -> None:
     from unittest import mock
 
@@ -1296,7 +1592,299 @@ def test_compute_handoff_default_limits_leave_provider_margin() -> None:
     assert COMPUTE_FILESYSTEM_RESERVATION_BYTES == 0
 
 
-def test_compute_run_captures_codex_last_message_on_clean_cli_exit() -> None:
+def test_bounded_stream_buffer_retains_complete_line_tail() -> None:
+    buffer = _BoundedTextBuffer(6)
+    buffer.append("abc\n")
+    buffer.append("def\n")
+
+    assert buffer.text() == "def\n"
+    assert buffer.retained_chars == 4
+    assert buffer.dropped_chars == 4
+
+
+def test_bounded_stream_buffer_drops_partial_secret_line() -> None:
+    buffer = _BoundedTextBuffer(8)
+    buffer.append("prefix-secret")
+    buffer.append("still-secret\nsafe\n")
+
+    assert buffer.text() == "safe\n"
+    assert "secret" not in buffer.text()
+    assert buffer.retained_chars + buffer.dropped_chars == len(
+        "prefix-secretstill-secret\nsafe\n"
+    )
+
+
+def test_bounded_stream_keeps_compact_usage_records() -> None:
+    capture = _JsonUsageCapture(max_chars=4096, max_line_chars=4096)
+    codex_event = json.dumps(
+        {
+            "type": "turn.completed",
+            "transcript": "content that must not be retained",
+            "usage": {
+                "input_tokens": 11,
+                "cached_input_tokens": 3,
+                "output_tokens": 5,
+            },
+        }
+    )
+    claude_event = json.dumps(
+        {
+            "type": "result",
+            "result": "another transcript",
+            "num_turns": 2,
+            "total_cost_usd": 1.25,
+            "usage": {"input_tokens": 7, "output_tokens": 4},
+        }
+    )
+    stream = codex_event + "\n" + claude_event + "\n"
+    capture.feed(stream[:17])
+    capture.feed(stream[17:])
+    capture.finish()
+
+    retained = capture.text()
+    assert "content that must not be retained" not in retained
+    codex_usage = parse_codex_jsonl(retained)
+    assert codex_usage.input_tokens == 11
+    assert codex_usage.output_tokens == 5
+    claude_usage = parse_claude_json(retained)
+    assert claude_usage.input_tokens == 7
+    assert claude_usage.output_tokens == 4
+    assert claude_usage.total_cost_usd == 1.25
+
+
+def test_truncated_stream_meters_usage_from_before_retained_tail() -> None:
+    async def exercise():
+        reader = asyncio.StreamReader()
+        proc = SimpleNamespace(stdout=reader, stderr=None)
+        stream = _StreamingProcess(
+            proc=proc,
+            cmd=["fake"],
+            deadline=1_000_000_000.0,
+            max_capture_chars=80,
+        )
+        first = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            }
+        )
+        second = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 5, "output_tokens": 7},
+            }
+        )
+        emitted = first + "\n" + ("x" * 200) + "\n" + second + "\n"
+        reader.feed_data(emitted.encode("utf-8"))
+        reader.feed_eof()
+        await asyncio.gather(stream._stdout_task, stream._stderr_task)
+        return stream, emitted
+
+    stream, emitted = asyncio.run(exercise())
+    assert stream.stdout_dropped_chars > 0
+    assert stream.stdout_chars == len(emitted)
+    usage = parse_codex_jsonl(stream.metering_stdout)
+    assert usage.n_turns == 2
+    assert usage.input_tokens == 7
+    assert usage.output_tokens == 10
+
+
+def test_compute_refreshes_rotated_transient_codex_secrets() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        codex_home = temp / "codex-home"
+        codex_home.mkdir()
+        rotated = "rotated-access-token-that-must-be-redacted"
+        (codex_home / "auth.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {"access_token": rotated},
+                }
+            ),
+            encoding="utf-8",
+        )
+        agent._codex_home_host = codex_home
+        agent._copied_codex_auth = True
+        agent._subscription_codex_auth = True
+        agent.events = SimpleNamespace(emit=lambda *args, **kwargs: None)
+
+        asyncio.run(
+            agent.refresh_sensitive_state(
+                SimpleNamespace(root=temp / "compute"),
+                Compute.Inputs(
+                    problem="P",
+                    problem_id="p",
+                    round=1,
+                    instructions="compute",
+                    compute_workspace=temp / "compute",
+                ),
+            )
+        )
+
+        assert rotated in agent._handoff_secrets
+        assert rotated not in agent.sanitize_cli_output(f"output {rotated}")
+
+
+def test_compute_refresh_fails_closed_when_transient_auth_disappears() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        codex_home = temp / "codex-home"
+        codex_home.mkdir()
+        agent._codex_home_host = codex_home
+        agent._copied_codex_auth = True
+        agent._subscription_codex_auth = True
+
+        try:
+            asyncio.run(
+                agent.refresh_sensitive_state(
+                    SimpleNamespace(root=temp / "compute"),
+                    Compute.Inputs(
+                        problem="P",
+                        problem_id="p",
+                        round=1,
+                        instructions="compute",
+                        compute_workspace=temp / "compute",
+                    ),
+                )
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise AssertionError("missing prepared auth was accepted")
+
+
+def test_sensitive_quarantine_uses_external_marker_when_workspace_write_fails() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace_marker = temp / "workspace" / "runtime" / "quarantine"
+        external_marker = temp / "control" / "quarantine"
+
+        def write_marker(path: Path) -> bool:
+            if path == workspace_marker:
+                return False
+            return _write_sensitive_quarantine_marker(path)
+
+        with mock.patch(
+            "proofstack.kinds.cli._write_sensitive_quarantine_marker",
+            side_effect=write_marker,
+        ):
+            persisted = _mark_sensitive_workspace_untrusted(
+                workspace_marker,
+                external_marker,
+            )
+
+        assert persisted == (external_marker,)
+        assert not workspace_marker.exists()
+        assert external_marker.exists()
+
+
+def test_compute_suppresses_artifacts_when_final_auth_is_unreadable() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        fake_bin = temp / "bin"
+        fake_bin.mkdir()
+        fake_codex = fake_bin / "codex"
+        rotated = "rotated-token-that-must-never-leave-the-workspace"
+        fake_codex.write_text(
+            f"""#!/bin/sh
+if [ "${{1:-}}" = "--version" ]; then
+  printf 'codex-cli 0.144.0\n'
+  exit 0
+fi
+if [ "${{1:-}}" = "login" ] && [ "${{2:-}}" = "status" ]; then
+  exit 0
+fi
+cat >/dev/null
+mkdir -p responses
+printf '%s\n' 'result {rotated}' > responses/response_round_1.md
+printf '%s\n' 'transcript {rotated}'
+rm -f "$CODEX_HOME/auth.json"
+"$FINISH_BIN" '{{"status":"done","summary":"finished"}}'
+exit 0
+""",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        fake_home = _fake_subscription_home(temp)
+        compute_workspace = temp / "compute"
+
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{fake_bin}{os.pathsep}{old_path}"
+        try:
+            ctx = RunContext.create(
+                run_id="test", root_workdir=temp / "run", flat=True
+            )
+            agent = Compute(ctx)
+            with mock.patch(
+                "proofstack.agents.ac.compute.Path.home",
+                return_value=fake_home,
+            ):
+                try:
+                    asyncio.run(
+                        agent(
+                            problem="P",
+                            problem_id="prob-001",
+                            round=1,
+                            instructions="do the computation",
+                            compute_workspace=compute_workspace,
+                            sandbox_backend="subprocess",
+                            codex_sandbox="workspace-write",
+                            filesystem_min_free_bytes=0,
+                            filesystem_min_free_inodes=0,
+                        )
+                    )
+                except RuntimeError as e:
+                    assert "artifacts were suppressed" in str(e)
+                else:
+                    raise AssertionError("unreadable final auth was accepted")
+        finally:
+            os.environ["PATH"] = old_path
+
+        assert rotated in (
+            compute_workspace / "responses" / "response_round_1.md"
+        ).read_text(encoding="utf-8")
+        workspace_marker = (
+            compute_workspace
+            / ".pwc"
+            / "runtime"
+            / "SENSITIVE_STATE_UNTRUSTED"
+        )
+        assert workspace_marker.exists()
+        external_marker = agent.sensitive_quarantine_path_for(compute_workspace)
+        assert external_marker.exists()
+        assert not list((temp / "run").rglob("cli_stdout.log"))
+        assert not list((temp / "run").rglob("cli_stderr.log"))
+        assert not list((temp / "run").rglob("compute_workspace_round_*.zip"))
+
+        # The sidecar must still block reuse if the model-writable marker is
+        # accidentally deleted between invocations.
+        workspace_marker.unlink()
+        second_agent = Compute(ctx)
+        with mock.patch(
+            "proofstack.agents.ac.compute.Path.home",
+            return_value=fake_home,
+        ), pytest.raises(RuntimeError, match="workspace is quarantined"):
+            asyncio.run(
+                second_agent(
+                    problem="P",
+                    problem_id="prob-001",
+                    round=2,
+                    instructions="do the computation",
+                    compute_workspace=compute_workspace,
+                    sandbox_backend="subprocess",
+                    codex_sandbox="workspace-write",
+                    filesystem_min_free_bytes=0,
+                    filesystem_min_free_inodes=0,
+                )
+            )
+
+
+def test_compute_run_captures_codex_last_message_with_finish_signal() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
         fake_bin = temp / "bin"
@@ -1319,6 +1907,7 @@ done
 cat >/dev/null
 mkdir -p "$(dirname "$out")"
 printf 'fake codex final message\\n' > "$out"
+"$FINISH_BIN" '{"status":"done","summary":"fake complete"}'
 exit 0
 """,
             encoding="utf-8",
@@ -1420,6 +2009,7 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 cat >/dev/null
+"$FINISH_BIN" '{"status":"done","summary":"no current result"}'
 exit 0
 """,
             encoding="utf-8",
@@ -1461,6 +2051,6 @@ exit 0
         assert out.response_md == (
             "(Worker did not write responses/response_round_2.md; "
             "falling back to finish summary)\n\n"
-            "(no done.json written)"
+            "no current result"
         )
         assert not stale_path.exists()

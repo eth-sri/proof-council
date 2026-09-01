@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from proofstack.agents.ac.blocks import CANONICAL_FILES
 
@@ -69,6 +69,11 @@ class AttachmentUploadFailure:
     size_bytes: int | None
     error_type: str
     message: str
+    disposition: Literal["permanent", "transient", "unknown"]
+
+    @property
+    def permanent(self) -> bool:
+        return self.disposition == "permanent"
 
 
 @dataclass
@@ -396,7 +401,76 @@ def _attachment_upload_failure(
         size_bytes=size_bytes,
         error_type=type(error).__name__,
         message=str(error)[:1000],
+        disposition=_classify_attachment_upload_error(error),
     )
+
+
+def _classify_attachment_upload_error(
+    error: Exception,
+) -> Literal["permanent", "transient", "unknown"]:
+    """Classify whether retrying this exact optional file can succeed later.
+
+    Only strong provider evidence is treated as permanent.  Unknown failures
+    deliberately remain retryable on a later Author round; quarantining them
+    would turn a one-off network failure into permanent loss of the handoff.
+    """
+    response = getattr(error, "response", None)
+    status_code = getattr(error, "status_code", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+
+    error_name = type(error).__name__.lower()
+    if status_code in {408, 425, 429} or (
+        isinstance(status_code, int) and status_code >= 500
+    ):
+        return "transient"
+    if any(token in error_name for token in ("timeout", "connection", "ratelimit")):
+        return "transient"
+
+    body = getattr(error, "body", None)
+    code = getattr(error, "code", None)
+    rendered = " ".join(
+        str(value) for value in (code, body, error) if value is not None
+    ).lower()
+    permanent_hints = (
+        "array_above_max_length",
+        "container_file_limit",
+        "file_too_large",
+        "payload_too_large",
+        "request_too_large",
+        "too many files",
+        "too_many_files",
+        "unsupported file",
+        "unsupported_file",
+        "invalid file",
+        "invalid_file",
+        "maximum file size",
+    )
+    if status_code == 413 or any(hint in rendered for hint in permanent_hints):
+        return "permanent"
+    # A 415 is specifically an unsupported upload media type. Generic 400/422
+    # validation errors are not enough to blame the file permanently: they can
+    # also reflect a transient provider/API mismatch or malformed metadata.
+    if status_code == 415:
+        return "permanent"
+    if any(
+        hint in rendered
+        for hint in (
+            "temporarily unavailable",
+            "rate limit",
+            "try again",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection aborted",
+        )
+    ):
+        return "transient"
+    return "unknown"
 
 
 def find_anthropic_generated_file_ids(conversation: Iterable[dict]) -> list[str]:

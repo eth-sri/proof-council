@@ -14,8 +14,10 @@ Workspace shape (``ac_workspaces/<pid>/compute/``)::
     responses/
       response_round_{N}.md            # worker's reply for round N
     code/  data/  papers/  notes/      # worker-owned, persistent
-    ../.compute_codex_home/<id>/       # transient codex auth (scrubbed)
     .pwc/runtime/                      # framework state (done.json, WRAP_UP)
+
+Transient Codex authentication lives in a private OS temporary directory
+outside this retained tree and is removed after every invocation.
 
 The worker is told never to write to ``problem_documents_readonly/``.
 After it finishes, the workflow:
@@ -57,6 +59,10 @@ from proofstack.codex_auth import (
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord, measure_workspace_usage
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
+from proofstack.transient_auth import (
+    create_codex_auth_parent,
+    require_codex_auth_parent_removed,
+)
 
 
 DEFAULT_MODEL = "gpt-5.6-sol"
@@ -286,11 +292,18 @@ scripts using ``numpy.trapz`` continue to work under NumPy 2.x.
 
 {instructions}
 
-## Soft-timeout sentinel
+## Runtime sentinels
 
 If ``.pwc/runtime/WRAP_UP`` appears, stop new investigations
 immediately, finalize ``responses/response_round_{round}.md``, and
 call ``$FINISH_BIN``.
+
+If ``.pwc/runtime/STORAGE_PRESSURE`` appears, stop new investigations
+immediately. Read its JSON limits, delete reproducible caches, failed
+databases, expanded archives, bulky logs, and obsolete intermediates, and
+reduce both allocated storage and entry count below the stated soft limits.
+Preserve compact certificates and essential conclusions. Then summarize the
+cleanup in ``responses/response_round_{round}.md`` and call ``$FINISH_BIN``.
 
 ## Finishing
 
@@ -351,6 +364,8 @@ class Compute(CLIAgent):
         docker_no_new_privileges=False,
     )
     SOFT_TIMEOUT_S: ClassVar[int] = DEFAULT_SOFT_TIMEOUT_S
+    COMPLETION_SIGNAL: ClassVar[str] = "finish"
+    WORKSPACE_RECOVERY_ENABLED: ClassVar[bool] = True
 
     class Inputs(BaseModel):
         problem: str
@@ -395,9 +410,9 @@ class Compute(CLIAgent):
             default=COMPUTE_FILESYSTEM_RESERVATION_BYTES,
             ge=0,
             description=(
-                "Bytes this active Compute worker reserves cooperatively. Set "
-                "this in the run input when parallel workers need guaranteed "
-                "headroom; zero disables coordinated reservations."
+                "Total workspace capacity this active Compute worker reserves "
+                "cooperatively. Existing allocated bytes reduce the remaining "
+                "reservation; zero disables coordinated reservations."
             ),
         )
         filesystem_reservation_dir: Path | None = Field(
@@ -482,6 +497,8 @@ class Compute(CLIAgent):
         self._paid_codex_api_key: str | None = None
         self._last_model: str | None = None
         self._last_cost_config: str | None = None
+        self._paid_cost_rates: dict[str, Any] | None = None
+        self._codex_auth_parent: Path | None = None
         self._codex_home_host: Path | None = None
         self._codex_home_env: str | None = None
         self._handoff_secrets: tuple[str, ...] = ()
@@ -493,8 +510,21 @@ class Compute(CLIAgent):
         ws.mkdir(parents=True, exist_ok=True)
         return ws
 
-    def _measure_workspace(self, root: Path) -> dict[str, Any]:
-        usage = super()._measure_workspace(root)
+    def _sanitize_workspace_usage(
+        self,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        # Usage events include largest-file paths while the CLI is still
+        # running. Refresh the transient copy here as well so a token rotated
+        # during the run cannot appear in an event filename.
+        try:
+            self._refresh_transient_auth_secrets()
+        except (OSError, RuntimeError, ValueError) as e:
+            # Preserve storage enforcement but suppress path-bearing details
+            # until the transient credential can be read again.
+            usage["largest_files"] = []
+            usage["credential_refresh_error"] = type(e).__name__
+            return usage
         for item in usage.get("largest_files", []):
             if isinstance(item, dict) and isinstance(item.get("path"), str):
                 item["path"] = redact_codex_secrets(
@@ -504,8 +534,32 @@ class Compute(CLIAgent):
         return usage
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
+        auth_parent = self._ensure_codex_auth_parent()
+        try:
+            return await self._run_with_auth_parent(inp)
+        finally:
+            self._paid_codex_api_key = None
+            self._paid_cost_rates = None
+            self._host_codex_auth_text = None
+            self._handoff_secrets = ()
+            try:
+                require_codex_auth_parent_removed(
+                    auth_parent,
+                    self.ctx.root_workdir,
+                )
+            finally:
+                self._codex_auth_parent = None
+                self._codex_home_host = None
+                self._codex_home_env = None
+                self._copied_codex_auth = False
+                self._subscription_codex_auth = False
+
+    async def _run_with_auth_parent(self, inp: BaseModel) -> BaseModel:
         self._last_model = inp.model  # type: ignore[attr-defined]
         self._last_cost_config = inp.cost_config  # type: ignore[attr-defined]
+        self._paid_codex_api_key = None
+        self._paid_cost_rates = None
+        self._handoff_secrets = ()
         soft_timeout_s = int(inp.soft_timeout_s)  # type: ignore[attr-defined]
         hard_timeout_s = int(inp.hard_timeout_s)  # type: ignore[attr-defined]
         self.SOFT_TIMEOUT_S = soft_timeout_s
@@ -558,16 +612,27 @@ class Compute(CLIAgent):
                 f"{Path.home() / '.codex' / 'auth.json'}. Run `codex login` again "
                 "or remove that file to use OPENAI_API_KEY."
             )
+        paid_codex_api_key: str | None = None
         if auth_class == "absent":
-            self._paid_codex_api_key = os.environ.get("OPENAI_API_KEY") or None
-            if self._paid_codex_api_key is None:
+            paid_codex_api_key = os.environ.get("OPENAI_API_KEY") or None
+            if paid_codex_api_key is None:
                 raise RuntimeError(
                     "Codex authentication is unavailable: no ChatGPT/API-key "
                     "auth.json and OPENAI_API_KEY is not set."
                 )
+        if auth_class != "subscription":
+            cfg_ref = self._last_cost_config or DEFAULT_COST_CONFIG
+            try:
+                self._paid_cost_rates = load_cost_rates(cfg_ref)
+            except (KeyError, FileNotFoundError, ValueError) as e:
+                raise RuntimeError(
+                    "Paid Codex cost configuration must be valid before the "
+                    f"worker starts ({cfg_ref}): {type(e).__name__}: {e}"
+                ) from e
+        self._paid_codex_api_key = paid_codex_api_key
         self._handoff_secrets = extract_codex_auth_secrets(
             self._host_codex_auth_text,
-            additional=(self._paid_codex_api_key or "",),
+            additional=(paid_codex_api_key or "",),
         )
         self.SANDBOX = SandboxSpec(
             cpu_limit=4,
@@ -594,6 +659,7 @@ class Compute(CLIAgent):
             return await super().run(inp)
         finally:
             self._paid_codex_api_key = None
+            self._paid_cost_rates = None
             self._host_codex_auth_text = None
             self._handoff_secrets = ()
 
@@ -653,9 +719,14 @@ class Compute(CLIAgent):
             phase="teardown",
             strict=False,
         )
-        if self._codex_home_host is not None:
-            shutil.rmtree(self._codex_home_host, ignore_errors=True)
+        auth_parent = self._codex_auth_parent
+        if auth_parent is not None:
+            require_codex_auth_parent_removed(
+                auth_parent,
+                self.ctx.root_workdir,
+            )
         shutil.rmtree(sandbox.root / ".codex-home", ignore_errors=True)
+        self._codex_auth_parent = None
         self._codex_home_host = None
         self._codex_home_env = None
         self._copied_codex_auth = False
@@ -671,15 +742,67 @@ class Compute(CLIAgent):
     def sanitize_cli_output(self, text: str) -> str:
         return redact_codex_secrets(text, self._handoff_secrets)
 
+    async def refresh_sensitive_state(
+        self,
+        sandbox: Sandbox,
+        inp: BaseModel,
+    ) -> None:
+        """Capture tokens refreshed inside the transient Codex home.
+
+        The host login remains a one-shot read for authentication/accounting
+        consistency.  Codex may rotate the copied credential while executing,
+        however, so re-read only that transient copy before logs, responses,
+        and handoff files are sanitized.
+        """
+        self._refresh_transient_auth_secrets()
+
+    def _refresh_transient_auth_secrets(self) -> None:
+        if self._codex_home_host is None:
+            return
+        auth_path = self._codex_home_host / "auth.json"
+        try:
+            auth_text = auth_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            if not self._copied_codex_auth:
+                return
+            raise
+        auth_class = classify_codex_auth(auth_text)
+        if auth_class not in {"subscription", "api_key"}:
+            raise ValueError("transient Codex authentication is invalid")
+        if self._copied_codex_auth:
+            expected_class = (
+                "subscription" if self._subscription_codex_auth else "api_key"
+            )
+            if auth_class != expected_class:
+                raise ValueError(
+                    "transient Codex authentication changed billing class"
+                )
+        refreshed_secrets = extract_codex_auth_secrets(auth_text)
+        if not refreshed_secrets:
+            raise ValueError(
+                "transient Codex authentication contains no redactable credential"
+            )
+        self._handoff_secrets = extract_codex_auth_secrets(
+            auth_text,
+            additional=self._handoff_secrets,
+        )
+
     def _codex_home_paths(self, inp: BaseModel) -> tuple[Path, str, tuple[str, ...]]:
         name = _safe_codex_home_name(
             f"{getattr(inp, 'problem_id', 'problem')}-r{getattr(inp, 'round', 0)}"
         )
-        host = (self.ctx.root_workdir / ".compute_codex_home" / name).resolve()
+        host = (self._ensure_codex_auth_parent() / name).resolve()
         backend = str(getattr(inp, "sandbox_backend", DEFAULT_SANDBOX_BACKEND) or DEFAULT_SANDBOX_BACKEND)
         if backend == "docker":
             return host, _DOCKER_CODEX_HOME, ("-v", f"{host}:{_DOCKER_CODEX_HOME}")
         return host, str(host), ()
+
+    def _ensure_codex_auth_parent(self) -> Path:
+        parent = self._codex_auth_parent
+        if parent is None:
+            parent = create_codex_auth_parent(self.ctx.root_workdir)
+            self._codex_auth_parent = parent
+        return parent
 
     def _ensure_codex_home(self, inp: BaseModel) -> Path:
         if self._codex_home_host is None or self._codex_home_env is None:
@@ -827,10 +950,33 @@ class Compute(CLIAgent):
             )
 
     def cli_input(self, inp: BaseModel) -> str:
+        instructions = inp.instructions or "(no instructions provided)"  # type: ignore[attr-defined]
+        recovery_banner = ""
+        if self._workspace_recovery_mode:
+            instructions = (
+                "The commissioned research task is deferred for this invocation. "
+                "Perform storage recovery only; do not launch new searches, "
+                "enumerations, downloads, builds, or package installations."
+            )
+            recovery_banner = f"""\
+URGENT STORAGE-RECOVERY INVOCATION
+==================================
+This workspace crossed its configured storage threshold. Your only task is
+to reclaim storage safely. Inspect `.pwc/runtime/STORAGE_PRESSURE`, remove
+reproducible or obsolete bulk data, and get allocated usage below
+{self.WORKSPACE_SOFT_LIMIT_BYTES or self.WORKSPACE_HARD_LIMIT_BYTES} bytes and entry count below
+{self.WORKSPACE_SOFT_LIMIT_ENTRIES or self.WORKSPACE_HARD_LIMIT_ENTRIES}. Growth during cleanup is bounded; avoid
+creating archives or copying trees. Preserve compact mathematical evidence,
+write a short cleanup report to `responses/response_round_{inp.round}.md`,
+and call `$FINISH_BIN`. Do not continue the Author's research request in this
+invocation.
+
+"""  # type: ignore[attr-defined]
         text = COMPUTE_WORKER_PROMPT.format(
             round=inp.round,  # type: ignore[attr-defined]
-            instructions=inp.instructions or "(no instructions provided)",  # type: ignore[attr-defined]
+            instructions=instructions,
         )
+        text = recovery_banner + text
         if not text.endswith("\n"):
             text += "\n"
         return text
@@ -974,26 +1120,42 @@ class Compute(CLIAgent):
     ) -> None:
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
+            if not self._subscription_codex_auth:
+                raise RuntimeError(
+                    "paid Codex call produced no parseable usage record"
+                )
             return
         cost = 0.0
         nominal: float | None = None
-        billing_unknown = False
         subscription = self._subscription_codex_auth
         cfg_ref: str | None = self._last_cost_config or DEFAULT_COST_CONFIG
-        try:
-            rates = load_cost_rates(cfg_ref)
-        except (KeyError, FileNotFoundError, ValueError) as e:
-            await self.events.emit(
-                "cli.cost_lookup_failed",
-                {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
-            )
-            billing_unknown = not subscription
-            cfg_ref = None
+        if subscription:
+            try:
+                rates = load_cost_rates(cfg_ref)
+            except (KeyError, FileNotFoundError, ValueError) as e:
+                await self.events.emit(
+                    "cli.cost_lookup_failed",
+                    {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
+                )
+                cfg_ref = None
+            else:
+                nominal = cost_for_codex_usage(usage, **rates)
         else:
+            rates = self._paid_cost_rates
+            if rates is None:
+                # Direct callers and old checkpoints may not have passed through
+                # run() yet. Keep this path fail-closed as well.
+                try:
+                    rates = load_cost_rates(cfg_ref)
+                except (KeyError, FileNotFoundError, ValueError) as e:
+                    raise RuntimeError(
+                        "Paid Codex usage cannot be recorded without a valid "
+                        f"cost configuration ({cfg_ref})"
+                    ) from e
+                self._paid_cost_rates = rates
             nominal = cost_for_codex_usage(usage, **rates)
-            if not subscription:
-                cost = nominal
-                self.tracker.add_usd(cost)
+            cost = nominal
+            self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
         await self.events.emit(
             "model.call",
@@ -1007,13 +1169,16 @@ class Compute(CLIAgent):
                 "cost_usd": cost,
                 "api_equivalent_usd": nominal,
                 "subscription": subscription,
-                "billing_unknown": billing_unknown,
+                "billing_unknown": False,
                 "n_turns": usage.n_turns,
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
                 "role": "ac_compute_worker",
             },
         )
+
+    def cli_usage_must_succeed(self) -> bool:
+        return not self._subscription_codex_auth
 
 # --- helpers ----------------------------------------------------------------
 
@@ -1244,7 +1409,7 @@ def _zip_workspace(
                         walk_errors += 1
                         continue
                     if is_dir:
-                        if excluded(rel, is_directory=True) or entry.is_symlink():
+                        if excluded(rel, is_directory=True):
                             excluded_files += 1
                             continue
                         directories.append(path)
@@ -1257,6 +1422,7 @@ def _zip_workspace(
                             pass
                         continue
                     source = path
+                    target_rel: Path | None = None
                     if path.is_symlink():
                         try:
                             source = path.resolve(strict=True)
@@ -1276,7 +1442,14 @@ def _zip_workspace(
                         excluded_files += 1
                         continue
                     size = max(0, stat_result.st_size)
-                    if _handoff_path_is_credential_sensitive(rel, secret_values):
+                    if _handoff_path_is_credential_sensitive(
+                        rel, secret_values
+                    ) or (
+                        target_rel is not None
+                        and _handoff_path_is_credential_sensitive(
+                            target_rel, secret_values
+                        )
+                    ):
                         credential_files += 1
                         credential_bytes += size
                         continue

@@ -68,7 +68,10 @@ if "loguru" not in sys.modules:
 
 from proofstack.agents.ac.author import Author, _is_attachment_rejection  # noqa: E402
 from proofstack.agents.ac.blocks import CANONICAL_FILES  # noqa: E402
-from proofstack.agents.ac.container_files import ContainerFileBridge  # noqa: E402
+from proofstack.agents.ac.container_files import (  # noqa: E402
+    ContainerFileBridge,
+    _classify_attachment_upload_error,
+)
 from proofstack.agents.ac.compute import (  # noqa: E402
     COMPUTE_HANDOFF_MAX_FILES,
     Compute,
@@ -97,6 +100,14 @@ class AuthorContainerCleanupTests(unittest.TestCase):
             _is_attachment_rejection(RuntimeError("attachment service unavailable"))
         )
         self.assertFalse(_is_attachment_rejection(RuntimeError("invalid file id")))
+
+    def test_generic_upload_validation_error_is_not_permanently_quarantined(
+        self,
+    ) -> None:
+        error = RuntimeError("provider rejected malformed request metadata")
+        error.status_code = 400
+
+        self.assertEqual(_classify_attachment_upload_error(error), "unknown")
 
     def test_cleanup_runs_when_api_call_raises(self) -> None:
         """``_one_shot_query`` raising must not skip the cleanup ``finally``."""
@@ -218,6 +229,63 @@ class AuthorContainerCleanupTests(unittest.TestCase):
                 "provider rejected optional attachment",
                 bridge.extra_upload_failures[0].message,
             )
+            self.assertEqual(
+                bridge.extra_upload_failures[0].disposition,
+                "unknown",
+            )
+
+    def test_transient_optional_upload_failure_is_not_quarantined(self) -> None:
+        class TransientUploadError(RuntimeError):
+            status_code = 503
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in CANONICAL_FILES:
+                (root / name).write_text(name, encoding="utf-8")
+            compute_zip = root / "compute.zip"
+            with zipfile.ZipFile(compute_zip, "w") as zf:
+                zf.writestr("notes/result.txt", "result")
+
+            client = MagicMock()
+            client.files.create.side_effect = [
+                *[
+                    SimpleNamespace(id=f"file-{idx}")
+                    for idx in range(len(CANONICAL_FILES))
+                ],
+                TransientUploadError("service temporarily unavailable"),
+            ]
+            bridge = ContainerFileBridge(
+                openai_client=client,
+                workspace=root,
+                names=CANONICAL_FILES,
+                extra_attachments=[(compute_zip, "compute artifact")],
+            )
+            bridge.upload()
+            failure = bridge.extra_upload_failures[0]
+            self.assertEqual(failure.disposition, "transient")
+
+            ctx = RunContext.create(
+                run_id="test_transient_attachment",
+                root_workdir=root / "run",
+                flat=True,
+            )
+            author = Author(ctx)
+            events: list[tuple[str, dict]] = []
+
+            async def emit(kind, payload, **kwargs):
+                events.append((kind, payload))
+
+            author.events = SimpleNamespace(emit=emit)
+            asyncio.run(
+                author._emit_attachment_upload_failures(
+                    [failure],
+                    provider="openai",
+                )
+            )
+
+            self.assertTrue(inspect_compute_handoff(compute_zip).attachable)
+            self.assertEqual(events[0][0], "ac.author.attachment_unavailable")
+            self.assertTrue(events[0][1]["retry_next_round"])
 
     def test_author_retries_provider_attachment_rejection_without_compute_zip(
         self,

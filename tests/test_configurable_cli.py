@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -211,6 +212,35 @@ class ConfigurableCLITests(unittest.TestCase):
             self.assertEqual(out.status, "done")
             self.assertEqual(out.summary, "written")
 
+    def test_required_finish_record_is_not_satisfied_by_clean_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["true"],
+                        "completion_signal": "finish",
+                        "sandbox": {"backend": "subprocess"},
+                        "output_schema": {
+                            "workspace": "string",
+                            "status": "string",
+                            "summary": "string",
+                        },
+                        "done_outputs": {
+                            "status": "status",
+                            "summary": "summary",
+                        },
+                    }
+                },
+            )
+
+            out = asyncio.run(ConfigurableCLIAgent(ctx, name="cfg_cli")())
+
+            self.assertEqual(out.status, "error")
+            self.assertIn("required finish completion record", out.summary)
+
     def test_file_completion_contract_uses_persistent_runtime_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ctx = RunContext.create(
@@ -411,6 +441,63 @@ class ConfigurableCLITests(unittest.TestCase):
             self.assertNotIn("gpt-5.4-mini", cmd)
             self.assertIn('model_reasoning_effort="xhigh"', cmd)
             self.assertNotIn('model_reasoning_effort="low"', cmd)
+
+    def test_paid_codex_cost_config_is_validated_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["codex", "exec"],
+                        "usage": {
+                            "type": "codex_jsonl",
+                            "cost_config": "models/openai/does-not-exist",
+                        },
+                    }
+                },
+            )
+
+            with self.assertRaisesRegex(
+                ValueError, "Paid Codex cost configuration must be valid"
+            ):
+                ConfigurableCLIAgent(ctx, name="cfg_cli")
+
+    def test_paid_codex_run_fails_closed_without_usage_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp_dir,
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["true"],
+                        "completion_signal": "exit",
+                        "usage": {
+                            "type": "codex_jsonl",
+                            "cost_config": "models/openai/gpt-54-mini",
+                        },
+                        "sandbox": {"backend": "subprocess"},
+                        "output_schema": {"workspace": "string"},
+                    }
+                },
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "required CLI usage accounting failed",
+            ):
+                agent = ConfigurableCLIAgent(ctx, name="cfg_cli")
+                agent.WORKSPACE_RESERVATION_BYTES = 1
+                agent.WORKSPACE_MIN_FREE_BYTES = 0
+                agent.WORKSPACE_RESERVATION_DIR = Path(temp_dir) / "leases"
+                asyncio.run(agent(workspace=Path(temp_dir) / "workspace"))
+
+            self.assertEqual(
+                list((Path(temp_dir) / "leases").glob("lease-*.json")),
+                [],
+            )
 
     def test_claude_node_model_override_rewrites_cmd_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -762,6 +849,115 @@ class ConfigurableCLITests(unittest.TestCase):
             self.assertNotIn(workspace, codex_home.parents)
             self.assertFalse((workspace / ".codex-home").exists())
             self.assertFalse(codex_home.exists())
+
+    def test_copy_codex_auth_redacts_rotated_token_from_outputs_and_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            home = temp / "home"
+            auth = home / ".codex" / "auth.json"
+            auth.parent.mkdir(parents=True)
+            original = "original-subscription-token"
+            rotated = "rotated-subscription-token-that-must-not-leak"
+            auth.write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {"access_token": original},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            command = (
+                "cat >/dev/null; "
+                "printf '%s' "
+                f"'{{\"auth_mode\":\"chatgpt\",\"tokens\":"
+                f"{{\"access_token\":\"{rotated}\"}}}}' "
+                '> "$CODEX_HOME/auth.json"; '
+                f"printf '%s' 'file {rotated}' > result.txt; "
+                f"printf '%s\\n' 'stdout {rotated}'; "
+                f"finish '{{\"status\":\"done\","
+                f"\"summary\":\"summary {rotated}\"}}'"
+            )
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp / "run",
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["sh", "-c", command],
+                        "copy_codex_auth": True,
+                        "sandbox": {"backend": "subprocess"},
+                        "output_schema": {
+                            "workspace": "string",
+                            "result": "string",
+                            "summary": "string",
+                        },
+                        "output_files": {"result": "result.txt"},
+                        "done_outputs": {"summary": "summary"},
+                    }
+                },
+            )
+            agent = ConfigurableCLIAgent(ctx, name="cfg_cli")
+            parent = agent._codex_auth_parent
+
+            with mock.patch.object(Path, "home", return_value=home):
+                out = asyncio.run(agent())
+
+            self.assertNotIn(rotated, out.result)
+            self.assertNotIn(rotated, out.summary)
+            self.assertIn("[redacted-codex-credential]", out.result)
+            logs = list((temp / "run").rglob("cli_stdout.log"))
+            self.assertEqual(len(logs), 1)
+            self.assertNotIn(rotated, logs[0].read_text(encoding="utf-8"))
+            assert parent is not None
+            self.assertEqual(list(parent.iterdir()), [])
+            agent._codex_auth_finalizer()
+
+    def test_copy_codex_auth_cleanup_failure_fails_the_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            home = temp / "home"
+            auth = home / ".codex" / "auth.json"
+            auth.parent.mkdir(parents=True)
+            auth.write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {"access_token": "subscription-token"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ctx = RunContext.create(
+                run_id="test",
+                root_workdir=temp / "run",
+                flat=True,
+                component_configs={
+                    "cfg_cli": {
+                        "cmd": ["true"],
+                        "completion_signal": "exit",
+                        "copy_codex_auth": True,
+                        "sandbox": {"backend": "subprocess"},
+                        "output_schema": {"workspace": "string"},
+                    }
+                },
+            )
+            agent = ConfigurableCLIAgent(ctx, name="cfg_cli")
+            parent = agent._codex_auth_parent
+
+            with mock.patch.object(Path, "home", return_value=home), mock.patch(
+                "proofstack.agents.configurable_cli.shutil.rmtree",
+                side_effect=OSError("simulated cleanup failure"),
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "transient Codex authentication cleanup failed",
+            ):
+                asyncio.run(agent())
+
+            assert parent is not None
+            self.assertTrue(any(parent.iterdir()))
+            shutil.rmtree(parent)
+            agent._codex_auth_finalizer()
 
     def test_env_template_can_use_parent_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

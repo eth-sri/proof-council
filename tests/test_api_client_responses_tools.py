@@ -893,6 +893,44 @@ class BackgroundTimeoutRetryTests(unittest.TestCase):
 
 
 class TerminateDuringBackgroundPollTests(unittest.TestCase):
+    def test_outer_retry_returns_immediately_for_client_termination(self) -> None:
+        api = APIClient(model="fake-pro", api="custom")
+        with patch.object(
+            api,
+            "_run_query",
+            side_effect=_ClientTerminated("terminated"),
+        ) as run_query, patch("mathagents.api_client.time.sleep") as sleep:
+            result = api._run_query_with_retry(
+                0,
+                [{"role": "user", "content": "hi"}],
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(run_query.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_outer_retry_preserves_typed_attachment_rejection(self) -> None:
+        api = APIClient(model="fake-pro", api="custom")
+        rejected = ProviderAttachmentRejectedError(
+            "file rejected",
+            cost={"cost": 1.5, "input_tokens": 10, "output_tokens": 2},
+        )
+        with patch.object(
+            api,
+            "_run_query",
+            side_effect=rejected,
+        ) as run_query, patch("mathagents.api_client.time.sleep") as sleep:
+            with self.assertRaises(ProviderAttachmentRejectedError) as raised:
+                api._run_query_with_retry(
+                    0,
+                    [{"role": "user", "content": "hi"}],
+                )
+
+        self.assertIs(raised.exception, rejected)
+        self.assertEqual(raised.exception.cost["cost"], 1.5)
+        self.assertEqual(run_query.call_count, 1)
+        sleep.assert_not_called()
+
     def test_terminate_cancels_response_and_escapes_poll(self) -> None:
         # terminate() must interrupt the poll within one sleep slice,
         # cancel the server-side response, and escape the retry loops

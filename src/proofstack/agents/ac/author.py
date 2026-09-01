@@ -1107,15 +1107,20 @@ class Author(APICallAgent):
         provider: str,
     ) -> None:
         for failure in failures:
-            mark_compute_handoff_local_only(
-                failure.path,
-                reason=(
-                    f"{provider} upload rejected {failure.name}: "
-                    f"{failure.error_type}: {failure.message}"
-                ),
-            )
+            if failure.permanent:
+                mark_compute_handoff_local_only(
+                    failure.path,
+                    reason=(
+                        f"{provider} upload rejected {failure.name}: "
+                        f"{failure.error_type}: {failure.message}"
+                    ),
+                )
             await self.events.emit(
-                "ac.author.attachment_rejected",
+                (
+                    "ac.author.attachment_rejected"
+                    if failure.permanent
+                    else "ac.author.attachment_unavailable"
+                ),
                 {
                     "provider": provider,
                     "phase": "upload",
@@ -1124,6 +1129,8 @@ class Author(APICallAgent):
                     "size_bytes": failure.size_bytes,
                     "type": failure.error_type,
                     "msg": failure.message,
+                    "disposition": failure.disposition,
+                    "retry_next_round": not failure.permanent,
                 },
             )
 

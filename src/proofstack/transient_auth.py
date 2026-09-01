@@ -34,14 +34,30 @@ def create_codex_auth_parent(run_path: Path | str) -> Path:
     return parent
 
 
-def remove_codex_auth_parent(parent: Path, run_path: Path | str) -> None:
-    """Remove one agent's auth parent without touching concurrent agents."""
+def remove_codex_auth_parent(parent: Path, run_path: Path | str) -> bool:
+    """Remove one agent's auth parent without touching concurrent agents.
+
+    Return whether the path is absent afterwards.  Finalizers may ignore this
+    result, while live call paths use :func:`require_codex_auth_parent_removed`
+    to fail closed when credential cleanup cannot be verified.
+    """
     root = codex_auth_run_root(run_path)
     if parent.parent != root or not parent.name.startswith("agent-"):
-        return
+        return False
     _remove_without_following(parent)
+    removed = not _path_exists_without_following(parent)
     _prune_empty(root)
     _prune_empty(_auth_base())
+    return removed
+
+
+def require_codex_auth_parent_removed(
+    parent: Path,
+    run_path: Path | str,
+) -> None:
+    """Remove a transient auth parent or raise without exposing credentials."""
+    if not remove_codex_auth_parent(parent, run_path):
+        raise RuntimeError("transient Codex authentication cleanup failed")
 
 
 def remove_codex_auth_for_run(run_path: Path | str) -> bool:
@@ -102,6 +118,17 @@ def _remove_without_following(path: Path) -> bool:
             path.unlink()
     except OSError:
         return False
+    return True
+
+
+def _path_exists_without_following(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable path cannot be treated as verified-clean.
+        return True
     return True
 
 

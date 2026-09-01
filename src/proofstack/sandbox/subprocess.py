@@ -11,15 +11,22 @@ Per-invocation isolation:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import resource
 import shlex
 import signal
 import time
+from collections import deque
 from pathlib import Path
 from typing import Iterable, Mapping
 
 from proofstack.sandbox.base import CommandResult, Sandbox
+
+
+STREAM_CAPTURE_MAX_CHARS = 16 * 1024 * 1024
+USAGE_CAPTURE_MAX_CHARS = 16 * 1024 * 1024
+USAGE_CAPTURE_MAX_LINE_CHARS = 2 * 1024 * 1024
 
 
 def _make_preexec(memory_gb: int, cpu_limit: int, cpu_seconds: int):
@@ -204,25 +211,229 @@ class SubprocessSandbox(Sandbox):
         return _StreamingProcess(proc=proc, cmd=cmd, deadline=deadline)
 
 
+class _BoundedTextBuffer:
+    """Retain a bounded, complete-line tail of an unbounded stream.
+
+    Dropping at an arbitrary character boundary can retain only the suffix of a
+    credential, which exact-value redaction cannot recognize. Once truncation
+    occurs, discard through the next newline so persisted output never starts
+    in the middle of a token or other logical record.
+    """
+
+    def __init__(self, max_chars: int) -> None:
+        self.max_chars = max(1, int(max_chars))
+        self._chunks: deque[str] = deque()
+        self.retained_chars = 0
+        self.dropped_chars = 0
+        self._discard_until_newline = False
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        if self._discard_until_newline:
+            newline = chunk.find("\n")
+            if newline < 0:
+                self.dropped_chars += len(chunk)
+                return
+            discarded = newline + 1
+            self.dropped_chars += discarded
+            chunk = chunk[discarded:]
+            self._discard_until_newline = False
+            if not chunk:
+                return
+        self._chunks.append(chunk)
+        self.retained_chars += len(chunk)
+        trimmed = False
+        cut_at_line_boundary = False
+        while self.retained_chars > self.max_chars and self._chunks:
+            overflow = self.retained_chars - self.max_chars
+            head = self._chunks[0]
+            if len(head) <= overflow:
+                self._chunks.popleft()
+                removed_text = head
+                removed = len(head)
+            else:
+                removed_text = head[:overflow]
+                self._chunks[0] = head[overflow:]
+                removed = overflow
+            self.retained_chars -= removed
+            self.dropped_chars += removed
+            trimmed = True
+            cut_at_line_boundary = removed_text.endswith("\n")
+        if trimmed and not cut_at_line_boundary:
+            self._discard_partial_first_line()
+
+    def _discard_partial_first_line(self) -> None:
+        while self._chunks:
+            head = self._chunks[0]
+            newline = head.find("\n")
+            if newline >= 0:
+                removed = newline + 1
+                if removed == len(head):
+                    self._chunks.popleft()
+                else:
+                    self._chunks[0] = head[removed:]
+                self.retained_chars -= removed
+                self.dropped_chars += removed
+                return
+            self._chunks.popleft()
+            removed = len(head)
+            self.retained_chars -= removed
+            self.dropped_chars += removed
+        self._discard_until_newline = True
+
+    def text(self) -> str:
+        return "".join(self._chunks)
+
+
+class _JsonUsageCapture:
+    """Retain compact JSONL usage records independently of output tails.
+
+    Codex and Claude emit usage alongside potentially large transcript events.
+    Keeping only a bounded transcript tail must not silently discard earlier
+    billing records, so recognized events are reduced to the fields consumed
+    by ``cli_usage`` and stored in a separate bounded buffer.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_chars: int = USAGE_CAPTURE_MAX_CHARS,
+        max_line_chars: int = USAGE_CAPTURE_MAX_LINE_CHARS,
+    ) -> None:
+        self._records = _BoundedTextBuffer(max_chars)
+        self._pending = ""
+        self._discard_line = False
+        self.max_line_chars = max(1, int(max_line_chars))
+        self.events = 0
+        self.oversized_lines = 0
+
+    def feed(self, chunk: str) -> None:
+        if not chunk:
+            return
+        pending = self._pending + chunk
+        self._pending = ""
+        while True:
+            newline = pending.find("\n")
+            if newline < 0:
+                if self._discard_line:
+                    return
+                if len(pending) > self.max_line_chars:
+                    self._discard_line = True
+                    self.oversized_lines += 1
+                    return
+                self._pending = pending
+                return
+            line, pending = pending[:newline], pending[newline + 1 :]
+            if self._discard_line:
+                self._discard_line = False
+                continue
+            self._capture_line(line)
+
+    def finish(self) -> None:
+        if not self._discard_line and self._pending:
+            self._capture_line(self._pending)
+        self._pending = ""
+        self._discard_line = False
+
+    def _capture_line(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped or not stripped.startswith("{"):
+            return
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+
+        compact: dict[str, object] | None = None
+        event_type = event.get("type")
+        usage = event.get("usage")
+        if event_type == "turn.completed" and isinstance(usage, dict):
+            compact = {"type": event_type, "usage": usage}
+        elif event_type == "result" and isinstance(usage, dict):
+            compact = {
+                "type": event_type,
+                "usage": usage,
+                "num_turns": event.get("num_turns"),
+                "total_cost_usd": event.get("total_cost_usd"),
+            }
+        elif event_type == "assistant":
+            message = event.get("message")
+            message_usage = (
+                message.get("usage") if isinstance(message, dict) else None
+            )
+            if isinstance(message_usage, dict):
+                compact = {
+                    "type": event_type,
+                    "message": {
+                        "id": message.get("id"),
+                        "usage": message_usage,
+                    },
+                }
+        elif isinstance(usage, dict):
+            compact = {
+                "type": event_type,
+                "usage": usage,
+                "num_turns": event.get("num_turns"),
+                "total_cost_usd": event.get("total_cost_usd"),
+            }
+
+        if compact is None:
+            return
+        rendered = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        self._records.append(rendered + "\n")
+        self.events += 1
+
+    def text(self) -> str:
+        return self._records.text()
+
+    @property
+    def dropped_chars(self) -> int:
+        return self._records.dropped_chars
+
+
 class _StreamingProcess:
-    def __init__(self, *, proc: asyncio.subprocess.Process, cmd: list[str], deadline: float):
+    def __init__(
+        self,
+        *,
+        proc: asyncio.subprocess.Process,
+        cmd: list[str],
+        deadline: float,
+        max_capture_chars: int = STREAM_CAPTURE_MAX_CHARS,
+    ):
         self.proc = proc
         self.cmd = cmd
         self.deadline = deadline
-        self._stdout_buf: list[str] = []
-        self._stderr_buf: list[str] = []
-        self._stdout_task = asyncio.create_task(self._drain(proc.stdout, self._stdout_buf))
+        self._stdout_buf = _BoundedTextBuffer(max_capture_chars)
+        self._stderr_buf = _BoundedTextBuffer(max_capture_chars)
+        self._stdout_usage = _JsonUsageCapture()
+        self._stdout_task = asyncio.create_task(
+            self._drain(proc.stdout, self._stdout_buf, self._stdout_usage)
+        )
         self._stderr_task = asyncio.create_task(self._drain(proc.stderr, self._stderr_buf))
 
     @staticmethod
-    async def _drain(stream, sink: list[str]) -> None:
+    async def _drain(
+        stream,
+        sink: _BoundedTextBuffer,
+        usage_capture: _JsonUsageCapture | None = None,
+    ) -> None:
         if stream is None:
             return
-        while True:
-            chunk = await stream.read(4096)
-            if not chunk:
-                break
-            sink.append(chunk.decode("utf-8", errors="replace"))
+        try:
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                text = chunk.decode("utf-8", errors="replace")
+                sink.append(text)
+                if usage_capture is not None:
+                    usage_capture.feed(text)
+        finally:
+            if usage_capture is not None:
+                usage_capture.finish()
 
     @property
     def remaining_s(self) -> float:
@@ -273,11 +484,45 @@ class _StreamingProcess:
 
     @property
     def stdout(self) -> str:
-        return "".join(self._stdout_buf)
+        return self._stdout_buf.text()
 
     @property
     def stderr(self) -> str:
-        return "".join(self._stderr_buf)
+        return self._stderr_buf.text()
+
+    @property
+    def stdout_chars(self) -> int:
+        return self._stdout_buf.retained_chars + self._stdout_buf.dropped_chars
+
+    @property
+    def stderr_chars(self) -> int:
+        return self._stderr_buf.retained_chars + self._stderr_buf.dropped_chars
+
+    @property
+    def stdout_dropped_chars(self) -> int:
+        return self._stdout_buf.dropped_chars
+
+    @property
+    def stderr_dropped_chars(self) -> int:
+        return self._stderr_buf.dropped_chars
+
+    @property
+    def metering_stdout(self) -> str:
+        if self._stdout_buf.dropped_chars and self._stdout_usage.events:
+            return self._stdout_usage.text()
+        return self.stdout
+
+    @property
+    def usage_events_captured(self) -> int:
+        return self._stdout_usage.events
+
+    @property
+    def usage_capture_dropped_chars(self) -> int:
+        return self._stdout_usage.dropped_chars
+
+    @property
+    def usage_capture_oversized_lines(self) -> int:
+        return self._stdout_usage.oversized_lines
 
 
 __all__ = ["SubprocessSandbox"]

@@ -20,6 +20,8 @@ class StorageReservationError(RuntimeError):
 @dataclass(frozen=True)
 class StorageReservationStatus:
     requested_bytes: int
+    workspace_allocated_bytes: int
+    remaining_reserved_bytes: int
     active_reserved_bytes: int
     filesystem_free_bytes: int
     minimum_free_bytes: int
@@ -81,17 +83,30 @@ class StorageReservationLease:
 
         with registry_lock_path.open("a+", encoding="utf-8") as registry_lock:
             fcntl.flock(registry_lock.fileno(), fcntl.LOCK_EX)
+            # Bracket the comparatively slow workspace scans. If a concurrent
+            # cleanup frees space between the active-reservation scan and the
+            # free-space sample, pairing the old reservation total with the new
+            # larger free value could over-admit. The lower sample is
+            # conservative under either concurrent growth or deletion.
+            free_before_scan = shutil.disk_usage(self.workspace_root).free
             active_reserved = self._active_reserved_bytes(filesystem_device)
-            free_bytes = shutil.disk_usage(self.workspace_root).free
+            workspace_allocated = _workspace_allocated_bytes(self.workspace_root)
+            remaining_reserved = max(
+                0,
+                self.requested_bytes - workspace_allocated,
+            )
+            free_after_scan = shutil.disk_usage(self.workspace_root).free
+            free_bytes = min(free_before_scan, free_after_scan)
             required_free = (
-                self.minimum_free_bytes + active_reserved + self.requested_bytes
+                self.minimum_free_bytes + active_reserved + remaining_reserved
             )
             if free_bytes < required_free:
                 raise StorageReservationError(
                     "filesystem reservation denied: "
                     f"{free_bytes} bytes free, but {required_free} bytes are "
                     "required for the configured global floor, existing active "
-                    "reservations, and this worker"
+                    "remaining reservations, and this worker's remaining "
+                    "workspace allowance"
                 )
 
             lease_path = self.registry_dir / f"lease-{uuid.uuid4().hex}.json"
@@ -102,13 +117,14 @@ class StorageReservationLease:
                     fcntl.LOCK_EX | fcntl.LOCK_NB,
                 )
                 payload = {
-                    "version": 1,
+                    "version": 2,
                     "owner": self.owner,
                     "pid": os.getpid(),
                     "hostname": socket.gethostname(),
                     "workspace": str(self.workspace_root),
                     "filesystem_device": filesystem_device,
                     "reserved_bytes": self.requested_bytes,
+                    "workspace_allocated_bytes_at_admission": workspace_allocated,
                     "created_at": time.time(),
                 }
                 json.dump(payload, lease_file, ensure_ascii=False, indent=2)
@@ -127,6 +143,8 @@ class StorageReservationLease:
             self._lease_file = lease_file
             self.status = StorageReservationStatus(
                 requested_bytes=self.requested_bytes,
+                workspace_allocated_bytes=workspace_allocated,
+                remaining_reserved_bytes=remaining_reserved,
                 active_reserved_bytes=active_reserved,
                 filesystem_free_bytes=free_bytes,
                 minimum_free_bytes=self.minimum_free_bytes,
@@ -182,7 +200,23 @@ class StorageReservationLease:
                             f"active storage lease is unreadable: {lease_path}"
                         )
                     if int(payload.get("filesystem_device", -1)) == filesystem_device:
-                        total += max(0, int(payload.get("reserved_bytes", 0) or 0))
+                        reserved_bytes = max(
+                            0, int(payload.get("reserved_bytes", 0) or 0)
+                        )
+                        workspace = payload.get("workspace")
+                        if not isinstance(workspace, str) or not workspace:
+                            # Old or malformed active leases are counted at
+                            # their full amount rather than weakening safety.
+                            total += reserved_bytes
+                            continue
+                        try:
+                            allocated_bytes = _workspace_allocated_bytes(
+                                Path(workspace)
+                            )
+                        except StorageReservationError:
+                            total += reserved_bytes
+                        else:
+                            total += max(0, reserved_bytes - allocated_bytes)
                 else:
                     stale = True
             finally:
@@ -209,6 +243,53 @@ def _read_lease_payload(handle: IO[str]) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _workspace_allocated_bytes(root: Path) -> int:
+    """Return physical blocks used by a workspace without following links."""
+    root = Path(root)
+    try:
+        root_stat = root.stat()
+    except OSError as e:
+        raise StorageReservationError(
+            f"cannot measure reservation workspace {root}: {e}"
+        ) from e
+    allocated_supported = hasattr(root_stat, "st_blocks")
+    allocated = max(0, int(getattr(root_stat, "st_blocks", 0))) * 512
+    apparent = max(0, int(root_stat.st_size))
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError as e:
+            raise StorageReservationError(
+                f"cannot scan reservation workspace {directory}: {e}"
+            ) from e
+        with entries:
+            iterator = iter(entries)
+            while True:
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                except OSError as e:
+                    raise StorageReservationError(
+                        f"cannot scan reservation workspace {directory}: {e}"
+                    ) from e
+                try:
+                    stat_result = entry.stat(follow_symlinks=False)
+                    is_directory = entry.is_dir(follow_symlinks=False)
+                except OSError as e:
+                    raise StorageReservationError(
+                        f"cannot stat reservation workspace entry {entry.path}: {e}"
+                    ) from e
+                apparent += max(0, int(stat_result.st_size))
+                if allocated_supported:
+                    allocated += max(0, int(stat_result.st_blocks)) * 512
+                if is_directory:
+                    stack.append(Path(entry.path))
+    return allocated if allocated_supported else apparent
 
 
 __all__ = [

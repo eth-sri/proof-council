@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shlex
 import shutil
+import stat
 import time
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -47,9 +49,96 @@ exit 0
 """
 _SHELL_START_BLOCK_BEGIN = "# proofstack finish shim begin"
 _SHELL_START_BLOCK_END = "# proofstack finish shim end"
+_SENSITIVE_STATE_QUARANTINE = "SENSITIVE_STATE_UNTRUSTED"
 
 
 DoneStatus = Literal["done", "partial", "blocked", "timeout", "error"]
+
+
+async def _release_storage_lease(lease: StorageReservationLease) -> None:
+    """Release a filesystem lease without blocking the shared event loop."""
+    await asyncio.to_thread(lease.release)
+
+
+_SENSITIVE_STATE_QUARANTINE_MESSAGE = (
+    "Credential refresh failed after an external CLI ran. Remove this marker "
+    "only after discarding or manually sanitizing the workspace.\n"
+)
+
+
+def _path_exists_without_following(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable marker location is not safe to treat as clean.
+        return True
+    return True
+
+
+def _write_sensitive_quarantine_marker(path: Path) -> bool:
+    """Create one marker without following a model-created symlink."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return _path_exists_without_following(path)
+    except OSError:
+        return False
+    try:
+        os.write(fd, _SENSITIVE_STATE_QUARANTINE_MESSAGE.encode("utf-8"))
+        os.fsync(fd)
+    except OSError:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def _mark_sensitive_workspace_untrusted(
+    workspace_marker: Path,
+    external_marker: Path,
+    *,
+    recovery_sources: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
+    """Persist a quarantine marker in at least one independent location.
+
+    The external sidecar survives deletion or corruption of the model-writable
+    runtime directory. If that filesystem is completely full, renaming an
+    existing runtime record gives the workspace marker an allocation-free
+    fallback on filesystems where rename remains possible.
+    """
+    persisted: list[Path] = []
+    for marker in (workspace_marker, external_marker):
+        if _write_sensitive_quarantine_marker(marker):
+            persisted.append(marker)
+
+    if workspace_marker not in persisted:
+        for source in recovery_sources:
+            try:
+                metadata = source.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    continue
+                os.replace(source, workspace_marker)
+            except OSError:
+                continue
+            persisted.append(workspace_marker)
+            break
+
+    if not persisted:
+        raise RuntimeError(
+            "CLI credential state is untrusted and its quarantine marker "
+            "could not be persisted"
+        )
+    return tuple(persisted)
 
 
 def measure_workspace_usage(
@@ -65,22 +154,34 @@ def measure_workspace_usage(
     creates an extreme number of entries. Reaching either threshold is enough
     for callers enforcing the corresponding hard limit.
     """
+    root = Path(root)
     total_bytes = 0
     allocated_bytes = 0
+    errors = 0
+    transient_errors = 0
+    try:
+        allocated_bytes_supported = hasattr(root.stat(), "st_blocks")
+    except OSError:
+        allocated_bytes_supported = False
+        errors += 1
     files = 0
     directories = 0
-    errors = 0
     broken_symlinks = 0
     files_over_100_mib = 0
     files_over_1_gib = 0
     largest: list[tuple[int, str]] = []
     scan_truncated = False
-    root = Path(root)
     stack = [Path(root)]
     while stack and not scan_truncated:
         directory = stack.pop()
         try:
             entries = os.scandir(directory)
+        except (FileNotFoundError, NotADirectoryError):
+            # A worker can remove or replace a directory while the monitor is
+            # walking it. This makes the snapshot approximate, but it is not a
+            # safety-scan failure worth killing the worker for.
+            transient_errors += 1
+            continue
         except OSError:
             errors += 1
             continue
@@ -91,12 +192,26 @@ def measure_workspace_usage(
                     entry = next(iterator)
                 except StopIteration:
                     break
+                except (FileNotFoundError, NotADirectoryError):
+                    transient_errors += 1
+                    break
                 except OSError:
                     errors += 1
                     break
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         directories += 1
+                        if allocated_bytes_supported:
+                            try:
+                                directory_stat = entry.stat(follow_symlinks=False)
+                            except (FileNotFoundError, NotADirectoryError):
+                                transient_errors += 1
+                            except OSError:
+                                errors += 1
+                            else:
+                                allocated_bytes += (
+                                    max(0, int(directory_stat.st_blocks)) * 512
+                                )
                         stack.append(Path(entry.path))
                         if (
                             stop_after_entries > 0
@@ -107,13 +222,17 @@ def measure_workspace_usage(
                             break
                         continue
                     stat_result = entry.stat(follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    transient_errors += 1
+                    continue
                 except OSError:
                     errors += 1
                     continue
                 files += 1
                 size = max(0, stat_result.st_size)
                 total_bytes += size
-                allocated_bytes += max(0, getattr(stat_result, "st_blocks", 0)) * 512
+                if allocated_bytes_supported:
+                    allocated_bytes += max(0, int(stat_result.st_blocks)) * 512
                 if size >= 100 * 1024 * 1024:
                     files_over_100_mib += 1
                 if size >= 1024 * 1024 * 1024:
@@ -130,7 +249,15 @@ def measure_workspace_usage(
                     largest.sort(reverse=True)
                     del largest[largest_count:]
                 if (
-                    (stop_after_bytes > 0 and total_bytes >= stop_after_bytes)
+                    (
+                        stop_after_bytes > 0
+                        and (
+                            allocated_bytes
+                            if allocated_bytes_supported
+                            else total_bytes
+                        )
+                        >= stop_after_bytes
+                    )
                     or (
                         stop_after_entries > 0
                         and files + directories >= stop_after_entries
@@ -153,11 +280,16 @@ def measure_workspace_usage(
     return {
         "bytes": total_bytes,
         "allocated_bytes": allocated_bytes,
+        "allocated_bytes_supported": allocated_bytes_supported,
+        "limit_bytes": (
+            allocated_bytes if allocated_bytes_supported else total_bytes
+        ),
         "files": files,
         "directories": directories,
         "entries": files + directories,
         "scan_truncated": scan_truncated,
         "errors": errors,
+        "transient_errors": transient_errors,
         "broken_symlinks": broken_symlinks,
         "files_over_100_mib": files_over_100_mib,
         "files_over_1_gib": files_over_1_gib,
@@ -209,7 +341,14 @@ class CLIAgent(Agent):
     WORKSPACE_MIN_FREE_INODES: ClassVar[int] = 0
     WORKSPACE_RESERVATION_BYTES: ClassVar[int] = 0
     WORKSPACE_RESERVATION_DIR: ClassVar[Path | None] = None
-    WORKSPACE_CHECK_INTERVAL_S: ClassVar[float] = 5.0
+    WORKSPACE_CHECK_INTERVAL_S: ClassVar[float] = 60.0
+    WORKSPACE_USAGE_EVENT_INTERVAL_S: ClassVar[float] = 300.0
+    WORKSPACE_USAGE_EVENT_MIN_BYTES_DELTA: ClassVar[int] = 1024 * 1024 * 1024
+    WORKSPACE_USAGE_EVENT_MIN_ENTRIES_DELTA: ClassVar[int] = 1_000
+    WORKSPACE_RECOVERY_ENABLED: ClassVar[bool] = False
+    WORKSPACE_RECOVERY_GROWTH_BYTES: ClassVar[int] = 1024 * 1024 * 1024
+    WORKSPACE_RECOVERY_GROWTH_ENTRIES: ClassVar[int] = 1_000
+    WORKSPACE_PRESSURE_FILENAME: ClassVar[str] = "STORAGE_PRESSURE"
     # 'finish'/'file': the completion record (done.json) is REQUIRED — a CLI
     # exit without it (or with an unparseable one) is an error even on rc 0.
     # 'exit': the exit code is the completion signal (codex-style CLIs that
@@ -226,6 +365,9 @@ class CLIAgent(Agent):
     ) -> None:
         super().__init__(ctx, **kw)
         self.sandbox_root = Path(sandbox_root) if sandbox_root is not None else None
+        self._workspace_recovery_mode = False
+        self._workspace_recovery_max_bytes: int | None = None
+        self._workspace_recovery_max_entries: int | None = None
 
     # --- subclass hooks --------------------------------------------------------
 
@@ -259,6 +401,10 @@ class CLIAgent(Agent):
     ) -> None:
         """Optionally bill token/cost usage from a CLI transcript."""
 
+    def cli_usage_must_succeed(self) -> bool:
+        """Whether missing or invalid usage must fail the invocation."""
+        return False
+
     def cli_input(self, inp: BaseModel) -> str:
         """Build the message piped into the CLI's stdin."""
         return ""
@@ -275,6 +421,13 @@ class CLIAgent(Agent):
         """Remove subclass-owned secrets before transcripts reach artifacts/events."""
         return text
 
+    async def refresh_sensitive_state(
+        self,
+        sandbox: Sandbox,
+        inp: BaseModel,
+    ) -> None:
+        """Refresh secrets that an external CLI may rotate while running."""
+
     def sandbox_root_for(self, inp: BaseModel) -> Path | None:
         """Return a persistent sandbox root for this invocation, if any."""
         return self.sandbox_root
@@ -289,6 +442,31 @@ class CLIAgent(Agent):
             return configured_path
         return self.ctx.root_workdir.parent / ".proofcouncil-storage-reservations"
 
+    def sensitive_quarantine_path_for(self, root: Path) -> Path:
+        """Return a model-inaccessible sidecar for a persistent workspace."""
+        resolved = Path(root).resolve()
+        digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()
+        return (
+            self.ctx.root_workdir.parent
+            / ".proofcouncil-sensitive-quarantine"
+            / f"{digest}.marker"
+        )
+
+    def _quarantine_sensitive_workspace(
+        self,
+        root: Path,
+        workspace_marker: Path,
+    ) -> tuple[Path, ...]:
+        runtime_dir = workspace_marker.parent
+        return _mark_sensitive_workspace_untrusted(
+            workspace_marker,
+            self.sensitive_quarantine_path_for(root),
+            recovery_sources=(
+                runtime_dir / "done.json",
+                runtime_dir / "WRAP_UP",
+            ),
+        )
+
     def _workspace_monitor_enabled(self) -> bool:
         return any(
             value > 0
@@ -301,36 +479,82 @@ class CLIAgent(Agent):
         )
 
     def _measure_workspace(self, root: Path) -> dict[str, Any]:
-        return measure_workspace_usage(
-            root,
-            stop_after_bytes=self.WORKSPACE_HARD_LIMIT_BYTES,
-            stop_after_entries=self.WORKSPACE_HARD_LIMIT_ENTRIES,
+        stop_after_bytes = self.WORKSPACE_HARD_LIMIT_BYTES
+        stop_after_entries = self.WORKSPACE_HARD_LIMIT_ENTRIES
+        if self._workspace_recovery_mode:
+            if self._workspace_recovery_max_bytes is not None:
+                stop_after_bytes = self._workspace_recovery_max_bytes
+            if self._workspace_recovery_max_entries is not None:
+                stop_after_entries = self._workspace_recovery_max_entries
+        return self._sanitize_workspace_usage(
+            measure_workspace_usage(
+                root,
+                stop_after_bytes=stop_after_bytes,
+                stop_after_entries=stop_after_entries,
+            )
         )
+
+    def _measure_workspace_recovery_baseline(self, root: Path) -> dict[str, Any]:
+        # A recovery ceiling must be relative to the complete current
+        # footprint, not the ordinary hard limit where the fast monitor
+        # truncates. This exceptional scan can be expensive, but an arbitrary
+        # cap would make sufficiently oversized workspaces impossible to
+        # recover: the raised ceiling could still sit below existing usage.
+        return self._sanitize_workspace_usage(
+            measure_workspace_usage(root)
+        )
+
+    def _sanitize_workspace_usage(
+        self,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        return usage
 
     def _workspace_limit_failure(
         self,
         usage: dict[str, Any],
+        *,
+        recovery_ceiling: bool = True,
     ) -> tuple[str, str] | None:
         entries = int(usage.get("entries", usage.get("files", 0)) or 0)
+        used_bytes = self._workspace_used_bytes(usage)
         free_bytes = usage.get("filesystem_free_bytes")
         free_inodes = usage.get("filesystem_free_inodes")
+        errors = int(usage.get("errors", 0) or 0)
+        if errors > 0:
+            return (
+                "workspace_scan_error",
+                f"workspace safety scan encountered {errors} filesystem error(s)",
+            )
+        hard_bytes = self.WORKSPACE_HARD_LIMIT_BYTES
+        hard_entries = self.WORKSPACE_HARD_LIMIT_ENTRIES
+        if recovery_ceiling and self._workspace_recovery_mode:
+            if self._workspace_recovery_max_bytes is not None:
+                hard_bytes = self._workspace_recovery_max_bytes
+            if self._workspace_recovery_max_entries is not None:
+                hard_entries = self._workspace_recovery_max_entries
         if (
-            self.WORKSPACE_HARD_LIMIT_BYTES > 0
-            and int(usage.get("bytes", 0) or 0) >= self.WORKSPACE_HARD_LIMIT_BYTES
+            hard_bytes > 0
+            and used_bytes >= hard_bytes
         ):
             return (
                 "workspace_hard_limit",
-                f"workspace size {usage['bytes']} is at or above hard limit "
-                f"{self.WORKSPACE_HARD_LIMIT_BYTES} bytes",
+                f"workspace allocated size {used_bytes} is at or above hard limit "
+                f"{hard_bytes} bytes",
             )
         if (
-            self.WORKSPACE_HARD_LIMIT_ENTRIES > 0
-            and entries >= self.WORKSPACE_HARD_LIMIT_ENTRIES
+            hard_entries > 0
+            and entries >= hard_entries
         ):
             return (
                 "workspace_entry_limit",
                 f"workspace entry count {entries} is at or above hard limit "
-                f"{self.WORKSPACE_HARD_LIMIT_ENTRIES}",
+                f"{hard_entries}",
+            )
+        if self.WORKSPACE_MIN_FREE_BYTES > 0 and not isinstance(free_bytes, int):
+            return (
+                "filesystem_free_unknown",
+                "filesystem free space could not be measured",
             )
         if (
             self.WORKSPACE_MIN_FREE_BYTES > 0
@@ -341,6 +565,11 @@ class CLIAgent(Agent):
                 "filesystem_min_free",
                 f"filesystem free space {free_bytes} is below required reserve "
                 f"{self.WORKSPACE_MIN_FREE_BYTES} bytes",
+            )
+        if self.WORKSPACE_MIN_FREE_INODES > 0 and not isinstance(free_inodes, int):
+            return (
+                "filesystem_free_inodes_unknown",
+                "filesystem free inodes could not be measured",
             )
         if (
             self.WORKSPACE_MIN_FREE_INODES > 0
@@ -354,11 +583,177 @@ class CLIAgent(Agent):
             )
         return None
 
+    @staticmethod
+    def _workspace_used_bytes(usage: dict[str, Any]) -> int:
+        if usage.get("allocated_bytes_supported") is True:
+            return int(usage.get("allocated_bytes", 0) or 0)
+        if "limit_bytes" in usage:
+            return int(usage.get("limit_bytes", 0) or 0)
+        return int(usage.get("bytes", 0) or 0)
+
+    def _workspace_soft_pressure(self, usage: dict[str, Any]) -> bool:
+        entries = int(usage.get("entries", usage.get("files", 0)) or 0)
+        return bool(
+            (
+                self.WORKSPACE_SOFT_LIMIT_BYTES > 0
+                and self._workspace_used_bytes(usage)
+                >= self.WORKSPACE_SOFT_LIMIT_BYTES
+            )
+            or (
+                self.WORKSPACE_SOFT_LIMIT_ENTRIES > 0
+                and entries >= self.WORKSPACE_SOFT_LIMIT_ENTRIES
+            )
+        )
+
+    def _workspace_recovery_target_satisfied(
+        self,
+        usage: dict[str, Any],
+    ) -> bool:
+        used_bytes = self._workspace_used_bytes(usage)
+        entries = int(usage.get("entries", usage.get("files", 0)) or 0)
+        byte_target = (
+            self.WORKSPACE_SOFT_LIMIT_BYTES
+            or self.WORKSPACE_HARD_LIMIT_BYTES
+        )
+        entry_target = (
+            self.WORKSPACE_SOFT_LIMIT_ENTRIES
+            or self.WORKSPACE_HARD_LIMIT_ENTRIES
+        )
+        return bool(
+            (byte_target <= 0 or used_bytes < byte_target)
+            and (entry_target <= 0 or entries < entry_target)
+        )
+
+    def _workspace_pressure_path(self, root: Path) -> Path:
+        return root / ".pwc" / "runtime" / self.WORKSPACE_PRESSURE_FILENAME
+
+    def _write_workspace_pressure(
+        self,
+        root: Path,
+        usage: dict[str, Any],
+        *,
+        reason: str,
+    ) -> None:
+        path = self._workspace_pressure_path(root)
+        payload = {
+            "reason": reason,
+            "allocated_bytes": self._workspace_used_bytes(usage),
+            "entries": int(usage.get("entries", usage.get("files", 0)) or 0),
+            "soft_limit_bytes": self.WORKSPACE_SOFT_LIMIT_BYTES or None,
+            "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES or None,
+            "soft_limit_entries": self.WORKSPACE_SOFT_LIMIT_ENTRIES or None,
+            "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
+            "created_at": time.time(),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except OSError:
+            pass
+
+    def _clear_workspace_pressure(self, root: Path) -> None:
+        try:
+            self._workspace_pressure_path(root).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _start_workspace_recovery(self, usage: dict[str, Any]) -> None:
+        used_bytes = self._workspace_used_bytes(usage)
+        entries = int(usage.get("entries", usage.get("files", 0)) or 0)
+        self._workspace_recovery_mode = True
+        self._workspace_recovery_max_bytes = max(
+            self.WORKSPACE_HARD_LIMIT_BYTES,
+            used_bytes,
+        ) + max(1, self.WORKSPACE_RECOVERY_GROWTH_BYTES)
+        self._workspace_recovery_max_entries = max(
+            self.WORKSPACE_HARD_LIMIT_ENTRIES,
+            entries,
+        ) + max(1, self.WORKSPACE_RECOVERY_GROWTH_ENTRIES)
+
+    def _workspace_usage_materially_changed(
+        self,
+        previous: dict[str, Any] | None,
+        current: dict[str, Any],
+    ) -> bool:
+        if previous is None:
+            return True
+        byte_delta = abs(
+            self._workspace_used_bytes(current)
+            - self._workspace_used_bytes(previous)
+        )
+        entry_delta = abs(
+            int(current.get("entries", current.get("files", 0)) or 0)
+            - int(previous.get("entries", previous.get("files", 0)) or 0)
+        )
+        return bool(
+            byte_delta >= self.WORKSPACE_USAGE_EVENT_MIN_BYTES_DELTA
+            or entry_delta >= self.WORKSPACE_USAGE_EVENT_MIN_ENTRIES_DELTA
+        )
+
+    async def _finalize_workspace_recovery(
+        self,
+        done: CLIDoneRecord,
+        workspace_root: Path | None,
+        *,
+        spawn_call_id: str,
+    ) -> CLIDoneRecord:
+        if not self._workspace_recovery_mode or workspace_root is None:
+            return done
+        usage = await asyncio.to_thread(self._measure_workspace, workspace_root)
+        failure = self._workspace_limit_failure(usage)
+        recovered = failure is None and self._workspace_recovery_target_satisfied(
+            usage
+        )
+        if recovered:
+            self._clear_workspace_pressure(workspace_root)
+            self._workspace_recovery_mode = False
+            await self.events.emit(
+                "cli.workspace_recovery_completed",
+                usage,
+                call_id=spawn_call_id,
+            )
+            return done
+
+        reason = failure[0] if failure is not None else "still_above_soft_limit"
+        self._write_workspace_pressure(
+            workspace_root,
+            usage,
+            reason=reason,
+        )
+        await self.events.emit(
+            "cli.workspace_recovery_incomplete",
+            {**usage, "reason": reason},
+            call_id=spawn_call_id,
+        )
+        detail = failure[1] if failure is not None else (
+            "workspace remains at or above its configured soft limit"
+        )
+        status: DoneStatus = "error" if done.status == "error" else "partial"
+        summary = (done.summary or "").strip()
+        suffix = f"storage recovery incomplete: {detail}"
+        return done.model_copy(
+            update={
+                "status": status,
+                "summary": f"{summary}; {suffix}" if summary else suffix,
+            }
+        )
+
     # --- framework-managed -----------------------------------------------------
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
         if not self.CLI_CMD:
             raise RuntimeError(f"{type(self).__name__}.CLI_CMD is empty")
+
+        self._workspace_recovery_mode = False
+        self._workspace_recovery_max_bytes = None
+        self._workspace_recovery_max_entries = None
 
         await self._emit_budget_warnings(self.tracker.check())
         self.tracker.add_tool_call()
@@ -378,6 +773,12 @@ class CLIAgent(Agent):
         # finally awaits THIS task rather than re-running metering, so a cancel
         # landing mid-metering neither loses it nor double-counts it (A7).
         meter_task: asyncio.Task | None = None
+        required_usage_error: BaseException | None = None
+        output_truncation_emitted = False
+        sensitive_state_trusted = True
+        sensitive_state_ever_failed = False
+        sensitive_quarantine_path: Path | None = None
+        sensitive_quarantine_external_path: Path | None = None
         sandbox: Sandbox | None = None
         storage_lease: StorageReservationLease | None = None
         try:
@@ -392,6 +793,28 @@ class CLIAgent(Agent):
             if persistent:
                 runtime_dir = sandbox.root / ".pwc" / "runtime"
                 runtime_dir.mkdir(parents=True, exist_ok=True)
+                sensitive_quarantine_path = (
+                    runtime_dir / _SENSITIVE_STATE_QUARANTINE
+                )
+                sensitive_quarantine_external_path = (
+                    self.sensitive_quarantine_path_for(sandbox.root)
+                )
+                quarantine_paths = (
+                    sensitive_quarantine_path,
+                    sensitive_quarantine_external_path,
+                )
+                existing_quarantine_paths = [
+                    path
+                    for path in quarantine_paths
+                    if _path_exists_without_following(path)
+                ]
+                if existing_quarantine_paths:
+                    raise RuntimeError(
+                        "persistent CLI workspace is quarantined after an "
+                        "unreadable credential refresh; discard or manually "
+                        "sanitize it before removing all quarantine markers: "
+                        + ", ".join(str(path) for path in existing_quarantine_paths)
+                    )
                 bin_dir = runtime_dir / ".bin"
                 bin_dir.mkdir(parents=True, exist_ok=True)
                 done_path = runtime_dir / "done.json"
@@ -446,6 +869,61 @@ class CLIAgent(Agent):
                     self._measure_workspace,
                     sandbox.root,
                 )
+                failure = self._workspace_limit_failure(
+                    usage,
+                    recovery_ceiling=False,
+                )
+                recoverable_reasons = {
+                    "workspace_hard_limit",
+                    "workspace_entry_limit",
+                }
+                if (
+                    self.WORKSPACE_RECOVERY_ENABLED
+                    and failure is not None
+                    and failure[0] in recoverable_reasons
+                    and usage.get("scan_truncated")
+                ):
+                    usage = await asyncio.to_thread(
+                        self._measure_workspace_recovery_baseline,
+                        sandbox.root,
+                    )
+                    failure = self._workspace_limit_failure(
+                        usage,
+                        recovery_ceiling=False,
+                    )
+
+                pressure = self._workspace_soft_pressure(usage)
+                recoverable_failure = (
+                    failure is not None and failure[0] in recoverable_reasons
+                )
+                if self.WORKSPACE_RECOVERY_ENABLED and (
+                    pressure or recoverable_failure
+                ):
+                    self._start_workspace_recovery(usage)
+                    reason = failure[0] if recoverable_failure else "soft_limit"
+                    self._write_workspace_pressure(
+                        sandbox.root,
+                        usage,
+                        reason=reason,
+                    )
+                    await self.events.emit(
+                        "cli.workspace_recovery_started",
+                        {
+                            **usage,
+                            "reason": reason,
+                            "recovery_max_bytes": self._workspace_recovery_max_bytes,
+                            "recovery_max_entries": self._workspace_recovery_max_entries,
+                        },
+                    )
+                    # Workspace byte/entry limits use the bounded recovery
+                    # ceiling. Global filesystem floors and scan errors remain
+                    # non-bypassable.
+                    failure = self._workspace_limit_failure(
+                        usage,
+                        recovery_ceiling=True,
+                    )
+                elif not pressure:
+                    self._clear_workspace_pressure(sandbox.root)
                 await self.events.emit(
                     "cli.workspace_usage",
                     {
@@ -457,9 +935,9 @@ class CLIAgent(Agent):
                         "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
                         "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
                         "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
+                        "recovery_mode": self._workspace_recovery_mode,
                     },
                 )
-                failure = self._workspace_limit_failure(usage)
                 if failure is not None:
                     reason, detail = failure
                     await self.events.emit(
@@ -525,6 +1003,9 @@ class CLIAgent(Agent):
                         if self.WORKSPACE_RESERVATION_BYTES > 0
                         else None
                     ),
+                    "workspace_recovery_mode": self._workspace_recovery_mode,
+                    "workspace_recovery_max_bytes": self._workspace_recovery_max_bytes,
+                    "workspace_recovery_max_entries": self._workspace_recovery_max_entries,
                 },
                 call_id=spawn_call_id,
             )
@@ -535,6 +1016,10 @@ class CLIAgent(Agent):
                 extra_path=[bin_dir],
                 timeout_s=timeout_s,
             )
+            # Once the external process has started it may rotate credentials.
+            # No transcript or workspace artifact is safe to persist until the
+            # terminal credential state has been refreshed successfully.
+            sensitive_state_trusted = False
             # Pipe the initial message to stdin if the process accepts it.
             if stream.proc.stdin is not None:
                 payload = self.cli_input(inp).encode("utf-8")
@@ -557,21 +1042,97 @@ class CLIAgent(Agent):
                 soft_timeout_s=soft_timeout_s,
                 workspace_root=sandbox.root if persistent else None,
             )
+            stdout_dropped = int(getattr(stream, "stdout_dropped_chars", 0) or 0)
+            stderr_dropped = int(getattr(stream, "stderr_dropped_chars", 0) or 0)
+            if stdout_dropped or stderr_dropped:
+                output_truncation_emitted = True
+                await self.events.emit(
+                    "cli.output_truncated",
+                    {
+                        "stdout_dropped_chars": stdout_dropped,
+                        "stderr_dropped_chars": stderr_dropped,
+                        "retention": "bounded_tail",
+                        "usage_events_captured": int(
+                            getattr(stream, "usage_events_captured", 0) or 0
+                        ),
+                        "usage_capture_dropped_chars": int(
+                            getattr(stream, "usage_capture_dropped_chars", 0) or 0
+                        ),
+                        "usage_capture_oversized_lines": int(
+                            getattr(stream, "usage_capture_oversized_lines", 0) or 0
+                        ),
+                    },
+                    call_id=spawn_call_id,
+                )
+            if not bool(getattr(stream, "done", False)):
+                sensitive_state_ever_failed = True
+                if sensitive_quarantine_path is not None:
+                    self._quarantine_sensitive_workspace(
+                        sandbox.root,
+                        sensitive_quarantine_path,
+                    )
+                await self.events.emit(
+                    "cli.sensitive_state_refresh_failed",
+                    {"type": "ProcessStillRunning", "phase": "post_process"},
+                    call_id=spawn_call_id,
+                )
+            else:
+                try:
+                    await self.refresh_sensitive_state(sandbox, inp)
+                except Exception as e:
+                    sensitive_state_ever_failed = True
+                    if sensitive_quarantine_path is not None:
+                        self._quarantine_sensitive_workspace(
+                            sandbox.root,
+                            sensitive_quarantine_path,
+                        )
+                    await self.events.emit(
+                        "cli.sensitive_state_refresh_failed",
+                        {"type": type(e).__name__, "phase": "post_process"},
+                        call_id=spawn_call_id,
+                    )
+                else:
+                    sensitive_state_trusted = True
             # Meter as a retained, shielded task. A cancellation landing while
             # record_cli_usage runs must not skip it (that loses a detected
             # rate limit); the finally awaits this exact task instead of
             # re-running metering, so the ledger is never double-counted (A7).
             meter_task = asyncio.ensure_future(
-                self.record_cli_usage(stream.stdout, stream.stderr, done)
+                self.record_cli_usage(
+                    getattr(stream, "metering_stdout", stream.stdout),
+                    stream.stderr,
+                    done,
+                )
             )
             usage_recorded = True
             try:
                 await asyncio.shield(meter_task)
             except Exception as e:  # a real failure; cancellation propagates
+                if self.cli_usage_must_succeed():
+                    required_usage_error = e
                 await self.events.emit(
                     "cli.usage_record_failed",
-                    {"type": type(e).__name__, "msg": str(e)},
+                    {"type": type(e).__name__},
                     call_id=spawn_call_id,
+                )
+                if self.cli_usage_must_succeed():
+                    raise RuntimeError(
+                        "required CLI usage accounting failed; downstream "
+                        "execution was stopped"
+                    ) from e
+            if not sensitive_state_trusted:
+                await self.events.emit(
+                    "cli.sensitive_artifacts_suppressed",
+                    {
+                        "reason": "credential_refresh_failed",
+                        "response_suppressed": True,
+                        "handoff_suppressed": True,
+                    },
+                    call_id=spawn_call_id,
+                )
+                raise RuntimeError(
+                    "CLI credential state could not be refreshed; response and "
+                    "handoff artifacts were suppressed"
                 )
             out = await self.collect(sandbox, inp, done)
             try:
@@ -602,7 +1163,87 @@ class CLIAgent(Agent):
                 try:
                     await asyncio.shield(stream.terminate())
                 except (asyncio.CancelledError, Exception):
-                    pass
+                    sensitive_state_trusted = False
+                    sensitive_state_ever_failed = True
+            process_stopped = stream is None or bool(getattr(stream, "done", False))
+            if stream is not None and not process_stopped:
+                sensitive_state_trusted = False
+                sensitive_state_ever_failed = True
+                if sensitive_quarantine_path is not None:
+                    self._quarantine_sensitive_workspace(
+                        sandbox.root,
+                        sensitive_quarantine_path,
+                    )
+            if sandbox is not None and stream is not None and process_stopped:
+                try:
+                    await asyncio.shield(self.refresh_sensitive_state(sandbox, inp))
+                except asyncio.CancelledError:
+                    sensitive_state_trusted = False
+                    sensitive_state_ever_failed = True
+                    if sensitive_quarantine_path is not None:
+                        self._quarantine_sensitive_workspace(
+                            sandbox.root,
+                            sensitive_quarantine_path,
+                        )
+                except Exception as e:
+                    sensitive_state_trusted = False
+                    sensitive_state_ever_failed = True
+                    if sensitive_quarantine_path is not None:
+                        self._quarantine_sensitive_workspace(
+                            sandbox.root,
+                            sensitive_quarantine_path,
+                        )
+                    try:
+                        await self.events.emit(
+                            "cli.sensitive_state_refresh_failed",
+                            {"type": type(e).__name__, "phase": "finalize"},
+                        )
+                    except Exception:
+                        pass
+                else:
+                    sensitive_state_trusted = not sensitive_state_ever_failed
+            if stream is not None and not output_truncation_emitted:
+                stdout_dropped = int(
+                    getattr(stream, "stdout_dropped_chars", 0) or 0
+                )
+                stderr_dropped = int(
+                    getattr(stream, "stderr_dropped_chars", 0) or 0
+                )
+                if stdout_dropped or stderr_dropped:
+                    try:
+                        await asyncio.shield(
+                            self.events.emit(
+                                "cli.output_truncated",
+                                {
+                                    "stdout_dropped_chars": stdout_dropped,
+                                    "stderr_dropped_chars": stderr_dropped,
+                                    "retention": "bounded_tail",
+                                    "usage_events_captured": int(
+                                        getattr(stream, "usage_events_captured", 0)
+                                        or 0
+                                    ),
+                                    "usage_capture_dropped_chars": int(
+                                        getattr(
+                                            stream,
+                                            "usage_capture_dropped_chars",
+                                            0,
+                                        )
+                                        or 0
+                                    ),
+                                    "usage_capture_oversized_lines": int(
+                                        getattr(
+                                            stream,
+                                            "usage_capture_oversized_lines",
+                                            0,
+                                        )
+                                        or 0
+                                    ),
+                                },
+                                call_id=spawn_call_id,
+                            )
+                        )
+                    except (asyncio.CancelledError, Exception):
+                        pass
             # Meter exactly once, even under cancellation — else the run loses
             # real token/cost accounting. If the run reached a done record,
             # metering was already dispatched as meter_task; await that same task
@@ -622,30 +1263,68 @@ class CLIAgent(Agent):
                         continue
                     except Exception:
                         break
+                if self.cli_usage_must_succeed() and meter_task.done():
+                    try:
+                        meter_error = meter_task.exception()
+                    except asyncio.CancelledError as e:
+                        meter_error = e
+                    if meter_error is not None and required_usage_error is None:
+                        required_usage_error = meter_error
             elif stream is not None and not usage_recorded:
-                try:
-                    await asyncio.shield(
-                        self.record_cli_usage(
-                            stream.stdout,
-                            stream.stderr,
-                            CLIDoneRecord(status="partial", summary="(cancelled mid-run)"),
-                        )
+                partial_meter_task = asyncio.ensure_future(
+                    self.record_cli_usage(
+                        getattr(stream, "metering_stdout", stream.stdout),
+                        stream.stderr,
+                        CLIDoneRecord(
+                            status="partial",
+                            summary="(cancelled mid-run)",
+                        ),
                     )
-                except (asyncio.CancelledError, Exception):
+                )
+                while not partial_meter_task.done():
+                    try:
+                        await asyncio.shield(partial_meter_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if self.cli_usage_must_succeed() and partial_meter_task.done():
+                    try:
+                        partial_meter_error = partial_meter_task.exception()
+                    except asyncio.CancelledError as e:
+                        partial_meter_error = e
+                    if partial_meter_error is not None:
+                        required_usage_error = partial_meter_error
+            if sensitive_state_trusted:
+                try:
+                    stdout_text = self.sanitize_cli_output(
+                        stream.stdout if stream is not None else ""
+                    )
+                    stderr_text = self.sanitize_cli_output(
+                        stream.stderr if stream is not None else ""
+                    )
+                    if stdout_text:
+                        (self.workdir / "cli_stdout.log").write_text(stdout_text, encoding="utf-8")
+                    if stderr_text:
+                        (self.workdir / "cli_stderr.log").write_text(stderr_text, encoding="utf-8")
+                except (NameError, OSError):
                     pass
-            try:
-                stdout_text = self.sanitize_cli_output(
-                    stream.stdout if stream is not None else ""
-                )
-                stderr_text = self.sanitize_cli_output(
-                    stream.stderr if stream is not None else ""
-                )
-                if stdout_text:
-                    (self.workdir / "cli_stdout.log").write_text(stdout_text, encoding="utf-8")
-                if stderr_text:
-                    (self.workdir / "cli_stderr.log").write_text(stderr_text, encoding="utf-8")
-            except (NameError, OSError):
-                pass
+            elif stream is not None:
+                try:
+                    await self.events.emit(
+                        "cli.sensitive_output_suppressed",
+                        {
+                            "reason": "credential_refresh_failed",
+                            "stdout_chars": int(
+                                getattr(stream, "stdout_chars", len(stream.stdout))
+                            ),
+                            "stderr_chars": int(
+                                getattr(stream, "stderr_chars", len(stream.stderr))
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
             # Keep the sandbox dir on disk so the workdir captures artifacts.
             # teardown() still runs so subclasses can scrub per-invocation
             # secrets such as copied CLI credentials.
@@ -662,7 +1341,7 @@ class CLIAgent(Agent):
                 if storage_lease is not None and storage_lease.status is not None:
                     reservation_status = storage_lease.status
                     try:
-                        storage_lease.release()
+                        await _release_storage_lease(storage_lease)
                     except Exception as e:
                         try:
                             await self.events.emit(
@@ -686,6 +1365,11 @@ class CLIAgent(Agent):
                             )
                         except Exception:
                             pass
+            if required_usage_error is not None:
+                raise RuntimeError(
+                    "required CLI usage accounting failed; downstream "
+                    "execution was stopped"
+                ) from required_usage_error
 
     async def _wait_for_done(
         self,
@@ -699,7 +1383,10 @@ class CLIAgent(Agent):
     ) -> CLIDoneRecord:
         spawn_t = time.monotonic()
         last_heartbeat = spawn_t
-        last_workspace_check = 0.0
+        next_workspace_check = spawn_t + max(0.0, self.WORKSPACE_CHECK_INTERVAL_S)
+        last_workspace_event = spawn_t
+        last_emitted_workspace_usage: dict[str, Any] | None = None
+        last_workspace_pressure = self._workspace_recovery_mode
         cleanup_warned = False
         wrap_up_signaled = False
         workspace_soft_warned = False
@@ -708,31 +1395,65 @@ class CLIAgent(Agent):
             if (
                 workspace_root is not None
                 and self._workspace_monitor_enabled()
-                and now - last_workspace_check >= self.WORKSPACE_CHECK_INTERVAL_S
+                and now >= next_workspace_check
             ):
-                last_workspace_check = now
+                scan_started = time.monotonic()
                 usage = await asyncio.to_thread(
                     self._measure_workspace,
                     workspace_root,
                 )
-                await self.events.emit(
-                    "cli.workspace_usage",
-                    {
-                        **usage,
-                        "phase": "running",
-                        "soft_limit_bytes": self.WORKSPACE_SOFT_LIMIT_BYTES or None,
-                        "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
-                        "soft_limit_entries": self.WORKSPACE_SOFT_LIMIT_ENTRIES or None,
-                        "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
-                        "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
-                        "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
-                    },
-                    call_id=spawn_call_id,
+                scan_finished = time.monotonic()
+                scan_duration_s = scan_finished - scan_started
+                next_workspace_check = scan_finished + max(
+                    max(0.0, self.WORKSPACE_CHECK_INTERVAL_S),
+                    scan_duration_s * 4.0,
                 )
                 failure = self._workspace_limit_failure(usage)
+                pressure = self._workspace_soft_pressure(usage)
+                should_emit_usage = bool(
+                    failure is not None
+                    or pressure != last_workspace_pressure
+                    or self._workspace_usage_materially_changed(
+                        last_emitted_workspace_usage,
+                        usage,
+                    )
+                    or scan_finished - last_workspace_event
+                    >= self.WORKSPACE_USAGE_EVENT_INTERVAL_S
+                )
+                if should_emit_usage:
+                    await self.events.emit(
+                        "cli.workspace_usage",
+                        {
+                            **usage,
+                            "phase": "running",
+                            "scan_duration_s": scan_duration_s,
+                            "next_check_in_s": max(
+                                0.0, next_workspace_check - scan_finished
+                            ),
+                            "soft_limit_bytes": self.WORKSPACE_SOFT_LIMIT_BYTES or None,
+                            "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
+                            "soft_limit_entries": self.WORKSPACE_SOFT_LIMIT_ENTRIES or None,
+                            "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
+                            "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
+                            "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
+                            "recovery_mode": self._workspace_recovery_mode,
+                        },
+                        call_id=spawn_call_id,
+                    )
+                    last_workspace_event = scan_finished
+                    last_emitted_workspace_usage = dict(usage)
                 if failure is not None:
-                    await stream.terminate()
                     reason, detail = failure
+                    if reason in {
+                        "workspace_hard_limit",
+                        "workspace_entry_limit",
+                    }:
+                        self._write_workspace_pressure(
+                            workspace_root,
+                            usage,
+                            reason=reason,
+                        )
+                    await stream.terminate()
                     await self.events.emit(
                         "cli.workspace_limit_exceeded",
                         {
@@ -743,6 +1464,7 @@ class CLIAgent(Agent):
                             "min_free_bytes": self.WORKSPACE_MIN_FREE_BYTES or None,
                             "min_free_inodes": self.WORKSPACE_MIN_FREE_INODES or None,
                             "reason": reason,
+                            "recovery_mode": self._workspace_recovery_mode,
                         },
                         call_id=spawn_call_id,
                     )
@@ -750,22 +1472,15 @@ class CLIAgent(Agent):
                         status="error",
                         summary=f"workspace safety limit reached; stopped CLI: {detail}",
                     )
-                if (
-                    not workspace_soft_warned
-                    and (
-                        (
-                            self.WORKSPACE_SOFT_LIMIT_BYTES > 0
-                            and usage["bytes"] >= self.WORKSPACE_SOFT_LIMIT_BYTES
-                        )
-                        or (
-                            self.WORKSPACE_SOFT_LIMIT_ENTRIES > 0
-                            and int(
-                                usage.get("entries", usage.get("files", 0)) or 0
-                            )
-                            >= self.WORKSPACE_SOFT_LIMIT_ENTRIES
-                        )
+                if pressure:
+                    self._write_workspace_pressure(
+                        workspace_root,
+                        usage,
+                        reason="soft_limit",
                     )
-                ):
+                else:
+                    self._clear_workspace_pressure(workspace_root)
+                if pressure and not workspace_soft_warned:
                     workspace_soft_warned = True
                     await self.events.emit(
                         "cli.workspace_limit_warning",
@@ -778,6 +1493,14 @@ class CLIAgent(Agent):
                         },
                         call_id=spawn_call_id,
                     )
+                elif not pressure and workspace_soft_warned:
+                    workspace_soft_warned = False
+                    await self.events.emit(
+                        "cli.workspace_limit_cleared",
+                        usage,
+                        call_id=spawn_call_id,
+                    )
+                last_workspace_pressure = pressure
             if done_path.exists():
                 grace_deadline = time.monotonic() + float(self.DONE_DRAIN_GRACE_S)
                 while (
@@ -787,22 +1510,39 @@ class CLIAgent(Agent):
                 ):
                     await asyncio.sleep(self.POLL_INTERVAL_S)
                 await stream.terminate()
-                return self._read_done(done_path, fallback_status="done")
+                done = self._read_done(
+                    done_path,
+                    fallback_status=(
+                        "error" if self.COMPLETION_SIGNAL != "exit" else "done"
+                    ),
+                    fallback_summary=(
+                        "required completion record is invalid"
+                        if self.COMPLETION_SIGNAL != "exit"
+                        else None
+                    ),
+                )
+                return await self._finalize_workspace_recovery(
+                    done,
+                    workspace_root,
+                    spawn_call_id=spawn_call_id,
+                )
             if stream.done:
-                # CLI exited without calling finish. Use the exit
-                # code as the done signal: 0 == clean termination == done,
-                # non-zero == failure == error. This is a pragmatic
-                # default for agents that don't (yet) wire finish
-                # reliably. TODO(SPEC §13): harden the explicit
-                # finish handshake and make exit-as-done opt-in.
                 rc = stream.proc.returncode
-                fallback = "done" if rc == 0 else "error"
+                completion_required = self.COMPLETION_SIGNAL != "exit"
+                fallback = (
+                    "error"
+                    if completion_required
+                    else ("done" if rc == 0 else "error")
+                )
+                fallback_summary = (
+                    f"required {self.COMPLETION_SIGNAL} completion record was not written"
+                    if completion_required
+                    else None
+                )
                 try:
                     await stream.terminate()
                 except Exception:
                     pass
-                stderr_tail = self.sanitize_cli_output(stream.stderr or "")[-2000:]
-                stdout_tail = self.sanitize_cli_output(stream.stdout or "")[-1000:]
                 await self.events.emit(
                     "cli.exit",
                     {
@@ -810,12 +1550,32 @@ class CLIAgent(Agent):
                         "exit_code": rc,
                         "status": fallback,
                         "via_finish": False,
-                        "stderr_tail": stderr_tail,
-                        "stdout_tail": stdout_tail,
+                        # Raw output is persisted only after subclasses have a
+                        # chance to refresh rotated credential values.  Do not
+                        # put pre-refresh output text into the event stream.
+                        "stdout_chars": (
+                            int(stream.stdout_chars)
+                            if hasattr(stream, "stdout_chars")
+                            else len(stream.stdout or "")
+                        ),
+                        "stderr_chars": (
+                            int(stream.stderr_chars)
+                            if hasattr(stream, "stderr_chars")
+                            else len(stream.stderr or "")
+                        ),
                     },
                     call_id=spawn_call_id,
                 )
-                return self._read_done(done_path, fallback_status=fallback)
+                done = self._read_done(
+                    done_path,
+                    fallback_status=fallback,
+                    fallback_summary=fallback_summary,
+                )
+                return await self._finalize_workspace_recovery(
+                    done,
+                    workspace_root,
+                    spawn_call_id=spawn_call_id,
+                )
             if (
                 not cleanup_warned
                 and self.CLEANUP_GRACE_S > 0
@@ -860,10 +1620,15 @@ class CLIAgent(Agent):
                     {"sandbox_id": str(self.workdir), "status": "partial", "reason": "timeout"},
                     call_id=spawn_call_id,
                 )
-                return self._read_done(
+                done = self._read_done(
                     done_path,
                     fallback_status="partial",
                     fallback_summary="budget/timeout reached; salvaged current sandbox state",
+                )
+                return await self._finalize_workspace_recovery(
+                    done,
+                    workspace_root,
+                    spawn_call_id=spawn_call_id,
                 )
 
             now = time.monotonic()
@@ -873,8 +1638,22 @@ class CLIAgent(Agent):
                     "cli.heartbeat",
                     {
                         "remaining_s": stream.remaining_s,
-                        "stdout_chars": len(stream.stdout),
-                        "stderr_chars": len(stream.stderr),
+                        "stdout_chars": (
+                            int(stream.stdout_chars)
+                            if hasattr(stream, "stdout_chars")
+                            else len(stream.stdout)
+                        ),
+                        "stderr_chars": (
+                            int(stream.stderr_chars)
+                            if hasattr(stream, "stderr_chars")
+                            else len(stream.stderr)
+                        ),
+                        "stdout_dropped_chars": int(
+                            getattr(stream, "stdout_dropped_chars", 0) or 0
+                        ),
+                        "stderr_dropped_chars": int(
+                            getattr(stream, "stderr_dropped_chars", 0) or 0
+                        ),
                     },
                     call_id=spawn_call_id,
                 )

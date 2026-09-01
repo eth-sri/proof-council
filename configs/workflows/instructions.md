@@ -53,8 +53,10 @@ inputs:
 For Author/Critic runs with Compute enabled, storage policy is also a run
 input. `compute_workspace_hard_limit_bytes` caps one worker's workspace;
 `compute_filesystem_min_free_bytes` keeps a global emergency floor; and
-`compute_filesystem_reservation_bytes` cooperatively reserves growth headroom
-for each active Compute worker. Concurrent runs sharing a filesystem must use
+`compute_filesystem_reservation_bytes` cooperatively reserves a total workspace
+allowance for each active Compute worker. Existing allocated bytes, and bytes
+written while the worker runs, reduce the remaining reserved headroom rather
+than being counted a second time. Concurrent runs sharing a filesystem must use
 the same `compute_filesystem_reservation_dir` (the default is shared by runs
 under the same outputs root; an explicit relative path is resolved there).
 The registry must remain outside the worker workspace. For example, to admit
@@ -69,9 +71,22 @@ inputs:
 ```
 
 Reservations are admission control among ProofCouncil workers, not filesystem
-quotas. Keep the hard workspace limit enabled for runtime enforcement. A zero
+quotas. Keep the hard workspace limit enabled for runtime enforcement. Soft
+pressure creates `.pwc/runtime/STORAGE_PRESSURE`; the worker must clean below
+the soft threshold, and an over-limit workspace starts in cleanup-only recovery
+mode with tightly bounded additional growth. A zero
 reservation disables coordinated admission, which is the portable default for
 hosts that do not have 100 GiB available.
+
+Compute remains opt-in: `enable_compute: true` only permits it, and a worker is
+started only when the Author emits a non-empty `<compute_agent>` request. This
+changes the research strategy compared with always-on Compute and should be
+called out when comparing runs.
+
+Codex subscription calls record tokens and an `api_equivalent_usd` estimate but
+add `$0` to actual spend. Consequently `budget.max_usd` limits paid API calls,
+not subscription Compute time. Use `max_wallclock_s`, `max_tokens`, Compute hard
+timeouts, and workspace limits as the subscription backstops.
 
 ## Prompt components
 

@@ -465,8 +465,9 @@ class ACWorkflow(Agent):
             default=DEFAULT_COMPUTE_FILESYSTEM_RESERVATION_BYTES,
             ge=0,
             description=(
-                "Per-Compute-worker storage headroom reserved cooperatively at "
-                "admission time. Zero disables reservations."
+                "Total per-Compute-worker workspace capacity reserved "
+                "cooperatively at admission time. Existing allocated bytes "
+                "reduce remaining headroom. Zero disables reservations."
             ),
         )
         compute_filesystem_reservation_dir: Path | None = Field(
