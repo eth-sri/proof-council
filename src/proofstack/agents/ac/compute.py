@@ -56,7 +56,12 @@ from proofstack.codex_auth import (
     extract_codex_auth_secrets,
     redact_codex_secrets,
 )
-from proofstack.kinds.cli import CLIAgent, CLIDoneRecord, measure_workspace_usage
+from proofstack.kinds.cli import (
+    CLIAgent,
+    CLIDoneRecord,
+    DoneStatus,
+    measure_workspace_usage,
+)
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
 from proofstack.transient_auth import (
@@ -88,7 +93,8 @@ COMPUTE_WORKSPACE_HARD_LIMIT_BYTES: Final[int] = 100 * 1024 * 1024 * 1024
 COMPUTE_WORKSPACE_SOFT_LIMIT_ENTRIES: Final[int] = 80_000
 COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES: Final[int] = 100_000
 # Host capacity varies widely, so filesystem-wide headroom is an explicit run
-# policy. Serious parallel runs should set both values on ACWorkflow.Inputs.
+# policy. The inode default is automatic: enforce it where inode accounting is
+# available, but do not reject filesystems such as btrfs that report none.
 COMPUTE_FILESYSTEM_MIN_FREE_BYTES: Final[int] = 0
 COMPUTE_FILESYSTEM_MIN_FREE_INODES: Final[int] = 100_000
 COMPUTE_FILESYSTEM_RESERVATION_BYTES: Final[int] = 0
@@ -298,12 +304,14 @@ If ``.pwc/runtime/WRAP_UP`` appears, stop new investigations
 immediately, finalize ``responses/response_round_{round}.md``, and
 call ``$FINISH_BIN``.
 
-If ``.pwc/runtime/STORAGE_PRESSURE`` appears, stop new investigations
-immediately. Read its JSON limits, delete reproducible caches, failed
-databases, expanded archives, bulky logs, and obsolete intermediates, and
-reduce both allocated storage and entry count below the stated soft limits.
-Preserve compact certificates and essential conclusions. Then summarize the
-cleanup in ``responses/response_round_{round}.md`` and call ``$FINISH_BIN``.
+If ``.pwc/runtime/STORAGE_PRESSURE`` appears, pause storage-growing work and
+read its JSON limits. Delete reproducible caches, failed databases, expanded
+archives, bulky logs, and obsolete intermediates, reducing both allocated
+storage and entry count below the stated soft limits. Preserve compact
+certificates and essential conclusions. Then continue the Author's commissioned
+task unless this prompt began with ``URGENT STORAGE-RECOVERY INVOCATION``; in
+that recovery mode, summarize the cleanup in
+``responses/response_round_{round}.md`` and call ``$FINISH_BIN`` instead.
 
 ## Finishing
 
@@ -365,7 +373,9 @@ class Compute(CLIAgent):
     )
     SOFT_TIMEOUT_S: ClassVar[int] = DEFAULT_SOFT_TIMEOUT_S
     COMPLETION_SIGNAL: ClassVar[str] = "finish"
+    MISSING_COMPLETION_STATUS: ClassVar[DoneStatus] = "partial"
     WORKSPACE_RECOVERY_ENABLED: ClassVar[bool] = True
+    WORKSPACE_MIN_FREE_INODES: ClassVar[int] = COMPUTE_FILESYSTEM_MIN_FREE_INODES
 
     class Inputs(BaseModel):
         problem: str
@@ -402,9 +412,15 @@ class Compute(CLIAgent):
             default=COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
             ge=0,
         )
-        filesystem_min_free_inodes: int = Field(
-            default=COMPUTE_FILESYSTEM_MIN_FREE_INODES,
+        filesystem_min_free_inodes: int | None = Field(
+            default=None,
             ge=0,
+            description=(
+                "Minimum free filesystem inodes. Omit for the automatic "
+                f"{COMPUTE_FILESYSTEM_MIN_FREE_INODES}-inode floor, which is "
+                "skipped when inode accounting is unavailable; zero disables "
+                "the floor; a positive explicit value requires accounting."
+            ),
         )
         filesystem_reservation_bytes: int = Field(
             default=COMPUTE_FILESYSTEM_RESERVATION_BYTES,
@@ -578,8 +594,15 @@ class Compute(CLIAgent):
         self.WORKSPACE_MIN_FREE_BYTES = int(  # type: ignore[attr-defined]
             inp.filesystem_min_free_bytes  # type: ignore[attr-defined]
         )
-        self.WORKSPACE_MIN_FREE_INODES = int(  # type: ignore[attr-defined]
-            inp.filesystem_min_free_inodes  # type: ignore[attr-defined]
+        configured_min_free_inodes = inp.filesystem_min_free_inodes  # type: ignore[attr-defined]
+        self.WORKSPACE_MIN_FREE_INODES = (
+            COMPUTE_FILESYSTEM_MIN_FREE_INODES
+            if configured_min_free_inodes is None
+            else int(configured_min_free_inodes)
+        )
+        self.WORKSPACE_REQUIRE_INODE_ACCOUNTING = bool(
+            configured_min_free_inodes is not None
+            and int(configured_min_free_inodes) > 0
         )
         self.WORKSPACE_RESERVATION_BYTES = int(  # type: ignore[attr-defined]
             inp.filesystem_reservation_bytes  # type: ignore[attr-defined]

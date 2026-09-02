@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -46,6 +47,7 @@ from proofstack.agents.ac.compute import (  # noqa: E402
 from proofstack.context import RunContext  # noqa: E402
 from proofstack.cli_usage import parse_claude_json, parse_codex_jsonl  # noqa: E402
 from proofstack.kinds.cli import (  # noqa: E402
+    CLIAgent,
     CLIDoneRecord,
     _mark_sensitive_workspace_untrusted,
     _write_sensitive_quarantine_marker,
@@ -171,7 +173,7 @@ def test_compute_inputs_default_to_sol_max_with_matching_cost_config() -> None:
     assert inp.workspace_soft_limit_entries == COMPUTE_WORKSPACE_SOFT_LIMIT_ENTRIES
     assert inp.workspace_hard_limit_entries == COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES
     assert inp.filesystem_min_free_bytes == COMPUTE_FILESYSTEM_MIN_FREE_BYTES
-    assert inp.filesystem_min_free_inodes == COMPUTE_FILESYSTEM_MIN_FREE_INODES
+    assert inp.filesystem_min_free_inodes is None
     assert inp.filesystem_reservation_bytes == COMPUTE_FILESYSTEM_RESERVATION_BYTES
     assert inp.filesystem_reservation_dir is None
     assert inp.handoff_max_files == COMPUTE_HANDOFF_MAX_FILES
@@ -1380,6 +1382,57 @@ def test_workspace_scan_errors_fail_closed() -> None:
     assert failure[0] == "workspace_scan_error"
 
 
+def test_missing_inode_accounting_skips_automatic_floor() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test",
+            root_workdir=Path(temp_dir) / "run",
+            flat=True,
+        )
+        agent = Compute(ctx)
+        agent.WORKSPACE_MIN_FREE_INODES = COMPUTE_FILESYSTEM_MIN_FREE_INODES
+        agent.WORKSPACE_REQUIRE_INODE_ACCOUNTING = False
+        failure = agent._workspace_limit_failure(
+            {
+                "bytes": 0,
+                "allocated_bytes": 0,
+                "allocated_bytes_supported": True,
+                "entries": 0,
+                "errors": 0,
+                "filesystem_free_bytes": 1_000_000,
+                "filesystem_free_inodes": None,
+            }
+        )
+
+    assert failure is None
+
+
+def test_missing_inode_accounting_fails_for_explicit_floor() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test",
+            root_workdir=Path(temp_dir) / "run",
+            flat=True,
+        )
+        agent = Compute(ctx)
+        agent.WORKSPACE_MIN_FREE_INODES = 100_000
+        agent.WORKSPACE_REQUIRE_INODE_ACCOUNTING = True
+        failure = agent._workspace_limit_failure(
+            {
+                "bytes": 0,
+                "allocated_bytes": 0,
+                "allocated_bytes_supported": True,
+                "entries": 0,
+                "errors": 0,
+                "filesystem_free_bytes": 1_000_000,
+                "filesystem_free_inodes": None,
+            }
+        )
+
+    assert failure is not None
+    assert failure[0] == "filesystem_free_inodes_unknown"
+
+
 def test_workspace_scan_deletion_races_do_not_stop_worker() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         ctx = RunContext.create(
@@ -1451,7 +1504,7 @@ def test_workspace_recovery_prompt_and_completion_require_soft_target() -> None:
             "filesystem_free_bytes": 1_000_000,
             "filesystem_free_inodes": 1_000_000,
         }
-        agent._start_workspace_recovery(over)
+        agent._configure_workspace_recovery(over)
         agent._write_workspace_pressure(root, over, reason="workspace_hard_limit")
         inp = Compute.Inputs(
             problem="P",
@@ -1468,6 +1521,8 @@ def test_workspace_recovery_prompt_and_completion_require_soft_target() -> None:
         prompt = agent.cli_input(inp)
         assert "STORAGE-RECOVERY INVOCATION" in prompt
         assert "launch another enumeration" not in prompt
+        assert "continue the Author's commissioned" in prompt
+        assert "unless this prompt began with" in prompt
         assert (root / ".pwc" / "runtime" / "STORAGE_PRESSURE").exists()
 
         events: list[tuple[str, dict]] = []
@@ -1504,6 +1559,596 @@ def test_workspace_recovery_prompt_and_completion_require_soft_target() -> None:
         assert complete.status == "done"
         assert not (root / ".pwc" / "runtime" / "STORAGE_PRESSURE").exists()
         assert any(kind == "cli.workspace_recovery_completed" for kind, _ in events)
+
+
+def test_workspace_recovery_clear_failure_downgrades_completion() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.WORKSPACE_SOFT_LIMIT_BYTES = 80
+        agent.WORKSPACE_HARD_LIMIT_BYTES = 100
+        usage = {
+            "bytes": 40,
+            "allocated_bytes": 40,
+            "allocated_bytes_supported": True,
+            "entries": 1,
+            "errors": 0,
+            "filesystem_free_bytes": 1_000_000,
+            "filesystem_free_inodes": 1_000_000,
+        }
+        agent._configure_workspace_recovery(
+            {**usage, "bytes": 110, "allocated_bytes": 110}
+        )
+        agent._write_workspace_pressure(
+            root,
+            {**usage, "bytes": 110, "allocated_bytes": 110},
+            reason="workspace_hard_limit",
+        )
+        agent._measure_workspace = lambda _root: dict(usage)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        with mock.patch.object(
+            agent,
+            "_clear_workspace_recovery_attempts_recorded",
+            new=mock.AsyncMock(return_value="OSError: read-only"),
+        ):
+            result = asyncio.run(
+                agent._finalize_workspace_recovery(
+                    CLIDoneRecord(status="done", summary="cleanup complete"),
+                    root,
+                    spawn_call_id="call",
+                )
+            )
+        pressure = json.loads(
+            (root / ".pwc" / "runtime" / "STORAGE_PRESSURE").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    assert result.status == "partial"
+    assert "attempt state could not be reset" in result.summary
+    assert not any(kind == "cli.workspace_recovery_completed" for kind, _ in events)
+    assert pressure["reason"] == "workspace_recovery_state_clear_failed"
+
+
+def test_compute_storage_pressure_prompt_resumes_normal_research() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="p",
+            round=1,
+            instructions="continue the commissioned search",
+            compute_workspace=root,
+        )
+
+        prompt = agent.cli_input(inp)
+
+    assert not prompt.startswith("URGENT STORAGE-RECOVERY INVOCATION")
+    assert "continue the Author's commissioned task" in " ".join(prompt.split())
+    assert "continue the commissioned search" in prompt
+
+
+def test_workspace_recovery_attempt_cap_survives_agent_reconstruction() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        over = {
+            "bytes": 110,
+            "allocated_bytes": 110,
+            "allocated_bytes_supported": True,
+            "entries": 11,
+            "errors": 0,
+            "filesystem_free_bytes": 1_000_000,
+            "filesystem_free_inodes": 1_000_000,
+        }
+
+        first = Compute(ctx)
+        first.WORKSPACE_HARD_LIMIT_BYTES = 100
+        first.WORKSPACE_HARD_LIMIT_ENTRIES = 10
+        first._configure_workspace_recovery(over)
+        first_claim = first._claim_workspace_recovery_attempt(root)
+        assert first_claim is not None
+        first._commit_workspace_recovery_claim(first_claim)
+        state_path = first.workspace_recovery_state_path_for(root)
+        assert state_path.is_file()
+
+        reconstructed = Compute(ctx)
+        reconstructed.WORKSPACE_HARD_LIMIT_BYTES = 100
+        reconstructed.WORKSPACE_HARD_LIMIT_ENTRIES = 10
+        reconstructed._configure_workspace_recovery(over)
+        assert reconstructed._claim_workspace_recovery_attempt(root) is None
+
+        reconstructed._clear_workspace_recovery_attempts(root)
+        assert not state_path.exists()
+        retry_claim = reconstructed._claim_workspace_recovery_attempt(root)
+        assert retry_claim is not None
+        reconstructed._commit_workspace_recovery_claim(retry_claim)
+        reconstructed._clear_workspace_recovery_attempts(root)
+
+
+def test_aborted_workspace_recovery_claim_does_not_consume_attempt() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+
+        first = Compute(ctx)
+        first_claim = first._claim_workspace_recovery_attempt(root)
+        assert first_claim is not None
+        first._abort_workspace_recovery_claim(first_claim)
+        assert not first.workspace_recovery_state_path_for(root).exists()
+
+        reconstructed = Compute(ctx)
+        retry_claim = reconstructed._claim_workspace_recovery_attempt(root)
+        assert retry_claim is not None
+        reconstructed._commit_workspace_recovery_claim(retry_claim)
+        reconstructed._clear_workspace_recovery_attempts(root)
+
+
+def test_workspace_recovery_checks_global_floor_before_claiming_attempt() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.WORKSPACE_HARD_LIMIT_BYTES = 100
+        agent.WORKSPACE_HARD_LIMIT_ENTRIES = 100
+        agent.WORKSPACE_MIN_FREE_BYTES = 10
+        usage = {
+            "bytes": 110,
+            "allocated_bytes": 110,
+            "allocated_bytes_supported": True,
+            "entries": 1,
+            "errors": 0,
+            "filesystem_free_bytes": 5,
+            "filesystem_free_inodes": 1_000_000,
+        }
+        initial_failure = agent._workspace_limit_failure(
+            usage,
+            recovery_ceiling=False,
+        )
+        assert initial_failure is not None
+        assert initial_failure[0] == "workspace_hard_limit"
+
+        claim, failure = agent._prepare_workspace_recovery_claim(usage, root)
+
+        assert claim is None
+        assert failure is not None
+        assert failure[0] == "filesystem_min_free"
+        assert not agent.workspace_recovery_state_path_for(root).exists()
+        assert agent._workspace_recovery_mode is False
+
+
+def test_workspace_recovery_spawn_failure_releases_claim() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="subprocess", timeout_s=10)
+        WORKSPACE_HARD_LIMIT_BYTES = 1
+        WORKSPACE_HARD_LIMIT_ENTRIES = 100
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+    class SpawnFailureSandbox(SimpleNamespace):
+        async def stream_command(self, *args, **kwargs):
+            raise RuntimeError("spawn failed")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        (root / "existing.bin").write_bytes(b"payload")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        sandbox = SpawnFailureSandbox(root=root)
+
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(RuntimeError, match="spawn failed"):
+                asyncio.run(agent.run(ProbeInput(workspace=root)))
+
+        assert not agent.workspace_recovery_state_path_for(root).exists()
+        reconstructed = ProbeAgent(ctx)
+        retry_claim = reconstructed._claim_workspace_recovery_attempt(root)
+        assert retry_claim is not None
+        reconstructed._abort_workspace_recovery_claim(retry_claim)
+
+
+def test_workspace_recovery_stdin_failure_does_not_consume_attempt() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="subprocess", timeout_s=10)
+        WORKSPACE_HARD_LIMIT_BYTES = 1
+        WORKSPACE_HARD_LIMIT_ENTRIES = 100
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        def cli_input(self, inp):
+            return "clean the workspace"
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+    class BrokenStdin:
+        def write(self, payload):
+            self.payload = payload
+
+        async def drain(self):
+            raise BrokenPipeError("child exited during startup")
+
+        def close(self):
+            return None
+
+    class StartedStream:
+        done = True
+        stdout = ""
+        stderr = ""
+
+        def __init__(self):
+            self.proc = SimpleNamespace(stdin=BrokenStdin(), returncode=1)
+
+        async def terminate(self):
+            self.done = True
+
+    class StartedSandbox(SimpleNamespace):
+        async def stream_command(self, *args, **kwargs):
+            return StartedStream()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        (root / "existing.bin").write_bytes(b"payload")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        sandbox = StartedSandbox(root=root)
+
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(
+                RuntimeError,
+                match="recovery prompt could not be delivered",
+            ):
+                asyncio.run(agent.run(ProbeInput(workspace=root)))
+
+        assert not agent.workspace_recovery_state_path_for(root).exists()
+        reconstructed = ProbeAgent(ctx)
+        retry_claim = reconstructed._claim_workspace_recovery_attempt(root)
+        assert retry_claim is not None
+        reconstructed._abort_workspace_recovery_claim(retry_claim)
+        invocation_lock = reconstructed._acquire_workspace_invocation_lock(root)
+        reconstructed._release_workspace_lock(invocation_lock)
+
+
+def test_workspace_recovery_claim_serializes_concurrent_resumes() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        first = Compute(ctx)
+        second = Compute(ctx)
+        first_claim = first._claim_workspace_recovery_attempt(root)
+        assert first_claim is not None
+
+        with pytest.raises(RuntimeError, match="recovery state is busy"):
+            second._claim_workspace_recovery_attempt(root)
+
+        first._commit_workspace_recovery_claim(first_claim)
+        assert second._claim_workspace_recovery_attempt(root) is None
+
+        first._clear_workspace_recovery_attempts(root)
+
+
+def test_workspace_invocation_lock_blocks_before_runtime_mutation() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="subprocess", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+        async def teardown(self, sandbox, inp):
+            self.teardown_called = True
+
+    class TrackingSandbox(SimpleNamespace):
+        spawned = False
+
+        async def stream_command(self, *args, **kwargs):
+            self.spawned = True
+            raise AssertionError("busy workspace must not spawn another worker")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        runtime = root / ".pwc" / "runtime"
+        runtime.mkdir(parents=True)
+        done_path = runtime / "done.json"
+        wrap_up_path = runtime / "WRAP_UP"
+        done_path.write_text("active done record", encoding="utf-8")
+        wrap_up_path.write_text("active wrap-up signal", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        owner = ProbeAgent(ctx)
+        contender = ProbeAgent(ctx)
+        contender.teardown_called = False
+        sandbox = TrackingSandbox(root=root)
+        invocation_lock = owner._acquire_workspace_invocation_lock(root)
+        try:
+            with mock.patch(
+                "proofstack.kinds.cli.make_sandbox",
+                return_value=sandbox,
+            ):
+                with pytest.raises(
+                    RuntimeError,
+                    match="persistent workspace is already active",
+                ):
+                    asyncio.run(contender.run(ProbeInput(workspace=root)))
+        finally:
+            owner._release_workspace_lock(invocation_lock)
+
+        assert done_path.read_text(encoding="utf-8") == "active done record"
+        assert wrap_up_path.read_text(encoding="utf-8") == "active wrap-up signal"
+        assert sandbox.spawned is False
+        assert contender.teardown_called is False
+
+
+def test_soft_pressure_does_not_reset_recovery_attempt_cap() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="subprocess", timeout_s=10)
+        WORKSPACE_SOFT_LIMIT_BYTES = 1
+        WORKSPACE_HARD_LIMIT_BYTES = 1024 * 1024 * 1024
+        WORKSPACE_HARD_LIMIT_ENTRIES = 100
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+    class SpawnFailureSandbox(SimpleNamespace):
+        async def stream_command(self, *args, **kwargs):
+            raise RuntimeError("spawn failed")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        (root / "payload.bin").write_bytes(b"payload")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        claim = agent._claim_workspace_recovery_attempt(root)
+        assert claim is not None
+        agent._commit_workspace_recovery_claim(claim)
+
+        sandbox = SpawnFailureSandbox(root=root)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(RuntimeError, match="spawn failed"):
+                asyncio.run(agent.run(ProbeInput(workspace=root)))
+
+        assert agent._read_workspace_recovery_attempts(root) == 1
+        agent._clear_workspace_recovery_attempts(root)
+
+
+def test_recovery_state_clear_failure_blocks_normal_spawn() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="subprocess", timeout_s=10)
+        WORKSPACE_SOFT_LIMIT_BYTES = 1024 * 1024
+        WORKSPACE_HARD_LIMIT_BYTES = 2 * 1024 * 1024
+        WORKSPACE_HARD_LIMIT_ENTRIES = 100
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+    class TrackingSandbox(SimpleNamespace):
+        spawned = False
+
+        async def stream_command(self, *args, **kwargs):
+            self.spawned = True
+            raise AssertionError("worker must not spawn with stale recovery state")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        claim = agent._claim_workspace_recovery_attempt(root)
+        assert claim is not None
+        agent._commit_workspace_recovery_claim(claim)
+        sandbox = TrackingSandbox(root=root)
+
+        with (
+            mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox),
+            mock.patch.object(
+                agent,
+                "_clear_workspace_recovery_attempts_recorded",
+                new=mock.AsyncMock(return_value="OSError: read-only"),
+            ),
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="persisted workspace recovery state could not be reset",
+            ):
+                asyncio.run(agent.run(ProbeInput(workspace=root)))
+
+        assert sandbox.spawned is False
+        assert agent._read_workspace_recovery_attempts(root) == 1
+        agent._clear_workspace_recovery_attempts(root)
+
+
+def test_workspace_recovery_clear_falls_back_to_zero_state() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        claim = agent._claim_workspace_recovery_attempt(root)
+        assert claim is not None
+        agent._commit_workspace_recovery_claim(claim)
+
+        with mock.patch.object(Path, "unlink", side_effect=PermissionError("denied")):
+            agent._clear_workspace_recovery_attempts(root)
+
+        assert agent._read_workspace_recovery_attempts(root) == 0
+        retry_claim = agent._claim_workspace_recovery_attempt(root)
+        assert retry_claim is not None
+        agent._abort_workspace_recovery_claim(retry_claim)
+        agent._clear_workspace_recovery_attempts(root)
+
+
+def test_workspace_recovery_clear_failure_is_reported() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        claim = agent._claim_workspace_recovery_attempt(root)
+        assert claim is not None
+        agent._commit_workspace_recovery_claim(claim)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        with (
+            mock.patch.object(Path, "unlink", side_effect=PermissionError("denied")),
+            mock.patch.object(
+                agent,
+                "_write_workspace_recovery_attempts",
+                side_effect=OSError("read-only"),
+            ),
+        ):
+            error = asyncio.run(
+                agent._clear_workspace_recovery_attempts_recorded(
+                    root,
+                    phase="test",
+                )
+            )
+
+        assert error is not None
+        event = next(
+            payload
+            for kind, payload in events
+            if kind == "cli.workspace_recovery_state_clear_failed"
+        )
+        assert event["phase"] == "test"
+        agent._clear_workspace_recovery_attempts(root)
+
+
+def test_workspace_recovery_attempt_cap_resets_for_recreated_workspace() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        over = {
+            "bytes": 110,
+            "allocated_bytes": 110,
+            "allocated_bytes_supported": True,
+            "entries": 11,
+            "errors": 0,
+            "filesystem_free_bytes": 1_000_000,
+            "filesystem_free_inodes": 1_000_000,
+        }
+
+        first = Compute(ctx)
+        first._configure_workspace_recovery(over)
+        first_claim = first._claim_workspace_recovery_attempt(root)
+        assert first_claim is not None
+        first._commit_workspace_recovery_claim(first_claim)
+        old_identity = first._workspace_identity(root)
+        root.rename(temp / "compute-old")
+        root.mkdir()
+        assert first._workspace_identity(root) != old_identity
+
+        first._configure_workspace_recovery(over)
+        recreated_claim = first._claim_workspace_recovery_attempt(root)
+        assert recreated_claim is not None
+        first._commit_workspace_recovery_claim(recreated_claim)
+        first._clear_workspace_recovery_attempts(root)
+
+
+def test_compute_clean_exit_without_finish_is_salvaged_as_partial() -> None:
+    class FakeStream:
+        done = True
+        proc = SimpleNamespace(returncode=0)
+        stdout = ""
+        stderr = ""
+
+        async def terminate(self):
+            return None
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        done = asyncio.run(
+            agent._wait_for_done(
+                FakeStream(),
+                temp / "missing-done.json",
+                spawn_call_id="call",
+            )
+        )
+
+    assert done.status == "partial"
+    assert "salvaged artifacts from a clean CLI exit" in done.summary
+    exit_event = next(payload for kind, payload in events if kind == "cli.exit")
+    assert exit_event["status"] == "partial"
 
 
 def test_filesystem_free_inode_guard_stops_compute_worker() -> None:

@@ -72,9 +72,14 @@ inputs:
 
 Reservations are admission control among ProofCouncil workers, not filesystem
 quotas. Keep the hard workspace limit enabled for runtime enforcement. Soft
-pressure creates `.pwc/runtime/STORAGE_PRESSURE`; the worker must clean below
-the soft threshold, and an over-limit workspace starts in cleanup-only recovery
-mode with tightly bounded additional growth. A zero
+pressure creates `.pwc/runtime/STORAGE_PRESSURE` while the commissioned research
+continues; the worker should clean below the soft threshold during normal work.
+Only a workspace already at the hard byte or entry limit starts a single
+cleanup-only recovery invocation with tightly bounded additional growth. An
+omitted inode reserve uses the automatic 100,000-inode floor where the
+filesystem exposes inode accounting and skips that floor on filesystems such as
+btrfs that do not. Setting a positive reserve explicitly is fail-closed when
+inode accounting is unavailable; zero disables the inode floor. A zero byte
 reservation disables coordinated admission, which is the portable default for
 hosts that do not have 100 GiB available.
 

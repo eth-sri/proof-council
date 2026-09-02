@@ -18,7 +18,6 @@ from proofstack.agents.ac.council import CouncilMember, _strip_visible_thought_b
 from proofstack.agents.ac.critic import ACCritic  # noqa: E402
 from proofstack.agents.ac.compute import (  # noqa: E402
     COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
-    COMPUTE_FILESYSTEM_MIN_FREE_INODES,
     COMPUTE_FILESYSTEM_RESERVATION_BYTES,
     COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES,
     COMPUTE_HANDOFF_MAX_FILES,
@@ -151,10 +150,7 @@ class ACCouncilDefaultsTests(unittest.TestCase):
             inp.compute_filesystem_min_free_bytes,
             COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
         )
-        self.assertEqual(
-            inp.compute_filesystem_min_free_inodes,
-            COMPUTE_FILESYSTEM_MIN_FREE_INODES,
-        )
+        self.assertIsNone(inp.compute_filesystem_min_free_inodes)
         self.assertEqual(
             inp.compute_filesystem_reservation_bytes,
             COMPUTE_FILESYSTEM_RESERVATION_BYTES,

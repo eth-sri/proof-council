@@ -82,9 +82,6 @@ from proofstack.agents.ac.compute import (
     COMPUTE_FILESYSTEM_MIN_FREE_BYTES as DEFAULT_COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
 )
 from proofstack.agents.ac.compute import (
-    COMPUTE_FILESYSTEM_MIN_FREE_INODES as DEFAULT_COMPUTE_FILESYSTEM_MIN_FREE_INODES,
-)
-from proofstack.agents.ac.compute import (
     COMPUTE_FILESYSTEM_RESERVATION_BYTES as DEFAULT_COMPUTE_FILESYSTEM_RESERVATION_BYTES,
 )
 from proofstack.agents.ac.compute import (
@@ -457,9 +454,14 @@ class ACWorkflow(Agent):
             default=DEFAULT_COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
             ge=0,
         )
-        compute_filesystem_min_free_inodes: int = Field(
-            default=DEFAULT_COMPUTE_FILESYSTEM_MIN_FREE_INODES,
+        compute_filesystem_min_free_inodes: int | None = Field(
+            default=None,
             ge=0,
+            description=(
+                "Minimum free filesystem inodes for Compute. Omit for the "
+                "portable automatic floor, zero to disable it, or set a "
+                "positive value to require measurable inode accounting."
+            ),
         )
         compute_filesystem_reservation_bytes: int = Field(
             default=DEFAULT_COMPUTE_FILESYSTEM_RESERVATION_BYTES,

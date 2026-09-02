@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import shlex
 import shutil
 import stat
+import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
@@ -50,9 +53,21 @@ exit 0
 _SHELL_START_BLOCK_BEGIN = "# proofstack finish shim begin"
 _SHELL_START_BLOCK_END = "# proofstack finish shim end"
 _SENSITIVE_STATE_QUARANTINE = "SENSITIVE_STATE_UNTRUSTED"
+_WORKSPACE_RECOVERY_STATE_DIR = ".proofcouncil-workspace-recovery"
 
 
 DoneStatus = Literal["done", "partial", "blocked", "timeout", "error"]
+
+
+@dataclass(frozen=True)
+class _WorkspaceRecoveryClaim:
+    workspace_root: Path
+    attempts: int
+    lock_fd: int
+
+
+class _WorkspaceLockBusy(RuntimeError):
+    """Another process currently holds a lock for this workspace."""
 
 
 async def _release_storage_lease(lease: StorageReservationLease) -> None:
@@ -339,6 +354,7 @@ class CLIAgent(Agent):
     WORKSPACE_HARD_LIMIT_ENTRIES: ClassVar[int] = 0
     WORKSPACE_MIN_FREE_BYTES: ClassVar[int] = 0
     WORKSPACE_MIN_FREE_INODES: ClassVar[int] = 0
+    WORKSPACE_REQUIRE_INODE_ACCOUNTING: ClassVar[bool] = False
     WORKSPACE_RESERVATION_BYTES: ClassVar[int] = 0
     WORKSPACE_RESERVATION_DIR: ClassVar[Path | None] = None
     WORKSPACE_CHECK_INTERVAL_S: ClassVar[float] = 60.0
@@ -346,6 +362,7 @@ class CLIAgent(Agent):
     WORKSPACE_USAGE_EVENT_MIN_BYTES_DELTA: ClassVar[int] = 1024 * 1024 * 1024
     WORKSPACE_USAGE_EVENT_MIN_ENTRIES_DELTA: ClassVar[int] = 1_000
     WORKSPACE_RECOVERY_ENABLED: ClassVar[bool] = False
+    WORKSPACE_RECOVERY_MAX_ATTEMPTS: ClassVar[int] = 1
     WORKSPACE_RECOVERY_GROWTH_BYTES: ClassVar[int] = 1024 * 1024 * 1024
     WORKSPACE_RECOVERY_GROWTH_ENTRIES: ClassVar[int] = 1_000
     WORKSPACE_PRESSURE_FILENAME: ClassVar[str] = "STORAGE_PRESSURE"
@@ -355,6 +372,7 @@ class CLIAgent(Agent):
     # never call finish). Plain subclasses keep the legacy 'exit' semantics;
     # ConfigurableCLIAgent sets this from its completion_signal config.
     COMPLETION_SIGNAL: ClassVar[str] = "exit"
+    MISSING_COMPLETION_STATUS: ClassVar[DoneStatus] = "error"
 
     def __init__(
         self,
@@ -368,6 +386,7 @@ class CLIAgent(Agent):
         self._workspace_recovery_mode = False
         self._workspace_recovery_max_bytes: int | None = None
         self._workspace_recovery_max_entries: int | None = None
+        self._workspace_recovery_attempts = 0
 
     # --- subclass hooks --------------------------------------------------------
 
@@ -451,6 +470,259 @@ class CLIAgent(Agent):
             / ".proofcouncil-sensitive-quarantine"
             / f"{digest}.marker"
         )
+
+    def workspace_recovery_state_path_for(self, root: Path) -> Path:
+        """Return host-side recovery state that survives workflow resumes."""
+        resolved = Path(root).resolve()
+        digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()
+        return (
+            self.ctx.root_workdir.parent
+            / _WORKSPACE_RECOVERY_STATE_DIR
+            / f"{digest}.json"
+        )
+
+    def workspace_recovery_lock_path_for(self, root: Path) -> Path:
+        """Return the stable lock file protecting one recovery state record."""
+        return self.workspace_recovery_state_path_for(root).with_suffix(".lock")
+
+    def workspace_invocation_lock_path_for(self, root: Path) -> Path:
+        """Return the lock file serializing use of one persistent workspace."""
+        return self.workspace_recovery_state_path_for(root).with_suffix(
+            ".active.lock"
+        )
+
+    @staticmethod
+    def _workspace_identity(root: Path) -> tuple[int, int]:
+        metadata = Path(root).resolve().stat()
+        return int(metadata.st_dev), int(metadata.st_ino)
+
+    @staticmethod
+    def _ensure_workspace_recovery_state_parent(path: Path) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        parent_metadata = path.parent.lstat()
+        if not stat.S_ISDIR(parent_metadata.st_mode):
+            raise RuntimeError(
+                f"workspace recovery state parent is not a directory: {path.parent}"
+            )
+
+    def _acquire_workspace_lock(self, path: Path, *, busy_message: str) -> int:
+        self._ensure_workspace_recovery_state_parent(path)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        try:
+            fd = os.open(path, flags, 0o600)
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise RuntimeError(
+                    f"workspace lock is not a private regular file: {path}"
+                )
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as e:
+                raise _WorkspaceLockBusy(
+                    f"{busy_message}: {path}"
+                ) from e
+            return fd
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            raise
+
+    def _acquire_workspace_recovery_lock(self, root: Path) -> int:
+        return self._acquire_workspace_lock(
+            self.workspace_recovery_lock_path_for(root),
+            busy_message="workspace recovery state is busy",
+        )
+
+    def _acquire_workspace_invocation_lock(self, root: Path) -> int:
+        return self._acquire_workspace_lock(
+            self.workspace_invocation_lock_path_for(root),
+            busy_message="persistent workspace is already active",
+        )
+
+    @staticmethod
+    def _release_workspace_lock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _read_workspace_recovery_attempts(self, root: Path) -> int:
+        path = self.workspace_recovery_state_path_for(root)
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            return 0
+        except OSError:
+            return max(1, self.WORKSPACE_RECOVERY_MAX_ATTEMPTS)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 4096:
+            return max(1, self.WORKSPACE_RECOVERY_MAX_ATTEMPTS)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+            try:
+                chunks: list[bytes] = []
+                remaining = 4097
+                while remaining > 0:
+                    chunk = os.read(fd, remaining)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                raw = b"".join(chunks)
+            finally:
+                os.close(fd)
+            if len(raw) > 4096:
+                return max(1, self.WORKSPACE_RECOVERY_MAX_ATTEMPTS)
+            payload = json.loads(raw.decode("utf-8"))
+            identity = self._workspace_identity(root)
+            if payload.get("workspace_identity") != [identity[0], identity[1]]:
+                return 0
+            attempts = int(payload.get("attempts", 0))
+            return max(0, attempts)
+        except (OSError, UnicodeDecodeError, ValueError, TypeError, AttributeError):
+            return max(1, self.WORKSPACE_RECOVERY_MAX_ATTEMPTS)
+
+    def _write_workspace_recovery_attempts(self, root: Path, attempts: int) -> None:
+        path = self.workspace_recovery_state_path_for(root)
+        self._ensure_workspace_recovery_state_parent(path)
+        identity = self._workspace_identity(root)
+        payload = json.dumps(
+            {
+                "attempts": max(0, int(attempts)),
+                "workspace_identity": [identity[0], identity[1]],
+                "updated_at": time.time(),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(fd, 0o600)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("could not write workspace recovery state")
+                offset += written
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(temporary, path)
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            raise
+
+    def _claim_workspace_recovery_attempt(
+        self,
+        root: Path,
+    ) -> _WorkspaceRecoveryClaim | None:
+        lock_fd = self._acquire_workspace_recovery_lock(root)
+        try:
+            # The host-side record is canonical. An agent instance can serve
+            # more than one workspace over its lifetime, so carrying the
+            # in-memory count across roots would incorrectly exhaust a fresh
+            # workspace (or one recreated at the same path).
+            attempts = self._read_workspace_recovery_attempts(root)
+            self._workspace_recovery_attempts = attempts
+            if (
+                self.WORKSPACE_RECOVERY_MAX_ATTEMPTS > 0
+                and attempts >= self.WORKSPACE_RECOVERY_MAX_ATTEMPTS
+            ):
+                claim = None
+            else:
+                claim = _WorkspaceRecoveryClaim(
+                    workspace_root=Path(root),
+                    attempts=attempts + 1,
+                    lock_fd=lock_fd,
+                )
+        except Exception:
+            self._release_workspace_lock(lock_fd)
+            raise
+        if claim is None:
+            self._release_workspace_lock(lock_fd)
+        return claim
+
+    def _commit_workspace_recovery_claim(
+        self,
+        claim: _WorkspaceRecoveryClaim,
+    ) -> None:
+        try:
+            self._write_workspace_recovery_attempts(
+                claim.workspace_root,
+                claim.attempts,
+            )
+            self._workspace_recovery_attempts = claim.attempts
+        finally:
+            self._release_workspace_lock(claim.lock_fd)
+
+    def _abort_workspace_recovery_claim(
+        self,
+        claim: _WorkspaceRecoveryClaim,
+    ) -> None:
+        self._release_workspace_lock(claim.lock_fd)
+
+    def _clear_workspace_recovery_attempts(self, root: Path) -> None:
+        path = self.workspace_recovery_state_path_for(root)
+        lock_fd = self._acquire_workspace_recovery_lock(root)
+        try:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as unlink_error:
+                try:
+                    self._write_workspace_recovery_attempts(root, 0)
+                except Exception as reset_error:
+                    raise RuntimeError(
+                        "could not clear persisted workspace recovery state"
+                    ) from reset_error
+                if self._read_workspace_recovery_attempts(root) != 0:
+                    raise RuntimeError(
+                        "persisted workspace recovery state did not reset"
+                    ) from unlink_error
+            self._workspace_recovery_attempts = 0
+        finally:
+            self._release_workspace_lock(lock_fd)
+
+    async def _clear_workspace_recovery_attempts_recorded(
+        self,
+        root: Path,
+        *,
+        phase: str,
+        call_id: str | None = None,
+    ) -> str | None:
+        try:
+            await asyncio.to_thread(self._clear_workspace_recovery_attempts, root)
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+            await self.events.emit(
+                "cli.workspace_recovery_state_clear_failed",
+                {
+                    "workspace": str(root),
+                    "phase": phase,
+                    "type": type(e).__name__,
+                    "msg": str(e),
+                },
+                call_id=call_id,
+            )
+            return detail
+        return None
 
     def _quarantine_sensitive_workspace(
         self,
@@ -566,10 +838,15 @@ class CLIAgent(Agent):
                 f"filesystem free space {free_bytes} is below required reserve "
                 f"{self.WORKSPACE_MIN_FREE_BYTES} bytes",
             )
-        if self.WORKSPACE_MIN_FREE_INODES > 0 and not isinstance(free_inodes, int):
+        if (
+            self.WORKSPACE_MIN_FREE_INODES > 0
+            and self.WORKSPACE_REQUIRE_INODE_ACCOUNTING
+            and not isinstance(free_inodes, int)
+        ):
             return (
                 "filesystem_free_inodes_unknown",
-                "filesystem free inodes could not be measured",
+                "filesystem free inodes could not be measured for the explicitly "
+                "configured reserve",
             )
         if (
             self.WORKSPACE_MIN_FREE_INODES > 0
@@ -664,7 +941,7 @@ class CLIAgent(Agent):
         except OSError:
             pass
 
-    def _start_workspace_recovery(self, usage: dict[str, Any]) -> None:
+    def _configure_workspace_recovery(self, usage: dict[str, Any]) -> None:
         used_bytes = self._workspace_used_bytes(usage)
         entries = int(usage.get("entries", usage.get("files", 0)) or 0)
         self._workspace_recovery_mode = True
@@ -676,6 +953,36 @@ class CLIAgent(Agent):
             self.WORKSPACE_HARD_LIMIT_ENTRIES,
             entries,
         ) + max(1, self.WORKSPACE_RECOVERY_GROWTH_ENTRIES)
+
+    def _cancel_workspace_recovery(self) -> None:
+        self._workspace_recovery_mode = False
+        self._workspace_recovery_max_bytes = None
+        self._workspace_recovery_max_entries = None
+
+    def _prepare_workspace_recovery_claim(
+        self,
+        usage: dict[str, Any],
+        workspace_root: Path,
+    ) -> tuple[
+        _WorkspaceRecoveryClaim | None,
+        tuple[str, str] | None,
+    ]:
+        self._configure_workspace_recovery(usage)
+        failure = self._workspace_limit_failure(
+            usage,
+            recovery_ceiling=True,
+        )
+        if failure is not None:
+            self._cancel_workspace_recovery()
+            return None, failure
+        try:
+            claim = self._claim_workspace_recovery_attempt(workspace_root)
+        except Exception:
+            self._cancel_workspace_recovery()
+            raise
+        if claim is None:
+            self._cancel_workspace_recovery()
+        return claim, None
 
     def _workspace_usage_materially_changed(
         self,
@@ -712,8 +1019,31 @@ class CLIAgent(Agent):
             usage
         )
         if recovered:
+            self._cancel_workspace_recovery()
+            state_error = await self._clear_workspace_recovery_attempts_recorded(
+                workspace_root,
+                phase="recovery_completed",
+                call_id=spawn_call_id,
+            )
+            if state_error is not None:
+                status: DoneStatus = "error" if done.status == "error" else "partial"
+                summary = (done.summary or "").strip()
+                suffix = (
+                    "storage recovery completed, but its attempt state could not "
+                    f"be reset: {state_error}"
+                )
+                self._write_workspace_pressure(
+                    workspace_root,
+                    usage,
+                    reason="workspace_recovery_state_clear_failed",
+                )
+                return done.model_copy(
+                    update={
+                        "status": status,
+                        "summary": f"{summary}; {suffix}" if summary else suffix,
+                    }
+                )
             self._clear_workspace_pressure(workspace_root)
-            self._workspace_recovery_mode = False
             await self.events.emit(
                 "cli.workspace_recovery_completed",
                 usage,
@@ -751,9 +1081,54 @@ class CLIAgent(Agent):
         if not self.CLI_CMD:
             raise RuntimeError(f"{type(self).__name__}.CLI_CMD is empty")
 
-        self._workspace_recovery_mode = False
-        self._workspace_recovery_max_bytes = None
-        self._workspace_recovery_max_entries = None
+        root = self.sandbox_root_for(inp)
+        workspace_invocation_lock_fd: int | None = None
+        if root is not None and self.WORKSPACE_RECOVERY_ENABLED:
+            try:
+                workspace_invocation_lock_fd = (
+                    self._acquire_workspace_invocation_lock(root)
+                )
+            except _WorkspaceLockBusy as e:
+                await self.events.emit(
+                    "cli.workspace_invocation_busy",
+                    {
+                        "workspace": str(root),
+                        "type": type(e).__name__,
+                        "msg": str(e),
+                    },
+                )
+                raise RuntimeError(str(e)) from e
+        try:
+            return await self._run_once(inp, root=root)
+        finally:
+            if workspace_invocation_lock_fd is not None:
+                try:
+                    self._release_workspace_lock(
+                        workspace_invocation_lock_fd
+                    )
+                except Exception as e:
+                    try:
+                        await self.events.emit(
+                            "cli.workspace_invocation_release_failed",
+                            {
+                                "workspace": str(root),
+                                "type": type(e).__name__,
+                                "msg": str(e),
+                            },
+                        )
+                    except Exception:
+                        pass
+
+    async def _run_once(
+        self,
+        inp: BaseModel,
+        *,
+        root: Path | None,
+    ) -> BaseModel:
+        if not self.CLI_CMD:
+            raise RuntimeError(f"{type(self).__name__}.CLI_CMD is empty")
+
+        self._cancel_workspace_recovery()
 
         await self._emit_budget_warnings(self.tracker.check())
         self.tracker.add_tool_call()
@@ -781,8 +1156,9 @@ class CLIAgent(Agent):
         sensitive_quarantine_external_path: Path | None = None
         sandbox: Sandbox | None = None
         storage_lease: StorageReservationLease | None = None
+        workspace_recovery_claim: _WorkspaceRecoveryClaim | None = None
+        workspace_recovery_started_payload: dict[str, Any] | None = None
         try:
-            root = self.sandbox_root_for(inp)
             if root is not None:
                 root.mkdir(parents=True, exist_ok=True)
                 sandbox = make_sandbox(self.SANDBOX, root=root)
@@ -896,34 +1272,101 @@ class CLIAgent(Agent):
                 recoverable_failure = (
                     failure is not None and failure[0] in recoverable_reasons
                 )
-                if self.WORKSPACE_RECOVERY_ENABLED and (
-                    pressure or recoverable_failure
-                ):
-                    self._start_workspace_recovery(usage)
-                    reason = failure[0] if recoverable_failure else "soft_limit"
+                if self.WORKSPACE_RECOVERY_ENABLED and recoverable_failure:
+                    reason = failure[0]
+                    hard_failure = failure
                     self._write_workspace_pressure(
                         sandbox.root,
                         usage,
                         reason=reason,
                     )
-                    await self.events.emit(
-                        "cli.workspace_recovery_started",
-                        {
+                    # Workspace byte/entry limits use the bounded recovery
+                    # ceiling. Global filesystem floors remain non-bypassable,
+                    # and must be checked before an attempt is claimed.
+                    try:
+                        (
+                            workspace_recovery_claim,
+                            failure,
+                        ) = self._prepare_workspace_recovery_claim(
+                            usage,
+                            sandbox.root,
+                        )
+                    except _WorkspaceLockBusy:
+                        failure = hard_failure
+                        await self.events.emit(
+                            "cli.workspace_recovery_busy",
+                            {
+                                **usage,
+                                "reason": reason,
+                            },
+                        )
+                    if failure is not None:
+                        self._cancel_workspace_recovery()
+                        self._write_workspace_pressure(
+                            sandbox.root,
+                            usage,
+                            reason=failure[0],
+                        )
+                    elif workspace_recovery_claim is not None:
+                        workspace_recovery_started_payload = {
                             **usage,
                             "reason": reason,
+                            "attempt": workspace_recovery_claim.attempts,
+                            "max_attempts": self.WORKSPACE_RECOVERY_MAX_ATTEMPTS,
                             "recovery_max_bytes": self._workspace_recovery_max_bytes,
                             "recovery_max_entries": self._workspace_recovery_max_entries,
+                        }
+                    else:
+                        self._cancel_workspace_recovery()
+                        failure = hard_failure
+                        await self.events.emit(
+                            "cli.workspace_recovery_exhausted",
+                            {
+                                **usage,
+                                "reason": reason,
+                                "attempts": self._workspace_recovery_attempts,
+                                "max_attempts": self.WORKSPACE_RECOVERY_MAX_ATTEMPTS,
+                            },
+                        )
+                elif pressure:
+                    self._write_workspace_pressure(
+                        sandbox.root,
+                        usage,
+                        reason="soft_limit",
+                    )
+                    await self.events.emit(
+                        "cli.workspace_limit_warning",
+                        {
+                            **usage,
+                            "phase": "pre_spawn",
+                            "soft_limit_bytes": self.WORKSPACE_SOFT_LIMIT_BYTES,
+                            "hard_limit_bytes": self.WORKSPACE_HARD_LIMIT_BYTES,
+                            "soft_limit_entries": self.WORKSPACE_SOFT_LIMIT_ENTRIES or None,
+                            "hard_limit_entries": self.WORKSPACE_HARD_LIMIT_ENTRIES or None,
                         },
                     )
-                    # Workspace byte/entry limits use the bounded recovery
-                    # ceiling. Global filesystem floors and scan errors remain
-                    # non-bypassable.
-                    failure = self._workspace_limit_failure(
-                        usage,
-                        recovery_ceiling=True,
-                    )
                 elif not pressure:
-                    self._clear_workspace_pressure(sandbox.root)
+                    if failure is None:
+                        state_error = (
+                            await self._clear_workspace_recovery_attempts_recorded(
+                                sandbox.root,
+                                phase="pre_spawn_below_pressure",
+                            )
+                        )
+                        if state_error is not None:
+                            failure = (
+                                "workspace_recovery_state_clear_failed",
+                                "persisted workspace recovery state could not be "
+                                f"reset: {state_error}",
+                            )
+                    if failure is None:
+                        self._clear_workspace_pressure(sandbox.root)
+                    elif failure[0] == "workspace_recovery_state_clear_failed":
+                        self._write_workspace_pressure(
+                            sandbox.root,
+                            usage,
+                            reason=failure[0],
+                        )
                 await self.events.emit(
                     "cli.workspace_usage",
                     {
@@ -1031,6 +1474,40 @@ class CLIAgent(Agent):
                     await self.events.emit(
                         "cli.stdin_closed",
                         {"type": type(e).__name__, "msg": str(e)},
+                        call_id=spawn_call_id,
+                    )
+                    if workspace_recovery_claim is not None:
+                        raise RuntimeError(
+                            "workspace recovery prompt could not be delivered"
+                        ) from e
+            elif workspace_recovery_claim is not None:
+                await self.events.emit(
+                    "cli.stdin_closed",
+                    {
+                        "type": "MissingStdin",
+                        "msg": "workspace recovery process has no stdin pipe",
+                    },
+                    call_id=spawn_call_id,
+                )
+                raise RuntimeError(
+                    "workspace recovery prompt could not be delivered"
+                )
+
+            # A recovery attempt is spent only after the cleanup instructions
+            # have reached the child. Startup and stdin failures remain retryable.
+            if workspace_recovery_claim is not None:
+                claim_to_commit = workspace_recovery_claim
+                try:
+                    self._commit_workspace_recovery_claim(claim_to_commit)
+                finally:
+                    # commit() releases the state-transaction lock even when its
+                    # durable write fails, so the outer finally must not close it
+                    # a second time.
+                    workspace_recovery_claim = None
+                if workspace_recovery_started_payload is not None:
+                    await self.events.emit(
+                        "cli.workspace_recovery_started",
+                        workspace_recovery_started_payload,
                         call_id=spawn_call_id,
                     )
 
@@ -1151,6 +1628,24 @@ class CLIAgent(Agent):
                 )
             return out
         finally:
+            if workspace_recovery_claim is not None:
+                try:
+                    self._abort_workspace_recovery_claim(
+                        workspace_recovery_claim
+                    )
+                except Exception as e:
+                    try:
+                        await self.events.emit(
+                            "cli.workspace_recovery_claim_release_failed",
+                            {
+                                "type": type(e).__name__,
+                                "msg": str(e),
+                            },
+                        )
+                    except Exception:
+                        pass
+                finally:
+                    workspace_recovery_claim = None
             # Terminate the streaming child unconditionally. If we're
             # being cancelled mid-``_wait_for_done`` the underlying
             # process is still alive; without this it can keep running
@@ -1530,12 +2025,21 @@ class CLIAgent(Agent):
                 rc = stream.proc.returncode
                 completion_required = self.COMPLETION_SIGNAL != "exit"
                 fallback = (
-                    "error"
+                    (
+                        self.MISSING_COMPLETION_STATUS
+                        if rc == 0
+                        else "error"
+                    )
                     if completion_required
                     else ("done" if rc == 0 else "error")
                 )
                 fallback_summary = (
-                    f"required {self.COMPLETION_SIGNAL} completion record was not written"
+                    (
+                        f"required {self.COMPLETION_SIGNAL} completion record was not "
+                        "written; salvaged artifacts from a clean CLI exit"
+                        if fallback == "partial"
+                        else f"required {self.COMPLETION_SIGNAL} completion record was not written"
+                    )
                     if completion_required
                     else None
                 )

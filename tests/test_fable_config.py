@@ -37,8 +37,8 @@ class FableModelConfigTests(unittest.TestCase):
         self._assert_common_fable_fields(cfg)
         self.assertEqual(cfg["thinking"]["display"], "omitted")
         self.assertEqual(cfg["output_config"]["effort"], "max")
-        self.assertEqual(cfg["timeout"], 7200)
-        self.assertEqual(cfg["max_wallclock_per_call_s"], 7500)
+        self.assertEqual(cfg["timeout"], 1800)
+        self.assertEqual(cfg["max_wallclock_per_call_s"], 1800)
         self.assertEqual(cfg["max_retries"], 1)
         self.assertEqual(cfg["max_retries_inner"], 1)
 
