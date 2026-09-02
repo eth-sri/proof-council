@@ -487,8 +487,12 @@ class CLIAgent(Agent):
 
     def workspace_invocation_lock_path_for(self, root: Path) -> Path:
         """Return the lock file serializing use of one persistent workspace."""
-        return self.workspace_recovery_state_path_for(root).with_suffix(
-            ".active.lock"
+        resolved = Path(root).resolve()
+        digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()
+        return (
+            resolved.parent
+            / _WORKSPACE_RECOVERY_STATE_DIR
+            / f"{digest}.active.lock"
         )
 
     @staticmethod
@@ -550,6 +554,16 @@ class CLIAgent(Agent):
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _close_workspace_invocation_lock(fd: int) -> None:
+        """Drop only this process's reference to an inherited lease.
+
+        Explicitly unlocking would also release the shared ``flock`` held by
+        a worker that survived an orchestrator crash or failed termination.
+        Closing releases the lease when no spawned process still owns it.
+        """
+        os.close(fd)
 
     def _read_workspace_recovery_attempts(self, root: Path) -> int:
         path = self.workspace_recovery_state_path_for(root)
@@ -1099,11 +1113,15 @@ class CLIAgent(Agent):
                 )
                 raise RuntimeError(str(e)) from e
         try:
-            return await self._run_once(inp, root=root)
+            return await self._run_once(
+                inp,
+                root=root,
+                workspace_invocation_lock_fd=workspace_invocation_lock_fd,
+            )
         finally:
             if workspace_invocation_lock_fd is not None:
                 try:
-                    self._release_workspace_lock(
+                    self._close_workspace_invocation_lock(
                         workspace_invocation_lock_fd
                     )
                 except Exception as e:
@@ -1124,6 +1142,7 @@ class CLIAgent(Agent):
         inp: BaseModel,
         *,
         root: Path | None,
+        workspace_invocation_lock_fd: int | None,
     ) -> BaseModel:
         if not self.CLI_CMD:
             raise RuntimeError(f"{type(self).__name__}.CLI_CMD is empty")
@@ -1161,11 +1180,27 @@ class CLIAgent(Agent):
         try:
             if root is not None:
                 root.mkdir(parents=True, exist_ok=True)
-                sandbox = make_sandbox(self.SANDBOX, root=root)
+                inherited_fds = (
+                    (workspace_invocation_lock_fd,)
+                    if workspace_invocation_lock_fd is not None
+                    else ()
+                )
+                sandbox = make_sandbox(
+                    self.SANDBOX,
+                    root=root,
+                    inherited_fds=inherited_fds,
+                )
                 persistent = True
             else:
                 sandbox = make_sandbox(self.SANDBOX, root=self.workdir / "sandbox")
                 persistent = False
+            ensure_workspace_available = getattr(
+                sandbox,
+                "ensure_workspace_available",
+                None,
+            )
+            if ensure_workspace_available is not None:
+                await ensure_workspace_available()
             if persistent:
                 runtime_dir = sandbox.root / ".pwc" / "runtime"
                 runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -1660,7 +1695,9 @@ class CLIAgent(Agent):
                 except (asyncio.CancelledError, Exception):
                     sensitive_state_trusted = False
                     sensitive_state_ever_failed = True
-            process_stopped = stream is None or bool(getattr(stream, "done", False))
+            process_stopped = stream is None or bool(
+                getattr(stream, "worker_stopped", getattr(stream, "done", False))
+            )
             if stream is not None and not process_stopped:
                 sensitive_state_trusted = False
                 sensitive_state_ever_failed = True

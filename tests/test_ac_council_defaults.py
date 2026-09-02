@@ -165,6 +165,17 @@ class ACCouncilDefaultsTests(unittest.TestCase):
             COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
         )
 
+        raised_entry_cap = ACWorkflow.Inputs(
+            problem="P",
+            problem_id="p",
+            compute_workspace_soft_limit_entries=150_000,
+            compute_workspace_hard_limit_entries=200_000,
+        )
+        self.assertEqual(
+            raised_entry_cap.compute_workspace_hard_limit_entries,
+            200_000,
+        )
+
         with self.assertRaisesRegex(ValueError, "must leave room"):
             ACWorkflow.Inputs(
                 problem="P",

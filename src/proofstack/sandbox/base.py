@@ -120,7 +120,13 @@ class Sandbox:
     execution. The interface is async to fit the rest of the stack.
     """
 
-    def __init__(self, spec: SandboxSpec, *, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        spec: SandboxSpec,
+        *,
+        root: Path | None = None,
+        inherited_fds: Iterable[int] = (),
+    ) -> None:
         self.spec = spec
         # Resolve to absolute at construction. Several env vars derived
         # from ``self.root`` (HOME, TMPDIR, CODEX_HOME, FINISH_DONE_PATH)
@@ -132,7 +138,11 @@ class Sandbox:
         raw_root = root if root is not None else Path(tempfile.mkdtemp(prefix="proofstack-sbx-"))
         self.root = Path(raw_root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.inherited_fds = tuple(int(fd) for fd in inherited_fds)
         self._closed = False
+
+    async def ensure_workspace_available(self) -> None:
+        """Fail if this backend still has an orphan using ``root``."""
 
     async def write_file(self, relpath: str, content: str | bytes) -> Path:
         path = self.root / relpath

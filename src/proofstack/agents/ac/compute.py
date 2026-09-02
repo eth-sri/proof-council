@@ -406,7 +406,6 @@ class Compute(CLIAgent):
         workspace_hard_limit_entries: int = Field(
             default=COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
             ge=1,
-            le=COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
         )
         filesystem_min_free_bytes: int = Field(
             default=COMPUTE_FILESYSTEM_MIN_FREE_BYTES,

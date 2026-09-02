@@ -448,7 +448,6 @@ class ACWorkflow(Agent):
         compute_workspace_hard_limit_entries: int = Field(
             default=DEFAULT_COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
             ge=1,
-            le=DEFAULT_COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
         )
         compute_filesystem_min_free_bytes: int = Field(
             default=DEFAULT_COMPUTE_FILESYSTEM_MIN_FREE_BYTES,

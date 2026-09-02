@@ -54,6 +54,12 @@ from proofstack.kinds.cli import (  # noqa: E402
     measure_workspace_usage,
 )
 from proofstack.sandbox.base import SandboxSpec  # noqa: E402
+from proofstack.sandbox.docker import (  # noqa: E402
+    DockerSandbox,
+    DockerSandboxError,
+    _container_name_for_root,
+    _docker_kill,
+)
 from proofstack.sandbox.subprocess import (  # noqa: E402
     SubprocessSandbox,
     _BoundedTextBuffer,
@@ -235,6 +241,22 @@ def test_compute_rejects_invalid_workspace_entry_limit_ordering() -> None:
             assert "workspace_soft_limit_entries must be less" in str(e)
         else:
             raise AssertionError("invalid workspace entry ordering was accepted")
+
+
+def test_compute_workspace_entry_cap_can_be_raised() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        inp = Compute.Inputs(
+            problem="P",
+            problem_id="p",
+            round=1,
+            instructions="compute",
+            compute_workspace=Path(temp_dir),
+            workspace_soft_limit_entries=150_000,
+            workspace_hard_limit_entries=200_000,
+        )
+
+    assert inp.workspace_soft_limit_entries == 150_000
+    assert inp.workspace_hard_limit_entries == 200_000
 
 
 def test_compute_rejects_handoff_member_limit_without_manifest_room() -> None:
@@ -1923,6 +1945,168 @@ def test_workspace_invocation_lock_blocks_before_runtime_mutation() -> None:
         assert wrap_up_path.read_text(encoding="utf-8") == "active wrap-up signal"
         assert sandbox.spawned is False
         assert contender.teardown_called is False
+
+
+def test_workspace_invocation_lock_is_shared_across_run_roots() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        root = temp / "shared" / "compute"
+        root.mkdir(parents=True)
+        first = Compute(
+            RunContext.create(
+                run_id="first",
+                root_workdir=temp / "first-run",
+                flat=True,
+            )
+        )
+        second = Compute(
+            RunContext.create(
+                run_id="second",
+                root_workdir=temp / "second-run",
+                flat=True,
+            )
+        )
+
+        assert (
+            first.workspace_invocation_lock_path_for(root)
+            == second.workspace_invocation_lock_path_for(root)
+        )
+        invocation_lock = first._acquire_workspace_invocation_lock(root)
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="persistent workspace is already active",
+            ):
+                second._acquire_workspace_invocation_lock(root)
+        finally:
+            first._release_workspace_lock(invocation_lock)
+
+
+def test_subprocess_worker_retains_invocation_lock_after_parent_close() -> None:
+    async def exercise(temp: Path) -> None:
+        root = temp / "compute"
+        root.mkdir()
+        ctx = RunContext.create(
+            run_id="owner",
+            root_workdir=temp / "owner-run",
+            flat=True,
+        )
+        owner = Compute(ctx)
+        contender = Compute(
+            RunContext.create(
+                run_id="contender",
+                root_workdir=temp / "contender-run",
+                flat=True,
+            )
+        )
+        invocation_lock = owner._acquire_workspace_invocation_lock(root)
+        sandbox = SubprocessSandbox(
+            SandboxSpec(
+                backend="subprocess",
+                provider_keys=(),
+                timeout_s=30,
+            ),
+            root=root,
+            inherited_fds=(invocation_lock,),
+        )
+        stream = await sandbox.stream_command(
+            [sys.executable, "-c", "import time; time.sleep(30)"]
+        )
+
+        # Simulate abrupt orchestrator death: its descriptor is closed without
+        # LOCK_UN, while the spawned worker still owns the shared lease.
+        owner._close_workspace_invocation_lock(invocation_lock)
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="persistent workspace is already active",
+            ):
+                contender._acquire_workspace_invocation_lock(root)
+        finally:
+            await stream.terminate()
+
+        reacquired = contender._acquire_workspace_invocation_lock(root)
+        contender._release_workspace_lock(reacquired)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_docker_workspace_identity_is_stable_and_blocks_orphans() -> None:
+    async def exercise(temp: Path) -> None:
+        root = temp / "compute"
+        root.mkdir()
+        alias = temp / "compute-alias"
+        alias.symlink_to(root, target_is_directory=True)
+        assert _container_name_for_root(alias) == _container_name_for_root(root)
+
+        sandbox = DockerSandbox(
+            SandboxSpec(backend="docker"),
+            root=root,
+        )
+        docker_cmd = sandbox._build_docker_cmd(
+            ["probe"],
+            env_extra=None,
+            extra_path=[],
+            cwd=None,
+            interactive=False,
+            container_name=sandbox.container_name,
+        )
+        label_index = docker_cmd.index("--label")
+        assert docker_cmd[label_index + 1].endswith(sandbox.container_owner)
+        with mock.patch(
+            "proofstack.sandbox.docker._docker_container_status",
+            new=mock.AsyncMock(return_value="running"),
+        ):
+            with pytest.raises(
+                DockerSandboxError,
+                match="refusing to overlap a resumed invocation",
+            ):
+                await sandbox.ensure_workspace_available()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_docker_cleanup_only_removes_the_owned_container() -> None:
+    async def exercise() -> None:
+        docker_control = mock.AsyncMock(return_value=(0, "", ""))
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=mock.AsyncMock(
+                    return_value=("running", "foreign-owner", "foreign-id")
+                ),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_control",
+                new=docker_control,
+            ),
+        ):
+            assert not await _docker_kill("workspace", owner="our-owner")
+        docker_control.assert_not_awaited()
+
+        docker_control = mock.AsyncMock(return_value=(0, "", ""))
+        identity = mock.AsyncMock(
+            side_effect=[("running", "our-owner", "our-id"), None]
+        )
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=identity,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_control",
+                new=docker_control,
+            ),
+        ):
+            assert await _docker_kill("workspace", owner="our-owner")
+        assert docker_control.await_args_list == [
+            mock.call("kill", "our-id"),
+            mock.call("rm", "--force", "our-id"),
+        ]
+
+    asyncio.run(exercise())
 
 
 def test_soft_pressure_does_not_reset_recovery_attempt_cap() -> None:

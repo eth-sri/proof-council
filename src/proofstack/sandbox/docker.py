@@ -20,34 +20,139 @@ image from ``deploy/sandbox/Dockerfile``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 import uuid
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from proofstack.sandbox.base import CommandResult, Sandbox
+from proofstack.sandbox.base import CommandResult, Sandbox, SandboxSpec
 from proofstack.sandbox.subprocess import _StreamingProcess
 
 
-async def _docker_kill(container_name: str) -> None:
-    """Best-effort ``docker kill <name>``.
+class DockerSandboxError(RuntimeError):
+    """Raised when docker is missing / image is not built / etc."""
+
+
+_DOCKER_CONTROL_TIMEOUT_S = 5.0
+_DOCKER_OWNER_LABEL = "proofstack.workspace-owner"
+
+
+async def _docker_control(*args: str) -> tuple[int, str, str]:
+    """Run a bounded Docker control command and retain its diagnostics."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as e:
+        raise DockerSandboxError("docker binary not found") from e
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=_DOCKER_CONTROL_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as e:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=1.0)
+        except (asyncio.TimeoutError, ProcessLookupError, ValueError):
+            pass
+        raise DockerSandboxError(
+            f"docker {' '.join(args)} timed out"
+        ) from e
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        stdout_b.decode("utf-8", errors="replace"),
+        stderr_b.decode("utf-8", errors="replace"),
+    )
+
+
+async def _docker_container_identity(
+    container_name: str,
+) -> tuple[str, str | None, str] | None:
+    """Return an exact container's status/owner/id, or ``None`` if absent."""
+    returncode, stdout, stderr = await _docker_control(
+        "container",
+        "inspect",
+        "--format",
+        (
+            "{{.Id}}\t{{.State.Status}}\t"
+            f'{{{{index .Config.Labels "{_DOCKER_OWNER_LABEL}"}}}}'
+        ),
+        container_name,
+    )
+    if returncode == 0:
+        fields = stdout.rstrip("\r\n").split("\t", maxsplit=2)
+        if len(fields) != 3 or not fields[0].strip():
+            raise DockerSandboxError(
+                f"Docker returned malformed identity for {container_name!r}"
+            )
+        container_id, status, owner = fields
+        normalized_owner = owner.strip()
+        if normalized_owner in {"", "<no value>"}:
+            normalized_owner = None
+        return (
+            status.strip() or "unknown",
+            normalized_owner,
+            container_id.strip(),
+        )
+    detail = stderr.strip()
+    lowered = detail.lower()
+    if "no such object" in lowered or "no such container" in lowered:
+        return None
+    failure_detail = detail or f"exit {returncode}"
+    raise DockerSandboxError(
+        f"could not inspect Docker container {container_name!r}: "
+        f"{failure_detail}"
+    )
+
+
+async def _docker_container_status(container_name: str) -> str | None:
+    identity = await _docker_container_identity(container_name)
+    return identity[0] if identity is not None else None
+
+
+async def _docker_kill(container_name: str, *, owner: str) -> bool:
+    """Stop and remove a container, returning whether absence was verified.
 
     Killing the ``docker run`` CLI client does NOT propagate to the
     container — dockerd sees a detached client but PID 1 in the
     container keeps running until it exits on its own, holding on to
-    the per-container resource caps. On timeout we issue an explicit
-    ``docker kill`` against the named container so nothing orphans.
+    the per-container resource caps. Termination therefore addresses
+    the named container and verifies that it no longer exists before
+    the workspace is treated as idle.
     """
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "kill", container_name,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except (FileNotFoundError, asyncio.TimeoutError, Exception):
-        pass
+        identity = await _docker_container_identity(container_name)
+    except DockerSandboxError:
+        return False
+    if identity is None:
+        return True
+    if identity[1] != owner:
+        return False
+    container_id = identity[2]
+
+    for command in (
+        ("kill", container_id),
+        ("rm", "--force", container_id),
+    ):
+        try:
+            await _docker_control(*command)
+        except DockerSandboxError:
+            # The final inspect below is authoritative. A command can fail
+            # simply because --rm already removed the container.
+            continue
+    try:
+        return await _docker_container_identity(container_name) is None
+    except DockerSandboxError:
+        return False
 
 
 CONTAINER_WORKDIR = "/work"
@@ -60,10 +165,6 @@ CONTAINER_TMPFS = "/tmp"
 CONTAINER_BASE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 
-class DockerSandboxError(RuntimeError):
-    """Raised when docker is missing / image is not built / etc."""
-
-
 class DockerSandbox(Sandbox):
     """Run each command in a fresh ``docker run --rm`` container.
 
@@ -74,6 +175,29 @@ class DockerSandbox(Sandbox):
     ``/work``; the orchestrator on the host polls
     ``<self.root>/done.json`` via the same bind mount.
     """
+
+    def __init__(
+        self,
+        spec: SandboxSpec,
+        *,
+        root: Path | None = None,
+        inherited_fds: Iterable[int] = (),
+    ) -> None:
+        super().__init__(spec, root=root, inherited_fds=inherited_fds)
+        self.container_owner = uuid.uuid4().hex
+
+    @property
+    def container_name(self) -> str:
+        return _container_name_for_root(self.root)
+
+    async def ensure_workspace_available(self) -> None:
+        status = await _docker_container_status(self.container_name)
+        if status is not None:
+            raise DockerSandboxError(
+                "persistent workspace still has a Docker sandbox "
+                f"({self.container_name}, status={status}); refusing to overlap "
+                "a resumed invocation"
+            )
 
     async def run_command(
         self,
@@ -88,7 +212,7 @@ class DockerSandbox(Sandbox):
         input_bytes = (
             input_data.encode("utf-8") if isinstance(input_data, str) else input_data
         )
-        container_name = _new_container_name()
+        container_name = self.container_name
         docker_cmd = self._build_docker_cmd(
             cmd,
             env_extra=env_extra,
@@ -105,6 +229,7 @@ class DockerSandbox(Sandbox):
                 stdin=(asyncio.subprocess.PIPE if input_bytes is not None else None),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                pass_fds=self.inherited_fds,
             )
         except FileNotFoundError as e:
             raise DockerSandboxError(
@@ -117,16 +242,36 @@ class DockerSandbox(Sandbox):
                 proc.communicate(input=input_bytes), timeout=timeout
             )
             returncode = proc.returncode if proc.returncode is not None else -1
+            if returncode != 0:
+                container_stopped = await _docker_kill(
+                    container_name,
+                    owner=self.container_owner,
+                )
+                if not container_stopped:
+                    suffix = (
+                        "Docker container could not be confirmed stopped or "
+                        "belongs to another invocation"
+                    ).encode("utf-8")
+                    stderr_b = stderr_b.rstrip()
+                    stderr_b += (b"\n" if stderr_b else b"") + suffix
         except asyncio.TimeoutError:
-            await _docker_kill(container_name)
             try:
                 proc.kill()
                 await proc.communicate()
             except ProcessLookupError:
                 pass
+            # Stop the client first so it cannot create the named container
+            # after an early "not found" result from the control commands.
+            container_stopped = await _docker_kill(
+                container_name,
+                owner=self.container_owner,
+            )
             returncode = -9
             stdout_b = b""
-            stderr_b = f"timeout after {timeout}s".encode("utf-8")
+            detail = f"timeout after {timeout}s"
+            if not container_stopped:
+                detail += "; Docker container could not be confirmed stopped"
+            stderr_b = detail.encode("utf-8")
         elapsed = time.monotonic() - start
         return CommandResult(
             cmd=cmd,
@@ -145,7 +290,7 @@ class DockerSandbox(Sandbox):
         env_extra: Mapping[str, str] | None = None,
         extra_path: Iterable[Path] = (),
     ) -> "_StreamingProcess":
-        container_name = _new_container_name()
+        container_name = self.container_name
         docker_cmd = self._build_docker_cmd(
             cmd,
             env_extra=env_extra,
@@ -160,6 +305,7 @@ class DockerSandbox(Sandbox):
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                pass_fds=self.inherited_fds,
             )
         except FileNotFoundError as e:
             raise DockerSandboxError(
@@ -175,6 +321,7 @@ class DockerSandbox(Sandbox):
             cmd=docker_cmd,
             deadline=deadline,
             container_name=container_name,
+            container_owner=self.container_owner,
         )
 
     # --- helpers ----------------------------------------------------------
@@ -189,7 +336,15 @@ class DockerSandbox(Sandbox):
         interactive: bool,
         container_name: str,
     ) -> list[str]:
-        args: list[str] = ["docker", "run", "--rm", "--name", container_name]
+        args: list[str] = [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--label",
+            f"{_DOCKER_OWNER_LABEL}={self.container_owner}",
+        ]
         if interactive:
             args += ["-i"]
         args += [
@@ -268,27 +423,47 @@ class DockerSandbox(Sandbox):
         return value
 
 
-def _new_container_name() -> str:
-    """Per-invocation container name; used with ``docker kill`` on timeout."""
-    return f"proofstack-sbx-{uuid.uuid4().hex[:12]}"
+def _container_name_for_root(root: Path) -> str:
+    """Return the stable Docker identity protecting one workspace path."""
+    resolved = Path(root).resolve()
+    digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:24]
+    return f"proofstack-sbx-{digest}"
 
 
 class _DockerStreamingProcess(_StreamingProcess):
     """Streaming handle that also knows how to signal its container.
 
-    ``_StreamingProcess.terminate`` only kills the docker CLI client,
-    which leaves the container running. We override to ``docker kill``
-    the named container first so nothing orphans.
+    ``_StreamingProcess.terminate`` only kills the Docker CLI client,
+    which can leave the container running. We then remove the exact
+    owner-labelled container and verify that the workspace is idle.
     """
 
-    def __init__(self, *, container_name: str, **kw) -> None:
+    def __init__(
+        self,
+        *,
+        container_name: str,
+        container_owner: str,
+        **kw,
+    ) -> None:
         super().__init__(**kw)
         self.container_name = container_name
+        self.container_owner = container_owner
+        self._container_stopped = False
+
+    @property
+    def worker_stopped(self) -> bool:
+        return self._container_stopped
 
     async def terminate(self) -> None:
-        if self.proc.returncode is None:
-            await _docker_kill(self.container_name)
-        await super().terminate()
+        try:
+            # Stop the client first so no new container can appear after the
+            # final inspect performed by _docker_kill.
+            await super().terminate()
+        finally:
+            self._container_stopped = await _docker_kill(
+                self.container_name,
+                owner=self.container_owner,
+            )
 
 
 def check_image_available(image: str = "proofstack-sandbox:latest") -> bool:

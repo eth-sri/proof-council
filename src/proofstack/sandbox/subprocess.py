@@ -145,6 +145,7 @@ class SubprocessSandbox(Sandbox):
                 stderr=asyncio.subprocess.PIPE,
                 preexec_fn=_make_preexec(self.spec.memory_gb, self.spec.cpu_limit, int(timeout)),
                 start_new_session=True,
+                pass_fds=self.inherited_fds,
             )
         except FileNotFoundError as e:
             return CommandResult(cmd=cmd, returncode=127, stdout="", stderr=str(e), duration_s=0.0)
@@ -206,6 +207,7 @@ class SubprocessSandbox(Sandbox):
             stderr=asyncio.subprocess.PIPE,
             preexec_fn=_make_preexec(self.spec.memory_gb, self.spec.cpu_limit, int(timeout)),
             start_new_session=True,
+            pass_fds=self.inherited_fds,
         )
         deadline = time.monotonic() + timeout
         return _StreamingProcess(proc=proc, cmd=cmd, deadline=deadline)
@@ -442,6 +444,11 @@ class _StreamingProcess:
     @property
     def done(self) -> bool:
         return self.proc.returncode is not None
+
+    @property
+    def worker_stopped(self) -> bool:
+        """Whether the process tree protected by the lease has stopped."""
+        return self.done
 
     async def wait(self, timeout_s: float | None = None) -> int:
         try:
