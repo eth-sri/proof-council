@@ -501,6 +501,7 @@ class Compute(CLIAgent):
         status: str = ""
         summary: str = ""
         workspace: Path | None = None
+        workspace_recovery_notice: str | None = None
         error: str | None = None
         handoff_stats: dict[str, Any] = Field(default_factory=dict)
 
@@ -524,6 +525,15 @@ class Compute(CLIAgent):
         ws = Path(inp.compute_workspace)  # type: ignore[attr-defined]
         ws.mkdir(parents=True, exist_ok=True)
         return ws
+
+    def attach_workspace_recovery_notice(
+        self,
+        out: BaseModel,
+        notice: str,
+    ) -> BaseModel:
+        if not isinstance(out, self.Outputs):
+            return out
+        return out.model_copy(update={"workspace_recovery_notice": notice})
 
     def _sanitize_workspace_usage(
         self,
@@ -1923,6 +1933,12 @@ def render_compute_reply_for_author(compute_out: Compute.Outputs) -> str:
     status_line = f"status: {compute_out.status or '(unknown)'}"
     if compute_out.error:
         status_line += f" — error: {compute_out.error}"
+    recovery_line = ""
+    if compute_out.workspace_recovery_notice:
+        recovery_line = (
+            "workspace recovery: "
+            f"{compute_out.workspace_recovery_notice.strip()}\n"
+        )
     zip_path = Path(compute_out.zip_path) if compute_out.zip_path is not None else None
     if zip_path is None:
         zip_line = "workspace zip: (none)"
@@ -1939,6 +1955,7 @@ def render_compute_reply_for_author(compute_out: Compute.Outputs) -> str:
     return (
         f"### Compute worker reply ###\n"
         f"{status_line}\n"
+        f"{recovery_line}"
         f"{zip_line}\n\n"
         f"{body}"
     )

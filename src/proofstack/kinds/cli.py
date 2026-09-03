@@ -59,6 +59,7 @@ _SHELL_START_BLOCK_BEGIN = "# proofstack finish shim begin"
 _SHELL_START_BLOCK_END = "# proofstack finish shim end"
 _SENSITIVE_STATE_QUARANTINE = "SENSITIVE_STATE_UNTRUSTED"
 _WORKSPACE_RECOVERY_STATE_DIR = ".proofcouncil-workspace-recovery"
+_WORKSPACE_QUARANTINE_DIR = ".proofcouncil-untrusted-workspaces"
 _WORKSPACE_ACTIVE_GUARD_VERSION = 2
 _WORKSPACE_ACTIVE_GUARD_MAX_BYTES = 4096
 _WORKSPACE_GUARD_IDLE = "idle"
@@ -81,6 +82,13 @@ class _WorkspaceRecoveryClaim:
     lock_fd: int
 
 
+@dataclass(frozen=True)
+class _GuardedWorkspaceRecovery:
+    action: Literal["cleared", "quarantined"]
+    backend: str
+    quarantine_path: Path | None = None
+
+
 class _WorkspaceLockBusy(RuntimeError):
     """Another process currently holds a lock for this workspace."""
 
@@ -94,8 +102,9 @@ class _WorkerStopUnconfirmed(RuntimeError):
         super().__init__(
             "CLI worker could not be confirmed stopped "
             f"(state={state.value}, phase={phase}); response and handoff "
-            "artifacts were suppressed and workspace availability will be "
-            "rechecked before the next invocation"
+            "artifacts were suppressed. Workspace availability will be "
+            "rechecked before the next invocation, and uncertain prior data "
+            "will be preserved in quarantine rather than deleted"
         )
 
 
@@ -363,12 +372,12 @@ def _validate_workspace_active_guard(path: Path, root: Path) -> dict[str, Any]:
     ):
         raise RuntimeError(
             "workspace active guard does not match the current workspace; "
-            f"refusing automatic deletion: {path}"
+            f"refusing automatic recovery: {path}"
         )
     if version == 1:
         # Version 1 did not record whether a Docker create request had settled.
         # Treat it as pending so an upgrade cannot turn heuristic absence into
-        # permission to delete or reuse a live workspace.
+        # permission to quarantine or reuse a live workspace.
         payload = {
             **payload,
             "backend": "unknown",
@@ -418,30 +427,85 @@ def _update_workspace_active_guard(
         raise
 
 
-def _discard_workspace_contents(root: Path) -> None:
-    """Remove one confirmed-idle workspace without following child symlinks."""
+def _quarantine_workspace(root: Path) -> Path:
+    """Atomically preserve an uncertain workspace and recreate its root.
+
+    The quarantine lives under a private sibling directory, so Docker workers
+    mounting only ``root`` cannot inspect it. The subprocess backend remains a
+    trusted-host backend and does not provide a filesystem security boundary.
+    """
     resolved = Path(root).resolve()
     metadata = resolved.lstat()
     if not stat.S_ISDIR(metadata.st_mode) or resolved == resolved.parent:
-        raise RuntimeError(f"refusing to discard unsafe workspace path: {resolved}")
-    with os.scandir(resolved) as entries:
-        children = list(entries)
-    for entry in children:
-        target = Path(entry.path)
+        raise RuntimeError(f"refusing to quarantine unsafe workspace path: {resolved}")
+
+    quarantine_parent = resolved.parent / _WORKSPACE_QUARANTINE_DIR
+    quarantine_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_metadata = quarantine_parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or getattr(parent_metadata, "st_uid", os.getuid()) != os.getuid()
+    ):
+        raise RuntimeError(
+            "workspace quarantine parent is not a private owned directory: "
+            f"{quarantine_parent}"
+        )
+    try:
+        quarantine_parent.chmod(0o700)
+    except OSError as e:
+        raise RuntimeError(
+            f"cannot secure workspace quarantine parent: {quarantine_parent}"
+        ) from e
+
+    digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()[:16]
+    quarantine_container = Path(
+        tempfile.mkdtemp(prefix=f"{digest}-", dir=quarantine_parent)
+    )
+    quarantined = quarantine_container / "workspace"
+    try:
+        os.rename(resolved, quarantined)
+    except OSError as e:
         try:
-            is_directory = entry.is_dir(follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if is_directory:
-            shutil.rmtree(target)
-        else:
-            try:
-                target.unlink()
-            except FileNotFoundError:
-                pass
-    with os.scandir(resolved) as entries:
-        if next(iter(entries), None) is not None:
-            raise RuntimeError(f"workspace discard was incomplete: {resolved}")
+            quarantine_container.rmdir()
+        except OSError:
+            pass
+        raise RuntimeError(f"could not quarantine workspace: {resolved}") from e
+
+    try:
+        resolved.mkdir(mode=stat.S_IMODE(metadata.st_mode))
+    except OSError as create_error:
+        try:
+            os.rename(quarantined, resolved)
+        except OSError as rollback_error:
+            raise RuntimeError(
+                "workspace was preserved in quarantine but its active path could "
+                f"not be recreated or restored: {quarantined}"
+            ) from rollback_error
+        try:
+            quarantine_container.rmdir()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"could not recreate quarantined workspace root: {resolved}"
+        ) from create_error
+    return quarantined
+
+
+def _restore_quarantined_workspace(root: Path, quarantined: Path) -> None:
+    """Roll back a quarantine transaction before its guard is cleared."""
+    resolved = Path(root).resolve()
+    try:
+        resolved.rmdir()
+        os.rename(quarantined, resolved)
+    except OSError as e:
+        raise RuntimeError(
+            "workspace quarantine could not be committed or rolled back; "
+            f"preserved data remains at {quarantined}"
+        ) from e
+    try:
+        quarantined.parent.rmdir()
+    except OSError:
+        pass
 
 
 def _clear_workspace_active_guard(path: Path) -> None:
@@ -706,6 +770,14 @@ class CLIAgent(Agent):
         """Harvest outputs from the sandbox after CLI exit."""
         raise NotImplementedError
 
+    def attach_workspace_recovery_notice(
+        self,
+        out: BaseModel,
+        notice: str,
+    ) -> BaseModel:
+        """Let persistent agents expose a workspace replacement to consumers."""
+        return out
+
     async def teardown(self, sandbox: Sandbox, inp: BaseModel) -> None:
         """Scrub per-invocation secrets from the sandbox workdir.
 
@@ -809,9 +881,14 @@ class CLIAgent(Agent):
             / f"{digest}.active.json"
         )
 
-    async def _recover_guarded_workspace(self, root: Path, guard: Path) -> None:
-        """Recover only guards whose persisted launch lifecycle is settled."""
-        def recover() -> tuple[str, str]:
+    async def _recover_guarded_workspace(
+        self,
+        root: Path,
+        guard: Path,
+    ) -> _GuardedWorkspaceRecovery:
+        """Preserve a guarded workspace before starting a clean invocation."""
+
+        def recover() -> _GuardedWorkspaceRecovery:
             payload = _validate_workspace_active_guard(guard, root)
             phase = str(payload["phase"])
             backend = str(payload["backend"])
@@ -823,24 +900,43 @@ class CLIAgent(Agent):
                 )
             if phase == _WORKSPACE_GUARD_IDLE:
                 _clear_workspace_active_guard(guard)
-                return "cleared", backend
-            _discard_workspace_contents(root)
-            self._clear_workspace_recovery_attempts(root)
-            _clear_workspace_active_guard(guard)
-            return "discarded", backend
+                return _GuardedWorkspaceRecovery(
+                    action="cleared",
+                    backend=backend,
+                )
+            if backend != "docker":
+                raise RuntimeError(
+                    "persistent workspace has a stale active guard, but the "
+                    f"{backend!r} backend cannot prove that every detached worker "
+                    "is gone. The workspace was preserved in place; an operator "
+                    f"must confirm it is idle before removing the guard: {guard}"
+                )
+            quarantined = _quarantine_workspace(root)
+            try:
+                self._clear_workspace_recovery_attempts(root)
+                _clear_workspace_active_guard(guard)
+            except BaseException:
+                _restore_quarantined_workspace(root, quarantined)
+                raise
+            return _GuardedWorkspaceRecovery(
+                action="quarantined",
+                backend=backend,
+                quarantine_path=quarantined,
+            )
 
-        # ``to_thread`` keeps a potentially large deletion off the event loop,
-        # but cancelling its await does not stop the underlying thread. Drain it
-        # before releasing the invocation lock so a resumed worker cannot race
-        # an in-progress discard.
-        action, backend = await _run_in_thread_uninterruptibly(recover)
-        if action == "discarded":
+        # Cancelling ``to_thread`` does not stop its filesystem operation. Drain
+        # the atomic move/recreate transaction before releasing the invocation
+        # lock so a resumed worker cannot race workspace replacement.
+        recovery = await _run_in_thread_uninterruptibly(recover)
+        if recovery.action == "quarantined":
             await self.events.emit(
-                "cli.workspace_discarded_after_unconfirmed_stop",
+                "cli.workspace_quarantined_after_unconfirmed_stop",
                 {
                     "workspace": str(Path(root).resolve()),
+                    "quarantine_path": str(recovery.quarantine_path),
                     "reason": "stale_active_guard",
-                    "backend": backend,
+                    "backend": recovery.backend,
+                    "fresh_workspace_created": True,
                 },
             )
         else:
@@ -849,9 +945,11 @@ class CLIAgent(Agent):
                 {
                     "workspace": str(Path(root).resolve()),
                     "reason": "stale_idle_guard",
-                    "backend": backend,
+                    "backend": recovery.backend,
                 },
             )
+        return recovery
+
     @staticmethod
     def _workspace_identity(root: Path) -> tuple[int, int]:
         metadata = Path(root).resolve().stat()
@@ -1546,6 +1644,7 @@ class CLIAgent(Agent):
         storage_lease: StorageReservationLease | None = None
         workspace_recovery_claim: _WorkspaceRecoveryClaim | None = None
         workspace_recovery_started_payload: dict[str, Any] | None = None
+        workspace_recovery_notice: str | None = None
 
         def repair_storage_retention_guard() -> None:
             if workspace_active_guard is None or sandbox is None:
@@ -1615,10 +1714,18 @@ class CLIAgent(Agent):
                         sandbox.root
                     )
                     if _path_exists_without_following(workspace_active_guard):
-                        await self._recover_guarded_workspace(
+                        guarded_recovery = await self._recover_guarded_workspace(
                             sandbox.root,
                             workspace_active_guard,
                         )
+                        if guarded_recovery.action == "quarantined":
+                            workspace_recovery_notice = (
+                                "A previous persistent workspace was preserved in "
+                                "host-side quarantine after its worker stop or "
+                                "teardown could not be confirmed. This invocation "
+                                "started with a fresh workspace; prior files were "
+                                "not available to the Compute worker."
+                            )
                 runtime_dir.mkdir(parents=True, exist_ok=True)
                 bin_dir = runtime_dir / ".bin"
                 bin_dir.mkdir(parents=True, exist_ok=True)
@@ -1950,8 +2057,8 @@ class CLIAgent(Agent):
                 )
             except SandboxSpawnError:
                 # The backend guarantees that no worker was created. Treat the
-                # workspace as idle so a missing executable cannot manufacture
-                # a stale guard and erase useful state on the next invocation.
+                # workspace as idle so a missing executable cannot manufacture a
+                # stale guard and quarantine useful state on the next invocation.
                 stream_spawn_attempted = False
                 raise
             worker_stop_phase = "finalize"
@@ -2049,7 +2156,7 @@ class CLIAgent(Agent):
                             "phase": e.phase,
                             "response_suppressed": True,
                             "handoff_suppressed": True,
-                            "workspace_discard_on_resume": (
+                            "workspace_quarantine_on_resume": (
                                 workspace_guard_armed
                                 and workspace_guard_phase
                                 == _WORKSPACE_GUARD_LAUNCH_SETTLED
@@ -2145,6 +2252,11 @@ class CLIAgent(Agent):
                     "handoff artifacts were suppressed"
                 )
             out = await self.collect(sandbox, inp, done)
+            if workspace_recovery_notice is not None:
+                out = self.attach_workspace_recovery_notice(
+                    out,
+                    workspace_recovery_notice,
+                )
             try:
                 await self._emit_budget_warnings(self.tracker.check())
             except BudgetExhausted as e:
@@ -2234,7 +2346,7 @@ class CLIAgent(Agent):
                                     "phase": worker_stop_phase,
                                     "response_suppressed": True,
                                     "handoff_suppressed": True,
-                                    "workspace_discard_on_resume": (
+                                    "workspace_quarantine_on_resume": (
                                         workspace_guard_armed
                                         and workspace_guard_phase
                                         == _WORKSPACE_GUARD_LAUNCH_SETTLED
@@ -2407,7 +2519,8 @@ class CLIAgent(Agent):
                     pass
             # Keep the sandbox dir on disk so the workdir captures artifacts.
             # Scrub per-invocation state only after the worker is confirmed
-            # stopped; otherwise its active guard forces a clean reset on resume.
+            # stopped; otherwise its active guard preserves the old workspace in
+            # quarantine before a fresh invocation can begin.
             teardown_succeeded = False
             try:
                 if sandbox is not None:

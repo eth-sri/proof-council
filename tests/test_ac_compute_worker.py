@@ -46,14 +46,15 @@ from proofstack.agents.ac.compute import (  # noqa: E402
     DEFAULT_REASONING_EFFORT,
     DEFAULT_SOFT_TIMEOUT_S,
     inspect_compute_handoff,
+    render_compute_reply_for_author,
 )
 from proofstack.context import RunContext  # noqa: E402
 from proofstack.cli_usage import parse_claude_json, parse_codex_jsonl  # noqa: E402
 from proofstack.kinds.cli import (  # noqa: E402
     CLIAgent,
     CLIDoneRecord,
-    _discard_workspace_contents,
     _mark_sensitive_workspace_untrusted,
+    _quarantine_workspace,
     _write_workspace_active_guard,
     _write_sensitive_quarantine_marker,
     measure_workspace_usage,
@@ -3236,7 +3237,7 @@ def test_unconfirmed_worker_stop_suppresses_collection_without_quarantine() -> N
                 "phase": "process_exit",
                 "response_suppressed": True,
                 "handoff_suppressed": True,
-                "workspace_discard_on_resume": True,
+                "workspace_quarantine_on_resume": True,
                 "workspace_quarantined": False,
             }
         ]
@@ -3365,14 +3366,18 @@ def test_unconfirmed_stop_quarantines_persistent_workspace_without_guard() -> No
         assert any(
             kind == "cli.worker_stop_unconfirmed"
             and payload["workspace_quarantined"] is True
-            and payload["workspace_discard_on_resume"] is False
+            and payload["workspace_quarantine_on_resume"] is False
             for kind, payload in events
         )
 
 
-def test_unconfirmed_worker_guard_discards_workspace_before_resume() -> None:
+def test_unconfirmed_worker_guard_preserves_workspace_before_resume() -> None:
     class ProbeInput(BaseModel):
         workspace: Path
+
+    class ProbeOutput(BaseModel):
+        workspace: Path
+        workspace_recovery_notice: str | None = None
 
     class ProbeAgent(CLIAgent):
         CLI_CMD = ["probe"]
@@ -3387,7 +3392,10 @@ def test_unconfirmed_worker_guard_discards_workspace_before_resume() -> None:
             (sandbox.root / "fresh.txt").write_text("fresh", encoding="utf-8")
 
         async def collect(self, sandbox, inp, done):
-            return inp
+            return ProbeOutput(workspace=inp.workspace)
+
+        def attach_workspace_recovery_notice(self, out, notice):
+            return out.model_copy(update={"workspace_recovery_notice": notice})
 
     class StoppedStream:
         done = True
@@ -3422,7 +3430,7 @@ def test_unconfirmed_worker_guard_discards_workspace_before_resume() -> None:
         ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
         agent = ProbeAgent(ctx)
         guard = agent.workspace_active_guard_path_for(workspace)
-        _write_workspace_active_guard(guard, workspace)
+        _write_workspace_active_guard(guard, workspace, backend="docker")
         events: list[tuple[str, dict]] = []
 
         async def emit(kind, payload, **kwargs):
@@ -3434,13 +3442,142 @@ def test_unconfirmed_worker_guard_discards_workspace_before_resume() -> None:
             out = asyncio.run(agent.run(ProbeInput(workspace=workspace)))
 
         assert out.workspace == workspace
+        assert out.workspace_recovery_notice is not None
+        assert "preserved in host-side quarantine" in out.workspace_recovery_notice
+        assert "started with a fresh workspace" in out.workspace_recovery_notice
         assert not (workspace / "unknown-secret.txt").exists()
         assert (workspace / "fresh.txt").read_text(encoding="utf-8") == "fresh"
         assert not guard.exists()
-        assert any(
-            kind == "cli.workspace_discarded_after_unconfirmed_stop"
-            for kind, _ in events
+        quarantine_events = [
+            payload
+            for kind, payload in events
+            if kind == "cli.workspace_quarantined_after_unconfirmed_stop"
+        ]
+        assert len(quarantine_events) == 1
+        quarantine_path = Path(quarantine_events[0]["quarantine_path"])
+        assert quarantine_events[0]["fresh_workspace_created"] is True
+        assert (quarantine_path / "unknown-secret.txt").read_text(
+            encoding="utf-8"
+        ) == "rotated credential"
+
+
+def test_compute_workspace_recovery_notice_is_rendered_for_author() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        ctx = RunContext.create(
+            run_id="test",
+            root_workdir=Path(temp_dir) / "run",
+            flat=True,
         )
+        agent = Compute(ctx)
+        notice = (
+            "A previous persistent workspace was preserved in host-side "
+            "quarantine; this invocation started with a fresh workspace."
+        )
+
+        out = agent.attach_workspace_recovery_notice(
+            Compute.Outputs(status="done", response_md="new result"),
+            notice,
+        )
+
+        assert isinstance(out, Compute.Outputs)
+        assert out.workspace_recovery_notice == notice
+        rendered = render_compute_reply_for_author(out)
+        assert f"workspace recovery: {notice}" in rendered
+        assert "new result" in rendered
+
+
+def test_teardown_failure_preserves_workspace_and_notifies_next_round() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeOutput(BaseModel):
+        workspace: Path
+        workspace_recovery_notice: str | None = None
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.setup_calls = 0
+            self.teardown_calls = 0
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def setup(self, sandbox, inp):
+            self.setup_calls += 1
+            if self.setup_calls == 2:
+                assert not (sandbox.root / "paper.pdf").exists()
+                (sandbox.root / "fresh.txt").write_text("fresh", encoding="utf-8")
+
+        async def collect(self, sandbox, inp, done):
+            return ProbeOutput(workspace=inp.workspace)
+
+        def attach_workspace_recovery_notice(self, out, notice):
+            return out.model_copy(update={"workspace_recovery_notice": notice})
+
+        async def teardown(self, sandbox, inp):
+            self.teardown_calls += 1
+            if self.teardown_calls == 1:
+                raise RuntimeError("transient teardown failure")
+
+    class StoppedStream:
+        done = True
+        worker_stop_state = WorkerStopState.STOPPED
+        worker_stopped = True
+        remaining_s = 10.0
+        proc = SimpleNamespace(stdin=None, returncode=0)
+        stdout = ""
+        stderr = ""
+        metering_stdout = ""
+        stdout_chars = 0
+        stderr_chars = 0
+
+        async def terminate(self):
+            return None
+
+    class StoppedSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            return StoppedStream()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        (workspace / "paper.pdf").write_bytes(b"research")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = StoppedSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            first = asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+            assert first.workspace_recovery_notice is None
+            assert (workspace / "paper.pdf").read_bytes() == b"research"
+            assert agent.workspace_active_guard_path_for(workspace).exists()
+
+            second = asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert second.workspace_recovery_notice is not None
+        assert (workspace / "fresh.txt").read_text(encoding="utf-8") == "fresh"
+        quarantine_event = next(
+            payload
+            for kind, payload in events
+            if kind == "cli.workspace_quarantined_after_unconfirmed_stop"
+        )
+        quarantined = Path(quarantine_event["quarantine_path"])
+        assert (quarantined / "paper.pdf").read_bytes() == b"research"
+        assert any(kind == "cli.teardown_error" for kind, _ in events)
 
 
 def test_pending_workspace_guard_refuses_automatic_recovery() -> None:
@@ -3466,6 +3603,36 @@ def test_pending_workspace_guard_refuses_automatic_recovery() -> None:
 
         assert retained.read_text(encoding="utf-8") == "research state"
         assert guard.exists()
+        agent.events.emit.assert_not_awaited()
+
+
+def test_settled_subprocess_guard_preserves_workspace_in_place() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        retained = workspace / "retained.txt"
+        retained.write_text("research state", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.events = SimpleNamespace(emit=mock.AsyncMock())
+        guard = agent.workspace_active_guard_path_for(workspace)
+        _write_workspace_active_guard(
+            guard,
+            workspace,
+            backend="subprocess",
+            phase="launch_settled",
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="cannot prove that every detached worker is gone",
+        ):
+            asyncio.run(agent._recover_guarded_workspace(workspace, guard))
+
+        assert retained.read_text(encoding="utf-8") == "research state"
+        assert guard.exists()
+        assert not (temp / ".proofcouncil-untrusted-workspaces").exists()
         agent.events.emit.assert_not_awaited()
 
 
@@ -3495,7 +3662,37 @@ def test_idle_workspace_guard_is_cleared_without_discarding_workspace() -> None:
         assert agent.events.emit.await_args.args[0] == "cli.workspace_idle_guard_cleared"
 
 
-def test_guarded_workspace_discard_finishes_before_cancellation_releases_lock() -> None:
+def test_guarded_workspace_quarantine_rolls_back_if_state_cleanup_fails() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        retained = workspace / "retained.txt"
+        retained.write_text("research state", encoding="utf-8")
+        original_identity = workspace.stat().st_ino
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.events = SimpleNamespace(emit=mock.AsyncMock())
+        guard = agent.workspace_active_guard_path_for(workspace)
+        _write_workspace_active_guard(guard, workspace, backend="docker")
+
+        with mock.patch.object(
+            agent,
+            "_clear_workspace_recovery_attempts",
+            side_effect=RuntimeError("state cleanup failed"),
+        ):
+            with pytest.raises(RuntimeError, match="state cleanup failed"):
+                asyncio.run(agent._recover_guarded_workspace(workspace, guard))
+
+        assert workspace.stat().st_ino == original_identity
+        assert retained.read_text(encoding="utf-8") == "research state"
+        assert guard.exists()
+        quarantines = temp / ".proofcouncil-untrusted-workspaces"
+        assert not list(quarantines.glob("*/workspace"))
+        agent.events.emit.assert_not_awaited()
+
+
+def test_guarded_workspace_quarantine_finishes_before_cancellation_releases_lock() -> None:
     async def exercise(temp: Path) -> None:
         workspace = temp / "compute"
         workspace.mkdir()
@@ -3504,21 +3701,24 @@ def test_guarded_workspace_discard_finishes_before_cancellation_releases_lock() 
         ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
         agent = Compute(ctx)
         guard = agent.workspace_active_guard_path_for(workspace)
-        _write_workspace_active_guard(guard, workspace)
+        _write_workspace_active_guard(guard, workspace, backend="docker")
         entered = threading.Event()
         release = threading.Event()
-        real_discard = _discard_workspace_contents
+        real_quarantine = _quarantine_workspace
+        quarantined_paths: list[Path] = []
 
-        def blocked_discard(root: Path) -> None:
+        def blocked_quarantine(root: Path) -> Path:
             entered.set()
             if not release.wait(timeout=5):
-                raise RuntimeError("test did not release workspace discard")
-            real_discard(root)
+                raise RuntimeError("test did not release workspace quarantine")
+            quarantined = real_quarantine(root)
+            quarantined_paths.append(quarantined)
+            return quarantined
 
         agent.events = SimpleNamespace(emit=mock.AsyncMock())
         with mock.patch(
-            "proofstack.kinds.cli._discard_workspace_contents",
-            side_effect=blocked_discard,
+            "proofstack.kinds.cli._quarantine_workspace",
+            side_effect=blocked_quarantine,
         ):
             task = asyncio.create_task(
                 agent._recover_guarded_workspace(workspace, guard)
@@ -3533,6 +3733,10 @@ def test_guarded_workspace_discard_finishes_before_cancellation_releases_lock() 
 
         assert not stale.exists()
         assert not guard.exists()
+        assert len(quarantined_paths) == 1
+        assert (quarantined_paths[0] / stale.name).read_text(
+            encoding="utf-8"
+        ) == "rotated credential"
 
     with tempfile.TemporaryDirectory() as temp_dir:
         asyncio.run(exercise(Path(temp_dir)))
