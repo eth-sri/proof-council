@@ -4,9 +4,12 @@ import asyncio
 import importlib.util
 import json
 import os
+import signal
 import stat
 import sys
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,22 +52,34 @@ from proofstack.cli_usage import parse_claude_json, parse_codex_jsonl  # noqa: E
 from proofstack.kinds.cli import (  # noqa: E402
     CLIAgent,
     CLIDoneRecord,
+    _discard_workspace_contents,
     _mark_sensitive_workspace_untrusted,
+    _write_workspace_active_guard,
     _write_sensitive_quarantine_marker,
     measure_workspace_usage,
 )
-from proofstack.sandbox.base import SandboxSpec  # noqa: E402
+from proofstack.sandbox.base import (  # noqa: E402
+    SandboxSpawnError,
+    SandboxSpec,
+    WorkerStopState,
+)
 from proofstack.sandbox.docker import (  # noqa: E402
     DockerSandbox,
     DockerSandboxError,
+    _DockerLaunchReceipt,
+    _DockerStreamingProcess,
     _container_name_for_root,
     _docker_kill,
+    _terminate_docker_run,
 )
 from proofstack.sandbox.subprocess import (  # noqa: E402
     SubprocessSandbox,
     _BoundedTextBuffer,
     _JsonUsageCapture,
+    _ProcessMarker,
     _StreamingProcess,
+    _find_marked_processes,
+    _terminate_marked_processes,
 )
 
 
@@ -1204,6 +1219,10 @@ def test_workspace_usage_and_hard_limit_stop_are_enforced() -> None:
     class FakeStream:
         terminated = False
 
+        @property
+        def worker_stopped(self):
+            return self.terminated
+
         async def terminate(self):
             self.terminated = True
 
@@ -1250,6 +1269,10 @@ def test_filesystem_free_space_guard_stops_compute_worker() -> None:
 
     class FakeStream:
         terminated = False
+
+        @property
+        def worker_stopped(self):
+            return self.terminated
 
         async def terminate(self):
             self.terminated = True
@@ -1299,6 +1322,10 @@ def test_filesystem_free_space_guard_stops_compute_worker() -> None:
 def test_workspace_entry_limit_stops_before_unbounded_scan() -> None:
     class FakeStream:
         terminated = False
+
+        @property
+        def worker_stopped(self):
+            return self.terminated
 
         async def terminate(self):
             self.terminated = True
@@ -2068,6 +2095,580 @@ def test_docker_workspace_identity_is_stable_and_blocks_orphans() -> None:
         asyncio.run(exercise(Path(temp_dir)))
 
 
+def test_stream_backends_report_definitive_client_spawn_failures() -> None:
+    async def exercise(temp: Path) -> None:
+        subprocess_sandbox = SubprocessSandbox(
+            SandboxSpec(backend="subprocess"),
+            root=temp / "subprocess",
+        )
+        with mock.patch(
+            "proofstack.sandbox.subprocess.asyncio.create_subprocess_exec",
+            new=mock.AsyncMock(side_effect=FileNotFoundError("missing binary")),
+        ):
+            with pytest.raises(SandboxSpawnError, match="missing binary"):
+                await subprocess_sandbox.stream_command(["missing-probe"])
+
+        docker_sandbox = DockerSandbox(
+            SandboxSpec(backend="docker"),
+            root=temp / "docker",
+        )
+        with mock.patch(
+            "proofstack.sandbox.docker.asyncio.create_subprocess_exec",
+            new=mock.AsyncMock(side_effect=FileNotFoundError("missing docker")),
+        ):
+            with pytest.raises(DockerSandboxError, match="missing docker") as exc:
+                await docker_sandbox.stream_command(["probe"])
+        assert isinstance(exc.value, SandboxSpawnError)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ("--name", "alternate"),
+        ("--name=alternate",),
+        ("--cidfile", "/tmp/alternate.cid"),
+        ("--detach",),
+        ("-d",),
+        ("-itd",),
+        ("--rm=false",),
+        ("--label-file", "/tmp/labels"),
+        ("--label", "proofstack.workspace-owner=alternate"),
+        ("--label=proofstack.workspace-owner=alternate",),
+        ("-lproofstack.workspace-owner=alternate",),
+    ],
+)
+def test_docker_extra_args_cannot_override_lifecycle_identity(
+    extra_args: tuple[str, ...],
+) -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with pytest.raises(DockerSandboxError, match="docker_extra_args cannot"):
+            DockerSandbox(
+                SandboxSpec(backend="docker", docker_extra_args=extra_args),
+                root=Path(temp_dir) / "docker",
+            )
+
+
+def test_docker_extra_args_allow_non_lifecycle_options() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        sandbox = DockerSandbox(
+            SandboxSpec(
+                backend="docker",
+                docker_extra_args=(
+                    "--label",
+                    "proofstack.test=allowed",
+                    "-v",
+                    f"{temp_dir}:/extra:ro",
+                ),
+            ),
+            root=Path(temp_dir) / "docker",
+        )
+
+        assert sandbox.spec.docker_extra_args[0] == "--label"
+
+
+def test_docker_stream_startup_exposes_cleanup_lifecycle() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = DockerSandbox(
+            SandboxSpec(backend="docker"),
+            root=temp / "docker",
+        )
+        proc = SimpleNamespace(stdout=None, stderr=None)
+        stream = SimpleNamespace(
+            confirm_launch=mock.AsyncMock(
+                side_effect=DockerSandboxError("launch inspect failed")
+            ),
+            terminate=mock.AsyncMock(),
+            worker_stop_state=WorkerStopState.STOPPED,
+            launch_settled=True,
+        )
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker.asyncio.create_subprocess_exec",
+                new=mock.AsyncMock(return_value=proc),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._DockerStreamingProcess",
+                return_value=stream,
+            ),
+        ):
+            with pytest.raises(DockerSandboxError, match="launch inspect failed"):
+                await sandbox.stream_command(["probe"])
+
+        stream.terminate.assert_awaited_once()
+        assert sandbox.worker_stop_state is WorkerStopState.STOPPED
+        assert sandbox.worker_launch_settled is True
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_docker_stream_launch_uses_a_separate_bounded_deadline() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = DockerSandbox(
+            SandboxSpec(
+                backend="docker",
+                timeout_s=9_000,
+                docker_launch_timeout_s=60,
+            ),
+            root=temp / "docker",
+        )
+        proc = SimpleNamespace(stdout=None, stderr=None)
+        stream = SimpleNamespace(
+            confirm_launch=mock.AsyncMock(),
+            worker_stop_state=WorkerStopState.SURVIVING,
+            launch_settled=True,
+        )
+        constructor = mock.Mock(return_value=stream)
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker.asyncio.create_subprocess_exec",
+                new=mock.AsyncMock(return_value=proc),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._DockerStreamingProcess",
+                new=constructor,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker.time.monotonic",
+                return_value=100.0,
+            ),
+        ):
+            assert await sandbox.stream_command(["probe"], timeout_s=9_000) is stream
+
+        call = constructor.call_args
+        assert call is not None
+        assert call.kwargs["deadline"] == 9_100.0
+        assert call.kwargs["launch_deadline"] == 160.0
+        stream.confirm_launch.assert_awaited_once()
+        call.kwargs["launch_receipt"].cleanup()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_docker_run_nonzero_exit_does_not_settle_absent_container() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = DockerSandbox(
+            SandboxSpec(backend="docker"),
+            root=temp / "docker",
+        )
+        proc = SimpleNamespace(
+            communicate=mock.AsyncMock(return_value=(b"", b"docker failed")),
+            returncode=125,
+        )
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.UNKNOWN)
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker.asyncio.create_subprocess_exec",
+                new=mock.AsyncMock(return_value=proc),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            result = await sandbox.run_command(["probe"])
+
+        assert result.returncode == 125
+        assert "stop state is unknown" in result.stderr
+        assert sandbox.worker_stop_state is WorkerStopState.UNKNOWN
+        assert sandbox.worker_launch_settled is False
+        docker_kill.assert_awaited_once_with(
+            sandbox.container_name,
+            owner=sandbox.container_owner,
+            absence_is_terminal=False,
+        )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_docker_run_nonzero_inner_exit_is_settled_by_cidfile() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = DockerSandbox(
+            SandboxSpec(backend="docker"),
+            root=temp / "docker",
+        )
+        proc = SimpleNamespace(
+            communicate=mock.AsyncMock(return_value=(b"", b"inner failure")),
+            returncode=1,
+        )
+        cidfiles: list[Path] = []
+
+        async def spawn(*args, **kwargs):
+            cidfile = Path(args[args.index("--cidfile") + 1])
+            cidfile.write_text("a" * 64, encoding="ascii")
+            cidfiles.append(cidfile)
+            return proc
+
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.STOPPED)
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker.asyncio.create_subprocess_exec",
+                new=spawn,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            result = await sandbox.run_command(["probe"])
+
+        assert result.returncode == 1
+        assert sandbox.worker_stop_state is WorkerStopState.STOPPED
+        assert sandbox.worker_launch_settled is True
+        docker_kill.assert_awaited_once_with(
+            sandbox.container_name,
+            owner=sandbox.container_owner,
+            absence_is_terminal=True,
+        )
+        assert len(cidfiles) == 1
+        assert not cidfiles[0].exists()
+        assert not cidfiles[0].parent.exists()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_docker_run_cleanup_observes_late_cidfile_receipt() -> None:
+    async def exercise() -> None:
+        receipt = _DockerLaunchReceipt()
+        proc = SimpleNamespace(kill=mock.Mock())
+
+        async def communicate():
+            receipt.path.write_text("d" * 64, encoding="ascii")
+            return b"", b""
+
+        proc.communicate = communicate
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.STOPPED)
+        try:
+            with mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ):
+                stop_state, launch_settled = await _terminate_docker_run(
+                    proc,
+                    "workspace",
+                    owner="our-owner",
+                    launch_settled=False,
+                    launch_receipt=receipt,
+                )
+
+            assert stop_state is WorkerStopState.STOPPED
+            assert launch_settled is True
+            docker_kill.assert_awaited_once_with(
+                "workspace",
+                owner="our-owner",
+                absence_is_terminal=True,
+            )
+        finally:
+            receipt.cleanup()
+
+    asyncio.run(exercise())
+
+
+def test_docker_launch_receipt_cleanup_retries_transient_failure() -> None:
+    receipt = _DockerLaunchReceipt()
+    receipt.path.write_text("a" * 64, encoding="ascii")
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def flaky_unlink(path: Path, *args, **kwargs) -> None:
+        nonlocal attempts
+        if path == receipt.path and attempts == 0:
+            attempts += 1
+            raise OSError("transient unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    try:
+        with mock.patch.object(Path, "unlink", new=flaky_unlink):
+            assert receipt.cleanup() is False
+            assert receipt.path.exists()
+            assert receipt._cleaned is False
+
+            assert receipt.cleanup() is True
+            assert receipt._cleaned is True
+            assert not receipt.path.exists()
+            assert not receipt.directory.exists()
+    finally:
+        receipt.cleanup()
+
+
+def test_docker_stream_retains_launch_receipt_until_cleanup_succeeds() -> None:
+    receipt = SimpleNamespace(cleanup=mock.Mock(side_effect=[False, True]))
+    stream = object.__new__(_DockerStreamingProcess)
+    stream._launch_receipt = receipt
+
+    stream._cleanup_launch_receipt()
+    assert stream._launch_receipt is receipt
+
+    stream._cleanup_launch_receipt()
+    assert stream._launch_receipt is None
+    assert receipt.cleanup.call_count == 2
+
+
+def test_docker_sandbox_refuses_to_overwrite_unresolved_lifecycle() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = DockerSandbox(
+            SandboxSpec(backend="docker"),
+            root=temp / "docker",
+        )
+        sandbox._set_worker_lifecycle(
+            WorkerStopState.UNKNOWN,
+            launch_settled=False,
+        )
+        spawn = mock.AsyncMock()
+        with mock.patch(
+            "proofstack.sandbox.docker.asyncio.create_subprocess_exec",
+            new=spawn,
+        ):
+            with pytest.raises(
+                DockerSandboxError,
+                match="prior worker is active or its launch state is unresolved",
+            ):
+                await sandbox.run_command(["second-command"])
+        spawn.assert_not_awaited()
+        assert sandbox.worker_stop_state is WorkerStopState.UNKNOWN
+        assert sandbox.worker_launch_settled is False
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_subprocess_setup_command_cancellation_drains_cleanup() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = SubprocessSandbox(
+            SandboxSpec(backend="subprocess"),
+            root=temp / "subprocess",
+        )
+        communicate_started = asyncio.Event()
+
+        async def communicate(*, input=None):
+            communicate_started.set()
+            await asyncio.Future()
+
+        proc = SimpleNamespace(
+            communicate=communicate,
+            returncode=None,
+            pid=12345,
+        )
+        cleanup = mock.AsyncMock(return_value=True)
+        with (
+            mock.patch(
+                "proofstack.sandbox.subprocess.asyncio.create_subprocess_exec",
+                new=mock.AsyncMock(return_value=proc),
+            ),
+            mock.patch(
+                "proofstack.sandbox.subprocess._terminate_process_group_uninterruptibly",
+                new=cleanup,
+            ),
+        ):
+            task = asyncio.create_task(sandbox.run_command(["probe"]))
+            await communicate_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        cleanup.assert_awaited_once_with(
+            proc,
+            grace_s=5.0,
+            process_marker=mock.ANY,
+        )
+        assert sandbox.worker_stop_state is WorkerStopState.STOPPED
+        assert sandbox.worker_launch_settled is True
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_subprocess_run_command_cleans_background_descendants() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = SubprocessSandbox(
+            SandboxSpec(backend="subprocess", provider_keys=()),
+            root=temp / "subprocess",
+        )
+        with mock.patch(
+            "proofstack.sandbox.subprocess._terminate_marked_processes",
+            new=mock.AsyncMock(return_value=True),
+        ):
+            result = await sandbox.run_command(
+                [
+                    "sh",
+                    "-c",
+                    "sleep 30 </dev/null >/dev/null 2>&1 & echo $!",
+                ]
+            )
+        descendant_pid = int(result.stdout.strip())
+
+        assert result.returncode == 0
+        assert sandbox.worker_stop_state is WorkerStopState.STOPPED
+        with pytest.raises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_subprocess_never_reports_stopped_while_setsid_descendant_survives() -> None:
+    async def exercise(temp: Path) -> None:
+        inspection_available = _find_marked_processes(
+            _ProcessMarker(token="unmatched-test-token", created_at=time.time())
+        )[1]
+        sandbox = SubprocessSandbox(
+            SandboxSpec(backend="subprocess", provider_keys=()),
+            root=temp / "subprocess",
+        )
+        result = await sandbox.run_command(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess, sys; "
+                    "p = subprocess.Popen("
+                    "[sys.executable, '-c', 'import time; time.sleep(30)'], "
+                    "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                    "stderr=subprocess.DEVNULL, start_new_session=True); "
+                    "print(p.pid, flush=True)"
+                ),
+            ]
+        )
+        descendant_pid = int(result.stdout.strip())
+        try:
+            try:
+                os.kill(descendant_pid, 0)
+            except ProcessLookupError:
+                descendant_alive = False
+            else:
+                descendant_alive = True
+
+            assert not (
+                sandbox.worker_stop_state is WorkerStopState.STOPPED
+                and descendant_alive
+            )
+            if inspection_available:
+                assert sandbox.worker_stop_state is WorkerStopState.STOPPED
+                assert descendant_alive is False
+            assert sandbox.worker_stop_state in {
+                WorkerStopState.STOPPED,
+                WorkerStopState.UNKNOWN,
+            }
+        finally:
+            try:
+                os.killpg(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_subprocess_stream_cleanup_is_idempotent_after_verified_stop() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=0)
+        stream = _StreamingProcess(
+            proc=proc,
+            cmd=["probe"],
+            deadline=time.monotonic() + 10,
+        )
+        cleanup = mock.AsyncMock(return_value=True)
+        with mock.patch(
+            "proofstack.sandbox.subprocess._terminate_process_group_uninterruptibly",
+            new=cleanup,
+        ):
+            await stream.terminate()
+            await stream.terminate()
+
+        cleanup.assert_awaited_once()
+        assert stream.worker_stop_state is WorkerStopState.STOPPED
+
+    asyncio.run(exercise())
+
+
+def test_marked_process_cleanup_fails_closed_when_scan_is_incomplete() -> None:
+    marker = _ProcessMarker(token="token", created_at=0.0)
+    with (
+        mock.patch(
+            "proofstack.sandbox.subprocess._find_marked_processes",
+            return_value=([], False),
+        ),
+        mock.patch(
+            "proofstack.sandbox.subprocess.PROCESS_MARKER_EXIT_TIMEOUT_S",
+            0.0,
+        ),
+    ):
+        assert asyncio.run(_terminate_marked_processes(marker)) is False
+
+
+def test_marked_process_cleanup_terminates_and_verifies_descendant() -> None:
+    process = SimpleNamespace(
+        terminate=mock.Mock(),
+        kill=mock.Mock(),
+    )
+    scan = mock.Mock(
+        side_effect=[
+            ([process], True),
+            ([], True),
+            ([], True),
+            ([], True),
+            ([], True),
+        ]
+    )
+    with (
+        mock.patch(
+            "proofstack.sandbox.subprocess._find_marked_processes",
+            new=scan,
+        ),
+        mock.patch(
+            "proofstack.sandbox.subprocess.asyncio.sleep",
+            new=mock.AsyncMock(),
+        ),
+    ):
+        assert asyncio.run(
+            _terminate_marked_processes(
+                _ProcessMarker(token="token", created_at=0.0)
+            )
+        ) is True
+
+    process.terminate.assert_called_once_with()
+    process.kill.assert_not_called()
+
+
+def test_marked_process_cleanup_kills_known_process_after_incomplete_scan() -> None:
+    process = SimpleNamespace(
+        terminate=mock.Mock(),
+        kill=mock.Mock(),
+    )
+    scan = mock.Mock(
+        side_effect=[
+            ([process], False),
+            ([], True),
+            ([], True),
+            ([], True),
+            ([], True),
+        ]
+    )
+    with (
+        mock.patch(
+            "proofstack.sandbox.subprocess._find_marked_processes",
+            new=scan,
+        ),
+        mock.patch(
+            "proofstack.sandbox.subprocess.asyncio.sleep",
+            new=mock.AsyncMock(),
+        ),
+    ):
+        assert asyncio.run(
+            _terminate_marked_processes(
+                _ProcessMarker(token="token", created_at=0.0)
+            )
+        ) is True
+
+    process.terminate.assert_called_once_with()
+
+
 def test_docker_cleanup_only_removes_the_owned_container() -> None:
     async def exercise() -> None:
         docker_control = mock.AsyncMock(return_value=(0, "", ""))
@@ -2083,12 +2684,20 @@ def test_docker_cleanup_only_removes_the_owned_container() -> None:
                 new=docker_control,
             ),
         ):
-            assert not await _docker_kill("workspace", owner="our-owner")
+            assert (
+                await _docker_kill("workspace", owner="our-owner")
+                is WorkerStopState.SURVIVING
+            )
         docker_control.assert_not_awaited()
 
         docker_control = mock.AsyncMock(return_value=(0, "", ""))
         identity = mock.AsyncMock(
-            side_effect=[("running", "our-owner", "our-id"), None]
+            side_effect=[
+                ("running", "our-owner", "our-id"),
+                None,
+                None,
+                None,
+            ]
         )
         with (
             mock.patch(
@@ -2100,13 +2709,1216 @@ def test_docker_cleanup_only_removes_the_owned_container() -> None:
                 new=docker_control,
             ),
         ):
-            assert await _docker_kill("workspace", owner="our-owner")
+            assert (
+                await _docker_kill("workspace", owner="our-owner")
+                is WorkerStopState.STOPPED
+            )
         assert docker_control.await_args_list == [
             mock.call("kill", "our-id"),
             mock.call("rm", "--force", "our-id"),
         ]
 
     asyncio.run(exercise())
+
+
+def test_docker_cleanup_distinguishes_unknown_from_surviving() -> None:
+    async def exercise() -> None:
+        with mock.patch(
+            "proofstack.sandbox.docker._docker_container_identity",
+            new=mock.AsyncMock(side_effect=DockerSandboxError("daemon timeout")),
+        ):
+            assert (
+                await _docker_kill("workspace", owner="our-owner")
+                is WorkerStopState.UNKNOWN
+            )
+
+        identity = mock.AsyncMock(
+            side_effect=[
+                ("running", "our-owner", "our-id"),
+                ("running", "our-owner", "our-id"),
+            ]
+        )
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=identity,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_control",
+                new=mock.AsyncMock(return_value=(1, "", "daemon busy")),
+            ),
+        ):
+            assert (
+                await _docker_kill("workspace", owner="our-owner")
+                is WorkerStopState.SURVIVING
+            )
+
+    asyncio.run(exercise())
+
+
+def test_docker_cleanup_requires_settled_absence() -> None:
+    async def exercise() -> None:
+        identity = mock.AsyncMock(
+            side_effect=[None, ("creating", "foreign-owner", "foreign-id")]
+        )
+        sleep = mock.AsyncMock()
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=identity,
+            ),
+            mock.patch("proofstack.sandbox.docker.asyncio.sleep", new=sleep),
+        ):
+            assert (
+                await _docker_kill("workspace", owner="our-owner")
+                is WorkerStopState.SURVIVING
+            )
+        assert identity.await_count == 2
+        sleep.assert_awaited_once()
+
+        identity = mock.AsyncMock(side_effect=[None, None, None])
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=identity,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker.asyncio.sleep",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            assert (
+                await _docker_kill("workspace", owner="our-owner")
+                is WorkerStopState.STOPPED
+            )
+        assert identity.await_count == 3
+
+        identity = mock.AsyncMock(side_effect=[None, None, None])
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=identity,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker.asyncio.sleep",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            assert (
+                await _docker_kill(
+                    "workspace",
+                    owner="our-owner",
+                    absence_is_terminal=False,
+                )
+                is WorkerStopState.UNKNOWN
+            )
+
+    asyncio.run(exercise())
+
+
+def test_docker_launch_is_observed_beyond_stop_absence_window() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=None)
+        identity = mock.AsyncMock(
+            side_effect=[None] * 55
+            + [("running", "our-owner", "our-id")]
+        )
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=identity,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker.asyncio.sleep",
+                new=mock.AsyncMock(),
+            ),
+        ):
+            stream = _DockerStreamingProcess(
+                proc=proc,
+                cmd=["docker", "run"],
+                deadline=1_000_000_000.0,
+                container_name="workspace",
+                container_owner="our-owner",
+            )
+            await stream.confirm_launch()
+
+        # The old fixed 50-probe limit rejected healthy but slow launches.
+        assert identity.await_count == 56
+        assert all(call.kwargs["timeout_s"] > 0 for call in identity.await_args_list)
+        assert stream.worker_stop_state is WorkerStopState.SURVIVING
+
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.STOPPED)
+        # This test replaces the base terminator, so model its successful
+        # process-group cleanup explicitly.
+        stream._process_group_stop_state = WorkerStopState.STOPPED
+        with (
+            mock.patch.object(
+                _StreamingProcess,
+                "terminate",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            await stream.terminate()
+            await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        docker_kill.assert_awaited_once_with(
+            "workspace",
+            owner="our-owner",
+            absence_is_terminal=True,
+        )
+
+    asyncio.run(exercise())
+
+
+def test_docker_launch_confirmation_respects_command_deadline() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=None)
+        identity = mock.AsyncMock(return_value=None)
+        sleep = mock.AsyncMock()
+        with (
+            mock.patch(
+                "proofstack.sandbox.docker._docker_container_identity",
+                new=identity,
+            ),
+            mock.patch("proofstack.sandbox.docker.asyncio.sleep", new=sleep),
+        ):
+            stream = _DockerStreamingProcess(
+                proc=proc,
+                cmd=["docker", "run"],
+                deadline=0.0,
+                container_name="workspace",
+                container_owner="our-owner",
+            )
+            with pytest.raises(DockerSandboxError, match="launch deadline"):
+                await stream.confirm_launch()
+            await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        identity.assert_not_awaited()
+        sleep.assert_not_awaited()
+
+    asyncio.run(exercise())
+
+
+def test_docker_nonzero_client_exit_does_not_settle_stream_launch() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=125)
+        stream = _DockerStreamingProcess(
+            proc=proc,
+            cmd=["docker", "run"],
+            deadline=1_000_000_000.0,
+            container_name="workspace",
+            container_owner="our-owner",
+        )
+
+        with pytest.raises(
+            DockerSandboxError,
+            match="daemon-side completion is unknown",
+        ):
+            await stream.confirm_launch()
+        await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        assert stream.launch_settled is False
+        assert stream.worker_stop_state is WorkerStopState.UNKNOWN
+
+    asyncio.run(exercise())
+
+
+def test_docker_stream_cidfile_settles_fast_inner_failure() -> None:
+    async def exercise(temp: Path) -> None:
+        sandbox = DockerSandbox(
+            SandboxSpec(backend="docker"),
+            root=temp / "docker",
+        )
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=1)
+        cidfiles: list[Path] = []
+
+        async def spawn(*args, **kwargs):
+            cidfile = Path(args[args.index("--cidfile") + 1])
+            cidfile.write_text("b" * 64, encoding="ascii")
+            cidfiles.append(cidfile)
+            return proc
+
+        with mock.patch(
+            "proofstack.sandbox.docker.asyncio.create_subprocess_exec",
+            new=spawn,
+        ):
+            stream = await sandbox.stream_command(["probe"])
+
+        assert stream.launch_settled is True
+        assert stream.worker_stop_state is WorkerStopState.UNKNOWN
+        assert sandbox.worker_launch_settled is True
+        assert sandbox.worker_stop_state is WorkerStopState.UNKNOWN
+        assert len(cidfiles) == 1
+        assert cidfiles[0].exists()
+
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.STOPPED)
+        # This test replaces the base terminator, so model its successful
+        # process-group cleanup explicitly.
+        stream._process_group_stop_state = WorkerStopState.STOPPED
+        with (
+            mock.patch.object(
+                _StreamingProcess,
+                "terminate",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            await stream.terminate()
+            await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        assert sandbox.worker_stop_state is WorkerStopState.STOPPED
+        assert sandbox.worker_launch_settled is True
+        assert not cidfiles[0].exists()
+        assert not cidfiles[0].parent.exists()
+        docker_kill.assert_awaited_once_with(
+            sandbox.container_name,
+            owner=sandbox.container_owner,
+            absence_is_terminal=True,
+        )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_unobserved_docker_launch_never_treats_absence_as_terminal() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=None)
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.UNKNOWN)
+        with (
+            mock.patch.object(
+                _StreamingProcess,
+                "terminate",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            stream = _DockerStreamingProcess(
+                proc=proc,
+                cmd=["docker", "run"],
+                deadline=1_000_000_000.0,
+                container_name="workspace",
+                container_owner="our-owner",
+            )
+            await stream.terminate()
+            await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        assert stream.worker_stop_state is WorkerStopState.UNKNOWN
+        docker_kill.assert_awaited_once_with(
+            "workspace",
+            owner="our-owner",
+            absence_is_terminal=False,
+        )
+
+    asyncio.run(exercise())
+
+
+def test_docker_stop_remains_unknown_when_client_group_is_unconfirmed() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=None)
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.STOPPED)
+        with (
+            mock.patch.object(
+                _StreamingProcess,
+                "terminate",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            stream = _DockerStreamingProcess(
+                proc=proc,
+                cmd=["docker", "run"],
+                deadline=1_000_000_000.0,
+                container_name="workspace",
+                container_owner="our-owner",
+            )
+            stream._launch_settled = True
+            await stream.terminate()
+            await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        assert stream.worker_stop_state is WorkerStopState.UNKNOWN
+        docker_kill.assert_awaited_once_with(
+            "workspace",
+            owner="our-owner",
+            absence_is_terminal=False,
+        )
+
+    asyncio.run(exercise())
+
+
+def test_docker_termination_observes_late_cidfile_receipt() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None, returncode=None)
+        receipt = _DockerLaunchReceipt()
+        docker_kill = mock.AsyncMock(return_value=WorkerStopState.STOPPED)
+
+        async def terminate_client(_stream) -> None:
+            receipt.path.write_text("c" * 64, encoding="ascii")
+            _stream._process_group_stop_state = WorkerStopState.STOPPED
+
+        with (
+            mock.patch.object(
+                _StreamingProcess,
+                "terminate",
+                new=terminate_client,
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            stream = _DockerStreamingProcess(
+                proc=proc,
+                cmd=["docker", "run"],
+                deadline=1_000_000_000.0,
+                container_name="workspace",
+                container_owner="our-owner",
+                launch_receipt=receipt,
+            )
+            await stream.terminate()
+            await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        assert stream.launch_settled is True
+        assert stream.worker_stop_state is WorkerStopState.STOPPED
+        assert not receipt.path.exists()
+        assert not receipt.directory.exists()
+        docker_kill.assert_awaited_once_with(
+            "workspace",
+            owner="our-owner",
+            absence_is_terminal=True,
+        )
+
+    asyncio.run(exercise())
+
+
+def test_docker_confirmed_stop_is_not_downgraded_by_final_cleanup() -> None:
+    async def exercise() -> None:
+        proc = SimpleNamespace(stdout=None, stderr=None)
+        docker_kill = mock.AsyncMock(
+            side_effect=[WorkerStopState.STOPPED, WorkerStopState.UNKNOWN]
+        )
+        with (
+            mock.patch.object(
+                _StreamingProcess,
+                "terminate",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch(
+                "proofstack.sandbox.docker._docker_kill",
+                new=docker_kill,
+            ),
+        ):
+            stream = _DockerStreamingProcess(
+                proc=proc,
+                cmd=["docker", "run"],
+                deadline=1_000_000_000.0,
+                container_name="workspace",
+                container_owner="our-owner",
+            )
+            stream._launch_settled = True
+            stream._process_group_stop_state = WorkerStopState.STOPPED
+            await stream.terminate()
+            await stream.terminate()
+            await asyncio.gather(stream._stdout_task, stream._stderr_task)
+
+        assert stream.worker_stop_state is WorkerStopState.STOPPED
+        assert stream.worker_stopped is True
+        docker_kill.assert_awaited_once_with(
+            "workspace",
+            owner="our-owner",
+            absence_is_terminal=True,
+        )
+
+    asyncio.run(exercise())
+
+
+def test_unconfirmed_worker_stop_suppresses_collection_without_quarantine() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.collected = False
+            self.refreshes = 0
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def refresh_sensitive_state(self, sandbox, inp):
+            self.refreshes += 1
+
+        async def collect(self, sandbox, inp, done):
+            self.collected = True
+            return inp
+
+    class UnknownStopStream:
+        done = True
+        worker_stop_state = WorkerStopState.UNKNOWN
+        worker_stopped = False
+        proc = SimpleNamespace(stdin=None, returncode=0)
+        stdout = "untrusted output"
+        stderr = ""
+        metering_stdout = ""
+        stdout_chars = len(stdout)
+        stderr_chars = 0
+
+        def __init__(self, guard_to_remove: Path | None = None):
+            self.terminations = 0
+            self.guard_to_remove = guard_to_remove
+
+        async def terminate(self):
+            self.terminations += 1
+            if self.terminations == 1 and self.guard_to_remove is not None:
+                self.guard_to_remove.unlink()
+
+    class UnknownStopSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            return self.stream
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        agent.WORKSPACE_RESERVATION_BYTES = 1024 * 1024
+        agent.WORKSPACE_MIN_FREE_BYTES = 0
+        agent.WORKSPACE_RESERVATION_DIR = temp / "reservations"
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        stream = UnknownStopStream(
+            agent.workspace_active_guard_path_for(workspace)
+        )
+        sandbox = UnknownStopSandbox(root=workspace, stream=stream)
+
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(
+                RuntimeError,
+                match="CLI worker could not be confirmed stopped",
+            ):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert agent.collected is False
+        assert agent.refreshes == 0
+        assert stream.terminations == 2
+        stop_events = [
+            payload
+            for kind, payload in events
+            if kind == "cli.worker_stop_unconfirmed"
+        ]
+        assert stop_events == [
+            {
+                "state": "unknown",
+                "phase": "process_exit",
+                "response_suppressed": True,
+                "handoff_suppressed": True,
+                "workspace_discard_on_resume": True,
+                "workspace_quarantined": False,
+            }
+        ]
+        assert agent.workspace_active_guard_path_for(workspace).exists()
+        assert not (
+            workspace / ".pwc" / "runtime" / "SENSITIVE_STATE_UNTRUSTED"
+        ).exists()
+        assert not agent.sensitive_quarantine_path_for(workspace).exists()
+        assert not any(
+            kind == "cli.sensitive_state_refresh_failed" for kind, _ in events
+        )
+        assert any(
+            kind == "cli.storage_retained"
+            and payload["retention_guard_state"] == "repaired"
+            for kind, payload in events
+        )
+        retained_leases = list(
+            (temp / "reservations").glob("lease-*.json")
+        )
+        assert len(retained_leases) == 1
+        retained_payload = json.loads(retained_leases[0].read_text(encoding="utf-8"))
+        assert retained_payload["retention_guard"] == str(
+            agent.workspace_active_guard_path_for(workspace)
+        )
+
+
+def test_storage_reservation_requires_workspace_recovery_guard() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="subprocess", timeout_s=10)
+        WORKSPACE_RESERVATION_BYTES = 1
+        WORKSPACE_MIN_FREE_BYTES = 0
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            raise AssertionError("worker must not start")
+
+    class IdleSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            raise AssertionError("worker must not start")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        sandbox = IdleSandbox(root=workspace)
+
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(
+                RuntimeError,
+                match="storage reservations require WORKSPACE_RECOVERY_ENABLED",
+            ):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+
+def test_unconfirmed_stop_quarantines_persistent_workspace_without_guard() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+    class UnknownStopStream:
+        done = True
+        worker_stop_state = WorkerStopState.UNKNOWN
+        worker_stopped = False
+        proc = SimpleNamespace(stdin=None, returncode=0)
+        stdout = ""
+        stderr = ""
+        metering_stdout = ""
+        stdout_chars = 0
+        stderr_chars = 0
+
+        async def terminate(self):
+            return None
+
+    class UnknownStopSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            return UnknownStopStream()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "persistent"
+        workspace.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = UnknownStopSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(
+                RuntimeError,
+                match="CLI worker could not be confirmed stopped",
+            ):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert (
+            workspace / ".pwc" / "runtime" / "SENSITIVE_STATE_UNTRUSTED"
+        ).exists()
+        assert agent.sensitive_quarantine_path_for(workspace).exists()
+        assert not agent.workspace_active_guard_path_for(workspace).exists()
+        assert any(
+            kind == "cli.worker_stop_unconfirmed"
+            and payload["workspace_quarantined"] is True
+            and payload["workspace_discard_on_resume"] is False
+            for kind, payload in events
+        )
+
+
+def test_unconfirmed_worker_guard_discards_workspace_before_resume() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def setup(self, sandbox, inp):
+            assert not (sandbox.root / "unknown-secret.txt").exists()
+            (sandbox.root / "fresh.txt").write_text("fresh", encoding="utf-8")
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+    class StoppedStream:
+        done = True
+        worker_stop_state = WorkerStopState.STOPPED
+        worker_stopped = True
+        remaining_s = 10.0
+        proc = SimpleNamespace(stdin=None, returncode=0)
+        stdout = ""
+        stderr = ""
+        metering_stdout = ""
+        stdout_chars = 0
+        stderr_chars = 0
+
+        async def terminate(self):
+            return None
+
+    class StoppedSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            return StoppedStream()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        (workspace / "unknown-secret.txt").write_text(
+            "rotated credential",
+            encoding="utf-8",
+        )
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        guard = agent.workspace_active_guard_path_for(workspace)
+        _write_workspace_active_guard(guard, workspace)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = StoppedSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            out = asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert out.workspace == workspace
+        assert not (workspace / "unknown-secret.txt").exists()
+        assert (workspace / "fresh.txt").read_text(encoding="utf-8") == "fresh"
+        assert not guard.exists()
+        assert any(
+            kind == "cli.workspace_discarded_after_unconfirmed_stop"
+            for kind, _ in events
+        )
+
+
+def test_pending_workspace_guard_refuses_automatic_recovery() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        retained = workspace / "retained.txt"
+        retained.write_text("research state", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.events = SimpleNamespace(emit=mock.AsyncMock())
+        guard = agent.workspace_active_guard_path_for(workspace)
+        _write_workspace_active_guard(
+            guard,
+            workspace,
+            backend="docker",
+            phase="launch_pending",
+        )
+
+        with pytest.raises(RuntimeError, match="unresolved external launch"):
+            asyncio.run(agent._recover_guarded_workspace(workspace, guard))
+
+        assert retained.read_text(encoding="utf-8") == "research state"
+        assert guard.exists()
+        agent.events.emit.assert_not_awaited()
+
+
+def test_idle_workspace_guard_is_cleared_without_discarding_workspace() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        retained = workspace / "retained.txt"
+        retained.write_text("research state", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        agent.events = SimpleNamespace(emit=mock.AsyncMock())
+        guard = agent.workspace_active_guard_path_for(workspace)
+        _write_workspace_active_guard(
+            guard,
+            workspace,
+            backend="docker",
+            phase="idle",
+        )
+
+        asyncio.run(agent._recover_guarded_workspace(workspace, guard))
+
+        assert retained.read_text(encoding="utf-8") == "research state"
+        assert not guard.exists()
+        agent.events.emit.assert_awaited_once()
+        assert agent.events.emit.await_args.args[0] == "cli.workspace_idle_guard_cleared"
+
+
+def test_guarded_workspace_discard_finishes_before_cancellation_releases_lock() -> None:
+    async def exercise(temp: Path) -> None:
+        workspace = temp / "compute"
+        workspace.mkdir()
+        stale = workspace / "unknown-secret.txt"
+        stale.write_text("rotated credential", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = Compute(ctx)
+        guard = agent.workspace_active_guard_path_for(workspace)
+        _write_workspace_active_guard(guard, workspace)
+        entered = threading.Event()
+        release = threading.Event()
+        real_discard = _discard_workspace_contents
+
+        def blocked_discard(root: Path) -> None:
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release workspace discard")
+            real_discard(root)
+
+        agent.events = SimpleNamespace(emit=mock.AsyncMock())
+        with mock.patch(
+            "proofstack.kinds.cli._discard_workspace_contents",
+            side_effect=blocked_discard,
+        ):
+            task = asyncio.create_task(
+                agent._recover_guarded_workspace(workspace, guard)
+            )
+            assert await asyncio.to_thread(entered.wait, 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert not stale.exists()
+        assert not guard.exists()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_cancellation_during_guard_write_preserves_unstarted_workspace() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.torn_down = False
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def teardown(self, sandbox, inp):
+            self.torn_down = True
+
+    class UnstartedSandbox(SimpleNamespace):
+        stream_calls = 0
+
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            self.stream_calls += 1
+            raise AssertionError("stream creation must not be reached")
+
+    async def exercise(temp: Path) -> None:
+        workspace = temp / "compute"
+        workspace.mkdir()
+        retained = workspace / "retained.txt"
+        retained.write_text("research state", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        sandbox = UnstartedSandbox(root=workspace)
+        agent.events = SimpleNamespace(emit=mock.AsyncMock())
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_write(path: Path, root: Path, **kwargs) -> None:
+            _write_workspace_active_guard(path, root, **kwargs)
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test did not release workspace guard write")
+
+        with (
+            mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox),
+            mock.patch(
+                "proofstack.kinds.cli._write_workspace_active_guard",
+                side_effect=blocked_write,
+            ),
+        ):
+            task = asyncio.create_task(agent.run(ProbeInput(workspace=workspace)))
+            assert await asyncio.to_thread(entered.wait, 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert retained.read_text(encoding="utf-8") == "research state"
+        assert not agent.workspace_active_guard_path_for(workspace).exists()
+        assert sandbox.stream_calls == 0
+        assert agent.torn_down is True
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        asyncio.run(exercise(Path(temp_dir)))
+
+
+def test_workspace_guard_remains_when_stream_creation_is_uncertain() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.torn_down = False
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+        async def teardown(self, sandbox, inp):
+            self.torn_down = True
+
+    class FailedSpawnSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            raise RuntimeError("Docker control connection failed during spawn")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = FailedSpawnSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(RuntimeError, match="control connection failed"):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert agent.torn_down is False
+        assert agent.workspace_active_guard_path_for(workspace).exists()
+        assert any(
+            kind == "cli.worker_stop_unconfirmed"
+            and payload["phase"] == "spawn"
+            for kind, payload in events
+        )
+
+
+def test_setup_unknown_worker_is_guarded_before_preflight() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.torn_down = False
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def setup(self, sandbox, inp):
+            guard = self.workspace_active_guard_path_for(sandbox.root)
+            payload = json.loads(guard.read_text(encoding="utf-8"))
+            assert payload["phase"] == "launch_pending"
+            await sandbox.run_command(["probe", "--version"])
+
+        async def teardown(self, sandbox, inp):
+            self.torn_down = True
+
+    class SetupUnknownSandbox(SimpleNamespace):
+        worker_stop_state = WorkerStopState.STOPPED
+        worker_launch_settled = True
+        stream_calls = 0
+
+        async def ensure_workspace_available(self):
+            return None
+
+        async def run_command(self, *args, **kwargs):
+            self.worker_stop_state = WorkerStopState.UNKNOWN
+            self.worker_launch_settled = False
+            return SimpleNamespace(returncode=-9, stdout="", stderr="timeout")
+
+        async def stream_command(self, *args, **kwargs):
+            self.stream_calls += 1
+            raise AssertionError("main worker must not start")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = SetupUnknownSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(
+                RuntimeError,
+                match="CLI worker could not be confirmed stopped",
+            ):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        guard = agent.workspace_active_guard_path_for(workspace)
+        assert json.loads(guard.read_text(encoding="utf-8"))["phase"] == "launch_pending"
+        assert sandbox.stream_calls == 0
+        assert agent.torn_down is False
+        assert any(
+            kind == "cli.worker_stop_unconfirmed"
+            and payload["phase"] == "setup"
+            for kind, payload in events
+        )
+
+
+def test_confirmed_stream_startup_cleanup_clears_workspace_guard() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.refreshes = 0
+            self.torn_down = False
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def refresh_sensitive_state(self, sandbox, inp):
+            self.refreshes += 1
+
+        async def teardown(self, sandbox, inp):
+            self.torn_down = True
+
+    class StoppedStartupSandbox(SimpleNamespace):
+        worker_stop_state = WorkerStopState.STOPPED
+        worker_launch_settled = True
+
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            self.worker_stop_state = WorkerStopState.STOPPED
+            self.worker_launch_settled = True
+            raise RuntimeError("launch confirmation failed after cleanup")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        retained = workspace / "retained.txt"
+        retained.write_text("research state", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = StoppedStartupSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(RuntimeError, match="launch confirmation failed"):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert retained.read_text(encoding="utf-8") == "research state"
+        assert agent.refreshes == 1
+        assert agent.torn_down is True
+        assert not agent.workspace_active_guard_path_for(workspace).exists()
+        assert not any(
+            kind == "cli.worker_stop_unconfirmed" for kind, _ in events
+        )
+
+
+def test_definitive_spawn_failure_preserves_workspace_and_clears_guard() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["missing-probe"]
+        SANDBOX = SandboxSpec(backend="subprocess", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def __init__(self, ctx):
+            super().__init__(ctx)
+            self.torn_down = False
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def teardown(self, sandbox, inp):
+            self.torn_down = True
+
+    class FailedSpawnSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            raise SandboxSpawnError("executable not found")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        retained = workspace / "retained.txt"
+        retained.write_text("research state", encoding="utf-8")
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        events: list[tuple[str, dict]] = []
+
+        async def emit(kind, payload, **kwargs):
+            events.append((kind, payload))
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = FailedSpawnSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(SandboxSpawnError, match="executable not found"):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert retained.read_text(encoding="utf-8") == "research state"
+        assert not agent.workspace_active_guard_path_for(workspace).exists()
+        assert not agent.sensitive_quarantine_path_for(workspace).exists()
+        assert agent.torn_down is True
+        assert not any(
+            kind == "cli.worker_stop_unconfirmed" for kind, _ in events
+        )
+
+
+def test_worker_stop_event_retries_after_first_emit_failure() -> None:
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(backend="docker", timeout_s=10)
+        WORKSPACE_RECOVERY_ENABLED = True
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def collect(self, sandbox, inp, done):
+            return inp
+
+    class UnknownStopStream:
+        done = True
+        worker_stop_state = WorkerStopState.UNKNOWN
+        worker_stopped = False
+        proc = SimpleNamespace(stdin=None, returncode=0)
+        stdout = ""
+        stderr = ""
+        metering_stdout = ""
+        stdout_chars = 0
+        stderr_chars = 0
+
+        async def terminate(self):
+            return None
+
+    class UnknownStopSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            return None
+
+        async def stream_command(self, *args, **kwargs):
+            return UnknownStopStream()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        workspace = temp / "compute"
+        workspace.mkdir()
+        ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
+        agent = ProbeAgent(ctx)
+        stop_attempts = 0
+        successful_stop_events: list[dict] = []
+
+        async def emit(kind, payload, **kwargs):
+            nonlocal stop_attempts
+            if kind == "cli.worker_stop_unconfirmed":
+                stop_attempts += 1
+                if stop_attempts == 1:
+                    raise RuntimeError("temporary event sink failure")
+                successful_stop_events.append(payload)
+
+        agent.events = SimpleNamespace(emit=emit)
+        sandbox = UnknownStopSandbox(root=workspace)
+        with mock.patch("proofstack.kinds.cli.make_sandbox", return_value=sandbox):
+            with pytest.raises(
+                RuntimeError,
+                match="CLI worker could not be confirmed stopped",
+            ):
+                asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+
+        assert stop_attempts == 2
+        assert [event["phase"] for event in successful_stop_events] == ["finalize"]
 
 
 def test_soft_pressure_does_not_reset_recovery_attempt_cap() -> None:
@@ -2340,6 +4152,10 @@ def test_filesystem_free_inode_guard_stops_compute_worker() -> None:
 
     class FakeStream:
         terminated = False
+
+        @property
+        def worker_stopped(self):
+            return self.terminated
 
         async def terminate(self):
             self.terminated = True
@@ -2649,9 +4465,15 @@ exit 0
                 run_id="test", root_workdir=temp / "run", flat=True
             )
             agent = Compute(ctx)
-            with mock.patch(
-                "proofstack.agents.ac.compute.Path.home",
-                return_value=fake_home,
+            with (
+                mock.patch(
+                    "proofstack.agents.ac.compute.Path.home",
+                    return_value=fake_home,
+                ),
+                mock.patch(
+                    "proofstack.sandbox.subprocess._terminate_marked_processes",
+                    new=mock.AsyncMock(return_value=True),
+                ),
             ):
                 try:
                     asyncio.run(
@@ -2748,9 +4570,15 @@ exit 0
         os.environ["PATH"] = f"{fake_bin}{os.pathsep}{old_path}"
         try:
             ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
-            with mock.patch(
-                "proofstack.agents.ac.compute.Path.home",
-                return_value=fake_home,
+            with (
+                mock.patch(
+                    "proofstack.agents.ac.compute.Path.home",
+                    return_value=fake_home,
+                ),
+                mock.patch(
+                    "proofstack.sandbox.subprocess._terminate_marked_processes",
+                    new=mock.AsyncMock(return_value=True),
+                ),
             ):
                 out = asyncio.run(
                     Compute(ctx)(
@@ -2800,9 +4628,15 @@ exit 0
         os.environ["PATH"] = f"{fake_bin}{os.pathsep}{old_path}"
         try:
             ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
-            with mock.patch(
-                "proofstack.agents.ac.compute.Path.home",
-                return_value=fake_home,
+            with (
+                mock.patch(
+                    "proofstack.agents.ac.compute.Path.home",
+                    return_value=fake_home,
+                ),
+                mock.patch(
+                    "proofstack.sandbox.subprocess._terminate_marked_processes",
+                    new=mock.AsyncMock(return_value=True),
+                ),
             ):
                 out = asyncio.run(
                     Compute(ctx)(
@@ -2855,9 +4689,15 @@ exit 0
         os.environ["PATH"] = f"{fake_bin}{os.pathsep}{old_path}"
         try:
             ctx = RunContext.create(run_id="test", root_workdir=temp / "run", flat=True)
-            with mock.patch(
-                "proofstack.agents.ac.compute.Path.home",
-                return_value=fake_home,
+            with (
+                mock.patch(
+                    "proofstack.agents.ac.compute.Path.home",
+                    return_value=fake_home,
+                ),
+                mock.patch(
+                    "proofstack.sandbox.subprocess._terminate_marked_processes",
+                    new=mock.AsyncMock(return_value=True),
+                ),
             ):
                 out = asyncio.run(
                     Compute(ctx)(

@@ -5,7 +5,13 @@ import os
 from pathlib import Path
 from typing import Iterable
 
-from proofstack.sandbox.base import CommandResult, Sandbox, SandboxBackend, SandboxSpec
+from proofstack.sandbox.base import (
+    CommandResult,
+    Sandbox,
+    SandboxBackend,
+    SandboxSpawnError,
+    SandboxSpec,
+)
 from proofstack.sandbox.docker import (
     DockerSandbox,
     DockerSandboxError,
@@ -71,6 +77,7 @@ __all__ = [
     "DockerSandboxError",
     "Sandbox",
     "SandboxBackend",
+    "SandboxSpawnError",
     "SandboxSpec",
     "SubprocessSandbox",
     "check_image_available",

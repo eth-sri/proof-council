@@ -5,8 +5,11 @@ Per-invocation isolation:
 - env stripped to the spec's allowlist plus declared provider keys;
 - wallclock timeout enforced by the orchestrator;
 - soft CPU/memory limits via ``setrlimit`` (best-effort);
-- new POSIX session (``start_new_session=True``) so descendents stay in
-  one process group and ``os.killpg`` can clean them up on teardown.
+- new POSIX session (``start_new_session=True``) so ordinary descendants
+  stay in one process group and ``os.killpg`` can clean them up on teardown;
+- a per-invocation environment marker to find descendants that create a new
+  session. If the host process table cannot be inspected, cleanup reports an
+  unknown state instead of claiming the worker stopped.
 """
 from __future__ import annotations
 
@@ -17,16 +20,141 @@ import resource
 import shlex
 import signal
 import time
+import uuid
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
-from proofstack.sandbox.base import CommandResult, Sandbox
+import psutil  # type: ignore[import-untyped]
+
+from proofstack.sandbox.base import (
+    CommandResult,
+    Sandbox,
+    SandboxSpawnError,
+    WorkerStopState,
+)
 
 
 STREAM_CAPTURE_MAX_CHARS = 16 * 1024 * 1024
 USAGE_CAPTURE_MAX_CHARS = 16 * 1024 * 1024
 USAGE_CAPTURE_MAX_LINE_CHARS = 2 * 1024 * 1024
+PROCESS_GROUP_EXIT_TIMEOUT_S = 5.0
+PROCESS_GROUP_EXIT_POLL_S = 0.05
+PROCESS_MARKER_ENV = "PROOFSTACK_PROCESS_TOKEN"
+PROCESS_MARKER_CLOCK_SKEW_S = 2.0
+PROCESS_MARKER_TERM_GRACE_S = 1.0
+PROCESS_MARKER_EXIT_TIMEOUT_S = 1.0
+PROCESS_MARKER_EMPTY_SCANS = 3
+
+
+@dataclass(frozen=True)
+class _ProcessMarker:
+    """Marker inherited by the descendants of one subprocess invocation."""
+
+    token: str
+    created_at: float
+
+
+def _new_process_marker() -> _ProcessMarker:
+    return _ProcessMarker(token=uuid.uuid4().hex, created_at=time.time())
+
+
+def _find_marked_processes(
+    marker: _ProcessMarker,
+) -> tuple[list[psutil.Process], bool]:
+    """Find same-user processes that inherited ``marker``.
+
+    The subprocess backend is not a security boundary: a hostile child can
+    remove the environment marker. It does, however, let cleanup find normal
+    descendants that call ``setsid()`` and leave the original process group.
+    Any process-table inspection gap makes the result incomplete so callers
+    fail closed instead of claiming that the worker stopped.
+    """
+    try:
+        current_uid = os.getuid()
+        candidates = psutil.process_iter(
+            attrs=["pid", "uids", "create_time"],
+            ad_value=None,
+        )
+    except (AttributeError, OSError, psutil.Error):
+        return [], False
+
+    found: list[psutil.Process] = []
+    complete = True
+    try:
+        for candidate in candidates:
+            try:
+                info = candidate.info
+                if info.get("pid") == os.getpid():
+                    continue
+                uids = info.get("uids")
+                if uids is None:
+                    complete = False
+                    continue
+                if getattr(uids, "real", None) != current_uid:
+                    continue
+                created_at = info.get("create_time")
+                if not isinstance(created_at, (int, float)):
+                    complete = False
+                    continue
+                if created_at < marker.created_at - PROCESS_MARKER_CLOCK_SKEW_S:
+                    continue
+                environment = candidate.environ()
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                continue
+            except (OSError, psutil.AccessDenied, psutil.Error):
+                complete = False
+                continue
+            if environment.get(PROCESS_MARKER_ENV) == marker.token:
+                found.append(candidate)
+    except (OSError, psutil.Error):
+        return found, False
+    return found, complete
+
+
+def _signal_marked_processes(
+    processes: Iterable[psutil.Process],
+    *,
+    kill: bool,
+) -> None:
+    for process in processes:
+        try:
+            process.kill() if kill else process.terminate()
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except (OSError, psutil.AccessDenied, psutil.Error):
+            # The verification scans below decide whether cleanup succeeded.
+            continue
+
+
+async def _terminate_marked_processes(marker: _ProcessMarker) -> bool:
+    """Stop escaped descendants and require repeated complete empty scans."""
+    processes, _ = _find_marked_processes(marker)
+    _signal_marked_processes(processes, kill=False)
+
+    term_deadline = time.monotonic() + PROCESS_MARKER_TERM_GRACE_S
+    while processes and time.monotonic() < term_deadline:
+        await asyncio.sleep(PROCESS_GROUP_EXIT_POLL_S)
+        processes, _ = _find_marked_processes(marker)
+
+    _signal_marked_processes(processes, kill=True)
+    verify_deadline = time.monotonic() + PROCESS_MARKER_EXIT_TIMEOUT_S
+    empty_scans = 0
+    while True:
+        processes, complete = _find_marked_processes(marker)
+        if not complete or processes:
+            empty_scans = 0
+            if processes:
+                _signal_marked_processes(processes, kill=True)
+        else:
+            empty_scans += 1
+            if empty_scans >= PROCESS_MARKER_EMPTY_SCANS:
+                return True
+        remaining = verify_deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(PROCESS_GROUP_EXIT_POLL_S, remaining))
 
 
 def _make_preexec(memory_gb: int, cpu_limit: int, cpu_seconds: int):
@@ -62,7 +190,32 @@ def _make_preexec(memory_gb: int, cpu_limit: int, cpu_seconds: int):
     return _apply
 
 
-async def _terminate_process_group(proc: asyncio.subprocess.Process, *, grace_s: float = 5.0) -> None:
+async def _process_group_stopped(
+    pgid: int,
+    *,
+    timeout_s: float = PROCESS_GROUP_EXIT_TIMEOUT_S,
+) -> bool:
+    """Wait briefly until no process remains in ``pgid``."""
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except (PermissionError, OSError):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(PROCESS_GROUP_EXIT_POLL_S, remaining))
+
+
+async def _terminate_process_group(
+    proc: asyncio.subprocess.Process,
+    *,
+    grace_s: float = 5.0,
+    process_marker: _ProcessMarker | None = None,
+) -> bool:
     """Best-effort SIGTERM-then-SIGKILL of the child's process group.
 
     With ``start_new_session=True``, the child is its own session leader
@@ -110,6 +263,40 @@ async def _terminate_process_group(proc: asyncio.subprocess.Process, *, grace_s:
             await proc.wait()
         except ProcessLookupError:
             pass
+    marked_processes_stopped = (
+        await _terminate_marked_processes(process_marker)
+        if process_marker is not None
+        else True
+    )
+    process_group_stopped = await _process_group_stopped(pid)
+    return process_group_stopped and marked_processes_stopped
+
+
+async def _terminate_process_group_uninterruptibly(
+    proc: asyncio.subprocess.Process,
+    *,
+    grace_s: float = 5.0,
+    process_marker: _ProcessMarker | None = None,
+) -> bool:
+    """Drain process-group cleanup despite cancellation of the caller."""
+    cleanup = asyncio.create_task(
+        _terminate_process_group(
+            proc,
+            grace_s=grace_s,
+            process_marker=process_marker,
+        )
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    try:
+        return bool(cleanup.result())
+    except (asyncio.CancelledError, Exception):
+        return False
 
 
 class SubprocessSandbox(Sandbox):
@@ -129,12 +316,15 @@ class SubprocessSandbox(Sandbox):
         env = self.spec.build_env(sandbox_root=self.root, extra_path=extra_path)
         if env_extra:
             env.update(env_extra)
+        process_marker = _new_process_marker()
+        env[PROCESS_MARKER_ENV] = process_marker.token
         timeout = timeout_s if timeout_s is not None else self.spec.timeout_s
         input_bytes = (
             input_data.encode("utf-8") if isinstance(input_data, str) else input_data
         )
 
         start = time.monotonic()
+        self._mark_worker_launch_pending()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -147,7 +337,11 @@ class SubprocessSandbox(Sandbox):
                 start_new_session=True,
                 pass_fds=self.inherited_fds,
             )
-        except FileNotFoundError as e:
+        except (OSError, ValueError) as e:
+            self._set_worker_lifecycle(
+                WorkerStopState.STOPPED,
+                launch_settled=True,
+            )
             return CommandResult(cmd=cmd, returncode=127, stdout="", stderr=str(e), duration_s=0.0)
 
         try:
@@ -155,17 +349,65 @@ class SubprocessSandbox(Sandbox):
                 proc.communicate(input=input_bytes), timeout=timeout
             )
             returncode = proc.returncode if proc.returncode is not None else -1
-        except asyncio.TimeoutError:
-            await _terminate_process_group(proc, grace_s=5.0)
-            try:
-                stdout_b, stderr_b = await proc.communicate()
-            except (ProcessLookupError, ValueError):
+            cleanup_succeeded = await _terminate_process_group(
+                proc,
+                grace_s=0.0,
+                process_marker=process_marker,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+            cleanup_succeeded = await _terminate_process_group_uninterruptibly(
+                proc,
+                grace_s=5.0,
+                process_marker=process_marker,
+            )
+            self._set_worker_lifecycle(
+                (
+                    WorkerStopState.STOPPED
+                    if cleanup_succeeded
+                    else WorkerStopState.UNKNOWN
+                ),
+                launch_settled=True,
+            )
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            if cleanup_succeeded:
+                try:
+                    stdout_b, stderr_b = await proc.communicate()
+                except (ProcessLookupError, ValueError):
+                    stdout_b = b""
+                    stderr_b = b""
+            else:
                 stdout_b = b""
                 stderr_b = b""
             returncode = -9
             if not stderr_b:
                 stderr_b = f"timeout after {timeout}s".encode("utf-8")
+        except BaseException:
+            cleanup_succeeded = await _terminate_process_group_uninterruptibly(
+                proc,
+                grace_s=0.0,
+                process_marker=process_marker,
+            )
+            self._set_worker_lifecycle(
+                (
+                    WorkerStopState.STOPPED
+                    if cleanup_succeeded
+                    else WorkerStopState.UNKNOWN
+                ),
+                launch_settled=True,
+            )
+            raise
 
+        stop_state = (
+            WorkerStopState.STOPPED
+            if cleanup_succeeded
+            else WorkerStopState.UNKNOWN
+        )
+        self._set_worker_lifecycle(stop_state, launch_settled=True)
+        if stop_state is not WorkerStopState.STOPPED:
+            suffix = b"subprocess process-tree stop state is unknown"
+            stderr_b = stderr_b.rstrip()
+            stderr_b += (b"\n" if stderr_b else b"") + suffix
         elapsed = time.monotonic() - start
         return CommandResult(
             cmd=cmd,
@@ -197,20 +439,47 @@ class SubprocessSandbox(Sandbox):
         env = self.spec.build_env(sandbox_root=self.root, extra_path=extra_path)
         if env_extra:
             env.update(env_extra)
+        process_marker = _new_process_marker()
+        env[PROCESS_MARKER_ENV] = process_marker.token
         timeout = timeout_s if timeout_s is not None else self.spec.timeout_s
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=str(cwd_path),
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            preexec_fn=_make_preexec(self.spec.memory_gb, self.spec.cpu_limit, int(timeout)),
-            start_new_session=True,
-            pass_fds=self.inherited_fds,
-        )
+        self._mark_worker_launch_pending()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(cwd_path),
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=_make_preexec(
+                    self.spec.memory_gb,
+                    self.spec.cpu_limit,
+                    int(timeout),
+                ),
+                start_new_session=True,
+                pass_fds=self.inherited_fds,
+            )
+        except (OSError, ValueError) as e:
+            self._set_worker_lifecycle(
+                WorkerStopState.STOPPED,
+                launch_settled=True,
+            )
+            executable = cmd[0] if cmd else "<empty command>"
+            raise SandboxSpawnError(
+                f"could not spawn sandbox command {executable!r}: {e}"
+            ) from e
         deadline = time.monotonic() + timeout
-        return _StreamingProcess(proc=proc, cmd=cmd, deadline=deadline)
+        self._set_worker_lifecycle(
+            WorkerStopState.SURVIVING,
+            launch_settled=True,
+        )
+        return _StreamingProcess(
+            proc=proc,
+            cmd=cmd,
+            deadline=deadline,
+            process_marker=process_marker,
+            lifecycle_callback=self._set_worker_lifecycle,
+        )
 
 
 class _BoundedTextBuffer:
@@ -363,17 +632,16 @@ class _JsonUsageCapture:
             }
         elif event_type == "assistant":
             message = event.get("message")
-            message_usage = (
-                message.get("usage") if isinstance(message, dict) else None
-            )
-            if isinstance(message_usage, dict):
-                compact = {
-                    "type": event_type,
-                    "message": {
-                        "id": message.get("id"),
-                        "usage": message_usage,
-                    },
-                }
+            if isinstance(message, dict):
+                message_usage = message.get("usage")
+                if isinstance(message_usage, dict):
+                    compact = {
+                        "type": event_type,
+                        "message": {
+                            "id": message.get("id"),
+                            "usage": message_usage,
+                        },
+                    }
         elif isinstance(usage, dict):
             compact = {
                 "type": event_type,
@@ -404,12 +672,17 @@ class _StreamingProcess:
         cmd: list[str],
         deadline: float,
         max_capture_chars: int = STREAM_CAPTURE_MAX_CHARS,
+        process_marker: _ProcessMarker | None = None,
+        lifecycle_callback: Callable[..., None] | None = None,
     ):
         self.proc = proc
         self.cmd = cmd
         self.deadline = deadline
+        self._process_marker = process_marker
         self._stdout_buf = _BoundedTextBuffer(max_capture_chars)
         self._stderr_buf = _BoundedTextBuffer(max_capture_chars)
+        self._process_group_stop_state = WorkerStopState.SURVIVING
+        self._process_lifecycle_callback = lifecycle_callback
         self._stdout_usage = _JsonUsageCapture()
         self._stdout_task = asyncio.create_task(
             self._drain(proc.stdout, self._stdout_buf, self._stdout_usage)
@@ -446,9 +719,23 @@ class _StreamingProcess:
         return self.proc.returncode is not None
 
     @property
+    def worker_stop_state(self) -> WorkerStopState:
+        """What is known about the process tree protected by the lease."""
+        return self.process_group_stop_state
+
+    @property
+    def process_group_stop_state(self) -> WorkerStopState:
+        """Terminal-state knowledge for the host-side client process group."""
+        if (
+            self._process_group_stop_state is WorkerStopState.SURVIVING
+            and self.done
+        ):
+            return WorkerStopState.UNKNOWN
+        return self._process_group_stop_state
+
+    @property
     def worker_stopped(self) -> bool:
-        """Whether the process tree protected by the lease has stopped."""
-        return self.done
+        return self.worker_stop_state is WorkerStopState.STOPPED
 
     async def wait(self, timeout_s: float | None = None) -> int:
         try:
@@ -459,7 +746,24 @@ class _StreamingProcess:
         return self.proc.returncode or 0
 
     async def terminate(self) -> None:
-        await _terminate_process_group(self.proc, grace_s=5.0)
+        if self._process_group_stop_state is WorkerStopState.STOPPED:
+            await self._drain_pipes(timeout_s=5.0)
+            return
+        cleanup_succeeded = await _terminate_process_group_uninterruptibly(
+            self.proc,
+            grace_s=5.0,
+            process_marker=self._process_marker,
+        )
+        self._process_group_stop_state = (
+            WorkerStopState.STOPPED
+            if cleanup_succeeded
+            else WorkerStopState.UNKNOWN
+        )
+        if self._process_lifecycle_callback is not None:
+            self._process_lifecycle_callback(
+                self._process_group_stop_state,
+                launch_settled=True,
+            )
         await self._drain_pipes(timeout_s=5.0)
 
     async def _drain_pipes(self, *, timeout_s: float) -> None:

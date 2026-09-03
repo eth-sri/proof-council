@@ -10,11 +10,14 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Callable, Literal
 
 
 class StorageReservationError(RuntimeError):
     """Raised when a requested filesystem reservation cannot be admitted."""
+
+
+StorageRetentionGuardState = Literal["present", "repaired", "unreadable"]
 
 
 @dataclass(frozen=True)
@@ -33,8 +36,10 @@ class StorageReservationLease:
     """A reservation represented by a locked lease file.
 
     The registry lock serializes admission. Each admitted process then keeps an
-    exclusive lock on its own lease file; if it crashes, the kernel releases
-    that lock and the next admission removes the stale file.
+    exclusive lock on its own lease file. An unlocked lease is stale unless its
+    host-side retention guard still exists; guarded records therefore continue
+    to reserve capacity across an orchestrator crash or an unconfirmed worker
+    stop, and are pruned after guarded workspace recovery clears that marker.
     """
 
     def __init__(
@@ -45,12 +50,20 @@ class StorageReservationLease:
         requested_bytes: int,
         minimum_free_bytes: int,
         owner: str,
+        retention_guard_path: Path | None = None,
+        retention_guard_repair: Callable[[], None] | None = None,
     ) -> None:
         self.registry_dir = Path(registry_dir).resolve()
         self.workspace_root = Path(workspace_root).resolve()
         self.requested_bytes = max(0, int(requested_bytes))
         self.minimum_free_bytes = max(0, int(minimum_free_bytes))
         self.owner = str(owner)
+        self.retention_guard_path = (
+            Path(retention_guard_path).resolve()
+            if retention_guard_path is not None
+            else None
+        )
+        self.retention_guard_repair = retention_guard_repair
         self.status: StorageReservationStatus | None = None
         self._lease_path: Path | None = None
         self._lease_file: IO[str] | None = None
@@ -117,7 +130,7 @@ class StorageReservationLease:
                     fcntl.LOCK_EX | fcntl.LOCK_NB,
                 )
                 payload = {
-                    "version": 2,
+                    "version": 4,
                     "owner": self.owner,
                     "pid": os.getpid(),
                     "hostname": socket.gethostname(),
@@ -125,6 +138,11 @@ class StorageReservationLease:
                     "filesystem_device": filesystem_device,
                     "reserved_bytes": self.requested_bytes,
                     "workspace_allocated_bytes_at_admission": workspace_allocated,
+                    "retention_guard": (
+                        str(self.retention_guard_path)
+                        if self.retention_guard_path is not None
+                        else None
+                    ),
                     "created_at": time.time(),
                 }
                 json.dump(payload, lease_file, ensure_ascii=False, indent=2)
@@ -179,6 +197,57 @@ class StorageReservationLease:
             self._lease_file = None
             self._lease_path = None
 
+    def retain(self) -> StorageRetentionGuardState | None:
+        """Leave an unlocked reservation record for an unconfirmed worker.
+
+        Guard-backed records remain active while the external workspace guard
+        exists and become stale automatically after guarded recovery. If the
+        guard unexpectedly disappeared, its owner must recreate it before this
+        method releases the lease lock.
+        """
+        lease_file = self._lease_file
+        if lease_file is None:
+            return None
+        if self.retention_guard_path is None:
+            raise StorageReservationError(
+                "retaining a storage reservation requires a recovery guard"
+            )
+        registry_lock_path = self.registry_dir / "registry.lock"
+        with registry_lock_path.open("a+", encoding="utf-8") as registry_lock:
+            fcntl.flock(registry_lock.fileno(), fcntl.LOCK_EX)
+            guard_state: StorageRetentionGuardState = "present"
+            try:
+                self.retention_guard_path.lstat()
+            except FileNotFoundError as e:
+                if self.retention_guard_repair is None:
+                    raise StorageReservationError(
+                        "storage reservation recovery guard disappeared before retention"
+                    ) from e
+                try:
+                    self.retention_guard_repair()
+                    self.retention_guard_path.lstat()
+                except OSError as repair_error:
+                    raise StorageReservationError(
+                        "storage reservation recovery guard could not be repaired"
+                    ) from repair_error
+                guard_state = "repaired"
+            except OSError:
+                # A transient inspection error is fail-closed by the admission
+                # scanner. Do not convert it into an unbounded permanent lease:
+                # once the guard is readable, its normal lifecycle applies.
+                guard_state = "unreadable"
+
+            # The payload and guard are durable before the lease lock is
+            # dropped. A concurrent admission either sees this lock or the
+            # retained record, never an unprotected gap between the two.
+            self._lease_file = None
+            self._lease_path = None
+            try:
+                fcntl.flock(lease_file.fileno(), fcntl.LOCK_UN)
+            finally:
+                lease_file.close()
+            return guard_state
+
     def _active_reserved_bytes(self, filesystem_device: int) -> int:
         total = 0
         for lease_path in self.registry_dir.glob("lease-*.json"):
@@ -199,26 +268,17 @@ class StorageReservationLease:
                         raise StorageReservationError(
                             f"active storage lease is unreadable: {lease_path}"
                         )
-                    if int(payload.get("filesystem_device", -1)) == filesystem_device:
-                        reserved_bytes = max(
-                            0, int(payload.get("reserved_bytes", 0) or 0)
-                        )
-                        workspace = payload.get("workspace")
-                        if not isinstance(workspace, str) or not workspace:
-                            # Old or malformed active leases are counted at
-                            # their full amount rather than weakening safety.
-                            total += reserved_bytes
-                            continue
-                        try:
-                            allocated_bytes = _workspace_allocated_bytes(
-                                Path(workspace)
-                            )
-                        except StorageReservationError:
-                            total += reserved_bytes
-                        else:
-                            total += max(0, reserved_bytes - allocated_bytes)
+                    total += _remaining_reserved_bytes(payload, filesystem_device)
                 else:
-                    stale = True
+                    payload = _read_lease_payload(lease_file)
+                    retained = _unlocked_lease_is_retained(payload)
+                    if retained and payload is not None:
+                        total += _remaining_reserved_bytes(
+                            payload,
+                            filesystem_device,
+                        )
+                    else:
+                        stale = True
             finally:
                 lease_file.close()
             if stale:
@@ -243,6 +303,45 @@ def _read_lease_payload(handle: IO[str]) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _unlocked_lease_is_retained(payload: dict[str, Any] | None) -> bool:
+    if payload is None:
+        return False
+    guard = payload.get("retention_guard")
+    if isinstance(guard, str) and guard:
+        path = Path(guard)
+        if not path.is_absolute():
+            return False
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Failure to inspect a safety marker must not free capacity.
+            return True
+        else:
+            return True
+    return False
+
+
+def _remaining_reserved_bytes(
+    payload: dict[str, Any],
+    filesystem_device: int,
+) -> int:
+    if int(payload.get("filesystem_device", -1)) != filesystem_device:
+        return 0
+    reserved_bytes = max(0, int(payload.get("reserved_bytes", 0) or 0))
+    workspace = payload.get("workspace")
+    if not isinstance(workspace, str) or not workspace:
+        # Old or malformed retained leases are counted at their full amount
+        # rather than weakening storage safety.
+        return reserved_bytes
+    try:
+        allocated_bytes = _workspace_allocated_bytes(Path(workspace))
+    except StorageReservationError:
+        return reserved_bytes
+    return max(0, reserved_bytes - allocated_bytes)
 
 
 def _workspace_allocated_bytes(root: Path) -> int:
@@ -296,4 +395,5 @@ __all__ = [
     "StorageReservationError",
     "StorageReservationLease",
     "StorageReservationStatus",
+    "StorageRetentionGuardState",
 ]

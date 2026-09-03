@@ -333,6 +333,11 @@ class ConfigurableCLIAgent(CLIAgent):
         inp: BaseModel,
     ) -> None:
         if self._copy_codex_auth_enabled():
+            # setup() can fail before a transient credential is installed. In
+            # that case there is no rotated state to refresh; teardown still
+            # removes any partially-created home.
+            if self._codex_home is None or not self._copied_codex_auth:
+                return
             self._refresh_transient_codex_secrets()
 
     def _refresh_transient_codex_secrets(self) -> None:

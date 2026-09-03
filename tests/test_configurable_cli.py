@@ -8,8 +8,8 @@ import stat
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -21,6 +21,16 @@ from app.dev_data import validate_preset_yaml  # noqa: E402
 
 
 class ConfigurableCLITests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests exercise configurable-agent contracts, not host process
+        # enumeration, which is unavailable in some test sandboxes.
+        patcher = mock.patch(
+            "proofstack.sandbox.subprocess._terminate_marked_processes",
+            new=mock.AsyncMock(return_value=True),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_cli_agent_collects_file_and_done_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             ctx = RunContext.create(
@@ -492,6 +502,7 @@ class ConfigurableCLITests(unittest.TestCase):
                 agent.WORKSPACE_RESERVATION_BYTES = 1
                 agent.WORKSPACE_MIN_FREE_BYTES = 0
                 agent.WORKSPACE_RESERVATION_DIR = Path(temp_dir) / "leases"
+                agent.WORKSPACE_RECOVERY_ENABLED = True
                 asyncio.run(agent(workspace=Path(temp_dir) / "workspace"))
 
             self.assertEqual(

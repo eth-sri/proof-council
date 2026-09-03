@@ -7,11 +7,24 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Iterable, Literal, Mapping
 
 
 SandboxBackend = Literal["subprocess", "docker"]
+
+
+class WorkerStopState(str, Enum):
+    """What the orchestrator knows about an external worker after cleanup."""
+
+    STOPPED = "stopped"
+    SURVIVING = "surviving"
+    UNKNOWN = "unknown"
+
+
+class SandboxSpawnError(RuntimeError):
+    """A sandbox command failed before any external worker was created."""
 
 
 # Standard env vars we always pass through; provider keys are added per call.
@@ -75,6 +88,10 @@ class SandboxSpec:
     docker_network: Literal["bridge", "none"] = "bridge"
     # Hard per-container pid cap. Prevents fork bombs.
     docker_pids_limit: int = 256
+    # Bound the control-plane launch handshake independently of the model's
+    # potentially multi-hour execution timeout. A launch that cannot be
+    # observed within this window is failed closed by the Docker backend.
+    docker_launch_timeout_s: float = 60.0
     # Some Docker/AppArmor installations reject every exec inside
     # node-based images when no-new-privileges is set. Keep it configurable
     # so Codex sandboxes can still run while retaining the other Docker caps.
@@ -139,7 +156,32 @@ class Sandbox:
         self.root = Path(raw_root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.inherited_fds = tuple(int(fd) for fd in inherited_fds)
+        self._worker_stop_state = WorkerStopState.STOPPED
+        self._worker_launch_settled = True
         self._closed = False
+
+    @property
+    def worker_stop_state(self) -> WorkerStopState:
+        """Latest backend-level knowledge about a command using this sandbox."""
+        return self._worker_stop_state
+
+    @property
+    def worker_launch_settled(self) -> bool:
+        """Whether the latest launch can no longer materialize in the future."""
+        return self._worker_launch_settled
+
+    def _mark_worker_launch_pending(self) -> None:
+        self._worker_stop_state = WorkerStopState.UNKNOWN
+        self._worker_launch_settled = False
+
+    def _set_worker_lifecycle(
+        self,
+        state: WorkerStopState,
+        *,
+        launch_settled: bool,
+    ) -> None:
+        self._worker_stop_state = state
+        self._worker_launch_settled = bool(launch_settled)
 
     async def ensure_workspace_available(self) -> None:
         """Fail if this backend still has an orphan using ``root``."""
@@ -185,5 +227,7 @@ __all__ = [
     "CommandResult",
     "DEFAULT_ENV_ALLOWLIST",
     "Sandbox",
+    "SandboxSpawnError",
     "SandboxSpec",
+    "WorkerStopState",
 ]

@@ -22,7 +22,12 @@ from proofstack.budget import BudgetExhausted
 from proofstack.context import RunContext
 from proofstack.events import new_call_id
 from proofstack.sandbox import make_sandbox, resolve_backend
-from proofstack.sandbox.base import Sandbox, SandboxSpec
+from proofstack.sandbox.base import (
+    Sandbox,
+    SandboxSpawnError,
+    SandboxSpec,
+    WorkerStopState,
+)
 from proofstack.storage_reservation import (
     StorageReservationError,
     StorageReservationLease,
@@ -54,6 +59,16 @@ _SHELL_START_BLOCK_BEGIN = "# proofstack finish shim begin"
 _SHELL_START_BLOCK_END = "# proofstack finish shim end"
 _SENSITIVE_STATE_QUARANTINE = "SENSITIVE_STATE_UNTRUSTED"
 _WORKSPACE_RECOVERY_STATE_DIR = ".proofcouncil-workspace-recovery"
+_WORKSPACE_ACTIVE_GUARD_VERSION = 2
+_WORKSPACE_ACTIVE_GUARD_MAX_BYTES = 4096
+_WORKSPACE_GUARD_IDLE = "idle"
+_WORKSPACE_GUARD_LAUNCH_PENDING = "launch_pending"
+_WORKSPACE_GUARD_LAUNCH_SETTLED = "launch_settled"
+_WORKSPACE_GUARD_PHASES = {
+    _WORKSPACE_GUARD_IDLE,
+    _WORKSPACE_GUARD_LAUNCH_PENDING,
+    _WORKSPACE_GUARD_LAUNCH_SETTLED,
+}
 
 
 DoneStatus = Literal["done", "partial", "blocked", "timeout", "error"]
@@ -70,9 +85,87 @@ class _WorkspaceLockBusy(RuntimeError):
     """Another process currently holds a lock for this workspace."""
 
 
+class _WorkerStopUnconfirmed(RuntimeError):
+    """The external worker may still be able to mutate its workspace."""
+
+    def __init__(self, state: WorkerStopState, *, phase: str) -> None:
+        self.state = state
+        self.phase = phase
+        super().__init__(
+            "CLI worker could not be confirmed stopped "
+            f"(state={state.value}, phase={phase}); response and handoff "
+            "artifacts were suppressed and workspace availability will be "
+            "rechecked before the next invocation"
+        )
+
+
+def _reported_worker_stop_state(worker: Any) -> WorkerStopState | None:
+    raw_state = getattr(worker, "worker_stop_state", None)
+    if isinstance(raw_state, WorkerStopState):
+        return raw_state
+    if isinstance(raw_state, str):
+        try:
+            return WorkerStopState(raw_state)
+        except ValueError:
+            pass
+    return None
+
+
+def _worker_stop_state(stream: Any) -> WorkerStopState:
+    """Normalize old and backend-specific streaming handle state."""
+    if (reported := _reported_worker_stop_state(stream)) is not None:
+        return reported
+    stopped = bool(
+        getattr(stream, "worker_stopped", getattr(stream, "done", False))
+    )
+    return WorkerStopState.STOPPED if stopped else WorkerStopState.SURVIVING
+
+
+def _sandbox_worker_stop_state(sandbox: Any) -> WorkerStopState:
+    """Return backend lifecycle state, defaulting legacy sandboxes to idle."""
+    state = _reported_worker_stop_state(sandbox) or WorkerStopState.STOPPED
+    if state is WorkerStopState.STOPPED and not bool(
+        getattr(sandbox, "worker_launch_settled", True)
+    ):
+        return WorkerStopState.UNKNOWN
+    return state
+
+
+def _require_worker_stopped(stream: Any, *, phase: str) -> None:
+    state = _worker_stop_state(stream)
+    if state is not WorkerStopState.STOPPED:
+        raise _WorkerStopUnconfirmed(state, phase=phase)
+
+
 async def _release_storage_lease(lease: StorageReservationLease) -> None:
     """Release a filesystem lease without blocking the shared event loop."""
     await asyncio.to_thread(lease.release)
+
+
+async def _retain_storage_lease(lease: StorageReservationLease) -> str | None:
+    """Persist a filesystem lease for a worker whose stop is unconfirmed."""
+    return await _run_in_thread_uninterruptibly(lease.retain)
+
+
+async def _run_in_thread_uninterruptibly(
+    func: Any,
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Finish a safety-critical thread operation before propagating cancel."""
+    task = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as e:
+            cancellation = e
+            continue
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
 
 
 _SENSITIVE_STATE_QUARANTINE_MESSAGE = (
@@ -154,6 +247,217 @@ def _mark_sensitive_workspace_untrusted(
             "could not be persisted"
         )
     return tuple(persisted)
+
+
+def _workspace_active_guard_payload(
+    root: Path,
+    *,
+    backend: str,
+    phase: str,
+    created_at: float | None = None,
+) -> bytes:
+    if phase not in _WORKSPACE_GUARD_PHASES:
+        raise ValueError(f"invalid workspace active guard phase: {phase}")
+    resolved = Path(root).resolve()
+    metadata = resolved.stat()
+    payload = json.dumps(
+        {
+            "version": _WORKSPACE_ACTIVE_GUARD_VERSION,
+            "workspace": str(resolved),
+            "workspace_identity": [int(metadata.st_dev), int(metadata.st_ino)],
+            "backend": str(backend),
+            "phase": phase,
+            "created_at": time.time() if created_at is None else created_at,
+            "updated_at": time.time(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) > _WORKSPACE_ACTIVE_GUARD_MAX_BYTES:
+        raise RuntimeError("workspace active guard payload is unexpectedly large")
+    return payload
+
+
+def _write_fd_all(fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(fd, payload[offset:])
+        if written <= 0:
+            raise OSError("could not write workspace active guard")
+        offset += written
+    os.fsync(fd)
+
+
+def _write_workspace_active_guard(
+    path: Path,
+    root: Path,
+    *,
+    backend: str = "unknown",
+    phase: str = _WORKSPACE_GUARD_LAUNCH_SETTLED,
+) -> None:
+    """Durably mark a workspace as unsafe until its worker is sanitized."""
+    payload = _workspace_active_guard_payload(
+        root,
+        backend=backend,
+        phase=phase,
+    )
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError as e:
+        raise RuntimeError(
+            f"workspace active guard already exists: {path}"
+        ) from e
+    try:
+        _write_fd_all(fd, payload)
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def _validate_workspace_active_guard(path: Path, root: Path) -> dict[str, Any]:
+    """Verify that a bounded, non-symlink guard belongs to this workspace."""
+    try:
+        metadata = path.lstat()
+    except OSError as e:
+        raise RuntimeError(f"cannot read workspace active guard: {path}") from e
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size > _WORKSPACE_ACTIVE_GUARD_MAX_BYTES
+    ):
+        raise RuntimeError(f"workspace active guard is invalid: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+        try:
+            raw = os.read(fd, _WORKSPACE_ACTIVE_GUARD_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
+        payload = json.loads(raw.decode("utf-8"))
+        resolved = Path(root).resolve()
+        root_metadata = resolved.stat()
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"workspace active guard is unreadable: {path}") from e
+    expected_identity = [int(root_metadata.st_dev), int(root_metadata.st_ino)]
+    version = payload.get("version") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or version not in {1, _WORKSPACE_ACTIVE_GUARD_VERSION}
+        or payload.get("workspace") != str(resolved)
+        or payload.get("workspace_identity") != expected_identity
+    ):
+        raise RuntimeError(
+            "workspace active guard does not match the current workspace; "
+            f"refusing automatic deletion: {path}"
+        )
+    if version == 1:
+        # Version 1 did not record whether a Docker create request had settled.
+        # Treat it as pending so an upgrade cannot turn heuristic absence into
+        # permission to delete or reuse a live workspace.
+        payload = {
+            **payload,
+            "backend": "unknown",
+            "phase": _WORKSPACE_GUARD_LAUNCH_PENDING,
+        }
+    if (
+        not isinstance(payload.get("backend"), str)
+        or payload.get("phase") not in _WORKSPACE_GUARD_PHASES
+    ):
+        raise RuntimeError(f"workspace active guard has invalid lifecycle data: {path}")
+    return payload
+
+
+def _update_workspace_active_guard(
+    path: Path,
+    root: Path,
+    *,
+    phase: str,
+) -> None:
+    """Atomically persist a lifecycle transition for an existing guard."""
+    current = _validate_workspace_active_guard(path, root)
+    payload = _workspace_active_guard_payload(
+        root,
+        backend=str(current["backend"]),
+        phase=phase,
+        created_at=float(current.get("created_at", time.time())),
+    )
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        _write_fd_all(fd, payload)
+        os.close(fd)
+        fd = -1
+        os.replace(temporary, path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _discard_workspace_contents(root: Path) -> None:
+    """Remove one confirmed-idle workspace without following child symlinks."""
+    resolved = Path(root).resolve()
+    metadata = resolved.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or resolved == resolved.parent:
+        raise RuntimeError(f"refusing to discard unsafe workspace path: {resolved}")
+    with os.scandir(resolved) as entries:
+        children = list(entries)
+    for entry in children:
+        target = Path(entry.path)
+        try:
+            is_directory = entry.is_dir(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if is_directory:
+            shutil.rmtree(target)
+        else:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+    with os.scandir(resolved) as entries:
+        if next(iter(entries), None) is not None:
+            raise RuntimeError(f"workspace discard was incomplete: {resolved}")
+
+
+def _clear_workspace_active_guard(path: Path) -> None:
+    """Remove a guard without following a substituted path."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise RuntimeError(f"cannot inspect workspace active guard: {path}") from e
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise RuntimeError(f"workspace active guard is invalid: {path}")
+    try:
+        path.unlink()
+    except OSError as e:
+        raise RuntimeError(f"cannot clear workspace active guard: {path}") from e
 
 
 def measure_workspace_usage(
@@ -495,6 +799,59 @@ class CLIAgent(Agent):
             / f"{digest}.active.lock"
         )
 
+    def workspace_active_guard_path_for(self, root: Path) -> Path:
+        """Return the model-inaccessible guard for an active CLI workspace."""
+        resolved = Path(root).resolve()
+        digest = hashlib.sha256(os.fsencode(str(resolved))).hexdigest()
+        return (
+            resolved.parent
+            / _WORKSPACE_RECOVERY_STATE_DIR
+            / f"{digest}.active.json"
+        )
+
+    async def _recover_guarded_workspace(self, root: Path, guard: Path) -> None:
+        """Recover only guards whose persisted launch lifecycle is settled."""
+        def recover() -> tuple[str, str]:
+            payload = _validate_workspace_active_guard(guard, root)
+            phase = str(payload["phase"])
+            backend = str(payload["backend"])
+            if phase == _WORKSPACE_GUARD_LAUNCH_PENDING:
+                raise RuntimeError(
+                    "persistent workspace has an unresolved external launch; "
+                    "automatic recovery is unsafe until an operator confirms "
+                    f"that no worker can still start: {guard}"
+                )
+            if phase == _WORKSPACE_GUARD_IDLE:
+                _clear_workspace_active_guard(guard)
+                return "cleared", backend
+            _discard_workspace_contents(root)
+            self._clear_workspace_recovery_attempts(root)
+            _clear_workspace_active_guard(guard)
+            return "discarded", backend
+
+        # ``to_thread`` keeps a potentially large deletion off the event loop,
+        # but cancelling its await does not stop the underlying thread. Drain it
+        # before releasing the invocation lock so a resumed worker cannot race
+        # an in-progress discard.
+        action, backend = await _run_in_thread_uninterruptibly(recover)
+        if action == "discarded":
+            await self.events.emit(
+                "cli.workspace_discarded_after_unconfirmed_stop",
+                {
+                    "workspace": str(Path(root).resolve()),
+                    "reason": "stale_active_guard",
+                    "backend": backend,
+                },
+            )
+        else:
+            await self.events.emit(
+                "cli.workspace_idle_guard_cleared",
+                {
+                    "workspace": str(Path(root).resolve()),
+                    "reason": "stale_idle_guard",
+                    "backend": backend,
+                },
+            )
     @staticmethod
     def _workspace_identity(root: Path) -> tuple[int, int]:
         metadata = Path(root).resolve().stat()
@@ -1171,12 +1528,40 @@ class CLIAgent(Agent):
         output_truncation_emitted = False
         sensitive_state_trusted = True
         sensitive_state_ever_failed = False
+        sensitive_suppression_reason = "credential_refresh_failed"
+        worker_stop_failure_emitted = False
+        worker_stop_workspace_quarantined = False
+        workspace_active_guard: Path | None = None
+        workspace_guard_armed = False
+        workspace_guard_phase: str | None = None
+        stream_spawn_attempted = False
+        worker_stop_phase = "setup"
+        spawn_call_id = new_call_id()
+        workspace_guard_error: BaseException | None = None
+        storage_lease_error: BaseException | None = None
+        storage_retention_guard_state: str | None = None
         sensitive_quarantine_path: Path | None = None
         sensitive_quarantine_external_path: Path | None = None
         sandbox: Sandbox | None = None
         storage_lease: StorageReservationLease | None = None
         workspace_recovery_claim: _WorkspaceRecoveryClaim | None = None
         workspace_recovery_started_payload: dict[str, Any] | None = None
+
+        def repair_storage_retention_guard() -> None:
+            if workspace_active_guard is None or sandbox is None:
+                raise StorageReservationError(
+                    "cannot repair a storage reservation without its workspace guard"
+                )
+            phase = workspace_guard_phase
+            if phase not in _WORKSPACE_GUARD_PHASES:
+                phase = _WORKSPACE_GUARD_LAUNCH_PENDING
+            _write_workspace_active_guard(
+                workspace_active_guard,
+                sandbox.root,
+                backend=resolve_backend(self.SANDBOX),
+                phase=phase,
+            )
+
         try:
             if root is not None:
                 root.mkdir(parents=True, exist_ok=True)
@@ -1203,7 +1588,6 @@ class CLIAgent(Agent):
                 await ensure_workspace_available()
             if persistent:
                 runtime_dir = sandbox.root / ".pwc" / "runtime"
-                runtime_dir.mkdir(parents=True, exist_ok=True)
                 sensitive_quarantine_path = (
                     runtime_dir / _SENSITIVE_STATE_QUARANTINE
                 )
@@ -1226,6 +1610,16 @@ class CLIAgent(Agent):
                         "sanitize it before removing all quarantine markers: "
                         + ", ".join(str(path) for path in existing_quarantine_paths)
                     )
+                if workspace_invocation_lock_fd is not None:
+                    workspace_active_guard = self.workspace_active_guard_path_for(
+                        sandbox.root
+                    )
+                    if _path_exists_without_following(workspace_active_guard):
+                        await self._recover_guarded_workspace(
+                            sandbox.root,
+                            workspace_active_guard,
+                        )
+                runtime_dir.mkdir(parents=True, exist_ok=True)
                 bin_dir = runtime_dir / ".bin"
                 bin_dir.mkdir(parents=True, exist_ok=True)
                 done_path = runtime_dir / "done.json"
@@ -1242,6 +1636,12 @@ class CLIAgent(Agent):
                 wrap_up_path = None
 
             if persistent and self.WORKSPACE_RESERVATION_BYTES > 0:
+                if workspace_active_guard is None:
+                    raise RuntimeError(
+                        "persistent CLI storage reservations require "
+                        "WORKSPACE_RECOVERY_ENABLED so an unconfirmed worker "
+                        "cannot lose its reservation after a process crash"
+                    )
                 reservation_dir = self.workspace_reservation_dir_for(sandbox.root)
                 storage_lease = StorageReservationLease(
                     registry_dir=reservation_dir,
@@ -1249,6 +1649,8 @@ class CLIAgent(Agent):
                     requested_bytes=self.WORKSPACE_RESERVATION_BYTES,
                     minimum_free_bytes=self.WORKSPACE_MIN_FREE_BYTES,
                     owner=f"{self.ctx.run_id}:{self.name}",
+                    retention_guard_path=workspace_active_guard,
+                    retention_guard_repair=repair_storage_retention_guard,
                 )
                 try:
                     reservation = await asyncio.to_thread(storage_lease.acquire)
@@ -1273,7 +1675,49 @@ class CLIAgent(Agent):
                     },
                 )
 
+            if workspace_active_guard is not None:
+                workspace_guard_armed = True
+                try:
+                    await _run_in_thread_uninterruptibly(
+                        _write_workspace_active_guard,
+                        workspace_active_guard,
+                        sandbox.root,
+                        backend=resolve_backend(self.SANDBOX),
+                        phase=_WORKSPACE_GUARD_IDLE,
+                    )
+                    workspace_guard_phase = _WORKSPACE_GUARD_IDLE
+                except asyncio.CancelledError:
+                    # The write may have completed before cancellation was
+                    # re-raised. Keep the in-memory guard armed so the finalizer
+                    # can clear it only after teardown succeeds.
+                    raise
+                except BaseException:
+                    workspace_guard_armed = False
+                    raise
+                await _run_in_thread_uninterruptibly(
+                    _update_workspace_active_guard,
+                    workspace_active_guard,
+                    sandbox.root,
+                    phase=_WORKSPACE_GUARD_LAUNCH_PENDING,
+                )
+                workspace_guard_phase = _WORKSPACE_GUARD_LAUNCH_PENDING
+
+            # setup() may invoke a CLI and may copy mutable credentials into the
+            # workspace. Do not trust artifacts again until backend cleanup and
+            # credential refresh both complete.
+            sensitive_state_trusted = False
             await self.setup(sandbox, inp)
+            setup_stop_state = _sandbox_worker_stop_state(sandbox)
+            if setup_stop_state is not WorkerStopState.STOPPED:
+                raise _WorkerStopUnconfirmed(setup_stop_state, phase="setup")
+            if workspace_active_guard is not None:
+                await _run_in_thread_uninterruptibly(
+                    _update_workspace_active_guard,
+                    workspace_active_guard,
+                    sandbox.root,
+                    phase=_WORKSPACE_GUARD_LAUNCH_SETTLED,
+                )
+                workspace_guard_phase = _WORKSPACE_GUARD_LAUNCH_SETTLED
 
             if persistent and self._workspace_monitor_enabled():
                 usage = await asyncio.to_thread(
@@ -1447,7 +1891,6 @@ class CLIAgent(Agent):
             extra_env.update(self.extra_env(sandbox, inp))
             self._install_shell_startup(sandbox, bin_dir=bin_dir, shim=shim, done_path=done_path)
 
-            spawn_call_id = new_call_id()
             timeout_s = self._effective_timeout_s()
             soft_timeout_s = self._effective_soft_timeout_s(timeout_s)
             await self.events.emit(
@@ -1488,12 +1931,38 @@ class CLIAgent(Agent):
                 call_id=spawn_call_id,
             )
 
-            stream = await sandbox.stream_command(
-                self.CLI_CMD,
-                env_extra=extra_env,
-                extra_path=[bin_dir],
-                timeout_s=timeout_s,
-            )
+            if workspace_active_guard is not None:
+                await _run_in_thread_uninterruptibly(
+                    _update_workspace_active_guard,
+                    workspace_active_guard,
+                    sandbox.root,
+                    phase=_WORKSPACE_GUARD_LAUNCH_PENDING,
+                )
+                workspace_guard_phase = _WORKSPACE_GUARD_LAUNCH_PENDING
+            worker_stop_phase = "spawn"
+            stream_spawn_attempted = True
+            try:
+                stream = await sandbox.stream_command(
+                    self.CLI_CMD,
+                    env_extra=extra_env,
+                    extra_path=[bin_dir],
+                    timeout_s=timeout_s,
+                )
+            except SandboxSpawnError:
+                # The backend guarantees that no worker was created. Treat the
+                # workspace as idle so a missing executable cannot manufacture
+                # a stale guard and erase useful state on the next invocation.
+                stream_spawn_attempted = False
+                raise
+            worker_stop_phase = "finalize"
+            if workspace_active_guard is not None:
+                await _run_in_thread_uninterruptibly(
+                    _update_workspace_active_guard,
+                    workspace_active_guard,
+                    sandbox.root,
+                    phase=_WORKSPACE_GUARD_LAUNCH_SETTLED,
+                )
+                workspace_guard_phase = _WORKSPACE_GUARD_LAUNCH_SETTLED
             # Once the external process has started it may rotate credentials.
             # No transcript or workspace artifact is safe to persist until the
             # terminal credential state has been refreshed successfully.
@@ -1546,14 +2015,56 @@ class CLIAgent(Agent):
                         call_id=spawn_call_id,
                     )
 
-            done = await self._wait_for_done(
-                stream,
-                done_path,
-                spawn_call_id=spawn_call_id,
-                wrap_up_path=wrap_up_path,
-                soft_timeout_s=soft_timeout_s,
-                workspace_root=sandbox.root if persistent else None,
-            )
+            try:
+                done = await self._wait_for_done(
+                    stream,
+                    done_path,
+                    spawn_call_id=spawn_call_id,
+                    wrap_up_path=wrap_up_path,
+                    soft_timeout_s=soft_timeout_s,
+                    workspace_root=sandbox.root if persistent else None,
+                )
+                # Every normal _wait_for_done exit terminates the worker first.
+                # Keep this check as defense in depth before credentials or
+                # model-created artifacts are read from the shared workspace.
+                _require_worker_stopped(stream, phase="post_process")
+            except _WorkerStopUnconfirmed as e:
+                sensitive_state_trusted = False
+                sensitive_suppression_reason = "worker_stop_unconfirmed"
+                if (
+                    sensitive_quarantine_path is not None
+                    and not workspace_guard_armed
+                ):
+                    self._quarantine_sensitive_workspace(
+                        sandbox.root,
+                        sensitive_quarantine_path,
+                    )
+                    sensitive_state_ever_failed = True
+                    worker_stop_workspace_quarantined = True
+                try:
+                    await self.events.emit(
+                        "cli.worker_stop_unconfirmed",
+                        {
+                            "state": e.state.value,
+                            "phase": e.phase,
+                            "response_suppressed": True,
+                            "handoff_suppressed": True,
+                            "workspace_discard_on_resume": (
+                                workspace_guard_armed
+                                and workspace_guard_phase
+                                == _WORKSPACE_GUARD_LAUNCH_SETTLED
+                            ),
+                            "workspace_quarantined": (
+                                worker_stop_workspace_quarantined
+                            ),
+                        },
+                        call_id=spawn_call_id,
+                    )
+                except Exception:
+                    pass
+                else:
+                    worker_stop_failure_emitted = True
+                raise
             stdout_dropped = int(getattr(stream, "stdout_dropped_chars", 0) or 0)
             stderr_dropped = int(getattr(stream, "stderr_dropped_chars", 0) or 0)
             if stdout_dropped or stderr_dropped:
@@ -1576,7 +2087,9 @@ class CLIAgent(Agent):
                     },
                     call_id=spawn_call_id,
                 )
-            if not bool(getattr(stream, "done", False)):
+            try:
+                await self.refresh_sensitive_state(sandbox, inp)
+            except Exception as e:
                 sensitive_state_ever_failed = True
                 if sensitive_quarantine_path is not None:
                     self._quarantine_sensitive_workspace(
@@ -1585,26 +2098,11 @@ class CLIAgent(Agent):
                     )
                 await self.events.emit(
                     "cli.sensitive_state_refresh_failed",
-                    {"type": "ProcessStillRunning", "phase": "post_process"},
+                    {"type": type(e).__name__, "phase": "post_process"},
                     call_id=spawn_call_id,
                 )
             else:
-                try:
-                    await self.refresh_sensitive_state(sandbox, inp)
-                except Exception as e:
-                    sensitive_state_ever_failed = True
-                    if sensitive_quarantine_path is not None:
-                        self._quarantine_sensitive_workspace(
-                            sandbox.root,
-                            sensitive_quarantine_path,
-                        )
-                    await self.events.emit(
-                        "cli.sensitive_state_refresh_failed",
-                        {"type": type(e).__name__, "phase": "post_process"},
-                        call_id=spawn_call_id,
-                    )
-                else:
-                    sensitive_state_trusted = True
+                sensitive_state_trusted = True
             # Meter as a retained, shielded task. A cancellation landing while
             # record_cli_usage runs must not skip it (that loses a detected
             # rate limit); the finally awaits this exact task instead of
@@ -1694,19 +2192,69 @@ class CLIAgent(Agent):
                     await asyncio.shield(stream.terminate())
                 except (asyncio.CancelledError, Exception):
                     sensitive_state_trusted = False
-                    sensitive_state_ever_failed = True
-            process_stopped = stream is None or bool(
-                getattr(stream, "worker_stopped", getattr(stream, "done", False))
-            )
-            if stream is not None and not process_stopped:
+                    sensitive_suppression_reason = "worker_stop_unconfirmed"
+            if stream is not None:
+                stop_state = _worker_stop_state(stream)
+            elif sandbox is not None and (
+                _reported_worker_stop_state(sandbox) is not None
+            ):
+                stop_state = _sandbox_worker_stop_state(sandbox)
+            elif stream_spawn_attempted:
+                # Legacy/custom sandboxes cannot report whether an interrupted
+                # spawn reached the operating system or container runtime.
+                stop_state = WorkerStopState.UNKNOWN
+            else:
+                stop_state = WorkerStopState.STOPPED
+            process_stopped = stop_state is WorkerStopState.STOPPED
+            if not process_stopped:
                 sensitive_state_trusted = False
-                sensitive_state_ever_failed = True
-                if sensitive_quarantine_path is not None:
+                sensitive_suppression_reason = "worker_stop_unconfirmed"
+                if (
+                    sensitive_quarantine_path is not None
+                    and not workspace_guard_armed
+                    and not worker_stop_workspace_quarantined
+                ):
+                    # Persistent agents that do not opt into automatic workspace
+                    # recovery still need the original fail-closed behavior.
+                    # Without either mechanism, a later invocation could reuse
+                    # files written by a worker whose terminal state is unknown.
                     self._quarantine_sensitive_workspace(
                         sandbox.root,
                         sensitive_quarantine_path,
                     )
-            if sandbox is not None and stream is not None and process_stopped:
+                    sensitive_state_ever_failed = True
+                    worker_stop_workspace_quarantined = True
+                if not worker_stop_failure_emitted:
+                    try:
+                        await asyncio.shield(
+                            self.events.emit(
+                                "cli.worker_stop_unconfirmed",
+                                {
+                                    "state": stop_state.value,
+                                    "phase": worker_stop_phase,
+                                    "response_suppressed": True,
+                                    "handoff_suppressed": True,
+                                    "workspace_discard_on_resume": (
+                                        workspace_guard_armed
+                                        and workspace_guard_phase
+                                        == _WORKSPACE_GUARD_LAUNCH_SETTLED
+                                    ),
+                                    "workspace_quarantined": (
+                                        worker_stop_workspace_quarantined
+                                    ),
+                                },
+                                call_id=spawn_call_id,
+                            )
+                        )
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    else:
+                        worker_stop_failure_emitted = True
+            if (
+                sandbox is not None
+                and process_stopped
+                and not sensitive_state_trusted
+            ):
                 try:
                     await asyncio.shield(self.refresh_sensitive_state(sandbox, inp))
                 except asyncio.CancelledError:
@@ -1846,7 +2394,7 @@ class CLIAgent(Agent):
                     await self.events.emit(
                         "cli.sensitive_output_suppressed",
                         {
-                            "reason": "credential_refresh_failed",
+                            "reason": sensitive_suppression_reason,
                             "stdout_chars": int(
                                 getattr(stream, "stdout_chars", len(stream.stdout))
                             ),
@@ -1858,26 +2406,68 @@ class CLIAgent(Agent):
                 except Exception:
                     pass
             # Keep the sandbox dir on disk so the workdir captures artifacts.
-            # teardown() still runs so subclasses can scrub per-invocation
-            # secrets such as copied CLI credentials.
+            # Scrub per-invocation state only after the worker is confirmed
+            # stopped; otherwise its active guard forces a clean reset on resume.
+            teardown_succeeded = False
             try:
                 if sandbox is not None:
-                    try:
-                        await self.teardown(sandbox, inp)
-                    except Exception as e:
-                        await self.events.emit(
-                            "cli.teardown_error",
-                            {"type": type(e).__name__, "msg": str(e)},
-                        )
+                    if process_stopped:
+                        try:
+                            await self.teardown(sandbox, inp)
+                        except Exception as e:
+                            try:
+                                await self.events.emit(
+                                    "cli.teardown_error",
+                                    {"type": type(e).__name__, "msg": str(e)},
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            teardown_succeeded = True
+                    if (
+                        workspace_guard_armed
+                        and workspace_active_guard is not None
+                        and process_stopped
+                        and teardown_succeeded
+                        and sensitive_state_trusted
+                    ):
+                        try:
+                            await _run_in_thread_uninterruptibly(
+                                _clear_workspace_active_guard,
+                                workspace_active_guard,
+                            )
+                        except Exception as e:
+                            workspace_guard_error = e
+                            try:
+                                await self.events.emit(
+                                    "cli.workspace_active_guard_clear_failed",
+                                    {
+                                        "workspace": str(sandbox.root),
+                                        "type": type(e).__name__,
+                                        "msg": str(e),
+                                    },
+                                )
+                            except Exception:
+                                pass
             finally:
                 if storage_lease is not None and storage_lease.status is not None:
                     reservation_status = storage_lease.status
                     try:
-                        await _release_storage_lease(storage_lease)
+                        if process_stopped:
+                            await _release_storage_lease(storage_lease)
+                        else:
+                            storage_retention_guard_state = (
+                                await _retain_storage_lease(storage_lease)
+                            )
                     except Exception as e:
+                        storage_lease_error = e
                         try:
                             await self.events.emit(
-                                "cli.storage_release_failed",
+                                (
+                                    "cli.storage_release_failed"
+                                    if process_stopped
+                                    else "cli.storage_retain_failed"
+                                ),
                                 {
                                     "workspace": str(sandbox.root) if sandbox else None,
                                     "type": type(e).__name__,
@@ -1889,10 +2479,19 @@ class CLIAgent(Agent):
                     else:
                         try:
                             await self.events.emit(
-                                "cli.storage_released",
+                                (
+                                    "cli.storage_released"
+                                    if process_stopped
+                                    else "cli.storage_retained"
+                                ),
                                 {
                                     "workspace": str(sandbox.root) if sandbox else None,
                                     "reserved_bytes": reservation_status.requested_bytes,
+                                    "retention_guard_state": (
+                                        storage_retention_guard_state
+                                        if not process_stopped
+                                        else None
+                                    ),
                                 },
                             )
                         except Exception:
@@ -1902,6 +2501,15 @@ class CLIAgent(Agent):
                     "required CLI usage accounting failed; downstream "
                     "execution was stopped"
                 ) from required_usage_error
+            if storage_lease_error is not None:
+                raise RuntimeError(
+                    "CLI storage reservation could not be finalized safely"
+                ) from storage_lease_error
+            if workspace_guard_error is not None:
+                raise RuntimeError(
+                    "CLI workspace safety guard could not be cleared; the "
+                    "workspace remains unavailable until guard recovery succeeds"
+                ) from workspace_guard_error
 
     async def _wait_for_done(
         self,
@@ -2000,6 +2608,7 @@ class CLIAgent(Agent):
                         },
                         call_id=spawn_call_id,
                     )
+                    _require_worker_stopped(stream, phase="workspace_limit")
                     return CLIDoneRecord(
                         status="error",
                         summary=f"workspace safety limit reached; stopped CLI: {detail}",
@@ -2042,6 +2651,7 @@ class CLIAgent(Agent):
                 ):
                     await asyncio.sleep(self.POLL_INTERVAL_S)
                 await stream.terminate()
+                _require_worker_stopped(stream, phase="completion_signal")
                 done = self._read_done(
                     done_path,
                     fallback_status=(
@@ -2084,6 +2694,7 @@ class CLIAgent(Agent):
                     await stream.terminate()
                 except Exception:
                     pass
+                _require_worker_stopped(stream, phase="process_exit")
                 await self.events.emit(
                     "cli.exit",
                     {
@@ -2161,6 +2772,7 @@ class CLIAgent(Agent):
                     {"sandbox_id": str(self.workdir), "status": "partial", "reason": "timeout"},
                     call_id=spawn_call_id,
                 )
+                _require_worker_stopped(stream, phase="timeout")
                 done = self._read_done(
                     done_path,
                     fallback_status="partial",
