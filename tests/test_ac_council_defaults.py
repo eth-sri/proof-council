@@ -16,6 +16,16 @@ from proofstack.agents.ac.ac_workflow import ACWorkflow, DEFAULT_COUNCIL_MODELS 
 from proofstack.agents.ac.author import Author  # noqa: E402
 from proofstack.agents.ac.council import CouncilMember, _strip_visible_thought_blocks  # noqa: E402
 from proofstack.agents.ac.critic import ACCritic  # noqa: E402
+from proofstack.agents.ac.compute import (  # noqa: E402
+    COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
+    COMPUTE_FILESYSTEM_RESERVATION_BYTES,
+    COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES,
+    COMPUTE_HANDOFF_MAX_FILES,
+    COMPUTE_HANDOFF_MAX_MEMBER_BYTES,
+    COMPUTE_HANDOFF_MAX_UNCOMPRESSED_BYTES,
+    COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
+    COMPUTE_WORKSPACE_SOFT_LIMIT_ENTRIES,
+)
 from proofstack.registry import load_preset  # noqa: E402
 from app.dev import _api_key_requirements_for_preset  # noqa: E402
 from mathagents.api_client import APIClient  # noqa: E402
@@ -118,6 +128,60 @@ class ACCouncilDefaultsTests(unittest.TestCase):
                 problem_id="p",
                 compute_soft_timeout_s=100,
                 compute_hard_timeout_s=100,
+            )
+
+    def test_workflow_exposes_provider_safe_compute_handoff_limits(self) -> None:
+        inp = ACWorkflow.Inputs(problem="P", problem_id="p")
+
+        self.assertEqual(inp.compute_handoff_max_files, COMPUTE_HANDOFF_MAX_FILES)
+        self.assertEqual(
+            inp.compute_handoff_max_compressed_bytes,
+            COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES,
+        )
+        self.assertEqual(
+            inp.compute_handoff_max_uncompressed_bytes,
+            COMPUTE_HANDOFF_MAX_UNCOMPRESSED_BYTES,
+        )
+        self.assertEqual(
+            inp.compute_handoff_max_member_bytes,
+            COMPUTE_HANDOFF_MAX_MEMBER_BYTES,
+        )
+        self.assertEqual(
+            inp.compute_filesystem_min_free_bytes,
+            COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
+        )
+        self.assertIsNone(inp.compute_filesystem_min_free_inodes)
+        self.assertEqual(
+            inp.compute_filesystem_reservation_bytes,
+            COMPUTE_FILESYSTEM_RESERVATION_BYTES,
+        )
+        self.assertIsNone(inp.compute_filesystem_reservation_dir)
+        self.assertEqual(
+            inp.compute_workspace_soft_limit_entries,
+            COMPUTE_WORKSPACE_SOFT_LIMIT_ENTRIES,
+        )
+        self.assertEqual(
+            inp.compute_workspace_hard_limit_entries,
+            COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
+        )
+
+        raised_entry_cap = ACWorkflow.Inputs(
+            problem="P",
+            problem_id="p",
+            compute_workspace_soft_limit_entries=150_000,
+            compute_workspace_hard_limit_entries=200_000,
+        )
+        self.assertEqual(
+            raised_entry_cap.compute_workspace_hard_limit_entries,
+            200_000,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must leave room"):
+            ACWorkflow.Inputs(
+                problem="P",
+                problem_id="p",
+                compute_handoff_max_uncompressed_bytes=2 * 1024 * 1024,
+                compute_handoff_max_member_bytes=2 * 1024 * 1024,
             )
 
     def test_opus_council_member_uses_max_adaptive_streaming_config(self) -> None:

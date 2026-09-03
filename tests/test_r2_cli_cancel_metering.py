@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -76,7 +77,11 @@ class DoubleCancelTests(unittest.TestCase):
                     await task
                 return agent.usage_calls
 
-        self.assertEqual(asyncio.run(drive()), ["done"])
+        with mock.patch(
+            "proofstack.sandbox.subprocess._terminate_marked_processes",
+            new=mock.AsyncMock(return_value=True),
+        ):
+            self.assertEqual(asyncio.run(drive()), ["done"])
 
 
 class CancelDuringMeteringTests(unittest.TestCase):
@@ -95,7 +100,11 @@ class CancelDuringMeteringTests(unittest.TestCase):
                     await task
                 return agent.usage_calls
 
-        calls = asyncio.run(drive())
+        with mock.patch(
+            "proofstack.sandbox.subprocess._terminate_marked_processes",
+            new=mock.AsyncMock(return_value=True),
+        ):
+            calls = asyncio.run(drive())
         # metered exactly once (the real done record), neither lost nor doubled
         self.assertEqual(calls, ["done"])
 

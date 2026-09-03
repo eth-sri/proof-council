@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -70,7 +71,11 @@ class CLICancelMetersPartialUsageTests(unittest.TestCase):
                         await task
                 return agent.usage_calls
 
-        calls = asyncio.run(drive())
+        with mock.patch(
+            "proofstack.sandbox.subprocess._terminate_marked_processes",
+            new=mock.AsyncMock(return_value=True),
+        ):
+            calls = asyncio.run(drive())
         # Pre-fix: [] (usage silently dropped). Post-fix: one partial metering.
         self.assertEqual(calls, ["partial"])
 
@@ -85,7 +90,11 @@ class CLICancelMetersPartialUsageTests(unittest.TestCase):
                 await agent()
                 return agent.usage_calls
 
-        calls = asyncio.run(drive())
+        with mock.patch(
+            "proofstack.sandbox.subprocess._terminate_marked_processes",
+            new=mock.AsyncMock(return_value=True),
+        ):
+            calls = asyncio.run(drive())
         # The finally must NOT double-meter after a normal record_cli_usage.
         self.assertEqual(calls, ["done"])
 

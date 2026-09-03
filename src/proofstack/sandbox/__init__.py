@@ -3,8 +3,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Iterable
 
-from proofstack.sandbox.base import CommandResult, Sandbox, SandboxBackend, SandboxSpec
+from proofstack.sandbox.base import (
+    CommandResult,
+    Sandbox,
+    SandboxBackend,
+    SandboxSpawnError,
+    SandboxSpec,
+)
 from proofstack.sandbox.docker import (
     DockerSandbox,
     DockerSandboxError,
@@ -27,7 +34,12 @@ def resolve_backend(spec: SandboxSpec) -> SandboxBackend:
     return spec.backend
 
 
-def make_sandbox(spec: SandboxSpec, *, root: Path | None = None) -> Sandbox:
+def make_sandbox(
+    spec: SandboxSpec,
+    *,
+    root: Path | None = None,
+    inherited_fds: Iterable[int] = (),
+) -> Sandbox:
     """Construct the appropriate Sandbox backend.
 
     Raises ``DockerSandboxError`` early if docker is selected but the
@@ -55,8 +67,8 @@ def make_sandbox(spec: SandboxSpec, *, root: Path | None = None) -> Sandbox:
                 f"or set PROOFSTACK_SANDBOX_BACKEND=subprocess to skip the "
                 f"container sandbox."
             )
-        return DockerSandbox(spec, root=root)
-    return SubprocessSandbox(spec, root=root)
+        return DockerSandbox(spec, root=root, inherited_fds=inherited_fds)
+    return SubprocessSandbox(spec, root=root, inherited_fds=inherited_fds)
 
 
 __all__ = [
@@ -65,6 +77,7 @@ __all__ = [
     "DockerSandboxError",
     "Sandbox",
     "SandboxBackend",
+    "SandboxSpawnError",
     "SandboxSpec",
     "SubprocessSandbox",
     "check_image_available",

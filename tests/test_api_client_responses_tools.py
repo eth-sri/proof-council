@@ -63,7 +63,11 @@ if "loguru" not in sys.modules:
     sys.modules["loguru"] = loguru
 
 from mathagents import api_client as api_client_module  # noqa: E402
-from mathagents.api_client import APIClient, _ClientTerminated  # noqa: E402
+from mathagents.api_client import (  # noqa: E402
+    APIClient,
+    ProviderAttachmentRejectedError,
+    _ClientTerminated,
+)
 
 
 def _function_tool(name: str = "list_persisted_files") -> dict:
@@ -628,6 +632,57 @@ class SalvagePrefersOutputTests(unittest.TestCase):
             "recovered on retry",
         )
 
+    def test_container_file_limit_is_terminal_even_with_partial_output(self) -> None:
+        queued = SimpleNamespace(id="resp_file_limit", status="queued")
+        failed = SimpleNamespace(
+            id="resp_file_limit",
+            status="failed",
+            error=SimpleNamespace(
+                code="array_above_max_length",
+                message="The container has too many files; maximum of 1000 files.",
+            ),
+            output=[_message("partial tool chatter is not a usable answer")],
+            usage=None,
+            model_dump=lambda: {"output": ["message"], "status": "failed"},
+        )
+
+        class _BackgroundResponses:
+            def __init__(self):
+                self.create_calls = 0
+
+            def create(self, **payload):
+                self.create_calls += 1
+                return queued
+
+            def retrieve(self, response_id):
+                return failed
+
+        responses = _BackgroundResponses()
+        api = APIClient(
+            model="fake-pro",
+            api="custom",
+            use_openai_responses_api=True,
+            background=True,
+        )
+
+        with patch("mathagents.api_client.request_logger.log_request"), patch(
+            "mathagents.api_client.request_logger.log_response"
+        ), patch("mathagents.api_client.time.sleep"):
+            with self.assertRaisesRegex(
+                ProviderAttachmentRejectedError,
+                "array_above_max_length",
+            ) as raised:
+                api._openai_query_responses_api(
+                    SimpleNamespace(responses=responses),
+                    0,
+                    [{"role": "user", "content": "hi"}],
+                )
+
+        self.assertEqual(responses.create_calls, 1)
+        self.assertGreaterEqual(raised.exception.cost["input_tokens"], 0)
+        self.assertGreater(raised.exception.cost["output_tokens"], 0)
+        self.assertGreater(raised.exception.cost["cost"], 0.0)
+
 
 class BackgroundTimeoutRetryTests(unittest.TestCase):
     def test_timeout_retry_cancels_and_downgrades_reasoning_effort(self) -> None:
@@ -838,6 +893,44 @@ class BackgroundTimeoutRetryTests(unittest.TestCase):
 
 
 class TerminateDuringBackgroundPollTests(unittest.TestCase):
+    def test_outer_retry_returns_immediately_for_client_termination(self) -> None:
+        api = APIClient(model="fake-pro", api="custom")
+        with patch.object(
+            api,
+            "_run_query",
+            side_effect=_ClientTerminated("terminated"),
+        ) as run_query, patch("mathagents.api_client.time.sleep") as sleep:
+            result = api._run_query_with_retry(
+                0,
+                [{"role": "user", "content": "hi"}],
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(run_query.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_outer_retry_preserves_typed_attachment_rejection(self) -> None:
+        api = APIClient(model="fake-pro", api="custom")
+        rejected = ProviderAttachmentRejectedError(
+            "file rejected",
+            cost={"cost": 1.5, "input_tokens": 10, "output_tokens": 2},
+        )
+        with patch.object(
+            api,
+            "_run_query",
+            side_effect=rejected,
+        ) as run_query, patch("mathagents.api_client.time.sleep") as sleep:
+            with self.assertRaises(ProviderAttachmentRejectedError) as raised:
+                api._run_query_with_retry(
+                    0,
+                    [{"role": "user", "content": "hi"}],
+                )
+
+        self.assertIs(raised.exception, rejected)
+        self.assertEqual(raised.exception.cost["cost"], 1.5)
+        self.assertEqual(run_query.call_count, 1)
+        sleep.assert_not_called()
+
     def test_terminate_cancels_response_and_escapes_poll(self) -> None:
         # terminate() must interrupt the poll within one sleep slice,
         # cancel the server-side response, and escape the retry loops

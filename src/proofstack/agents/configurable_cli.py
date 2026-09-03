@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import tempfile
 import weakref
 from contextvars import ContextVar
@@ -29,6 +30,11 @@ from proofstack.cli_usage import (
     load_cost_rates,
     parse_claude_json,
     parse_codex_jsonl,
+)
+from proofstack.codex_auth import (
+    classify_codex_auth,
+    extract_codex_auth_secrets,
+    redact_codex_secrets,
 )
 from proofstack.kinds.cli import CLIAgent, CLIDoneRecord
 from proofstack.sandbox import resolve_backend
@@ -53,6 +59,9 @@ _CALL_DONE_PATH: ContextVar[Path | None] = ContextVar("cli_call_done_path", defa
 _CALL_COPIED_AUTH: ContextVar[bool] = ContextVar("cli_call_copied_auth", default=False)
 _CALL_CODEX_HOME: ContextVar[tuple[Path, str] | None] = ContextVar(
     "cli_call_codex_home", default=None
+)
+_CALL_CODEX_SECRETS: ContextVar[tuple[str, ...]] = ContextVar(
+    "cli_call_codex_secrets", default=()
 )
 _CODEX_AUTH_CONTAINER_ROOT = "/proofstack-codex-home"
 
@@ -84,6 +93,28 @@ class ConfigurableCLIAgent(CLIAgent):
             raise ValueError(
                 "component completion_signal must be 'finish', 'file', or 'exit'"
             )
+        # CLIAgent owns the completion semantics.  Keep the validated
+        # component value on this instance so a clean process exit cannot
+        # silently satisfy a component that requires a finish/file record.
+        self.COMPLETION_SIGNAL = completion_signal
+
+        self._paid_codex_cost_rates: dict[str, Any] | None = None
+        usage_cfg = self.component_config.get("usage") or {}
+        if (
+            isinstance(usage_cfg, dict)
+            and usage_cfg.get("type") == "codex_jsonl"
+            and not self._copy_codex_auth_enabled()
+        ):
+            cfg_ref = str(
+                usage_cfg.get("cost_config") or "models/openai/gpt-54-mini"
+            )
+            try:
+                self._paid_codex_cost_rates = load_cost_rates(cfg_ref)
+            except (KeyError, FileNotFoundError, ValueError) as e:
+                raise ValueError(
+                    "Paid Codex cost configuration must be valid before the "
+                    f"component starts ({cfg_ref}): {type(e).__name__}: {e}"
+                ) from e
 
         sandbox_spec = self.SANDBOX
         blocked_keys = self._subscription_api_key_envs()
@@ -181,11 +212,37 @@ class ConfigurableCLIAgent(CLIAgent):
     def _codex_home(self, value: tuple[Path, str] | None) -> None:
         _CALL_CODEX_HOME.set(value)
 
+    @property
+    def _codex_secrets(self) -> tuple[str, ...]:
+        return _CALL_CODEX_SECRETS.get()
+
+    @_codex_secrets.setter
+    def _codex_secrets(self, value: tuple[str, ...]) -> None:
+        _CALL_CODEX_SECRETS.set(tuple(value))
+
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
+        # ContextVars inherit the caller's context. Reset every invocation so
+        # state left by a completed/manual call cannot bleed into the next
+        # agent instance created in the same task.
+        self._active_workspace_root = None
+        self._completion_record_path = None
+        self._copied_codex_auth = False
+        self._codex_home = None
+        self._codex_secrets = ()
         self.CLI_CMD = self._command_for(inp)
         if "soft_timeout_s" in self.component_config:
             self.SOFT_TIMEOUT_S = int(self.component_config["soft_timeout_s"] or 0)
-        return await super().run(inp)
+        try:
+            return await super().run(inp)
+        finally:
+            state = self._codex_home
+            try:
+                if state is not None:
+                    self._remove_call_codex_home(state[0])
+            finally:
+                self._codex_home = None
+                self._copied_codex_auth = False
+                self._codex_secrets = ()
 
     def sandbox_root_for(self, inp: BaseModel) -> Path | None:
         fields = self._fields(inp)
@@ -213,6 +270,7 @@ class ConfigurableCLIAgent(CLIAgent):
         if self._copy_codex_auth_enabled():
             self._copied_codex_auth = False
             self._codex_home = None
+            self._codex_secrets = ()
             host_auth = Path.home() / ".codex" / "auth.json"
             if not host_auth.is_file():
                 raise RuntimeError(
@@ -221,31 +279,26 @@ class ConfigurableCLIAgent(CLIAgent):
                 )
             try:
                 auth_text = host_auth.read_text(encoding="utf-8")
-                auth_data = json.loads(auth_text)
             except OSError as e:
                 raise RuntimeError(
                     f"could not read Codex subscription authentication from {host_auth}: {e}"
                 ) from e
-            except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"Codex authentication at {host_auth} is not valid JSON. "
-                    "Run `codex login` again."
-                ) from e
-            auth_mode = (
-                str(auth_data.get("auth_mode") or "").lower()
-                if isinstance(auth_data, dict)
-                else ""
-            )
-            api_key = auth_data.get("OPENAI_API_KEY") if isinstance(auth_data, dict) else None
-            if auth_mode != "chatgpt" or (isinstance(api_key, str) and api_key.strip()):
+            if classify_codex_auth(auth_text) != "subscription":
                 raise RuntimeError(
                     "Codex subscription authentication is unavailable: "
                     f"{host_auth} is not a ChatGPT login. Run `codex login` "
                     "with a ChatGPT subscription."
                 )
+            secrets = extract_codex_auth_secrets(auth_text)
+            if not secrets:
+                raise RuntimeError(
+                    "Codex subscription authentication contains no redactable "
+                    "credential. Run `codex login` again."
+                )
             auth_home, auth_home_env = self._new_codex_home(sandbox)
             auth_path = auth_home / "auth.json"
             self._codex_home = (auth_home, auth_home_env)
+            self._codex_secrets = secrets
             try:
                 auth_path.write_text(auth_text, encoding="utf-8")
             except OSError as e:
@@ -262,13 +315,72 @@ class ConfigurableCLIAgent(CLIAgent):
         if self._copy_codex_auth_enabled():
             state = self._codex_home
             if state is not None:
-                shutil.rmtree(state[0], ignore_errors=True)
+                self._remove_call_codex_home(state[0])
             self._codex_home = None
             # Remove credentials left by pre-hardening runs that reused a
             # persistent workspace.
             shutil.rmtree(sandbox.root / ".codex-home", ignore_errors=True)
             self._copied_codex_auth = False
+            self._codex_secrets = ()
         self._completion_record_path = None
+
+    def sanitize_cli_output(self, text: str) -> str:
+        return redact_codex_secrets(text, self._codex_secrets)
+
+    async def refresh_sensitive_state(
+        self,
+        sandbox: Sandbox,
+        inp: BaseModel,
+    ) -> None:
+        if self._copy_codex_auth_enabled():
+            # setup() can fail before a transient credential is installed. In
+            # that case there is no rotated state to refresh; teardown still
+            # removes any partially-created home.
+            if self._codex_home is None or not self._copied_codex_auth:
+                return
+            self._refresh_transient_codex_secrets()
+
+    def _refresh_transient_codex_secrets(self) -> None:
+        state = self._codex_home
+        if state is None or not self._copied_codex_auth:
+            raise RuntimeError("Codex subscription authentication was not prepared")
+        try:
+            auth_text = (state[0] / "auth.json").read_text(encoding="utf-8")
+        except OSError as e:
+            raise RuntimeError(
+                "transient Codex subscription authentication is unreadable"
+            ) from e
+        if classify_codex_auth(auth_text) != "subscription":
+            raise RuntimeError(
+                "transient Codex authentication changed billing class"
+            )
+        refreshed = extract_codex_auth_secrets(
+            auth_text,
+            additional=self._codex_secrets,
+        )
+        if not extract_codex_auth_secrets(auth_text):
+            raise RuntimeError(
+                "transient Codex authentication contains no redactable credential"
+            )
+        self._codex_secrets = refreshed
+
+    def _sanitize_workspace_usage(
+        self,
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        usage = super()._sanitize_workspace_usage(usage)
+        if not self._copy_codex_auth_enabled() or not self._copied_codex_auth:
+            return usage
+        try:
+            self._refresh_transient_codex_secrets()
+        except (OSError, RuntimeError, ValueError) as e:
+            usage["largest_files"] = []
+            usage["credential_refresh_error"] = type(e).__name__
+            return usage
+        for item in usage.get("largest_files", []):
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                item["path"] = self.sanitize_cli_output(item["path"])
+        return usage
 
     def cli_input(self, inp: BaseModel) -> str:
         fields = self._fields(inp, workspace=self._active_workspace_root)
@@ -388,6 +500,8 @@ class ConfigurableCLIAgent(CLIAgent):
         data.update(self._constant_outputs(inp, sandbox))
         data.update(self._done_outputs(done))
         await self._collect_file_outputs(sandbox, data)
+        if self._copy_codex_auth_enabled():
+            data = _sanitize_output_value(data, self._codex_secrets)
         return self.Outputs.model_validate(data)
 
     async def record_cli_usage(
@@ -407,6 +521,10 @@ class ConfigurableCLIAgent(CLIAgent):
             return
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
+            if not self._copied_codex_auth:
+                raise RuntimeError(
+                    "paid Codex call produced no parseable usage record"
+                )
             return
         cost = 0.0
         cfg_ref = None
@@ -414,14 +532,20 @@ class ConfigurableCLIAgent(CLIAgent):
         # A declarative bill:false flag must never hide a paid-key fallback.
         if not self._copied_codex_auth:
             cfg_ref = str(usage_cfg.get("cost_config") or "models/openai/gpt-54-mini")
-            try:
-                rates = load_cost_rates(cfg_ref)
-            except (KeyError, FileNotFoundError, ValueError) as e:
-                await self.events.emit(
-                    "cli.cost_lookup_failed",
-                    {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
-                )
-                return
+            rates = self._paid_codex_cost_rates
+            if rates is None:
+                # Defensive fallback for a subscription-configured component
+                # whose observed auth state is nevertheless paid. Normal paid
+                # runs cache this before spawning; this path remains fail-closed
+                # if the configured rates are invalid.
+                try:
+                    rates = load_cost_rates(cfg_ref)
+                except (KeyError, FileNotFoundError, ValueError) as e:
+                    raise RuntimeError(
+                        "Paid Codex usage cannot be recorded without a valid "
+                        f"cost configuration ({cfg_ref})"
+                    ) from e
+                self._paid_codex_cost_rates = rates
             cost = cost_for_codex_usage(usage, **rates)
             self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
@@ -438,6 +562,14 @@ class ConfigurableCLIAgent(CLIAgent):
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
             },
+        )
+
+    def cli_usage_must_succeed(self) -> bool:
+        usage_cfg = self.component_config.get("usage")
+        return bool(
+            isinstance(usage_cfg, dict)
+            and usage_cfg.get("type") == "codex_jsonl"
+            and not self._copied_codex_auth
         )
 
     def _claude_model_name(self) -> str:
@@ -561,6 +693,38 @@ class ConfigurableCLIAgent(CLIAgent):
             env_home = str(host_home)
         return host_home, env_home
 
+    def _remove_call_codex_home(self, home: Path) -> None:
+        parent = self._codex_auth_parent
+        home = Path(home)
+        if parent is None or home.parent != parent:
+            raise RuntimeError("refusing to remove an unrecognized Codex auth path")
+        try:
+            metadata = home.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            raise RuntimeError(
+                "transient Codex authentication cleanup could not be verified"
+            ) from e
+        try:
+            if stat.S_ISDIR(metadata.st_mode):
+                shutil.rmtree(home)
+            else:
+                home.unlink()
+        except OSError as e:
+            raise RuntimeError(
+                "transient Codex authentication cleanup failed"
+            ) from e
+        try:
+            home.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            raise RuntimeError(
+                "transient Codex authentication cleanup could not be verified"
+            ) from e
+        raise RuntimeError("transient Codex authentication cleanup failed")
+
     async def _write_file_group(
         self,
         sandbox: Sandbox,
@@ -650,6 +814,25 @@ class ConfigurableCLIAgent(CLIAgent):
             else:
                 value = path.read_text(encoding="utf-8")
             _set_nested(data, str(field), value)
+
+
+def _sanitize_output_value(value: Any, secrets: tuple[str, ...]) -> Any:
+    if isinstance(value, str):
+        return redact_codex_secrets(value, secrets)
+    if isinstance(value, dict):
+        return {
+            (
+                redact_codex_secrets(key, secrets)
+                if isinstance(key, str)
+                else key
+            ): _sanitize_output_value(item, secrets)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_output_value(item, secrets) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_output_value(item, secrets) for item in value)
+    return value
 
 
 def _coerce_cmd(raw: Any, fields: dict[str, Any]) -> list[str]:

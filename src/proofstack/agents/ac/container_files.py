@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from proofstack.agents.ac.blocks import CANONICAL_FILES
 
@@ -48,10 +48,32 @@ class UploadedFile:
     name: str
     platform_file_id: str
     container_path: str  # e.g. /mnt/data/file-XXXX-answer.tex
+    source_path: Path
     is_canonical: bool = True
     # Optional one-line note rendered alongside the listing entry (used
     # for extra attachments to explain what they are).
     note: str = ""
+
+
+@dataclass(frozen=True)
+class AttachmentUploadFailure:
+    """A non-canonical attachment that could not be uploaded.
+
+    Canonical workspace files are required and still fail the Author turn.
+    Compute handoffs and other extras are advisory, so bridges record their
+    failure and continue with the canonical files.
+    """
+
+    name: str
+    path: Path
+    size_bytes: int | None
+    error_type: str
+    message: str
+    disposition: Literal["permanent", "transient", "unknown"]
+
+    @property
+    def permanent(self) -> bool:
+        return self.disposition == "permanent"
 
 
 @dataclass
@@ -67,6 +89,9 @@ class ContainerFileBridge:
     # — the Author cannot edit them and they will not be downloaded back.
     extra_attachments: list[tuple[Path, str]] = field(default_factory=list)
     uploaded: list[UploadedFile] = field(default_factory=list)
+    extra_upload_failures: list[AttachmentUploadFailure] = field(
+        default_factory=list
+    )
 
     # ----- upload -----------------------------------------------------------
 
@@ -80,6 +105,7 @@ class ContainerFileBridge:
         upload order (canonical files first, then extras).
         """
         ids: list[str] = []
+        self.extra_upload_failures.clear()
         for name in self.names:
             path = self.workspace / name
             if not path.exists() or path.stat().st_size == 0:
@@ -90,14 +116,19 @@ class ContainerFileBridge:
         for attach_path, note in self.extra_attachments:
             if not attach_path.exists():
                 continue
-            ids.append(
-                self._upload_one(
-                    attach_path,
-                    attach_path.name,
-                    is_canonical=False,
-                    note=note,
+            try:
+                ids.append(
+                    self._upload_one(
+                        attach_path,
+                        attach_path.name,
+                        is_canonical=False,
+                        note=note,
+                    )
                 )
-            )
+            except Exception as e:
+                self.extra_upload_failures.append(
+                    _attachment_upload_failure(attach_path, e)
+                )
         return ids
 
     def _upload_one(
@@ -115,6 +146,7 @@ class ContainerFileBridge:
                 name=name,
                 platform_file_id=file_obj.id,
                 container_path=container_path,
+                source_path=path,
                 is_canonical=is_canonical,
                 note=note,
             )
@@ -123,7 +155,7 @@ class ContainerFileBridge:
 
     # ----- prompt fragment --------------------------------------------------
 
-    def render_workspace_listing(self) -> str:
+    def render_workspace_listing(self, *, include_extras: bool = True) -> str:
         """Render a listing the Author can quote in its prompt.
 
         Canonical files have both a read-only input path and a writable
@@ -133,6 +165,8 @@ class ContainerFileBridge:
         """
         lines: list[str] = []
         for u in self.uploaded:
+            if not include_extras and not u.is_canonical:
+                continue
             if u.is_canonical:
                 lines.append(
                     f"- {u.name}: read from `{u.container_path}` (read-only); "
@@ -187,6 +221,7 @@ class ContainerFileBridge:
 class AnthropicUploadedFile:
     name: str
     platform_file_id: str
+    source_path: Path
     is_canonical: bool = True
     note: str = ""
 
@@ -202,9 +237,13 @@ class AnthropicContainerFileBridge:
     betas: tuple[str, ...] = (ANTHROPIC_FILES_BETA,)
     uploaded: list[AnthropicUploadedFile] = field(default_factory=list)
     downloaded_generated_file_ids: list[str] = field(default_factory=list)
+    extra_upload_failures: list[AttachmentUploadFailure] = field(
+        default_factory=list
+    )
 
     def upload(self) -> list[str]:
         ids: list[str] = []
+        self.extra_upload_failures.clear()
         for name in self.names:
             path = self.workspace / name
             if not path.exists() or path.stat().st_size == 0:
@@ -213,14 +252,19 @@ class AnthropicContainerFileBridge:
         for attach_path, note in self.extra_attachments:
             if not attach_path.exists():
                 continue
-            ids.append(
-                self._upload_one(
-                    attach_path,
-                    attach_path.name,
-                    is_canonical=False,
-                    note=note,
+            try:
+                ids.append(
+                    self._upload_one(
+                        attach_path,
+                        attach_path.name,
+                        is_canonical=False,
+                        note=note,
+                    )
                 )
-            )
+            except Exception as e:
+                self.extra_upload_failures.append(
+                    _attachment_upload_failure(attach_path, e)
+                )
         return ids
 
     def _upload_one(
@@ -235,15 +279,18 @@ class AnthropicContainerFileBridge:
             AnthropicUploadedFile(
                 name=name,
                 platform_file_id=file_obj.id,
+                source_path=path,
                 is_canonical=is_canonical,
                 note=note,
             )
         )
         return file_obj.id
 
-    def render_workspace_listing(self) -> str:
+    def render_workspace_listing(self, *, include_extras: bool = True) -> str:
         lines: list[str] = []
         for u in self.uploaded:
+            if not include_extras and not u.is_canonical:
+                continue
             if u.is_canonical:
                 lines.append(
                     f"- {u.name}: attached as Files API upload `{u.platform_file_id}`. "
@@ -258,10 +305,13 @@ class AnthropicContainerFileBridge:
                 )
         return "\n".join(lines)
 
-    def render_container_upload_blocks(self) -> list[dict[str, str]]:
+    def render_container_upload_blocks(
+        self, *, include_extras: bool = True
+    ) -> list[dict[str, str]]:
         return [
             {"type": "container_upload", "file_id": u.platform_file_id}
             for u in self.uploaded
+            if include_extras or u.is_canonical
         ]
 
     @property
@@ -338,6 +388,91 @@ def find_container_id(conversation: Iterable[dict]) -> str | None:
     return None
 
 
+def _attachment_upload_failure(
+    path: Path, error: Exception
+) -> AttachmentUploadFailure:
+    try:
+        size_bytes = path.stat().st_size
+    except OSError:
+        size_bytes = None
+    return AttachmentUploadFailure(
+        name=path.name,
+        path=path,
+        size_bytes=size_bytes,
+        error_type=type(error).__name__,
+        message=str(error)[:1000],
+        disposition=_classify_attachment_upload_error(error),
+    )
+
+
+def _classify_attachment_upload_error(
+    error: Exception,
+) -> Literal["permanent", "transient", "unknown"]:
+    """Classify whether retrying this exact optional file can succeed later.
+
+    Only strong provider evidence is treated as permanent.  Unknown failures
+    deliberately remain retryable on a later Author round; quarantining them
+    would turn a one-off network failure into permanent loss of the handoff.
+    """
+    response = getattr(error, "response", None)
+    status_code = getattr(error, "status_code", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+
+    error_name = type(error).__name__.lower()
+    if status_code in {408, 425, 429} or (
+        isinstance(status_code, int) and status_code >= 500
+    ):
+        return "transient"
+    if any(token in error_name for token in ("timeout", "connection", "ratelimit")):
+        return "transient"
+
+    body = getattr(error, "body", None)
+    code = getattr(error, "code", None)
+    rendered = " ".join(
+        str(value) for value in (code, body, error) if value is not None
+    ).lower()
+    permanent_hints = (
+        "array_above_max_length",
+        "container_file_limit",
+        "file_too_large",
+        "payload_too_large",
+        "request_too_large",
+        "too many files",
+        "too_many_files",
+        "unsupported file",
+        "unsupported_file",
+        "invalid file",
+        "invalid_file",
+        "maximum file size",
+    )
+    if status_code == 413 or any(hint in rendered for hint in permanent_hints):
+        return "permanent"
+    # A 415 is specifically an unsupported upload media type. Generic 400/422
+    # validation errors are not enough to blame the file permanently: they can
+    # also reflect a transient provider/API mismatch or malformed metadata.
+    if status_code == 415:
+        return "permanent"
+    if any(
+        hint in rendered
+        for hint in (
+            "temporarily unavailable",
+            "rate limit",
+            "try again",
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connection aborted",
+        )
+    ):
+        return "transient"
+    return "unknown"
+
+
 def find_anthropic_generated_file_ids(conversation: Iterable[dict]) -> list[str]:
     ids: list[str] = []
     seen: set[str] = set()
@@ -406,6 +541,7 @@ def _read_binary_response(resp: object) -> str:
 __all__ = [
     "CONTAINER_DATA_ROOT",
     "ANTHROPIC_FILES_BETA",
+    "AttachmentUploadFailure",
     "AnthropicContainerFileBridge",
     "AnthropicUploadedFile",
     "ContainerFileBridge",

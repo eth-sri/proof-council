@@ -73,6 +73,36 @@ from proofstack.agents.ac.compute import (
     DEFAULT_SOFT_TIMEOUT_S as DEFAULT_COMPUTE_SOFT_TIMEOUT_S,
 )
 from proofstack.agents.ac.compute import (
+    COMPUTE_WORKSPACE_HARD_LIMIT_BYTES as DEFAULT_COMPUTE_WORKSPACE_HARD_LIMIT_BYTES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_WORKSPACE_SOFT_LIMIT_BYTES as DEFAULT_COMPUTE_WORKSPACE_SOFT_LIMIT_BYTES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_FILESYSTEM_MIN_FREE_BYTES as DEFAULT_COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_FILESYSTEM_RESERVATION_BYTES as DEFAULT_COMPUTE_FILESYSTEM_RESERVATION_BYTES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES as DEFAULT_COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_WORKSPACE_SOFT_LIMIT_ENTRIES as DEFAULT_COMPUTE_WORKSPACE_SOFT_LIMIT_ENTRIES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES as DEFAULT_COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_HANDOFF_MAX_FILES as DEFAULT_COMPUTE_HANDOFF_MAX_FILES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_HANDOFF_MAX_MEMBER_BYTES as DEFAULT_COMPUTE_HANDOFF_MAX_MEMBER_BYTES,
+)
+from proofstack.agents.ac.compute import (
+    COMPUTE_HANDOFF_MAX_UNCOMPRESSED_BYTES as DEFAULT_COMPUTE_HANDOFF_MAX_UNCOMPRESSED_BYTES,
+)
+from proofstack.agents.ac.compute import (
     Compute,
     render_compute_reply_for_author,
 )
@@ -89,6 +119,11 @@ from proofstack.latex_contract import (
     DEFAULT_FIRSTPROOF_PAGE_LIMIT,
     normalize_firstproof_latex,
 )
+
+
+def _compute_requested(enable_compute: bool, instructions: str | None) -> bool:
+    """True only for an enabled, explicit, non-blank Author request."""
+    return bool(enable_compute and instructions and instructions.strip())
 
 
 # --- Local LaTeX compile helper -------------------------------------------
@@ -398,6 +433,71 @@ class ACWorkflow(Agent):
         compute_cost_config: str = DEFAULT_COMPUTE_COST_CONFIG
         compute_soft_timeout_s: int = Field(default=DEFAULT_COMPUTE_SOFT_TIMEOUT_S, ge=0)
         compute_hard_timeout_s: int = Field(default=DEFAULT_COMPUTE_HARD_TIMEOUT_S, ge=1)
+        compute_workspace_soft_limit_bytes: int = Field(
+            default=DEFAULT_COMPUTE_WORKSPACE_SOFT_LIMIT_BYTES,
+            ge=0,
+        )
+        compute_workspace_hard_limit_bytes: int = Field(
+            default=DEFAULT_COMPUTE_WORKSPACE_HARD_LIMIT_BYTES,
+            ge=1,
+        )
+        compute_workspace_soft_limit_entries: int = Field(
+            default=DEFAULT_COMPUTE_WORKSPACE_SOFT_LIMIT_ENTRIES,
+            ge=0,
+        )
+        compute_workspace_hard_limit_entries: int = Field(
+            default=DEFAULT_COMPUTE_WORKSPACE_HARD_LIMIT_ENTRIES,
+            ge=1,
+        )
+        compute_filesystem_min_free_bytes: int = Field(
+            default=DEFAULT_COMPUTE_FILESYSTEM_MIN_FREE_BYTES,
+            ge=0,
+        )
+        compute_filesystem_min_free_inodes: int | None = Field(
+            default=None,
+            ge=0,
+            description=(
+                "Minimum free filesystem inodes for Compute. Omit for the "
+                "portable automatic floor, zero to disable it, or set a "
+                "positive value to require measurable inode accounting."
+            ),
+        )
+        compute_filesystem_reservation_bytes: int = Field(
+            default=DEFAULT_COMPUTE_FILESYSTEM_RESERVATION_BYTES,
+            ge=0,
+            description=(
+                "Total per-Compute-worker workspace capacity reserved "
+                "cooperatively at admission time. Existing allocated bytes "
+                "reduce remaining headroom. Zero disables reservations."
+            ),
+        )
+        compute_filesystem_reservation_dir: Path | None = Field(
+            default=None,
+            description=(
+                "Shared reservation registry for concurrent runs on the same "
+                "filesystem. Defaults to a registry beside the run outputs."
+            ),
+        )
+        compute_handoff_max_files: int = Field(
+            default=DEFAULT_COMPUTE_HANDOFF_MAX_FILES,
+            ge=2,
+            le=DEFAULT_COMPUTE_HANDOFF_MAX_FILES,
+        )
+        compute_handoff_max_compressed_bytes: int = Field(
+            default=DEFAULT_COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES,
+            ge=1,
+            le=DEFAULT_COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES,
+        )
+        compute_handoff_max_uncompressed_bytes: int = Field(
+            default=DEFAULT_COMPUTE_HANDOFF_MAX_UNCOMPRESSED_BYTES,
+            gt=1024 * 1024,
+            le=DEFAULT_COMPUTE_HANDOFF_MAX_UNCOMPRESSED_BYTES,
+        )
+        compute_handoff_max_member_bytes: int = Field(
+            default=DEFAULT_COMPUTE_HANDOFF_MAX_MEMBER_BYTES,
+            ge=1,
+            le=DEFAULT_COMPUTE_HANDOFF_MAX_MEMBER_BYTES,
+        )
         # ``docker`` (default) or ``subprocess`` (host CLI; needed when
         # the pwc sandbox image is unavailable). Forwarded to
         # ``Compute.Inputs.sandbox_backend``.
@@ -427,6 +527,30 @@ class ACWorkflow(Agent):
             if self.compute_soft_timeout_s >= self.compute_hard_timeout_s:
                 raise ValueError(
                     "compute_soft_timeout_s must be less than compute_hard_timeout_s"
+                )
+            if (
+                self.compute_workspace_soft_limit_bytes
+                >= self.compute_workspace_hard_limit_bytes
+            ):
+                raise ValueError(
+                    "compute_workspace_soft_limit_bytes must be less than "
+                    "compute_workspace_hard_limit_bytes"
+                )
+            if (
+                self.compute_workspace_soft_limit_entries
+                >= self.compute_workspace_hard_limit_entries
+            ):
+                raise ValueError(
+                    "compute_workspace_soft_limit_entries must be less than "
+                    "compute_workspace_hard_limit_entries"
+                )
+            if (
+                self.compute_handoff_max_member_bytes + 1024 * 1024
+                > self.compute_handoff_max_uncompressed_bytes
+            ):
+                raise ValueError(
+                    "compute_handoff_max_member_bytes must leave room for the "
+                    "handoff manifest within compute_handoff_max_uncompressed_bytes"
                 )
             return self
 
@@ -643,8 +767,10 @@ class ACWorkflow(Agent):
                     and bool(inp.council_models)
                 )
                 requested_compute = (
-                    inp.enable_compute
-                    and bool(awaiting_author.compute_instructions)
+                    _compute_requested(
+                        inp.enable_compute,
+                        awaiting_author.compute_instructions,
+                    )
                 )
                 terminal_auxiliary_blocked, kinds, pending_terminal_auxiliary = (
                     self._terminal_auxiliary_decision(
@@ -863,8 +989,10 @@ class ACWorkflow(Agent):
                     and bool(inp.council_models)
                 )
                 requested_compute = (
-                    inp.enable_compute
-                    and bool(author_k.compute_instructions)
+                    _compute_requested(
+                        inp.enable_compute,
+                        author_k.compute_instructions,
+                    )
                 )
                 terminal_auxiliary_blocked, kinds, pending_terminal_auxiliary = (
                     self._terminal_auxiliary_decision(
@@ -1747,8 +1875,17 @@ class ACWorkflow(Agent):
         pending_compute_text = _safe_read(last_snap / "compute_response.md")
         pending_compute_zip_path = None
         for zip_path in sorted(last_snap.glob("compute_workspace_round_*.zip")):
-            pending_compute_zip_path = self._encode_run_path(zip_path)
-            break
+            if zip_path.is_file():
+                pending_compute_zip_path = self._encode_run_path(zip_path)
+                break
+        if pending_compute_zip_path is None:
+            handoff_ref = _read_json_if_exists(last_snap / "compute_handoff_ref.json")
+            if isinstance(handoff_ref, dict):
+                source_text = handoff_ref.get("source")
+                if isinstance(source_text, str) and source_text:
+                    source_path = Path(source_text)
+                    if source_path.is_file():
+                        pending_compute_zip_path = self._encode_run_path(source_path)
 
         pending_critique = ""
         active_review = review_raw
@@ -2084,6 +2221,18 @@ class ACWorkflow(Agent):
                 cost_config=inp.compute_cost_config,
                 soft_timeout_s=inp.compute_soft_timeout_s,
                 hard_timeout_s=inp.compute_hard_timeout_s,
+                workspace_soft_limit_bytes=inp.compute_workspace_soft_limit_bytes,
+                workspace_hard_limit_bytes=inp.compute_workspace_hard_limit_bytes,
+                workspace_soft_limit_entries=inp.compute_workspace_soft_limit_entries,
+                workspace_hard_limit_entries=inp.compute_workspace_hard_limit_entries,
+                filesystem_min_free_bytes=inp.compute_filesystem_min_free_bytes,
+                filesystem_min_free_inodes=inp.compute_filesystem_min_free_inodes,
+                filesystem_reservation_bytes=inp.compute_filesystem_reservation_bytes,
+                filesystem_reservation_dir=inp.compute_filesystem_reservation_dir,
+                handoff_max_files=inp.compute_handoff_max_files,
+                handoff_max_compressed_bytes=inp.compute_handoff_max_compressed_bytes,
+                handoff_max_uncompressed_bytes=inp.compute_handoff_max_uncompressed_bytes,
+                handoff_max_member_bytes=inp.compute_handoff_max_member_bytes,
                 sandbox_backend=inp.compute_sandbox_backend,
                 docker_image=inp.compute_docker_image,
                 codex_sandbox=inp.compute_codex_sandbox,
@@ -2199,8 +2348,12 @@ class ACWorkflow(Agent):
             if compute_out.zip_path is not None:
                 try:
                     src_zip = Path(compute_out.zip_path)
-                    if src_zip.exists():
-                        shutil.copyfile(src_zip, snap / src_zip.name)
+                    if src_zip.is_file():
+                        _snapshot_compute_handoff(
+                            src_zip,
+                            snap,
+                            sha256=str(compute_out.handoff_stats.get("sha256") or ""),
+                        )
                 except OSError:
                     pass
 
@@ -2424,6 +2577,55 @@ class ACWorkflow(Agent):
 
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _snapshot_compute_handoff(
+    source: Path, snapshot_dir: Path, *, sha256: str = ""
+) -> None:
+    """Retain a handoff without duplicating its archive bytes per round."""
+    source = source.resolve(strict=True)
+    destination = snapshot_dir / source.name
+    try:
+        destination.unlink()
+    except FileNotFoundError:
+        pass
+
+    mode = "reference"
+    try:
+        os.link(source, destination)
+        mode = "hardlink"
+    except OSError:
+        try:
+            relative_source = os.path.relpath(source, start=snapshot_dir.resolve())
+            destination.symlink_to(relative_source)
+            mode = "symlink"
+        except OSError:
+            pass
+
+    stat_result = source.stat()
+    if not sha256:
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        sha256 = digest.hexdigest()
+    metadata = {
+        "version": 1,
+        "source": str(source),
+        "source_relative": os.path.relpath(source, start=snapshot_dir.resolve()),
+        "snapshot": str(destination) if destination.exists() else None,
+        "mode": mode,
+        "size_bytes": stat_result.st_size,
+        "allocated_bytes": getattr(stat_result, "st_blocks", 0) * 512,
+        "device": stat_result.st_dev,
+        "inode": stat_result.st_ino,
+        "sha256": sha256,
+        "retained_duplicate_bytes": 0,
+    }
+    _write_text_atomic(
+        snapshot_dir / "compute_handoff_ref.json",
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def _safe_id(problem_id: str) -> str:
