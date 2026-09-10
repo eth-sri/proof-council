@@ -1,0 +1,72 @@
+workflow: proofstack.agents.proof_cleanup.AuthorCriticCleanupWorkflow
+description: Run Author/Critic unchanged, edit an accepted proof and bibliography, and review both with a fresh critic.
+
+inputs:
+  page_limit: 12
+
+budget:
+  max_usd: 1000.0
+  max_wallclock_s: 86400
+
+dag:
+  nodes:
+    - id: author_critic
+      kind: workflow_ref
+      preset: author_critic
+
+    - id: cleanup
+      kind: workflow_ref
+      needs: [author_critic]
+      preset: proof_cleanup
+      inputs:
+        answer_tex_path: $node.author_critic.answer_tex
+        references_bib_path: $node.author_critic.references_bib
+      when:
+        inputs:
+          last_gasp: $node.author_critic.last_gasp
+          error: $node.author_critic.error
+          accepted: $node.author_critic.last_critic_accepted
+          final_mode: $node.author_critic.final_critic_mode_run
+          final_accepted: $node.author_critic.final_critic_answer_ready
+        python: |
+          not inputs.get("error") and not inputs.get("last_gasp") and (
+              inputs.get("accepted") is True if inputs.get("final_mode") == "not_run"
+              else inputs.get("final_mode") == "run" and inputs.get("final_accepted") is True
+          )
+      default:
+        answer_tex: ''
+        references_bib: ''
+        answer_tex_path: ''
+        references_bib_path: ''
+
+    - id: fresh_critic
+      kind: agent
+      needs: [cleanup]
+      agent: proofstack.agents.ac.ACCritic
+      inputs:
+        answer_tex: $node.cleanup.answer_tex
+        references_bib: $node.cleanup.references_bib
+        mode: fresh
+        prior_messages: []
+        omit_author_thinking: true
+      when:
+        inputs:
+          proof: $node.cleanup.answer_tex
+          status: $node.cleanup.status
+        python: inputs.get("status") == "done" and bool((inputs.get("proof") or "").strip())
+      default:
+        answer_ready: false
+
+  outputs:
+    final_critic_answer_ready:
+      coalesce: [$node.fresh_critic.answer_ready, false]
+    error:
+      coalesce: [$node.author_critic.error, $node.cleanup.error]
+    original_proof:
+      answer_tex: $node.author_critic.answer_tex
+      references_bib: $node.author_critic.references_bib
+    cleaned_proof:
+      answer_tex: $node.cleanup.answer_tex_path
+      references_bib: $node.cleanup.references_bib_path
+export:
+  label: Author Critic Cleanup
