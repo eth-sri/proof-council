@@ -414,8 +414,8 @@ def _update_workspace_active_guard(
     try:
         os.fchmod(fd, 0o600)
         _write_fd_all(fd, payload)
-        os.close(fd)
-        fd = -1
+        closing_fd, fd = fd, -1
+        os.close(closing_fd)
         os.replace(temporary, path)
     except BaseException:
         if fd >= 0:
@@ -1085,8 +1085,8 @@ class CLIAgent(Agent):
                     raise OSError("could not write workspace recovery state")
                 offset += written
             os.fsync(fd)
-            os.close(fd)
-            fd = -1
+            closing_fd, fd = fd, -1
+            os.close(closing_fd)
             os.replace(temporary, path)
         except Exception:
             if fd >= 0:
@@ -1678,6 +1678,7 @@ class CLIAgent(Agent):
             else:
                 sandbox = make_sandbox(self.SANDBOX, root=self.workdir / "sandbox")
                 persistent = False
+            sandbox.emit_memory_event = self.events.emit
             ensure_workspace_available = getattr(
                 sandbox,
                 "ensure_workspace_available",
@@ -2049,11 +2050,17 @@ class CLIAgent(Agent):
             worker_stop_phase = "spawn"
             stream_spawn_attempted = True
             try:
+                admission_kwargs = {}
+                if self.SANDBOX.memory_policy is not None:
+                    remaining_s = self.tracker.remaining_wallclock_s()
+                    if remaining_s is not None:
+                        admission_kwargs["wallclock_deadline"] = time.monotonic() + remaining_s
                 stream = await sandbox.stream_command(
                     self.CLI_CMD,
                     env_extra=extra_env,
                     extra_path=[bin_dir],
                     timeout_s=timeout_s,
+                    **admission_kwargs,
                 )
             except SandboxSpawnError:
                 # The backend guarantees that no worker was created. Treat the
@@ -2123,6 +2130,13 @@ class CLIAgent(Agent):
                     )
 
             try:
+                if self.SANDBOX.memory_policy is not None:
+                    # Admission may consume the run's remaining time, but not
+                    # the worker allowance. Still reserve wrap-up time when the
+                    # absolute run deadline shortens the admitted invocation.
+                    soft_timeout_s = self._effective_soft_timeout_s(
+                        max(0, int(stream.remaining_s))
+                    )
                 done = await self._wait_for_done(
                     stream,
                     done_path,
@@ -2624,7 +2638,24 @@ class CLIAgent(Agent):
                     "workspace remains unavailable until guard recovery succeeds"
                 ) from workspace_guard_error
 
-    async def _wait_for_done(
+    async def _wait_for_done(self, stream, done_path: Path, **kwargs) -> CLIDoneRecord:
+        done = await self._wait_for_done_inner(stream, done_path, **kwargs)
+        sample = getattr(stream, "memory_sample", None)
+        failure = getattr(stream, "memory_failure", None)
+        if sample:
+            await self.events.emit("cli.memory_summary", {
+                **sample, "reason": failure,
+            }, call_id=kwargs.get("spawn_call_id"))
+        if failure:
+            return CLIDoneRecord(
+                status="error",
+                summary=(f"Compute stopped for memory safety ({failure}). "
+                         "Use smaller chunks or a lower-memory algorithm; "
+                         "the previous computation was not completed."),
+            )
+        return done
+
+    async def _wait_for_done_inner(
         self,
         stream,
         done_path: Path,

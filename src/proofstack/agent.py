@@ -107,6 +107,12 @@ class Agent(ABC):
     @abstractmethod
     async def run(self, inp: BaseModel) -> BaseModel: ...
 
+    def cache_output_is_reusable(self, out: BaseModel) -> bool:
+        return True
+
+    def cache_input_is_reusable(self, inp: BaseModel) -> bool:
+        return True
+
     async def __call__(self, **kwargs: Any) -> BaseModel:
         inp = self.Inputs(**kwargs)
         call_id = new_call_id()
@@ -119,7 +125,9 @@ class Agent(ABC):
 
         if self.cache_enabled:
             cached = self.ctx.resume_cache.get(cache_key)
-            if cached is not None:
+            if (cached is not None and self.cache_input_is_reusable(inp)
+                    and self.cache_output_is_reusable(self._coerce_output(cached))):
+                out = self._coerce_output(cached)
                 # Re-persist into the current run's cache so a chain of resumes
                 # (resuming a run that was itself resumed) stays self-contained.
                 self.ctx.resume_cache.put(cache_key, cached)
@@ -130,7 +138,7 @@ class Agent(ABC):
                     execution_mode=type(self).execution_mode,
                     parent_call_id=parent_call_id,
                 )
-                return self._coerce_output(cached)
+                return out
 
         # Allocate a fresh workdir per invocation. This is the fix for
         # parallel re-use of the same agent instance overwriting its
@@ -208,7 +216,7 @@ class Agent(ABC):
                         pass
 
         out_json = self._dump_output(out)
-        if self.cache_enabled:
+        if self.cache_enabled and self.cache_input_is_reusable(inp) and self.cache_output_is_reusable(out):
             self.ctx.resume_cache.put(cache_key, out_json)
         await self._persist_output(out, workdir)
         await self.events.emit(

@@ -6,8 +6,8 @@ FROM python:3.12-slim-bookworm
 
 # System packages:
 #   texlive-*    - pdflatex for configurable LaTeX compile nodes.
-#   nodejs/npm   - host for the @openai/codex and @anthropic-ai/claude-code
-#                  CLIs used by ConfigurableCLIAgent.
+#   nodejs/npm   - installation/launcher for @openai/codex.
+#                  Claude Code is installed directly as a pinned native binary.
 #   curl, ca-certs - provider HTTPS calls (provider SDKs already use these,
 #                    but explicit install keeps the Dockerfile self-documenting).
 #   git/file/time/column - common Compute Worker probes, profiling, retrieval.
@@ -79,12 +79,21 @@ RUN set -eux; \
 
 # Coding-CLI binaries used by ConfigurableCLIAgent.
 # Pin Codex because workflow command flags are part of the runtime contract.
-ARG OPENAI_CODEX_VERSION=0.144.0
-RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION} @anthropic-ai/claude-code \
+ARG OPENAI_CODEX_VERSION=0.154.0
+ARG ANTHROPIC_CLAUDE_CODE_VERSION=2.1.251
+RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION} \
  && codex --version | grep -q -- "${OPENAI_CODEX_VERSION}" \
  && codex exec --help | grep -q -- '--output-last-message' \
  && codex exec --help | grep -q -- '--sandbox' \
  && codex exec --help | grep -q -- '--dangerously-bypass-approvals-and-sandbox'
+
+ENV DISABLE_AUTOUPDATER=1
+COPY scripts/install_claude_native.sh /tmp/install_claude_native.sh
+COPY src/proofstack/cleanup_runtime.py /tmp/check_cleanup_runtime.py
+RUN sh /tmp/install_claude_native.sh "${ANTHROPIC_CLAUDE_CODE_VERSION}" /usr/local/bin/claude \
+ && python /tmp/check_cleanup_runtime.py --claude-version "${ANTHROPIC_CLAUDE_CODE_VERSION}" \
+        --codex-version "${OPENAI_CODEX_VERSION}" \
+ && rm /tmp/install_claude_native.sh /tmp/check_cleanup_runtime.py
 
 WORKDIR /app
 
@@ -131,8 +140,9 @@ RUN for bin in sage gap singular gp git file column time; do \
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=0 \
     MATHAGENTS_CONFIGS_ROOT=/app/configs \
-    PROOFSTACK_SANDBOX_BACKEND=subprocess
+    PROOFSTACK_SANDBOX_BACKEND=subprocess \
+    FIRSTPROOF_WORKFLOW=firstproof_batch3
 
-RUN python -c "from proofstack.registry import load_preset; load_preset('author_critic')"
+RUN python -c "import os; from proofstack.registry import load_preset; load_preset(os.environ['FIRSTPROOF_WORKFLOW']); load_preset('author_critic')"
 
 ENTRYPOINT ["python", "scripts/firstproof_entrypoint.py"]

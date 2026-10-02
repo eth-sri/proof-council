@@ -54,8 +54,15 @@ _FORBIDDEN_FORMATTING_COMMANDS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
-def render_firstproof_latex_contract(page_limit: int) -> str:
+def render_firstproof_latex_contract(page_limit: int, *, can_compile: bool = True) -> str:
     """Human-facing formatting contract for Author/Critic prompts."""
+    compilation = (
+        "Run `pdflatex` and fix compile errors before claiming readiness."
+        if can_compile else
+        "You have web search only, no shell or LaTeX compiler. Return the complete LaTeX; "
+        "the harness will run `pdflatex` and measure its pages. Do not claim to have compiled "
+        "it, and do not declare UNABLE merely because you cannot run the compiler."
+    )
     return f"""\
 First Proof LaTeX submission contract:
 - `answer.tex` must be a complete standalone LaTeX document.
@@ -69,13 +76,49 @@ First Proof LaTeX submission contract:
   `\\baselinestretch`, `\\onehalfspacing`, or `\\doublespacing`.
 - Do not change font size inside the document: no `\\small`,
   `\\footnotesize`, `\\scriptsize`, or `\\fontsize`.
-- Run `pdflatex` and fix compile errors before claiming readiness.
+- {compilation}
 """
 
 
 def normalize_firstproof_latex(tex: str, *, removals: list[str] | None = None) -> str:
     """Return a complete 12pt article with forbidden formatting stripped."""
     return ensure_complete_latex(tex, removals=removals)
+
+
+def normalize_submission_latex(tex: str, *, removals: list[str] | None = None) -> str:
+    """Canonical bytes shared by the Batch 3 review gate and export adapter."""
+    # Sanitization can expose further whitespace/formatting matches. Settle them
+    # before review so exporting the accepted bytes never requires another edit.
+    while True:
+        normalized = repair_common_missing_packages(ensure_complete_latex(tex, removals=removals), removals)
+        if normalized == tex:
+            return normalized
+        tex = normalized
+
+
+_COMMON_PACKAGE_REPAIRS = (
+    ("graphicx", re.compile(r"\\includegraphics(?:\s*\[[^\]]*\])?\s*\{"), ("graphicx",)),
+    ("hyperref", re.compile(r"\\(?:url|href)\s*\{"), ("hyperref", "url")),
+    ("xcolor", re.compile(r"\\(?:textcolor|color)\s*(?:\[[^\]]*\])?\s*\{"), ("xcolor", "color")),
+    ("cleveref", re.compile(r"\\[cC](?:ref|pageref)\s*\{"), ("cleveref",)),
+)
+
+
+def repair_common_missing_packages(tex: str, removals: list[str] | None = None) -> str:
+    packages = {name.strip() for match in _USEPACKAGE_RE.finditer(tex)
+                for name in match.group(1).split(",")}
+    insertions = []
+    for package, trigger, alternatives in _COMMON_PACKAGE_REPAIRS:
+        if trigger.search(tex) and not packages.intersection(alternatives):
+            insertions.append(f"\\usepackage{{{package}}}")
+            packages.add(package)
+            if removals is not None:
+                removals.append(f"inserted \\usepackage{{{package}}} for missing command support")
+    if not insertions:
+        return tex
+    insert = "\n".join(insertions) + "\n"
+    idx = tex.find(r"\begin{document}")
+    return tex[:idx] + insert + tex[idx:] if idx >= 0 else tex.rstrip() + "\n" + insert
 
 
 def strip_forbidden_packages(tex: str) -> tuple[str, list[str]]:

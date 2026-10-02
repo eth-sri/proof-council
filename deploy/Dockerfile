@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Coding-CLI binaries used by ConfigurableCLIAgent.
 # Pin Codex because model and reasoning-effort support are runtime contracts.
-ARG OPENAI_CODEX_VERSION=0.144.0
+ARG OPENAI_CODEX_VERSION=0.154.0
 RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION} @anthropic-ai/claude-code \
     && codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"
 

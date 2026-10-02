@@ -1,0 +1,25 @@
+workflow: proofstack.agents.cleanup_session.CleanupSession
+description: "Opt-in persistent Fable 5.1/xhigh editor with managed Codex reviews. No independent acceptance gate in this standalone preset."
+# Planning defaults only; launching paid calls requires operator authorization.
+budget:
+  max_usd: 400
+  max_wallclock_s: 7200
+inputs:
+  problem: ''
+  document: ''
+  partial: true
+  page_limit: 16
+  session_key: standalone
+components:
+  CleanupSession:
+    cleanup:
+      model: claude-fable-5-1
+      effort: xhigh
+      cost_config: models/anthropic/fable_51
+      codex_model: gpt-6-astra
+      codex_effort: xhigh
+      codex_cost_config: models/openai/gpt-6-astra
+      codex_budget_fraction: 0.3
+      max_invocations: 3
+      max_invocation_usd: 150
+      max_episode_usd: 500

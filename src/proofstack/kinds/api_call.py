@@ -12,6 +12,8 @@ richer behavior.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import json
 import re
 import time
@@ -20,8 +22,10 @@ from typing import Any, ClassVar
 from pydantic import BaseModel
 
 from proofstack.agent import Agent
+from proofstack.budget import BudgetExhausted, budget_overrun_allowed
 from proofstack.context import ModelSpec
 from proofstack.events import new_call_id
+from proofstack.provider_accounting import record_provider_usage
 
 Message = dict[str, Any]
 
@@ -69,6 +73,16 @@ class APICallAgent(Agent):
     def extra_client_kwargs(self) -> dict[str, Any]:
         return {}
 
+    def _on_response(self, raw_text: str, inp: BaseModel) -> None:
+        """Observe a completed reply synchronously, before logging awaits.
+
+        Overrides must not raise or perform I/O. This is for callers that
+        must retain a reply even when later bookkeeping is interrupted.
+        """
+
+    def _on_provider_response(self, client, trace) -> None:
+        """Optional bounded, synchronous artifact capture during provider polling."""
+
     # --- framework-managed ----------------------------------------------------
 
     async def run(self, inp: BaseModel) -> BaseModel:
@@ -98,7 +112,7 @@ class APICallAgent(Agent):
         )
 
         start = time.monotonic()
-        result = await asyncio.to_thread(_one_shot_query, client, client_messages)
+        result = await self._query(client, client_messages, _one_shot_query, call_id=call_id)
         elapsed = time.monotonic() - start
 
         # result: (idx, conversation, detailed_cost)
@@ -111,10 +125,9 @@ class APICallAgent(Agent):
         # them (OpenAI Responses/Chat-Completions reasoning models,
         # Gemini thinking). 0 when not reported.
         reasoning_tok = int(cost.get("reasoning_tokens", 0) or 0)
-        self.tracker.add_usd(usd)
-        self.tracker.add_tokens(in_tok + out_tok)
-        await self.events.emit(
-            "model.call",
+        raw_text = _assistant_text(conversation)
+        self._on_response(raw_text, inp)
+        await self._record_model_usage(
             {
                 "model": getattr(client, "model", str(self.MODEL)),
                 "in_tokens": in_tok,
@@ -122,19 +135,31 @@ class APICallAgent(Agent):
                 "reasoning_tokens": reasoning_tok,
                 "cost_usd": usd,
                 "duration_s": elapsed,
+                "status": "completed" if raw_text.strip() else "empty",
+                "provider_outcomes": cost.get("provider_outcomes", []),
+                "usage_unavailable": cost.get("usage_unavailable", False),
             },
             call_id=call_id,
         )
 
         # Best-effort post-call check (raises if we just blew a limit).
-        post_warnings = self.tracker.check()
+        try:
+            post_warnings = self.tracker.check()
+        except BudgetExhausted as e:
+            # The call has already completed and been charged. A caller that
+            # branches on the reply (WriteupLoop's UNABLE: catastrophe signal)
+            # must not lose it just because the charge crossed a limit, so
+            # attach it. The raise itself is unchanged.
+            with contextlib.suppress(Exception):
+                e.completed_output = self.parse_output(
+                    _assistant_text(conversation), inp)
+            raise
         for scope, kind, used, limit in post_warnings:
             await self.events.emit(
                 "budget.warn",
                 {"scope": scope, "kind": kind, "used": used, "limit": limit},
             )
 
-        raw_text = _assistant_text(conversation)
         if not raw_text.strip():
             await self.events.emit(
                 "model.empty_response",
@@ -145,6 +170,112 @@ class APICallAgent(Agent):
                 call_id=call_id,
             )
         return self.parse_output(raw_text, inp)
+
+    async def _query(self, client, messages, query, *, call_id=None):
+        from mathagents.provider_trace import ProviderTrace, active_trace
+
+        call_id = call_id or new_call_id()
+        # Authors may reuse a client across rounds; construction-time caps alone
+        # would give a late call the first round's much larger timeout.
+        remaining = self.tracker.remaining_wallclock_s()
+        if remaining is not None and not budget_overrun_allowed():
+            self.tracker.check()
+            for key in ("timeout", "max_wallclock_per_call_s"):
+                if hasattr(client, key):
+                    configured = getattr(client, key)
+                    setattr(client, key, min(float(configured), remaining) if configured is not None else remaining)
+        loop = asyncio.get_running_loop()
+
+        def attempt_failed(payload):
+            # APIClient runs in a worker thread. Flush the small diagnostic
+            # before its retry sleep so monitors need not wait for query exit.
+            if loop.is_closed():
+                return
+            emission = self.events.emit("model.attempt.failed", payload, call_id=call_id)
+            try:
+                pending = asyncio.run_coroutine_threadsafe(emission, loop)
+            except RuntimeError:
+                emission.close()
+                raise
+            try:
+                pending.result(timeout=5)
+            except Exception:
+                pending.cancel()
+                raise
+
+        trace = ProviderTrace(self.workdir / "provider-attempts.jsonl",
+                              run_id=self.ctx.root_workdir.name, agent=self.workdir.name, call_id=call_id,
+                              on_failure=attempt_failed, on_response=self._on_provider_response)
+        token = active_trace.set(trace)
+        task = asyncio.create_task(asyncio.to_thread(query, client, messages))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            # Cancelling to_thread does not stop its provider polling loop.
+            with contextlib.suppress(Exception):
+                client.terminate()
+            # Give background cancellation a bounded chance to persist its
+            # acknowledgement and final usage; never wait for a stuck transport.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+            if trace.completed_report:
+                exc.completed_report = trace.completed_report
+            try:
+                await self._charge_failed_provider_trace(trace, client, call_id, "cancelled")
+            except Exception as accounting_error:
+                # Cancellation was already delivered before settlement began.
+                # A failed append must not turn this stop into a retryable error.
+                raise exc from accounting_error
+            with contextlib.suppress(Exception):
+                await self.events.emit("model.call.cancelled", {
+                    "model": getattr(client, "model", str(self.MODEL)),
+                    "usage_unavailable": not trace.totals()["provider_attempts"] or trace.totals()["usage_unavailable"],
+                    "note": "Cancellation requested; provider charges may still apply.",
+                }, call_id=call_id)
+            raise
+        except Exception as exc:
+            if isinstance(getattr(exc, "cost", None), dict):
+                # Author owns attachment-rejection charging; enrich its receipt
+                # rather than charge the same response twice.
+                totals = trace.totals()
+                for name, value in totals.items():
+                    if name in exc.cost and isinstance(value, (int, float)):
+                        exc.cost[name] = max(exc.cost[name] or 0, value)
+            else:
+                await self._charge_failed_provider_trace(trace, client, call_id, "failed")
+            raise
+        finally:
+            self._provider_tool_evidence = trace.tool_evidence()
+            active_trace.reset(token)
+            # Retrieve a late exception without making shutdown await that task.
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+
+    async def _charge_failed_provider_trace(self, trace, client, call_id, status):
+        totals = trace.totals()
+        if not totals["provider_attempts"]:
+            return
+        await self._record_model_usage({
+            "model": getattr(client, "model", str(self.MODEL)),
+            "cost_usd": totals["cost"], "in_tokens": totals["input_tokens"],
+            "out_tokens": totals["output_tokens"], "reasoning_tokens": totals["reasoning_tokens"],
+            "status": status, "usage_unavailable": totals["usage_unavailable"],
+            "invocation_id": totals["invocation_id"],
+            "provider_outcomes": totals["provider_outcomes"],
+        }, call_id=call_id)
+
+    async def _record_model_usage(self, payload, *, call_id):
+        await record_provider_usage(self.ctx, self.tracker, payload, call_id=call_id, emitter=self.events)
+
+    def _limit_client_deadline(self, cfg):
+        remaining = self.tracker.remaining_wallclock_s()
+        if remaining is not None and not budget_overrun_allowed():
+            for key in ("timeout", "max_wallclock_per_call_s"):
+                # Leave absent defaults to APIClient; _query caps the actual
+                # client immediately before use without widening those defaults.
+                if key in cfg:
+                    configured = cfg[key]
+                    cfg[key] = min(float(configured), remaining) if configured is not None else remaining
+        return cfg
 
     async def _get_client(self) -> Any:
         if self._client is not None:
@@ -163,12 +294,19 @@ class APICallAgent(Agent):
         ``max_tool_calls=N`` actually reach ``APIClient.__init__`` —
         post-hoc ``setattr`` would not reconfigure the tool loop.
         """
-        from mathagents import load_solver_config
+        from mathagents import APIClient, load_solver_config
 
         cfg = load_solver_config(spec)
         cfg = {k: v for k, v in cfg.items() if not k.startswith("__")}
-        cfg.update(self.extra_client_kwargs())
-        return self.ctx.api_client_factory(cfg)
+        extra = dict(self.extra_client_kwargs())
+        defaults = inspect.signature(APIClient).parameters
+        for key in ("timeout", "max_wallclock_per_call_s"):
+            if key in extra and extra[key] is not None:
+                configured = cfg.get(key, defaults[key].default)
+                if configured is not None:
+                    extra[key] = min(float(configured), float(extra[key]))
+        cfg.update(extra)
+        return self.ctx.api_client_factory(self._limit_client_deadline(cfg))
 
     def _messages_with_tool_context(self, messages: list[Message]) -> list[Message]:
         copied = [msg.copy() for msg in messages]

@@ -7,6 +7,8 @@ and writes the required aggregate files under /data/output.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import os
 import re
@@ -19,10 +21,14 @@ import time
 import uuid
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from proofstack.agents.writeup_loop import _GateCanceller
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +41,8 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from proofstack.latex_contract import (  # noqa: E402
     DEFAULT_FIRSTPROOF_PAGE_LIMIT,
-    ensure_complete_latex,
+    normalize_submission_latex,
+    repair_common_missing_packages as _repair_common_missing_packages,
     normalize_documentclass,
     strip_forbidden_formatting_commands,
     strip_forbidden_packages,
@@ -48,6 +55,16 @@ from _secret_paths import (  # noqa: E402
 DEFAULT_INPUT_PATH = Path("/data/input/input.json")
 DEFAULT_OUTPUT_DIR = Path("/data/output")
 DEFAULT_TMP_PROBLEM_DIR = Path("/tmp/firstproof_problems")
+LIVE_SNAPSHOT_INTERVAL_S = 60.0
+
+
+def _batch3_cleanup_seconds(workflow):
+    from proofstack.registry import load_preset
+    from proofstack.agents.firstproof_batch3 import FirstProofBatch3Workflow
+
+    preset = load_preset(workflow)
+    default = FirstProofBatch3Workflow.Inputs.model_fields["partial_cleanup_seconds"].default
+    return float(preset.build_inputs().get("partial_cleanup_seconds", default))
 
 
 @dataclass(frozen=True)
@@ -69,6 +86,15 @@ class Settings:
     run_namespace: str = ""
     adaptive_continuation: bool = False
     adaptive_max_rounds: int = 200
+    deadline_at: float | None = None
+    research_deadline_at: float | None = None
+    batch3: bool = False
+    compute_max_parallel_workers: int | None = None
+    author_parallelism: int | None = None
+    compute_disabled_reason: str | None = None
+    cleanup_disabled_reason: str | None = None
+    stop_requested: asyncio.Event = field(default_factory=asyncio.Event, compare=False, repr=False)
+    event_snapshots: dict[Path, _EventSnapshot] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -217,28 +243,65 @@ def _settings() -> Settings:
             + "-"
             + uuid.uuid4().hex[:8]
         )
-    return Settings(
+    workflow = os.environ.get("FIRSTPROOF_WORKFLOW") or "firstproof_submission"
+    from proofstack.agents.firstproof_batch3 import FirstProofBatch3Workflow
+    from proofstack.registry import PresetError, load_preset
+
+    preset = None
+    try:
+        preset = load_preset(workflow)
+        batch3 = issubclass(preset.workflow_cls, FirstProofBatch3Workflow)
+    except (PresetError, OSError, ValueError, KeyError, ImportError) as exc:
+        warnings.append(f"Could not inspect workflow {workflow!r}: {exc}")
+        batch3 = False
+    compute_max_parallel_workers = None
+    if batch3:
+        default_workers = int(preset.inputs.get(
+            "compute_max_parallel_workers",
+            preset.workflow_cls.Inputs.model_fields["compute_max_parallel_workers"].default,
+        ))
+        if default_workers < 1:
+            raise ValueError("Batch 3 requires a positive compute_max_parallel_workers")
+        compute_max_parallel_workers = _read_int_env(
+            "FIRSTPROOF_COMPUTE_MAX_PARALLEL_WORKERS", default_workers, warnings,
+        )
+    author_parallelism = None
+    if preset is not None and "author_parallelism" in preset.workflow_cls.Inputs.model_fields:
+        default_parallelism = preset.inputs.get(
+            "author_parallelism",
+            preset.workflow_cls.Inputs.model_fields["author_parallelism"].default,
+        )
+        if (
+            isinstance(default_parallelism, bool)
+            or not isinstance(default_parallelism, int)
+            or default_parallelism < 1
+        ):
+            raise ValueError("Workflow requires a positive integer author_parallelism")
+        author_parallelism = _read_int_env(
+            "FIRSTPROOF_AUTHOR_PARALLELISM", default_parallelism, warnings,
+        )
+    settings = Settings(
         input_path=Path(os.environ.get("FIRSTPROOF_INPUT_PATH") or DEFAULT_INPUT_PATH),
         output_dir=Path(os.environ.get("FIRSTPROOF_OUTPUT_DIR") or DEFAULT_OUTPUT_DIR),
-        workflow=os.environ.get("FIRSTPROOF_WORKFLOW") or "firstproof_submission",
+        workflow=workflow,
         max_parallel=_read_int_env(
             "FIRSTPROOF_MAX_PARALLEL",
-            6,
+            10 if batch3 else 6,
             warnings,
         ),
         page_limit=_read_int_env(
             "FIRSTPROOF_PAGE_LIMIT",
-            DEFAULT_FIRSTPROOF_PAGE_LIMIT,
+            16 if batch3 else DEFAULT_FIRSTPROOF_PAGE_LIMIT,
             warnings,
         ),
         budget_usd_per_question=_read_float_env(
             "FIRSTPROOF_BUDGET_USD_PER_QUESTION",
-            1000.0,
+            1050.0 if batch3 else 1000.0,
             warnings,
         ),
         n_rounds=_read_int_env(
             "FIRSTPROOF_N_ROUNDS",
-            10,
+            50 if batch3 else 10,
             warnings,
         ),
         round_batch_size=_read_int_env(
@@ -248,7 +311,7 @@ def _settings() -> Settings:
         ),
         adaptive_continuation=_read_bool_env(
             "FIRSTPROOF_ADAPTIVE_CONTINUATION",
-            True,
+            not batch3,
             warnings,
         ),
         adaptive_max_rounds=_read_int_env(
@@ -264,7 +327,20 @@ def _settings() -> Settings:
         warnings=warnings,
         deadline_seconds=deadline_seconds,
         run_namespace=run_namespace,
+        batch3=batch3,
+        compute_max_parallel_workers=compute_max_parallel_workers,
+        author_parallelism=author_parallelism,
     )
+    if batch3 and settings.adaptive_continuation:
+        warnings.append("Batch 3 runs the complete pipeline once; disabling FIRSTPROOF_ADAPTIVE_CONTINUATION")
+        settings = replace(settings, adaptive_continuation=False)
+    if batch3 and not 1 <= settings.page_limit <= 16:
+        warnings.append("Batch 3 requires a page limit between 1 and 16; clamping FIRSTPROOF_PAGE_LIMIT")
+        settings = replace(settings, page_limit=max(1, min(16, settings.page_limit)))
+    if batch3 and settings.n_rounds > 500:
+        warnings.append("Batch 3 supports at most 500 rounds; clamping FIRSTPROOF_N_ROUNDS")
+        settings = replace(settings, n_rounds=500)
+    return settings
 
 
 def _prepare_output_dir(path: Path) -> None:
@@ -275,8 +351,8 @@ def _prepare_output_dir(path: Path) -> None:
     # First Proof mounts a fresh /data/output per run, but a local
     # re-run can reuse the directory. Drop stale healthcheck artefacts
     # so usage rows from a previous run don't leak into
-    # ``token_usage.jsonl`` and the proceed-sentinel from an aborted
-    # strict run doesn't cause this one to skip its own halt-and-wait.
+    # ``token_usage.jsonl``. Remove the obsolete proceed-sentinel too;
+    # it no longer bypasses a failed startup gate.
     for stale in ("healthcheck.json", "healthcheck.proceed"):
         target = path / stale
         try:
@@ -490,13 +566,15 @@ def _safe_id(value: str, fallback: str) -> str:
     return cleaned[:120].strip("._-") or fallback
 
 
-def _unique_safe_id(base: str, seen: dict[str, int]) -> str:
-    count = seen.get(base, 0)
-    seen[base] = count + 1
-    if count == 0:
-        return base
-    suffix = f"-{count + 1}"
-    return f"{base[: 120 - len(suffix)]}{suffix}"
+def _unique_safe_id(base: str, seen: set[str]) -> str:
+    candidate = base
+    count = 1
+    while candidate in seen:
+        count += 1
+        suffix = f"-{count}"
+        candidate = f"{base[: 120 - len(suffix)]}{suffix}"
+    seen.add(candidate)
+    return candidate
 
 
 def _problem_text(item: Any) -> tuple[str, str | None]:
@@ -514,7 +592,7 @@ def _problem_text(item: Any) -> tuple[str, str | None]:
 def _parse_problems(items: list[Any], settings: Settings) -> list[Problem]:
     tmp_dir = Path(os.environ.get("FIRSTPROOF_TMP_PROBLEM_DIR") or DEFAULT_TMP_PROBLEM_DIR)
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    seen: dict[str, int] = {}
+    seen: set[str] = set()
     problems: list[Problem] = []
     for idx, item in enumerate(items, start=1):
         default_id = f"prob-{idx:03d}"
@@ -571,17 +649,6 @@ def _latex_escape(value: str) -> str:
     return "".join(replacements.get(ch, ch) for ch in value)
 
 
-_USEPACKAGE_RE = re.compile(
-    r"\\usepackage\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}",
-)
-_COMMON_PACKAGE_REPAIRS: tuple[tuple[str, re.Pattern[str], tuple[str, ...]], ...] = (
-    ("graphicx", re.compile(r"\\includegraphics(?:\s*\[[^\]]*\])?\s*\{"), ("graphicx",)),
-    ("hyperref", re.compile(r"\\(?:url|href)\s*\{"), ("hyperref", "url")),
-    ("xcolor", re.compile(r"\\(?:textcolor|color)\s*(?:\[[^\]]*\])?\s*\{"), ("xcolor", "color")),
-    ("cleveref", re.compile(r"\\[cC](?:ref|pageref)\s*\{"), ("cleveref",)),
-)
-
-
 def _strip_forbidden_packages(tex: str) -> tuple[str, list[str]]:
     return strip_forbidden_packages(tex)
 
@@ -593,36 +660,6 @@ def _strip_forbidden_formatting_commands(tex: str, removals: list[str] | None) -
     return cleaned
 
 
-def _document_packages(tex: str) -> set[str]:
-    packages: set[str] = set()
-    for match in _USEPACKAGE_RE.finditer(tex):
-        packages.update(name.strip() for name in match.group(1).split(",") if name.strip())
-    return packages
-
-
-def _insert_before_begin_document(tex: str, lines: list[str]) -> str:
-    if not lines:
-        return tex
-    marker = r"\begin{document}"
-    idx = tex.find(marker)
-    insert = "\n".join(lines) + "\n"
-    if idx < 0:
-        return tex.rstrip() + "\n" + insert
-    return tex[:idx] + insert + tex[idx:]
-
-
-def _repair_common_missing_packages(tex: str, removals: list[str] | None) -> str:
-    packages = _document_packages(tex)
-    insertions: list[str] = []
-    for package, trigger, alternatives in _COMMON_PACKAGE_REPAIRS:
-        if trigger.search(tex) and not any(existing in packages for existing in alternatives):
-            insertions.append(f"\\usepackage{{{package}}}")
-            packages.add(package)
-            if removals is not None:
-                removals.append(f"inserted \\usepackage{{{package}}} for missing command support")
-    return _insert_before_begin_document(tex, insertions)
-
-
 def _repair_normalized_latex(tex: str, removals: list[str] | None) -> str:
     return _repair_common_missing_packages(
         _strip_forbidden_formatting_commands(tex, removals),
@@ -631,17 +668,49 @@ def _repair_normalized_latex(tex: str, removals: list[str] | None) -> str:
 
 
 def _ensure_complete_latex(tex: str, *, removals: list[str] | None = None) -> str:
-    return _repair_common_missing_packages(
-        ensure_complete_latex(tex, removals=removals),
-        removals,
-    )
+    return normalize_submission_latex(tex, removals=removals)
 
 
 def _normalize_documentclass(tex: str, *, removals: list[str] | None = None) -> str:
     return normalize_documentclass(tex, removals=removals)
 
 
-def _count_pdf_pages(pdf_path: Path) -> int:
+def _run_validation_command(
+    cmd: list[str], *, timeout_s: float, deadline: float | None = None,
+    canceller: _GateCanceller | None = None, cwd: Path | None = None,
+) -> subprocess.CompletedProcess:
+    from proofstack.agents.writeup_loop import _kill_compiler
+
+    if canceller is not None and canceller.stopped():
+        raise InterruptedError("submission compilation cancelled")
+    if deadline is not None:
+        timeout_s = min(timeout_s, deadline - time.monotonic())
+    if timeout_s <= 0:
+        raise subprocess.TimeoutExpired(cmd, timeout_s)
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    if canceller is not None:
+        canceller.track(proc)
+    try:
+        if deadline is not None:
+            timeout_s = min(timeout_s, max(0.0, deadline - time.monotonic()))
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        if canceller is not None and canceller.stopped():
+            raise InterruptedError("submission compilation cancelled")
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except BaseException:
+        _kill_compiler(proc)
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=5)
+        raise
+    finally:
+        if canceller is not None:
+            canceller.untrack()
+
+
+def _count_pdf_pages(
+    pdf_path: Path, *, deadline: float | None = None, canceller: _GateCanceller | None = None,
+) -> int:
     try:
         import warnings
 
@@ -653,15 +722,11 @@ def _count_pdf_pages(pdf_path: Path) -> int:
             return int(doc.page_count)
     except Exception:
         try:
-            proc = subprocess.run(
-                ["pdfinfo", str(pdf_path)],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
+            proc = _run_validation_command(
+                ["pdfinfo", str(pdf_path)], timeout_s=30, deadline=deadline, canceller=canceller,
             )
             if proc.returncode == 0:
-                match = re.search(r"^Pages:\s*(\d+)\s*$", proc.stdout, re.MULTILINE)
+                match = re.search(rb"^Pages:\s*(\d+)\s*$", proc.stdout, re.MULTILINE)
                 if match:
                     return int(match.group(1))
         except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
@@ -674,46 +739,59 @@ def _count_pdf_pages(pdf_path: Path) -> int:
         return len(re.findall(rb"/Type\s*/Page(?!s)", data))
 
 
-def _compile_exact_latex_once(
+def _compile_exact_latex(
     tex: str,
     *,
     page_limit: int,
     timeout_s: int = 120,
+    deadline: float | None = None,
+    canceller: _GateCanceller | None = None,
 ) -> tuple[bool, str]:
-    """Compile the exact LaTeX bytes the adapter is about to ship."""
+    """Compile the exact output twice, sharing one timeout across both passes."""
     with tempfile.TemporaryDirectory(prefix="firstproof_final_tex_") as work_str:
         work = Path(work_str)
         tex_path = work / "solution.tex"
         tex_path.write_text(tex, encoding="utf-8")
+        timeout_deadline = time.monotonic() + timeout_s
+        deadline = min(timeout_deadline, deadline) if deadline is not None else timeout_deadline
         try:
-            proc = subprocess.run(
-                [
-                    "pdflatex",
-                    "-interaction=nonstopmode",
-                    "-halt-on-error",
-                    "solution.tex",
-                ],
-                cwd=work,
-                capture_output=True,
-                timeout=timeout_s,
-                check=False,
-            )
+            # Unresolved references on the first pass can change pagination.
+            for _ in range(2):
+                proc = _run_validation_command(
+                    [
+                        "pdflatex",
+                        "-interaction=nonstopmode",
+                        "-halt-on-error",
+                        "solution.tex",
+                    ],
+                    cwd=work,
+                    timeout_s=timeout_s,
+                    deadline=deadline,
+                    canceller=canceller,
+                )
+                if proc.returncode != 0:
+                    break
+            pdf_path = work / "solution.pdf"
+            if proc.returncode == 0 and pdf_path.exists():
+                page_count = _count_pdf_pages(pdf_path, deadline=deadline, canceller=canceller)
+                if canceller is not None and canceller.stopped():
+                    raise InterruptedError("submission compilation cancelled")
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("submission validation", timeout_s)
+                if page_count <= 0:
+                    return False, "pdflatex produced a PDF but page count could not be determined"
+                if page_count > page_limit:
+                    return (
+                        False,
+                        f"pdflatex produced {page_count} pages, above page_limit={page_limit}",
+                    )
+                return True, f"compiled with {page_count} pages"
         except FileNotFoundError:
             return False, "pdflatex binary not found"
         except subprocess.TimeoutExpired:
-            return False, f"pdflatex timed out after {timeout_s}s"
-
-        pdf_path = work / "solution.pdf"
-        if proc.returncode == 0 and pdf_path.exists():
-            page_count = _count_pdf_pages(pdf_path)
-            if page_count <= 0:
-                return False, "pdflatex produced a PDF but page count could not be determined"
-            if page_count > page_limit:
-                return (
-                    False,
-                    f"pdflatex produced {page_count} pages, above page_limit={page_limit}",
-                )
-            return True, f"compiled with {page_count} pages"
+            return False, "submission compilation timed out or reached the batch deadline"
+        except InterruptedError:
+            return False, "submission compilation cancelled"
 
         log_path = work / "solution.log"
         try:
@@ -729,11 +807,32 @@ async def _verify_exact_latex_for_submission(
     settings: Settings,
     tex: str,
 ) -> tuple[bool, str]:
-    ok, detail = await asyncio.to_thread(
-        _compile_exact_latex_once,
+    from proofstack.agents.writeup_loop import _GateCanceller
+
+    if settings.stop_requested.is_set():
+        raise asyncio.CancelledError("operator stop")
+    if settings.deadline_at is not None and time.monotonic() >= settings.deadline_at:
+        raise asyncio.CancelledError("batch deadline")
+    canceller = _GateCanceller()
+    worker = asyncio.create_task(asyncio.to_thread(
+        _compile_exact_latex,
         tex,
         page_limit=settings.page_limit,
-    )
+        deadline=settings.deadline_at,
+        canceller=canceller,
+    ))
+    try:
+        ok, detail = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        canceller.cancel()
+        # Reap the compiler and remove its temporary files before returning.
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.shield(worker)
+        raise
+    if settings.stop_requested.is_set():
+        raise asyncio.CancelledError("operator stop")
+    if settings.deadline_at is not None and time.monotonic() >= settings.deadline_at:
+        raise asyncio.CancelledError("batch deadline")
     if not ok:
         await _write_log_line(
             problem.log_path,
@@ -826,6 +925,8 @@ def _stage_has_followup_rounds(settings: Settings, n_rounds: int) -> bool:
 
 
 def _round_schedule(settings: Settings) -> list[int]:
+    if settings.batch3:
+        return [settings.n_rounds]
     total = _max_scheduled_rounds(settings)
     batch = max(int(settings.round_batch_size), 1)
     if batch >= total:
@@ -836,6 +937,47 @@ def _round_schedule(settings: Settings) -> list[int]:
     return schedule
 
 
+@asynccontextmanager
+async def _problem_slot(settings: Settings, semaphore: asyncio.Semaphore):
+    """Limit research concurrency without queueing deadline cleanup behind it."""
+    cutoff = settings.research_deadline_at
+    if not settings.batch3 or cutoff is None:
+        async with semaphore:
+            yield
+        return
+    held = False
+    timer = None
+
+    def release():
+        nonlocal held
+        if held:
+            held = False
+            semaphore.release()
+
+    async def release_at_cutoff():
+        await asyncio.sleep(max(0.0, cutoff - time.monotonic()))
+        release()
+
+    try:
+        if time.monotonic() < cutoff:
+            try:
+                await asyncio.wait_for(semaphore.acquire(), timeout=cutoff - time.monotonic())
+                held = True
+            except TimeoutError:
+                pass
+        if held:
+            timer = asyncio.create_task(release_at_cutoff())
+        yield
+    finally:
+        if timer is not None:
+            timer.cancel()
+            try:
+                await timer
+            except asyncio.CancelledError:
+                pass
+        release()
+
+
 async def _run_subprocess(
     problem: Problem,
     settings: Settings,
@@ -844,6 +986,8 @@ async def _run_subprocess(
     restart_from: str | None = None,
     stage_index: int = 1,
 ) -> int:
+    if settings.stop_requested.is_set():
+        raise asyncio.CancelledError("operator stop")
     runner = settings.runner_script
     cmd = [
         sys.executable,
@@ -869,6 +1013,27 @@ async def _run_subprocess(
         "--input",
         f"compute_codex_sandbox={settings.compute_codex_sandbox}",
     ]
+    if settings.compute_max_parallel_workers is not None:
+        cmd.extend(["--input", f"compute_max_parallel_workers={settings.compute_max_parallel_workers}"])
+    if settings.compute_disabled_reason is not None:
+        cmd.extend(["--input", "enable_compute=false"])
+    if settings.cleanup_disabled_reason is not None:
+        cmd.extend(["--input", "cleanup_backend=api"])
+    if settings.author_parallelism is not None:
+        cmd.extend(["--input", f"author_parallelism={settings.author_parallelism}"])
+    if settings.batch3 and settings.deadline_at is not None:
+        remaining = settings.deadline_at - time.monotonic() - 60
+        if remaining <= 0:
+            raise TimeoutError("no container time left to start Batch 3 workflow")
+        now, unix_now = time.monotonic(), time.time()
+        research_at = settings.research_deadline_at
+        if research_at is None:
+            research_at = settings.deadline_at - 60 - _batch3_cleanup_seconds(settings.workflow)
+        cmd.extend([
+            "--input", f"max_wallclock_s={remaining}",
+            "--input", f"research_deadline_unix_s={unix_now + research_at - now}",
+            "--input", f"run_deadline_unix_s={unix_now + settings.deadline_at - now - 60}",
+        ])
     stop_after_review_round = stage_index > 0 and _stage_has_followup_rounds(
         settings,
         n_rounds,
@@ -881,6 +1046,9 @@ async def _run_subprocess(
             [
                 "--additional-instructions",
                 (
+                    "Resume the interrupted Batch 3 workflow from its saved checkpoint, "
+                    "retaining the original deadlines, cumulative budget and review gates."
+                    if settings.batch3 else
                     "The previous pass did not reach Author/Critic agreement. "
                     f"Continue the existing run up to round {n_rounds}; focus on "
                     "resolving the remaining Critic objections instead of restarting."
@@ -893,6 +1061,8 @@ async def _run_subprocess(
     )
     await _write_log_line(problem.log_path, f"command: {' '.join(cmd)}\n\n")
 
+    if settings.stop_requested.is_set():
+        raise asyncio.CancelledError("operator stop")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=REPO_ROOT,
@@ -906,6 +1076,8 @@ async def _run_subprocess(
     )
     assert proc.stdout is not None
     try:
+        if settings.stop_requested.is_set():
+            raise asyncio.CancelledError("operator stop")
         while True:
             chunk = await proc.stdout.read(8192)
             if not chunk:
@@ -926,7 +1098,7 @@ async def _run_subprocess(
             problem.log_path,
             f"\n[{_utc_now()}] workflow cancelled; terminating subprocess group\n",
         )
-        await _terminate_workflow_subprocess(proc, grace_s=5.0)
+        await _terminate_workflow_subprocess(proc, grace_s=15.0)
         raise
     finally:
         # Belt-and-suspenders: if the proc somehow left a child alive
@@ -1006,7 +1178,7 @@ def _workflow_output_rejection(
     metadata = _read_run_metadata(run_dir)
     if metadata.get("status") == "error":
         return "workflow metadata reported status=error"
-    outputs = metadata.get("outputs")
+    outputs = _workflow_outputs(problem, settings)
     if not isinstance(outputs, dict):
         return None
     output_error = outputs.get("error")
@@ -1019,6 +1191,7 @@ def _workflow_output_rejection(
         and completed is not None
         and completed < min_rounds_completed
         and outputs.get("early_stopped") is not True
+        and not _batch3_partial(problem, settings)
     ):
         return (
             f"workflow reported only {completed} completed rounds, "
@@ -1041,8 +1214,25 @@ def _workflow_output_rejection(
 
 def _workflow_outputs(problem: Problem, settings: Settings) -> dict[str, Any]:
     run_dir = settings.output_dir / "workflow_runs" / problem.run_id
+    if settings.batch3:
+        try:
+            checkpoint = json.loads((run_dir / "batch3-output.json").read_text(encoding="utf-8"))
+            return checkpoint if isinstance(checkpoint, dict) else {}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            return {}
     outputs = _read_run_metadata(run_dir).get("outputs")
     return outputs if isinstance(outputs, dict) else {}
+
+
+def _batch3_partial(problem: Problem, settings: Settings) -> bool:
+    if not settings.batch3:
+        return False
+    outputs = _workflow_outputs(problem, settings)
+    return (outputs.get("partial_ready") is True
+            and outputs.get("submission_approved") is False
+            and outputs.get("output_kind") == "partial_unreviewed")
 
 
 def _workflow_budget_exhausted(problem: Problem, settings: Settings) -> str | None:
@@ -1076,11 +1266,55 @@ def _workflow_rounds_completed(problem: Problem, settings: Settings) -> int | No
 
 def _author_critic_agreed(problem: Problem, settings: Settings) -> bool:
     outputs = _workflow_outputs(problem, settings)
+    if settings.batch3:
+        return (outputs.get("submission_approved") is True
+                and outputs.get("partial_ready") is not True
+                and outputs.get("early_stopped") is True)
     return bool(outputs.get("early_stopped") is True)
+
+
+def _published_solution(problem: Problem, settings: Settings) -> tuple[Path, str] | None:
+    """Read one committed publication and validate the exact bytes returned."""
+    from proofstack.agents.firstproof_batch3 import published_document_path
+
+    run_dir = settings.output_dir / "workflow_runs" / problem.run_id
+    outputs = _workflow_outputs(problem, settings)
+    partial = (outputs.get("partial_ready") is True
+               and outputs.get("submission_approved") is False
+               and outputs.get("output_kind") == "partial_unreviewed")
+    if not partial and (outputs.get("submission_approved") is not True or outputs.get("partial_ready") is True):
+        return None
+    if partial or settings.stop_requested.is_set() or (
+        settings.deadline_at is not None and time.monotonic() >= settings.deadline_at
+    ):
+        try:
+            valid_pages = 0 < int(outputs.get("pages", 0)) <= settings.page_limit
+        except (TypeError, ValueError):
+            valid_pages = False
+        if outputs.get("compiled") is not True or not valid_pages:
+            return None
+    digest = outputs.get("partial_sha256" if partial else "submission_sha256")
+    candidate = published_document_path(
+        run_dir, problem.safe_id, partial=partial, digest=digest,
+        version=outputs.get("publication_version"),
+    )
+    if candidate is None:
+        return None
+    try:
+        document = candidate.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if hashlib.sha256(document.encode("utf-8")).hexdigest() != digest:
+        return None
+    # Never normalize or repair away from the published bytes.
+    return (candidate, document) if _ensure_complete_latex(document) == document else None
 
 
 def _find_solution_tex(problem: Problem, settings: Settings) -> Path | None:
     run_dir = settings.output_dir / "workflow_runs" / problem.run_id
+    if settings.batch3:
+        published = _published_solution(problem, settings)
+        return published[0] if published is not None else None
     preferred = run_dir / "solutions" / f"{problem.safe_id}.tex"
     candidates = [preferred, *_metadata_tex_candidates(run_dir)]
     solutions_dir = run_dir / "solutions"
@@ -1122,6 +1356,7 @@ def _stage_solution_candidate(
         completed is not None
         and completed < n_rounds
         and not _author_critic_agreed(problem, settings)
+        and not _batch3_partial(problem, settings)
     ):
         return None
     return _find_solution_tex(problem, settings)
@@ -1217,6 +1452,22 @@ async def _ship_solution_or_fallback(
     fallback_status: str,
     solution_status: str,
 ) -> tuple[str, str, str, Path | None]:
+    if settings.stop_requested.is_set() or (
+        settings.deadline_at is not None and time.monotonic() >= settings.deadline_at
+    ):
+        # A committed publication already passed compilation. Export only those
+        # exact bytes, without starting new model work or a compiler on shutdown.
+        stopped = settings.stop_requested.is_set()
+        status = "operator_stopped" if stopped else "deadline_cancelled"
+        reason = "operator stopped workflow" if stopped else "internal deadline reached"
+        published = _published_solution(problem, settings) if settings.batch3 else None
+        if published is not None:
+            return published[1], status + "_with_solution", reason + "; exported validated publication", None
+        try:
+            latex = problem.output_tex_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            latex = _fallback_tex(problem, reason)
+        return latex, status, reason + "; raw research retained for recovery", None
     return await _verified_solution_or_fallback(
         problem,
         settings,
@@ -1390,6 +1641,33 @@ def _preserve_rejected_solution(
     return dst
 
 
+def _batch3_can_retry(problem: Problem, settings: Settings, returncode: int) -> bool:
+    if (settings.stop_requested.is_set() or not settings.batch3
+            or returncode in (0, 2, 130, 143, -signal.SIGINT, -signal.SIGTERM)):
+        return False
+    if _workflow_outputs(problem, settings).get("error_retryable") is False:
+        return False
+    if _workflow_budget_exhausted(problem, settings):
+        return False
+    # An interim partial is a crash fallback, not a completed research run.
+    if (_workflow_outputs(problem, settings).get("submission_approved") is True
+            and _find_solution_tex(problem, settings) is not None):
+        return False
+    if settings.deadline_at is not None and settings.deadline_at - time.monotonic() <= 60:
+        return False
+    from proofstack.agents.firstproof_batch3 import _Schedule, _problem_hash
+
+    run_dir = settings.output_dir / "workflow_runs" / problem.run_id
+    try:
+        schedule = _Schedule.model_validate_json((run_dir / "batch3-schedule.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    # --restart-from restores recorded spend and clamps the new invocation to
+    # this schedule, even if the very first Author call never saved research.
+    return (schedule.problem_hash == _problem_hash(problem.text)
+            and schedule.run_deadline_unix_s > time.time())
+
+
 async def _run_problem(
     problem: Problem,
     settings: Settings,
@@ -1447,7 +1725,9 @@ async def _run_problem(
         stage_start_time = time.monotonic()
         restart_from = problem.run_id if stage_index > 1 else None
         try:
-            async with semaphore:
+            async with _problem_slot(settings, semaphore):
+                if settings.stop_requested.is_set():
+                    raise asyncio.CancelledError("operator stop")
                 returncode = await _run_subprocess(
                     problem,
                     settings,
@@ -1455,16 +1735,30 @@ async def _run_problem(
                     restart_from=restart_from,
                     stage_index=stage_index,
                 )
+                if _batch3_can_retry(problem, settings, returncode):
+                    await _write_log_line(
+                        problem.log_path,
+                        f"[{_utc_now()}] Batch 3 early workflow failure (exit {returncode}); "
+                        "checkpoint retry 1/1 with the original deadlines and budget\n",
+                    )
+                    returncode = await _run_subprocess(
+                        problem,
+                        settings,
+                        n_rounds=n_rounds,
+                        restart_from=problem.run_id,
+                        stage_index=stage_index,
+                    )
         except asyncio.CancelledError:
             returncode = None
-            reason = "internal deadline cancelled workflow before it finished"
+            reason = ("operator stopped workflow" if settings.stop_requested.is_set()
+                      else "internal deadline cancelled workflow before it finished")
             await _write_log_line(problem.log_path, f"\n[{_utc_now()}] adapter cancelled: {reason}\n")
             latex, status, error, rejected = await _ship_solution_or_fallback(
                 problem,
                 settings,
                 reason=reason,
-                fallback_status="deadline_cancelled",
-                solution_status="deadline_cancelled_with_solution",
+                fallback_status="operator_stopped" if settings.stop_requested.is_set() else "deadline_cancelled",
+                solution_status="operator_stopped_with_solution" if settings.stop_requested.is_set() else "deadline_cancelled_with_solution",
             )
             latex, status, error = await _prefer_best_stage_solution(
                 problem,
@@ -1574,6 +1868,9 @@ async def _run_problem(
         elif solved:
             stage_status = "solved"
             stage_error = None
+        elif solution_path is not None and _batch3_partial(problem, settings):
+            stage_status = "partial_unreviewed"
+            stage_error = None
         else:
             stage_status = "needs_more_rounds"
             stage_error = None
@@ -1586,7 +1883,7 @@ async def _run_problem(
                 stage_error=stage_error,
             )
         )
-        if snapshot_error is not None and stage_status in {"needs_more_rounds", "solved"}:
+        if snapshot_error is not None and stage_status in {"needs_more_rounds", "solved", "partial_unreviewed"}:
             stage_status = snapshot_status
             stage_error = snapshot_error
             solved = False
@@ -1635,7 +1932,7 @@ async def _run_problem(
             stages=list(stages),
             in_progress=continue_next,
         )
-        if stage_status in {"needs_more_rounds", "solved"} and stage_error is None:
+        if stage_status in {"needs_more_rounds", "solved", "partial_unreviewed"} and stage_error is None:
             best_stage_result = snapshot_result
         if on_stage_complete is not None:
             await on_stage_complete(snapshot_result)
@@ -1688,7 +1985,7 @@ async def _run_problem(
             latex = _fallback_tex(problem, reason)
         else:
             reason = None
-            status = "ok"
+            status = "partial_unreviewed" if _batch3_partial(problem, settings) else "ok"
             compiled, compile_detail = await _verify_exact_latex_for_submission(
                 problem, settings, latex
             )
@@ -1808,10 +2105,13 @@ def _infer_provider(model: Any) -> str | None:
 
 
 def _usage_record(problem: Problem, event: dict[str, Any]) -> dict[str, Any] | None:
+    kind = str(event.get("kind") or "")
+    # Phase costs summarize model.call events already included in the export.
+    if kind in {"batch3.phase_end", "ac.author.delegate.wave_done", "ac.author.subagent_done"}:
+        return None
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     merged = {**usage, **payload}
-    kind = str(event.get("kind") or "")
     model = _first_present(merged, ("model", "model_name", "model_id"))
     input_tokens = _first_present(merged, ("input_tokens", "in_tokens", "prompt_tokens"))
     output_tokens = _first_present(merged, ("output_tokens", "out_tokens", "completion_tokens"))
@@ -1853,6 +2153,8 @@ def _usage_record(problem: Problem, event: dict[str, Any]) -> dict[str, Any] | N
         record["total_tokens"] = total_tokens
     if cost_usd is not None:
         record["cost_usd"] = cost_usd
+    if merged.get("usage_unavailable"):
+        record["usage_unavailable"] = True
     if not has_usage:
         record["raw_event"] = event
     return record
@@ -1894,32 +2196,117 @@ def _collect_healthcheck_usage(settings: Settings) -> tuple[list[dict[str, Any]]
     return records, warnings
 
 
-def _collect_token_usage(problems: list[Problem], settings: Settings) -> tuple[list[dict[str, Any]], list[str]]:
+def _empty_problem_health() -> dict:
+    return {"helpers_finished": 0, "helpers_completed": 0, "helpers_timed_out": 0,
+            "helpers_artifact_degraded": 0, "last_activity": None}
+
+
+@dataclass
+class _EventSnapshot:
+    identity: tuple[int, int] | None = None
+    offset: int = 0
+    line_number: int = 0
+    mtime_ns: int = 0
+    anchor: bytes = b""
+    records: list[dict] = field(default_factory=list)
+    model_events: list[dict] = field(default_factory=list)
+    health: dict = field(default_factory=_empty_problem_health)
+    warnings: list[str] = field(default_factory=list)
+
+    def consume(self, problem: Problem, line: bytes, *, provisional=False) -> None:
+        if not line.strip():
+            return
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            if not provisional:
+                self.warnings.append(f"{problem.original_id}: invalid JSON event at line {self.line_number}")
+            return
+        if not isinstance(event, dict):
+            return
+        record = _usage_record(problem, event)
+        if record is not None:
+            self.records.append(record)
+        kind = event.get("kind")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if kind == "model.call":
+            # Reconciliation only needs billed calls, not tool transcripts.
+            self.model_events.append({"kind": kind, "call_id": event.get("call_id"), "payload": {
+                k: payload.get(k) for k in ("cost_usd", "in_tokens", "out_tokens", "reasoning_tokens")
+            }})
+        self.health["last_activity"] = {"kind": kind, "timestamp": event.get("timestamp", event.get("ts"))}
+        if kind == "ac.author.subagent_done":
+            self.health["helpers_finished"] += 1
+            self.health["helpers_completed"] += not bool(payload.get("error"))
+            self.health["helpers_timed_out"] += "deadline" in str(payload.get("error", ""))
+            self.health["helpers_artifact_degraded"] += bool(payload.get("checkpoint_errors") or payload.get("artifact_error"))
+
+
+def _problem_event_snapshot(problem: Problem, settings: Settings) -> _EventSnapshot:
+    path = settings.output_dir / "workflow_runs" / problem.run_id / "events.jsonl"
+    cached = settings.event_snapshots.setdefault(path, _EventSnapshot())
+    tail = b""
+    warning = None
+    try:
+        with path.open("rb") as handle:
+            stat = os.fstat(handle.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            handle.seek(max(0, cached.offset - len(cached.anchor)))
+            anchor = handle.read(len(cached.anchor))
+            if (cached.identity != identity or stat.st_size < cached.offset or anchor != cached.anchor
+                    or (stat.st_size == cached.offset and stat.st_mtime_ns != cached.mtime_ns)):
+                cached = _EventSnapshot(identity=identity)
+                settings.event_snapshots[path] = cached
+            handle.seek(cached.offset)
+            # Bound this snapshot to the size observed at open, even while writers append.
+            while handle.tell() < stat.st_size:
+                line = handle.readline(stat.st_size - handle.tell())
+                if not line:
+                    break
+                if not line.endswith(b"\n"):
+                    tail = line
+                    break
+                cached.line_number += 1
+                cached.consume(problem, line)
+                cached.offset = handle.tell()
+            handle.seek(max(0, cached.offset - 256))
+            cached.anchor = handle.read(min(cached.offset, 256))
+            cached.mtime_ns = stat.st_mtime_ns
+    except FileNotFoundError:
+        cached = _EventSnapshot()
+        settings.event_snapshots.pop(path, None)
+        warning = f"{problem.original_id}: no events.jsonl found at {path}"
+    except OSError as exc:
+        warning = f"{problem.original_id}: could not read token events: {exc}"
+    view = replace(cached, records=list(cached.records), model_events=list(cached.model_events),
+                   health=dict(cached.health), warnings=list(cached.warnings))
+    if tail:
+        # A valid unterminated final event is visible, but not committed to the
+        # cursor: the next poll re-reads it in case the writer was interrupted.
+        view.consume(problem, tail, provisional=True)
+    if warning:
+        view.warnings.append(warning)
+    return view
+
+
+def _collect_token_usage(problems: list[Problem], settings: Settings, *, snapshots=None) -> tuple[list[dict[str, Any]], list[str]]:
     records: list[dict[str, Any]] = []
     warnings: list[str] = []
     for problem in problems:
         events_path = settings.output_dir / "workflow_runs" / problem.run_id / "events.jsonl"
-        if not events_path.exists():
-            warnings.append(f"{problem.original_id}: no events.jsonl found at {events_path}")
-            continue
+        snapshot = snapshots[problem.run_id] if snapshots is not None else _problem_event_snapshot(problem, settings)
+        records.extend(snapshot.records)
+        warnings.extend(snapshot.warnings)
+        from mathagents.provider_trace import usage_adjustments
         try:
-            with events_path.open("r", encoding="utf-8") as handle:
-                for line_number, line in enumerate(handle, start=1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        warnings.append(f"{problem.original_id}: invalid JSON event at line {line_number}")
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-                    record = _usage_record(problem, event)
-                    if record is not None:
-                        records.append(record)
-        except OSError as exc:
-            warnings.append(f"{problem.original_id}: could not read token events: {exc}")
+            for event in usage_adjustments(events_path.parent, snapshot.model_events):
+                record = _usage_record(problem, event)
+                if record is not None:
+                    records.append(record)
+                if event["payload"].get("usage_unavailable"):
+                    warnings.append(f"{problem.original_id}: provider usage remains unresolved for call {event['call_id']}")
+        except (OSError, ValueError) as exc:
+            warnings.append(f"{problem.original_id}: provider accounting could not be reconciled: {exc}")
     if not records:
         warnings.append("no token or cost usage events were found")
     return records, warnings
@@ -2032,10 +2419,8 @@ def _aggregate_payloads(
     }
 
     finalized = [r for r in results if r is not None and not r.in_progress]
-    token_records, token_warnings = _collect_token_usage(
-        [problems[i] for i, r in enumerate(results) if r is not None],
-        settings,
-    )
+    snapshots = {p.run_id: _problem_event_snapshot(p, settings) for p in problems}
+    token_records, token_warnings = _collect_token_usage(problems, settings, snapshots=snapshots)
     healthcheck_records, healthcheck_warnings = _collect_healthcheck_usage(settings)
     token_records_all = healthcheck_records + token_records
     token_warnings.extend(healthcheck_warnings)
@@ -2049,6 +2434,8 @@ def _aggregate_payloads(
         "finished_at": finished,
         "duration_seconds": duration,
         "in_progress": in_progress,
+        "updated_at": finished,
+        "operator_stopped": settings.stop_requested.is_set(),
         "deadline_reached": deadline_reached,
         "deadline_seconds": settings.deadline_seconds,
         "workflow": settings.workflow,
@@ -2060,40 +2447,48 @@ def _aggregate_payloads(
         "adaptive_max_rounds": settings.adaptive_max_rounds,
         "round_schedule": _round_schedule(settings),
         "compute_codex_sandbox": settings.compute_codex_sandbox,
+        "compute_max_parallel_workers": settings.compute_max_parallel_workers,
+        "compute_disabled_reason": settings.compute_disabled_reason,
+        "cleanup_disabled_reason": settings.cleanup_disabled_reason,
+        "author_parallelism": settings.author_parallelism,
         "budget_usd_per_question": settings.budget_usd_per_question,
         "total_budget_usd_requested": settings.budget_usd_per_question * len(problems),
         "problem_count": len(problems),
         "completed_count": len(finalized),
         "totals": token_totals,
         "token_counting_convention": {
-            "input_tokens": "prompt tokens, per provider (OpenAI: input_tokens; Anthropic: input_tokens; Google: promptTokenCount).",
+            "input_tokens": "Provider input tokens; Google includes promptTokenCount plus toolUsePromptTokenCount.",
             "output_tokens": (
-                "completion tokens, per provider. NOTE: for OpenAI Responses + Chat-Completions and Anthropic, "
-                "the provider's output_tokens already INCLUDES the reasoning/thinking tokens; "
-                "for Google native, it does NOT (reasoning is reported separately in thoughtsTokenCount)."
+                "Billable output tokens including reasoning/thinking. Google candidatesTokenCount "
+                "and thoughtsTokenCount are combined by the adapter. Do not add reasoning again."
             ),
             "reasoning_tokens": (
                 "internal-reasoning tokens. Surfaced via output_tokens_details.reasoning_tokens (OpenAI), "
                 "completion_tokens_details.reasoning_tokens (OpenAI Chat-Completions o-family), "
-                "thoughtsTokenCount (Google), or codex JSONL reasoning_out_tokens (Compute Worker). "
-                "0 when the provider does not separately report it (Anthropic bundles thinking into output)."
+                "output_tokens_details.thinking_tokens (Anthropic), thoughtsTokenCount (Google), "
+                "or codex JSONL reasoning_out_tokens (Compute Worker). Zero when not separately reported."
             ),
             "total_tokens": (
                 "When the provider reports a total_tokens field, that is used verbatim. Otherwise we "
-                "synthesize input_tokens + output_tokens (no double-counting risk because reasoning is "
-                "already in output for OpenAI/Anthropic). For Google calls without provider total, the "
-                "synthesized total will under-count by the reasoning amount; consumers wanting the "
-                "all-inclusive figure should sum input + output + reasoning themselves."
+                "synthesize input_tokens + output_tokens. Reasoning is already included in output."
             ),
             "cost_usd": "USD cost per call, computed from each provider's rates declared in configs/models/.",
         },
         "per_problem": [
-            _summary_problem(result, settings.output_dir) if result else {"id": problem.original_id, "status": "pending"}
+            {**(_summary_problem(result, settings.output_dir) if result else {
+                "id": problem.original_id,
+                "status": "running" if (settings.output_dir / "workflow_runs" / problem.run_id / "events.jsonl").exists() else "pending",
+            }), "health": snapshots[problem.run_id].health,
+                "totals": _token_totals([record for record in token_records if record["safe_id"] == problem.safe_id])}
             for problem, result in zip(problems, results)
         ],
         "warnings": warnings,
     }
     return solutions_payload, summary_payload, token_records_all
+
+
+def _live_problem_health(problem: Problem, settings: Settings) -> dict:
+    return _problem_event_snapshot(problem, settings).health
 
 
 async def _write_aggregates(
@@ -2110,17 +2505,11 @@ async def _write_aggregates(
     atomically. Safe to call repeatedly during the run; see
     ``_aggregate_payloads`` for the shape contract.
     """
-    solutions_payload, summary_payload, token_records_all = _aggregate_payloads(
-        problems,
-        results,
-        settings,
-        overall_started,
-        overall_start_time,
-        in_progress=in_progress,
-        deadline_reached=deadline_reached,
-    )
-
     def _do_writes() -> None:
+        solutions_payload, summary_payload, token_records_all = _aggregate_payloads(
+            problems, results, settings, overall_started, overall_start_time,
+            in_progress=in_progress, deadline_reached=deadline_reached,
+        )
         _write_json_atomic(settings.output_dir / "solutions.json", solutions_payload)
         _write_json_atomic(settings.output_dir / "run_summary.json", summary_payload)
         token_path = settings.output_dir / "token_usage.jsonl"
@@ -2130,7 +2519,14 @@ async def _write_aggregates(
                 handle.write(json.dumps(record, ensure_ascii=False, default=_json_default) + "\n")
         os.replace(tmp, token_path)
 
-    await asyncio.to_thread(_do_writes)
+    writer = asyncio.create_task(asyncio.to_thread(_do_writes))
+    try:
+        await asyncio.shield(writer)
+    except asyncio.CancelledError:
+        # Keep the caller's aggregate lock until the thread exits. Otherwise a
+        # late live snapshot can overwrite the final summary after shutdown.
+        await writer
+        raise
 
 
 def _summary_problem(result: ProblemResult, output_dir: Path) -> dict[str, Any]:
@@ -2195,7 +2591,7 @@ def _summary_stage(stage: StageResult, output_dir: Path) -> dict[str, Any]:
     return out
 
 
-def _bootstrap_codex_auth() -> tuple[bool, str | None]:
+async def _bootstrap_codex_auth() -> tuple[bool, str | None]:
     """Best-effort one-time codex CLI login from ``OPENAI_API_KEY``.
 
     The Compute Worker (`src/proofstack/agents/ac/compute.py:Compute.setup`)
@@ -2224,88 +2620,117 @@ def _bootstrap_codex_auth() -> tuple[bool, str | None]:
     codex_bin = shutil.which("codex")
     if codex_bin is None:
         return False, "codex CLI not on PATH; skipping codex auth bootstrap."
+    proc = None
     try:
-        proc = subprocess.run(
-            [codex_bin, "login", "--with-api-key"],
-            input=api_key,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
+        proc = await asyncio.create_subprocess_exec(
+            codex_bin, "login", "--with-api-key",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, start_new_session=True,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(api_key.encode()), timeout=30)
+    except (TimeoutError, OSError) as exc:
         return False, f"codex login failed: {type(exc).__name__}: {exc}"
+    finally:
+        if proc is not None and proc.returncode is None:
+            await _terminate_workflow_subprocess(proc, grace_s=2.0)
     if proc.returncode != 0:
         return False, (
             f"codex login --with-api-key exited {proc.returncode}: "
-            f"{(proc.stderr or proc.stdout).strip()[:400]}"
+            f"{(stderr or stdout).decode(errors='replace').strip()[:400]}"
         )
     return True, None
 
 
-async def _run_healthcheck(settings: Settings) -> None:
-    """Run the optional preflight helper when it is bundled.
+async def _run_healthcheck(settings: Settings) -> Settings:
+    """Batch 3 always checks the native execution host before paid research."""
+    from proofstack.healthcheck import check_compute
+    from proofstack.agents.cleanup_session import check_cleanup_launch, CleanupUnavailable
+    from proofstack.registry import load_preset
 
-    The public build keeps healthcheck disabled by default. If the optional
-    ``scripts/firstproof_healthcheck.py`` helper is present, ``warn`` and
-    ``strict`` run it; otherwise the adapter logs a warning and continues.
-    """
     mode = (os.environ.get("FIRSTPROOF_HEALTHCHECK") or "off").lower()
-    if mode == "off":
-        print("FirstProof adapter: healthcheck disabled (FIRSTPROOF_HEALTHCHECK=off)")
-        return
-
-    script = REPO_ROOT / "scripts" / "firstproof_healthcheck.py"
-    if not script.exists():
-        print(
-            "FirstProof adapter: FIRSTPROOF_HEALTHCHECK requested but "
-            "scripts/firstproof_healthcheck.py is not bundled; continuing.",
-            file=sys.stderr,
-        )
-        return
-
-    cmd = [sys.executable, str(script)]
-    env = os.environ.copy()
-    env.setdefault("FIRSTPROOF_OUTPUT_DIR", str(settings.output_dir))
-    env.setdefault("FIRSTPROOF_WORKFLOW", settings.workflow)
-    env.setdefault(
-        "MATHAGENTS_REQUEST_LOG_DIR",
-        str(settings.output_dir / "logs" / "requests"),
-    )
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=REPO_ROOT,
-        env=env,
-        stdout=None,
-        stderr=None,
-    )
-    code = await proc.wait()
-    if code == 0:
-        return
-
-    # Non-zero exit = the healthcheck script itself crashed (NOT the
-    # "probe failed" path, which is reported via the report file and
-    # in strict mode is handled inside the script as a halt-loop).
-    msg = f"FirstProof adapter: healthcheck subprocess exited {code} (script-level crash)."
-    if mode == "strict":
-        proceed_path = settings.output_dir / "healthcheck.proceed"
-        print(
-            f"{msg} strict mode — halting entrypoint; "
-            f"touch {proceed_path} to override.",
-            file=sys.stderr,
-        )
-        while not proceed_path.exists():
-            await asyncio.sleep(60)
-        print(
-            f"FirstProof adapter: operator proceed-signal at {proceed_path}; continuing.",
-            file=sys.stderr,
-        )
-        return
-    print(f"{msg} warn mode — continuing.", file=sys.stderr)
+    if mode not in {"off", "warn", "strict"}:
+        raise ValueError("FIRSTPROOF_HEALTHCHECK must be off, warn, or strict")
+    if not settings.batch3 and mode == "off":
+        return settings
+    preset = load_preset(settings.workflow)
+    overrides = {"compute_codex_sandbox": settings.compute_codex_sandbox,
+                 "compute_sandbox_backend": _workflow_env()["PROOFSTACK_SANDBOX_BACKEND"]}
+    if settings.compute_max_parallel_workers is not None:
+        overrides["compute_max_parallel_workers"] = settings.compute_max_parallel_workers
+    inputs = preset.workflow_cls.Inputs(**preset.build_inputs(
+        problem="offline preflight", problem_id="__healthcheck__", cli_overrides=overrides,
+    )).model_dump()
+    try:
+        await check_compute(inputs, settings.output_dir)
+    except RuntimeError as exc:
+        if mode == "strict":
+            raise
+        warning = str(exc)
+        if settings.batch3:
+            settings = replace(settings, compute_disabled_reason=str(exc))
+            warning += (
+                "; disabling Compute for every problem in this launch, including retries. "
+                "Continuing with the configured Author, critic, council and cleanup workflow."
+            )
+        settings.warnings.append(warning)
+        print(f"FirstProof adapter warning: {warning}", file=sys.stderr)
+    if settings.batch3:
+        report = {"paid_calls": 0, "backend": inputs["cleanup_backend"], "ok": False}
+        try:
+            report["registry_probes"] = await check_cleanup_launch(
+                inputs, preset.component_configs, settings.output_dir / "workflow_runs")
+            report["ok"] = True
+        except CleanupUnavailable as exc:
+            report.update(ok=False, reason=str(exc), backend="api" if mode != "strict" else "claude_code")
+            if mode == "strict":
+                raise
+            settings = replace(settings, cleanup_disabled_reason=str(exc))
+            warning = (f"{exc}; selecting API cleanup for every problem in this launch, including retries. "
+                       "Claude Code cleanup is unavailable.")
+            settings.warnings.append(warning)
+            print(f"FirstProof adapter warning: {warning}", file=sys.stderr)
+        except Exception as exc:
+            report.update(reason=str(exc), error_type=type(exc).__name__)
+            raise
+        finally:
+            _write_json_atomic(settings.output_dir / "cleanup-healthcheck.json", report)
+    return settings
 
 
-async def _amain() -> int:
-    settings = _settings()
+async def _startup_checks(settings: Settings) -> Settings:
+    if settings.stop_requested.is_set():
+        raise asyncio.CancelledError("operator stop during startup")
+
+    async def checks():
+        bootstrap_done, bootstrap_warning = await _bootstrap_codex_auth()
+        if bootstrap_done:
+            print("FirstProof adapter: codex CLI authenticated via OPENAI_API_KEY.")
+        if bootstrap_warning:
+            settings.warnings.append(f"codex_auth_bootstrap: {bootstrap_warning}")
+            print(f"FirstProof adapter: {bootstrap_warning}", file=sys.stderr)
+        if settings.stop_requested.is_set():
+            raise asyncio.CancelledError("operator stop during startup")
+        return await _run_healthcheck(settings)
+
+    probe = asyncio.create_task(checks())
+    stop = asyncio.create_task(settings.stop_requested.wait())
+    try:
+        await asyncio.wait((probe, stop), return_when=asyncio.FIRST_COMPLETED)
+        if settings.stop_requested.is_set():
+            raise asyncio.CancelledError("operator stop during startup")
+        return probe.result()
+    finally:
+        for task in (probe, stop):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(probe, stop, return_exceptions=True)
+
+
+async def _amain_run(settings: Settings, *, on_output_ready=None) -> int:
+    if settings.batch3 and any((settings.output_dir / "workflow_runs").glob("*/batch3-schedule.json")):
+        print("FirstProof adapter: existing Batch 3 checkpoints found; use scripts/resume_batch3.py "
+              "instead of resetting their clocks with a fresh launch.", file=sys.stderr)
+        return 2
     overall_started = _utc_now()
     overall_start_time = time.monotonic()
     try:
@@ -2313,6 +2738,8 @@ async def _amain() -> int:
     except OSError as exc:
         print(f"FirstProof adapter fatal: output directory is not writable: {exc}", file=sys.stderr)
         return 2
+    if on_output_ready is not None:
+        on_output_ready()
     try:
         items = _load_problem_items(settings.input_path)
     except Exception as exc:
@@ -2325,36 +2752,16 @@ async def _amain() -> int:
         print(f"FirstProof adapter fatal: could not prepare problem files: {exc}", file=sys.stderr)
         return 2
 
-    # Bootstrap codex auth BEFORE the healthcheck. The compute probe in
-    # warn/strict mode launches codex CLI, which needs ``~/.codex/auth.json``
-    # to exist; in a fresh First Proof container that file isn't there,
-    # so without this ordering the healthcheck would falsely fail on
-    # auth and either log a fake warning (warn) or halt the entrypoint
-    # (strict) — before the bootstrap that the real workflow relies on
-    # has even run. The bootstrap is idempotent (skips when auth.json
-    # already exists), so running it first is safe even when no
-    # healthcheck is configured.
-    bootstrap_done, bootstrap_warning = _bootstrap_codex_auth()
-    if bootstrap_done:
-        print("FirstProof adapter: codex CLI authenticated via OPENAI_API_KEY.")
-    if bootstrap_warning:
-        # Recorded into ``settings.warnings`` so it shows up in
-        # ``run_summary.json`` — easier to spot than scrolling stderr.
-        settings.warnings.append(f"codex_auth_bootstrap: {bootstrap_warning}")
-        print(f"FirstProof adapter: {bootstrap_warning}", file=sys.stderr)
-
-    await _run_healthcheck(settings)
-
-    print(f"FirstProof adapter starting {len(problems)} problem(s) with max_parallel={settings.max_parallel}")
     if settings.deadline_seconds is not None:
-        print(
-            f"FirstProof adapter: internal deadline set at "
-            f"{settings.deadline_seconds:.0f}s "
-            f"({settings.deadline_seconds / 60:.1f} min) from now."
+        settings = replace(
+            settings,
+            deadline_at=overall_start_time + settings.deadline_seconds,
+            research_deadline_at=overall_start_time + min(82800, max(0, settings.deadline_seconds - (
+                _batch3_cleanup_seconds(settings.workflow) + 60 if settings.batch3 else 3300))),
         )
 
     # Write the per-problem fallback .tex stubs *eagerly*, before any
-    # task starts running and before the zero-th aggregate snapshot
+    # startup probe or task and before the zero-th aggregate snapshot
     # below. Combined with _aggregate_payloads' _latex_for_pending, this
     # means even an early crash leaves /data/output populated with
     # valid (fallback) solutions for every problem.
@@ -2392,6 +2799,47 @@ async def _amain() -> int:
             file=sys.stderr,
         )
 
+    # Prepare authentication for later workers. The native-host launch probe
+    # itself is credential-free and never submits a model request.
+    try:
+        settings = await _startup_checks(settings)
+    except asyncio.CancelledError:
+        if not settings.stop_requested.is_set():
+            raise
+        stopped_results = [await _exception_result(problem, RuntimeError("operator stop during startup"), settings)
+                           for problem in problems]
+        await _write_aggregates(
+            problems, stopped_results, settings, overall_started, overall_start_time, in_progress=False,
+        )
+        return 143
+    except (RuntimeError, ValueError, OSError) as exc:
+        settings.warnings.append(f"startup healthcheck failed: {exc}")
+        print(f"FirstProof adapter fatal: {exc}", file=sys.stderr)
+        failed_results = [await _exception_result(problem, exc, settings) for problem in problems]
+        try:
+            await _write_aggregates(
+                problems, failed_results, settings, overall_started, overall_start_time, in_progress=False
+            )
+        except OSError as write_exc:
+            print(f"FirstProof adapter: failed startup aggregate write failed: {write_exc}", file=sys.stderr)
+        return 2
+
+    # Persist any degraded-mode decision before the first paid workflow starts.
+    try:
+        await _write_aggregates(
+            problems, results, settings, overall_started, overall_start_time, in_progress=True
+        )
+    except OSError as write_exc:
+        print(f"FirstProof adapter: startup aggregate write failed: {write_exc}", file=sys.stderr)
+
+    print(f"FirstProof adapter starting {len(problems)} problem(s) with max_parallel={settings.max_parallel}")
+    if settings.deadline_seconds is not None:
+        print(
+            f"FirstProof adapter: internal deadline set at "
+            f"{settings.deadline_seconds:.0f}s "
+            f"({settings.deadline_seconds / 60:.1f} min) from adapter start."
+        )
+
     async def _run_and_record(idx: int, problem: Problem) -> None:
         async def record_stage_snapshot(snapshot: ProblemResult) -> None:
             async with aggregate_lock:
@@ -2416,7 +2864,7 @@ async def _amain() -> int:
         except BaseException as exc:
             async with aggregate_lock:
                 previous_snapshot = results[idx]
-            if previous_snapshot is not None:
+            if previous_snapshot is not None and not settings.stop_requested.is_set():
                 try:
                     await _write_log_line(
                         problem.log_path,
@@ -2446,51 +2894,67 @@ async def _amain() -> int:
         for i, problem in enumerate(problems)
     ]
     gather_fut = asyncio.gather(*tasks, return_exceptions=True)
+    stop_task = asyncio.create_task(settings.stop_requested.wait())
+
+    async def live_snapshots():
+        while True:
+            await asyncio.sleep(LIVE_SNAPSHOT_INTERVAL_S)
+            async with aggregate_lock:
+                try:
+                    await _write_aggregates(
+                        problems, results, settings, overall_started, overall_start_time, in_progress=True,
+                    )
+                except OSError as exc:
+                    print(f"FirstProof adapter: live snapshot failed: {type(exc).__name__}", file=sys.stderr)
+
+    snapshot_task = asyncio.create_task(live_snapshots())
 
     deadline_reached = False
     try:
-        if settings.deadline_seconds is not None:
-            await asyncio.wait_for(gather_fut, timeout=settings.deadline_seconds)
-        else:
-            await gather_fut
-    except asyncio.TimeoutError:
-        deadline_reached = True
+        timeout = None if settings.deadline_at is None else max(0, settings.deadline_at - time.monotonic())
+        done, _ = await asyncio.wait((gather_fut, stop_task), timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        if gather_fut not in done:
+            deadline_reached = not settings.stop_requested.is_set()
+            raise asyncio.TimeoutError
+    except (asyncio.TimeoutError, asyncio.CancelledError):
         print(
-            f"FirstProof adapter: internal deadline of "
-            f"{settings.deadline_seconds:.0f}s reached; cancelling in-flight "
+            "FirstProof adapter: stop/deadline requested; cancelling in-flight "
             "problems and flushing partial aggregates.",
             file=sys.stderr,
         )
-        # Cancel anything still running. asyncio.wait_for has already
-        # tried to cancel the gather; this is belt-and-suspenders for
-        # tasks that didn't honor it (e.g. blocked on a subprocess).
+        # Cancel all children once, leaving their cleanup a bounded drain interval.
         for task in tasks:
             if not task.done():
                 task.cancel()
-        # Give them up to 10s to write their in-progress aggregate row,
+        # Give them up to 20s to reconcile providers and write their aggregate row,
         # then move on. Anything still blocked will be SIGKILLed by the
         # harness's outer ``timeout`` shortly.
         try:
             await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=10.0,
+                timeout=20.0,
             )
         except asyncio.TimeoutError:
             print(
-                "FirstProof adapter: ≤10s drain expired with tasks still pending; "
+                "FirstProof adapter: drain expired with tasks still pending; "
                 "writing final aggregate with whatever lives in `results`.",
                 file=sys.stderr,
             )
+    finally:
+        stop_task.cancel()
+        snapshot_task.cancel()
+        await asyncio.gather(stop_task, snapshot_task, return_exceptions=True)
 
     # Final aggregate write — same shape, but flagged ``in_progress=False``.
     final_results: list[ProblemResult] = []
     for problem, result in zip(problems, results):
-        if result is None:
+        if result is None or (settings.stop_requested.is_set() and result.in_progress):
             # Defensive: a task that raised (or was cancelled at the
             # deadline) before _exception_result could have left a slot
             # empty. Synthesize a fallback so the final summary is
             # well-formed and the on-disk .tex stub remains the truth
-            # for that problem.
+            # for that problem. A second cancellation during shutdown can also
+            # leave an earlier in-progress stage; re-read its publication now.
             reason = (
                 "internal deadline reached before this problem finished"
                 if deadline_reached
@@ -2510,15 +2974,38 @@ async def _amain() -> int:
         in_progress=False,
         deadline_reached=deadline_reached,
     )
-    try:
-        output_finalization_warnings = _finalize_output_permissions(settings.output_dir)
-    except Exception as exc:
-        output_finalization_warnings = [f"RETRIEVAL_UNSAFE: output finalization failed unexpectedly: {exc}"]
-    for warning in output_finalization_warnings:
-        print(f"FirstProof adapter: output finalization warning: {warning}", file=sys.stderr)
     duration = round(time.monotonic() - overall_start_time, 3)
     print(f"FirstProof adapter finished in {duration:.3f}s; outputs written to {settings.output_dir}")
-    return 0
+    return 143 if settings.stop_requested.is_set() else 0
+
+
+async def _amain() -> int:
+    settings = _settings()
+    loop = asyncio.get_running_loop()
+    handlers = {}
+    output_ready = False
+    def mark_output_ready():
+        nonlocal output_ready
+        output_ready = True
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous = signal.getsignal(sig)
+            loop.add_signal_handler(sig, settings.stop_requested.set)
+            handlers[sig] = previous
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+    try:
+        return await _amain_run(settings, on_output_ready=mark_output_ready)
+    finally:
+        try:
+            warnings = _finalize_output_permissions(settings.output_dir) if output_ready else []
+        except Exception as exc:
+            warnings = [f"RETRIEVAL_UNSAFE: output finalization failed: {type(exc).__name__}"]
+        for warning in warnings:
+            print(f"FirstProof adapter: {warning}", file=sys.stderr)
+        for sig, previous in handlers.items():
+            loop.remove_signal_handler(sig)
+            signal.signal(sig, previous)
 
 
 def main() -> int:

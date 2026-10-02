@@ -37,8 +37,8 @@ class ACCouncilDefaultsTests(unittest.TestCase):
         self.assertEqual(
             DEFAULT_COUNCIL_MODELS,
             (
-                "models/openai/gpt-56-sol-pro",
-                "models/anthropic/opus_47_max",
+                "models/openai/gpt-6-astra-pro",
+                "models/anthropic/fable_51",
                 "models/gemini/gemini-31-pro",
             ),
         )
@@ -52,19 +52,19 @@ class ACCouncilDefaultsTests(unittest.TestCase):
 
         self.assertEqual(
             preset.component_configs["Author"]["model"],
-            "models/openai/gpt-56-sol-pro",
+            "models/openai/gpt-6-astra-pro",
         )
         self.assertEqual(
             preset.component_configs["ACCritic"]["model"],
-            "models/openai/gpt-56-sol-pro",
+            "models/openai/gpt-6-astra-pro",
         )
         self.assertEqual(
             preset.inputs["council_models"],
             list(DEFAULT_COUNCIL_MODELS),
         )
 
-    def test_runtime_author_critic_and_council_defaults_use_sol_pro(self) -> None:
-        expected = "models/openai/gpt-56-sol-pro"
+    def test_runtime_author_critic_and_council_defaults_use_astra_pro(self) -> None:
+        expected = "models/openai/gpt-6-astra-pro"
 
         self.assertEqual(Author.MODEL, expected)
         self.assertEqual(ACCritic.MODEL, expected)
@@ -110,12 +110,12 @@ class ACCouncilDefaultsTests(unittest.TestCase):
         self.assertEqual(maximum["model"], "gpt-5.6-sol--max")
         self.assertEqual(maximum["reasoning"], {"summary": "auto"})
 
-    def test_prescreen_uses_sol_pro(self) -> None:
+    def test_prescreen_uses_astra_pro(self) -> None:
         preset = load_preset("prescreen")
 
         self.assertEqual(
             preset.component_configs["cfg_prescreen"]["model"],
-            "models/openai/gpt-56-sol-pro",
+            "models/openai/gpt-6-astra-pro",
         )
 
     def test_workflow_inputs_reject_invalid_compute_timeout_pair(self) -> None:

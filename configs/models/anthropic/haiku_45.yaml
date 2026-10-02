@@ -1,0 +1,21 @@
+model: claude-haiku-4-5
+api: anthropic
+max_tokens: 16000
+concurrent_requests: 16
+temperature: null
+top_p: null
+cache_write_cost: 1.25
+cache_read_cost: 0.1
+read_cost: 1
+write_cost: 5
+# Haiku 4.5 predates adaptive thinking: a token budget is the only form.
+thinking:
+  type: enabled
+  budget_tokens: 4000
+cache_control:
+  type: ephemeral
+batch_processing: false
+timeout: 600
+max_wallclock_per_call_s: 900
+sleep_on_error: 10
+sleep_on_error_max: 60

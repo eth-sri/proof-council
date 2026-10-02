@@ -488,6 +488,7 @@ class ResponsesToolLoopTests(unittest.TestCase):
                     "code": 'print("ok")',
                     "container_id": "cntr_1",
                     "status": "completed",
+                    "outputs": None,
                 }
             ],
         )
@@ -530,7 +531,7 @@ class SalvagePrefersOutputTests(unittest.TestCase):
                 self.create_calls += 1
                 return queued
 
-            def retrieve(self, response_id):
+            def retrieve(self, response_id, **kwargs):
                 self.retrieve_calls += 1
                 return failed_with_output
 
@@ -597,7 +598,7 @@ class SalvagePrefersOutputTests(unittest.TestCase):
                     id=f"resp_{self.create_calls}", status="queued"
                 )
 
-            def retrieve(self, response_id):
+            def retrieve(self, response_id, **kwargs):
                 self.retrieve_calls += 1
                 # First poll: failed-with-no-output (triggers retry).
                 # Second poll: a clean completed response on the retry.
@@ -654,7 +655,7 @@ class SalvagePrefersOutputTests(unittest.TestCase):
                 self.create_calls += 1
                 return queued
 
-            def retrieve(self, response_id):
+            def retrieve(self, response_id, **kwargs):
                 return failed
 
         responses = _BackgroundResponses()
@@ -713,11 +714,11 @@ class BackgroundTimeoutRetryTests(unittest.TestCase):
                     return queued
                 return completed
 
-            def retrieve(self, response_id):
+            def retrieve(self, response_id, **kwargs):
                 self.retrieve_calls += 1
                 return queued
 
-            def cancel(self, response_id):
+            def cancel(self, response_id, **kwargs):
                 self.cancelled.append(response_id)
 
         clock = {"now": 0.0}
@@ -782,10 +783,10 @@ class BackgroundTimeoutRetryTests(unittest.TestCase):
                 self.create_calls += 1
                 return queued
 
-            def retrieve(self, response_id):
+            def retrieve(self, response_id, **kwargs):
                 return queued
 
-            def cancel(self, response_id):
+            def cancel(self, response_id, **kwargs):
                 self.cancelled.append(response_id)
 
         clock = {"now": 0.0}
@@ -850,10 +851,10 @@ class BackgroundTimeoutRetryTests(unittest.TestCase):
             def create(self, **payload):
                 return queued
 
-            def retrieve(self, response_id):
+            def retrieve(self, response_id, **kwargs):
                 return queued
 
-            def cancel(self, response_id):
+            def cancel(self, response_id, **kwargs):
                 cancelled_at.append(clock["now"])
 
         clock = {"now": 0.0}
@@ -951,11 +952,11 @@ class TerminateDuringBackgroundPollTests(unittest.TestCase):
             def create(self, **payload):
                 return pending
 
-            def retrieve(self, response_id):
+            def retrieve(self, response_id, **kwargs):
                 self.retrieve_calls += 1
                 return pending
 
-            def cancel(self, response_id):
+            def cancel(self, response_id, **kwargs):
                 self.cancelled.append(response_id)
 
         api = APIClient(
@@ -981,7 +982,7 @@ class TerminateDuringBackgroundPollTests(unittest.TestCase):
                 )
 
         self.assertEqual(responses.cancelled, ["resp_pending_1"])
-        self.assertEqual(responses.retrieve_calls, 0)
+        self.assertEqual(responses.retrieve_calls, 1)  # Reconcile the same ID; never create a replacement.
 
 
 if __name__ == "__main__":

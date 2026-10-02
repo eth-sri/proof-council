@@ -1,0 +1,92 @@
+# Recommended use of the WriteupLoop node: four copies in series, each
+# polishing the previous stage's output. Testing suggests continued
+# improvement up to a chain of at least four.
+#
+#   uv run python scripts/run_workflow.py --workflow writeup_loop_chain4 \
+#     --problem-text "" --problem-id demo \
+#     --input document_text="$(cat /path/to/answer.tex)"
+#
+# Same seat switch as writeup_loop (--component WriteupLoop.seat=cli).
+# Every stage has the node's own reliability contract, so a failed stage
+# passes its input through unchanged and the chain never loses the
+# document. Give each stage a DISTINCT `name:` (below): that name is the
+# stage identity the node mixes into its seats' resume-cache keys, so
+# stages sampling the same document sample independently rather than
+# replaying each other. Note that a later stage's trust anchor is the previous
+# stage's output, not the original input: a catastrophe fallback in
+# stage n ships stage n-1's document.
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: 'Fallback, not the default write-up node (use cleanup_session / firstproof_batch3). Four WriteupLoop passes in series: rewrite + cold-referee/repair, four times.'
+budget:
+  max_usd: 80.0
+  max_wallclock_s: 28800
+components:
+  WriteupLoop:
+    seat: api
+    cli_model: gpt-6-astra
+    cli_reasoning_effort: max
+    cli_codex_bin: ~/.local/bin/codex
+    cli_web_search: true
+    cli_ignore_user_config: true
+dag:
+  nodes:
+  - id: polish1
+    kind: agent
+    agent: proofstack.agents.writeup_loop.WriteupLoop
+    name: writeup_loop_1
+    inputs:
+      document_text: $input.document_text
+      bib_text: $input.bib_text
+      research_notes_text: $input.research_notes_text
+      page_limit: $input.page_limit
+      rounds: $input.rounds
+  - id: polish2
+    kind: agent
+    needs: [polish1]
+    agent: proofstack.agents.writeup_loop.WriteupLoop
+    name: writeup_loop_2
+    inputs:
+      document_text: $node.polish1.document_text
+      bib_text: $input.bib_text
+      research_notes_text: $input.research_notes_text
+      page_limit: $input.page_limit
+      rounds: $input.rounds
+  - id: polish3
+    kind: agent
+    needs: [polish2]
+    agent: proofstack.agents.writeup_loop.WriteupLoop
+    name: writeup_loop_3
+    inputs:
+      document_text: $node.polish2.document_text
+      bib_text: $input.bib_text
+      research_notes_text: $input.research_notes_text
+      page_limit: $input.page_limit
+      rounds: $input.rounds
+  - id: polish4
+    kind: agent
+    needs: [polish3]
+    agent: proofstack.agents.writeup_loop.WriteupLoop
+    name: writeup_loop_4
+    inputs:
+      document_text: $node.polish3.document_text
+      bib_text: $input.bib_text
+      research_notes_text: $input.research_notes_text
+      page_limit: $input.page_limit
+      rounds: $input.rounds
+  outputs:
+    document_text: $node.polish4.document_text
+    stage_errors:
+    - $node.polish1.error
+    - $node.polish2.error
+    - $node.polish3.error
+    - $node.polish4.error
+    stage_improved:
+    - $node.polish1.improved
+    - $node.polish2.improved
+    - $node.polish3.improved
+    - $node.polish4.improved
+inputs:
+  bib_text: null
+  research_notes_text: null
+  page_limit: null
+  rounds: 2

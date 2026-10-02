@@ -1,0 +1,10 @@
+Here is a mathematics write-up:
+
+<document>
+{{document}}
+</document>
+
+Is this note correct? List any errors, marking each as critical or minor (likely not
+hard to fix). Comments beginning %% FLAG: were left by an editor to mark points
+deserving extra attention. Finally, end your report with a line containing exactly
+NO ERRORS or exactly ERRORS FOUND.

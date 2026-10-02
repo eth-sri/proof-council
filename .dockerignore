@@ -23,11 +23,16 @@ suspect_key.txt
 *.pdf
 *.zip
 brainstorming/
+archive/
+lean/
+PRIVATE_DEVELOPMENT.md
+local-artifacts/
 private_problems/
 test_run_problems/
 problems/
 input.json
 outputs/
+output/
 solutions/
 agent_checkpoints/
 logs/

@@ -56,6 +56,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from proofstack.agent import Agent
 from proofstack.agents.ac.author import Author
+from proofstack.agents.ac.multi_author import MultiAuthor
 from proofstack.agents.ac.blocks import CANONICAL_FILES
 from proofstack.agents.ac.compute import (
     DEFAULT_COST_CONFIG as DEFAULT_COMPUTE_COST_CONFIG,
@@ -111,7 +112,7 @@ from proofstack.agents.ac.council import (
     CouncilReply,
     render_council_replies_for_author,
 )
-from proofstack.agents.ac.critic import ACCritic
+from proofstack.agents.ac.critic import ACCritic, CriticContextTooLarge
 from proofstack.agents.dag_workflow import DAGWorkflow, _bare_wrap
 from proofstack.agents.pwc.workspace import embed_or_ship_bibliography
 from proofstack.budget import BudgetExhausted
@@ -395,8 +396,8 @@ def _simple_compile_latex(
 
 DEFAULT_PAGE_LIMIT = DEFAULT_FIRSTPROOF_PAGE_LIMIT
 DEFAULT_COUNCIL_MODELS: tuple[str, ...] = (
-    "models/openai/gpt-56-sol-pro",
-    "models/anthropic/opus_47_max",
+    "models/openai/gpt-6-astra-pro",
+    "models/anthropic/fable_51",
     "models/gemini/gemini-31-pro",
 )
 
@@ -418,6 +419,13 @@ class ACWorkflow(Agent):
         problem_id: str
         n_rounds: int = Field(default=5, ge=1, le=500)
         full_critic_interval: int = Field(default=3, ge=1, le=20)
+        author_parallelism: int = Field(
+            default=1, ge=1, strict=True,
+            description=(
+                "Per-problem Author parallelism: 1 disables delegation; larger "
+                "values allow up to this many concurrent helpers while the lead waits."
+            ),
+        )
         enable_council: bool = True
         council_models: list[str] = Field(default_factory=lambda: list(DEFAULT_COUNCIL_MODELS))
         # Reserved for a future Pro-vetted summarizer of council replies;
@@ -502,6 +510,10 @@ class ACWorkflow(Agent):
         # the pwc sandbox image is unavailable). Forwarded to
         # ``Compute.Inputs.sandbox_backend``.
         compute_sandbox_backend: str = "docker"
+        compute_memory_gb: int = Field(default=8, ge=1)
+        compute_max_parallel_workers: int = Field(default=0, ge=0)
+        compute_memory_reserve_gb: int = Field(default=16, ge=0)
+        compute_memory_registry_dir: Path | None = None
         compute_docker_image: str = "proofstack-pwc-sandbox:latest"
         # Codex sandbox flag: ``auto`` | ``workspace-write`` |
         # ``docker-bypass`` | ``none``. ``auto`` resolves correctly
@@ -571,10 +583,11 @@ class ACWorkflow(Agent):
         final_critic_review_md: str = ""
         last_gasp: bool = False
         error: str | None = None
+        error_retryable: bool = True
 
     def __init__(self, ctx, **kw):
         super().__init__(ctx, **kw)
-        self.author = Author(ctx, parent_budget_scope=self.tracker.scope)
+        self.author = MultiAuthor(ctx, name="Author", parent_budget_scope=self.tracker.scope)
         self.critic = ACCritic(ctx, parent_budget_scope=self.tracker.scope)
         self.council = Council(ctx, parent_budget_scope=self.tracker.scope)
         self.compute = Compute(ctx, parent_budget_scope=self.tracker.scope)
@@ -586,6 +599,12 @@ class ACWorkflow(Agent):
     # --- main loop ---------------------------------------------------------
 
     async def run(self, inp):  # type: ignore[override]
+        from .async_helpers import helper_scope
+        async with helper_scope():
+            return await self._run_research(inp)
+
+    async def _run_research(self, inp):
+        self.author.author_parallelism = inp.author_parallelism
         workspace = self._workspace_path(inp.problem_id, inp.problem)
         resume_state = self._load_resume_state(workspace) if inp.resume_run else None
         if inp.resume_run and resume_state is None:
@@ -625,7 +644,7 @@ class ACWorkflow(Agent):
         )
         if resume_state is not None:
             self._restore_workspace_from_resume(workspace, resume_state)
-            self._apply_resume_budget_offset()
+            await self._apply_resume_budget_offset()
             await self.events.emit(
                 "ac.resume",
                 {
@@ -759,6 +778,8 @@ class ACWorkflow(Agent):
                         critic_conversation=critic_conversation,
                         critic_instance_turn=critic_instance_turn,
                         awaiting_review_kind=awaiting_review_kind,
+                        pending_review=(resume_state or {}).get("awaiting_review_context"),
+                        previous_n_rounds=(resume_state or {}).get("n_rounds_at_checkpoint"),
                     )
                 )
                 requested_council = (
@@ -812,7 +833,7 @@ class ACWorkflow(Agent):
                     )
                 review_history.append(review_k)
                 critic_conversation = list(review_k.messages_after)
-                critic_instance_turn += 1
+                critic_instance_turn = 1 if review_k.mode == "fresh" else critic_instance_turn + 1
                 self._write_review_artifacts(
                     workspace, review_k, round=awaiting_review_round
                 )
@@ -847,7 +868,7 @@ class ACWorkflow(Agent):
                 await self.events.emit(
                     "ac.round_start", {"round": 0, "n_rounds": inp.n_rounds}
                 )
-                author_0 = await self.author(
+                author_0 = await self._call_author(workspace,
                     **self._author_inputs(
                         inp=inp, workspace=workspace,
                         prev_critique="", prev_council="",
@@ -933,7 +954,7 @@ class ACWorkflow(Agent):
                 )
                 pending_critique = ""
 
-                author_k = await self.author(
+                author_k = await self._call_author(workspace,
                     **self._author_inputs(
                         inp=inp, workspace=workspace,
                         prev_critique=prev_critique_for_author,
@@ -1034,7 +1055,7 @@ class ACWorkflow(Agent):
                     )
                 review_history.append(review_k)
                 critic_conversation = list(review_k.messages_after)
-                critic_instance_turn += 1
+                critic_instance_turn = 1 if review_k.mode == "fresh" else critic_instance_turn + 1
                 self._write_review_artifacts(workspace, review_k, round=k)
 
                 # ---- Early-stop logic ------------------------------
@@ -1433,6 +1454,7 @@ class ACWorkflow(Agent):
                 final_critic_review_md="",
                 last_gasp=True,
                 error=error_str,
+                error_retryable=not (_is_programming_error(e) or isinstance(e, CriticContextTooLarge)),
             )
 
     # --- workspace + I/O helpers ---------------------------------------
@@ -1505,6 +1527,7 @@ class ACWorkflow(Agent):
         )
         return {
             "problem": inp.problem,
+            "recovery_problem": _safe_read(workspace / "problem.txt") or inp.problem,
             "round": round,
             "n_rounds": inp.n_rounds,
             "page_limit": inp.page_limit,
@@ -1526,8 +1549,22 @@ class ACWorkflow(Agent):
         omit_author_thinking: bool = False,
         round: int,
     ) -> dict:
+        canonical = inp.model_copy(update={
+            "problem": _safe_read(workspace / "problem.txt") or inp.problem,
+            "resume_run": False,
+        })
+        state_path = workspace / ".ac/resume-state.json"
+        state = _read_json_if_exists(state_path)
+        if isinstance(state, dict) and state.get("awaiting_review_round") == round:
+            state["awaiting_review_context"] = {
+                "mode": mode, "prior_messages": list(prior_messages),
+                "instance_turn": 0 if mode == "fresh" else int(state.get("critic_instance_turn") or 0),
+                "omit_author_thinking": omit_author_thinking,
+            }
+            _write_text_atomic(state_path, json.dumps(state, ensure_ascii=False))
         return {
             "problem": inp.problem,
+            "recovery_problem": self._problem_with_run_notes(canonical, resume_stop_round=None),
             "round": round,
             "n_rounds": inp.n_rounds,
             "page_limit": inp.page_limit,
@@ -1674,6 +1711,7 @@ class ACWorkflow(Agent):
             ),
             last_gasp=bool(outputs.get("last_gasp", False)),
             error=outputs.get("error"),
+            error_retryable=bool(outputs.get("error_retryable", True)),
         )
 
     def _problem_with_run_notes(self, inp, *, resume_stop_round: int | None) -> str:
@@ -1701,9 +1739,18 @@ class ACWorkflow(Agent):
         critic_conversation: list[dict],
         critic_instance_turn: int,
         awaiting_review_kind: str,
+        pending_review: dict | None = None,
+        previous_n_rounds: int | None = None,
     ) -> tuple[str, list[dict], int, bool]:
+        if pending_review is not None:
+            packet = ACCritic.Inputs(problem="", mode=pending_review["mode"],
+                                     prior_messages=pending_review["prior_messages"],
+                                     omit_author_thinking=pending_review["omit_author_thinking"])
+            return packet.mode, packet.prior_messages, int(pending_review["instance_turn"]), packet.omit_author_thinking
         if awaiting_review_kind == "final_author":
             return "fresh", [], 0, True
+        if previous_n_rounds is not None:
+            inp = inp.model_copy(update={"n_rounds": int(previous_n_rounds)})
         return (
             *self._critic_mode_for_round(
                 inp=inp,
@@ -1788,6 +1835,13 @@ class ACWorkflow(Agent):
     ) -> None:
         ac_dir = workspace / ".ac"
         ac_dir.mkdir(parents=True, exist_ok=True)
+        pending_review = None
+        if awaiting_review_round is not None:
+            mode, history, turn, omit = self._critic_mode_for_resume_review(
+                inp=inp, round=awaiting_review_round, critic_conversation=critic_conversation,
+                critic_instance_turn=critic_instance_turn, awaiting_review_kind=awaiting_review_kind or "")
+            pending_review = {"mode": mode, "prior_messages": history,
+                              "instance_turn": turn, "omit_author_thinking": omit}
         state = {
             "version": 1,
             "source": "checkpoint",
@@ -1798,10 +1852,18 @@ class ACWorkflow(Agent):
             "next_round": next_round,
             "awaiting_review_round": awaiting_review_round,
             "awaiting_review_kind": awaiting_review_kind,
+            "awaiting_review_context": pending_review,
             "awaiting_author": (
                 awaiting_author.model_dump(mode="json")
                 if awaiting_author is not None
                 else None
+            ),
+            # Compilation may normalize the Author's text before review.
+            # Resume must restore the exact packet, not the raw model output.
+            "awaiting_review_files": (
+                {name: _safe_read(workspace / name) for name in
+                 ("answer.tex", "research_notes.tex", "references.bib")}
+                if awaiting_review_round is not None else None
             ),
             "awaiting_finalization": awaiting_finalization,
             "review_history": [
@@ -1819,9 +1881,8 @@ class ACWorkflow(Agent):
             "early_stopped": early_stopped,
             "terminal_outputs": terminal_outputs,
         }
-        (ac_dir / "resume-state.json").write_text(
+        _write_text_atomic(ac_dir / "resume-state.json",
             json.dumps(state, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
         )
 
     def _load_resume_state(self, workspace: Path) -> dict[str, Any] | None:
@@ -1965,6 +2026,14 @@ class ACWorkflow(Agent):
     def _restore_workspace_from_resume(
         self, workspace: Path, state: dict[str, Any]
     ) -> None:
+        review_files = state.get("awaiting_review_files")
+        if isinstance(review_files, dict):
+            for name in ("answer.tex", "research_notes.tex", "references.bib"):
+                if name not in review_files or not isinstance(review_files[name], str):
+                    raise ValueError("Incomplete saved critic review packet")
+            for name in ("answer.tex", "research_notes.tex", "references.bib"):
+                (workspace / name).write_text(review_files[name], encoding="utf-8")
+            return
         awaiting_author = state.get("awaiting_author")
         if isinstance(awaiting_author, dict):
             for field, name in (
@@ -1994,13 +2063,12 @@ class ACWorkflow(Agent):
             return path
         return self.ctx.root_workdir / path
 
-    def _apply_resume_budget_offset(self) -> None:
+    async def _apply_resume_budget_offset(self) -> None:
         if self._resume_cost_offset_applied:
             return
+        from proofstack.provider_accounting import settle_provider_usage
+        await settle_provider_usage(self.ctx, self.tracker)
         self._resume_cost_offset_applied = True
-        prior_cost = _sum_logged_model_cost(self.ctx.root_workdir / "events.jsonl")
-        if prior_cost > 0:
-            self.tracker.add_usd(prior_cost)
 
     async def _gather_critic_council(
         self,
@@ -2221,6 +2289,10 @@ class ACWorkflow(Agent):
                 cost_config=inp.compute_cost_config,
                 soft_timeout_s=inp.compute_soft_timeout_s,
                 hard_timeout_s=inp.compute_hard_timeout_s,
+                memory_gb=inp.compute_memory_gb,
+                max_parallel_workers=inp.compute_max_parallel_workers,
+                memory_reserve_gb=inp.compute_memory_reserve_gb,
+                memory_registry_dir=inp.compute_memory_registry_dir,
                 workspace_soft_limit_bytes=inp.compute_workspace_soft_limit_bytes,
                 workspace_hard_limit_bytes=inp.compute_workspace_hard_limit_bytes,
                 workspace_soft_limit_entries=inp.compute_workspace_soft_limit_entries,
@@ -2268,6 +2340,30 @@ class ACWorkflow(Agent):
                 error=f"{type(e).__name__}: {e}",
             )
 
+    async def _call_author(self, workspace: Path, **inputs) -> Author.Outputs:
+        try:
+            return await self.author(**inputs)
+        except BudgetExhausted as exc:
+            completed = getattr(exc, "completed_output", None)
+            if isinstance(completed, Author.Outputs) and completed.artifact_status != "failed":
+                round = inputs["round"]
+                state = self._load_resume_state(workspace) or {
+                    "version": 1, "problem_hash": _problem_hash(
+                        _safe_read(workspace / "problem.txt") or inputs["problem"]),
+                    "last_round_run": round - 1, "review_history": [], "critic_conversation": [],
+                }
+                state.update(next_round=round, awaiting_review_round=round,
+                             awaiting_review_kind="round_review", awaiting_author=completed.model_dump(mode="json"),
+                             awaiting_review_files=None,
+                             early_stopped=False, awaiting_finalization=False, terminal_outputs=None,
+                             pending_workflow_feedback="Completed Author saved at budget boundary; this candidate is UNREVIEWED.")
+                # Checkpoint the complete bytes first. A crash during workspace
+                # publication can then be repaired by normal resume restoration.
+                _write_text_atomic(workspace / ".ac/resume-state.json", json.dumps(state, ensure_ascii=False, indent=2))
+                self._write_files_from_author(workspace, completed)
+                self._write_author_artifacts(workspace, completed, round=round)
+            raise
+
     def _write_files_from_author(self, workspace: Path, author: Author.Outputs) -> None:
         (workspace / "answer.tex").write_text(author.answer_tex, encoding="utf-8")
         (workspace / "research_notes.tex").write_text(
@@ -2282,6 +2378,10 @@ class ACWorkflow(Agent):
     ) -> None:
         ac_dir = workspace / ".ac"
         ac_dir.mkdir(parents=True, exist_ok=True)
+        _write_text_atomic(ac_dir / f"author-round-{round}-status.json", json.dumps({
+            "artifact_status": author.artifact_status,
+            "warnings": author.parse_warnings,
+        }))
         (ac_dir / f"author-round-{round}.md").write_text(
             (
                 f"# Author round {round}\n\n"
@@ -2291,6 +2391,7 @@ class ACWorkflow(Agent):
                 f"Council to: {author.council_to or '(default models)'}\n"
                 f"Parse warnings: {author.parse_warnings or '(none)'}\n\n"
                 f"## Thinking summary\n\n{author.thinking_summary or '(empty)'}\n"
+                + (f"\n## Delegation\n\n{author.delegation_summary}\n" if author.delegation_summary else "")
             ),
             encoding="utf-8",
         )
@@ -2393,9 +2494,16 @@ class ACWorkflow(Agent):
         it, records the compile log under ``.ac/``, and gives the next
         Author concrete page/compile/format feedback.
         """
+        artifact_feedback = ""
+        try:
+            status = json.loads(_safe_read(workspace / ".ac" / f"author-round-{round}-status.json"))
+            if status.get("artifact_status") == "failed":
+                artifact_feedback = "Previous Author edit failed; no new canonical manuscript was recovered. " + " ".join(status.get("warnings", [])) + "\n"
+        except ValueError:
+            pass
         answer_path = workspace / "answer.tex"
         if not answer_path.exists():
-            return "answer.tex is missing."
+            return artifact_feedback + "answer.tex is missing."
         body = answer_path.read_text(encoding="utf-8", errors="replace")
         bib_path = workspace / "references.bib"
         bib_arg = bib_path if bib_path.exists() and bib_path.stat().st_size > 0 else None
@@ -2408,7 +2516,7 @@ class ACWorkflow(Agent):
                 is_full_document=True,
             )
         except Exception as e:
-            return f"LaTeX compile check failed before pdflatex: {type(e).__name__}: {e}"
+            return artifact_feedback + f"LaTeX compile check failed before pdflatex: {type(e).__name__}: {e}"
 
         answer_path.write_text(out.tex, encoding="utf-8")
         ac_dir = workspace / ".ac"
@@ -2442,7 +2550,9 @@ class ACWorkflow(Agent):
                 out.bbl_path.unlink()
             except OSError:
                 pass
-        return "\n".join(messages) if messages else "No LaTeX compile or formatting issues detected."
+        if self.ctx.author_checkpoint is not None:
+            messages.append(await self.ctx.author_checkpoint(workspace, round))
+        return artifact_feedback + ("\n".join(messages) if messages else "No LaTeX compile or formatting issues detected.")
 
     @staticmethod
     def _write_compile_artifact(
@@ -2576,6 +2686,11 @@ class ACWorkflow(Agent):
 # --- helpers ----------------------------------------------------------------
 
 
+def _is_programming_error(error: Exception) -> bool:
+    return isinstance(error, (TypeError, AttributeError, NameError, LookupError,
+                              AssertionError, NotImplementedError, ImportError, SyntaxError))
+
+
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -2644,6 +2759,8 @@ def _write_text_atomic(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         Path(tmp).replace(path)
     except BaseException:
         try:
@@ -2703,28 +2820,8 @@ def _review_resume_record(review: ACCritic.Outputs) -> dict[str, Any]:
 
 
 def _sum_logged_model_cost(events_path: Path) -> float:
-    total = 0.0
-    try:
-        lines = events_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return 0.0
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("kind") != "model.call":
-            continue
-        payload = event.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        try:
-            total += float(payload.get("cost_usd", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            continue
-    return total
+    from proofstack.provider_accounting import provider_usage_snapshot
+    return provider_usage_snapshot(events_path.parent).cost_usd
 
 
 
@@ -2735,6 +2832,11 @@ class ACDAGWorkflow(DAGWorkflow):
 
     Inputs = ACWorkflow.Inputs
     Outputs = ACWorkflow.Outputs
+
+    async def run(self, inp):
+        from .async_helpers import helper_scope
+        async with helper_scope():
+            return await super().run(inp)
 
     async def _last_gasp(self, inp, state: dict[str, Any], error: Exception):
         helper = ACWorkflow(self.ctx, name="ac_last_gasp")
@@ -2780,6 +2882,7 @@ class ACDAGWorkflow(DAGWorkflow):
             final_critic_review_md="",
             last_gasp=True,
             error=f"{type(error).__name__}: {error}",
+            error_retryable=not (_is_programming_error(error) or isinstance(error, CriticContextTooLarge)),
         )
 
 

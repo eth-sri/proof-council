@@ -1,0 +1,4 @@
+base: models/openai/gpt-6-astra-max
+openai_pro_fallback_after_failures: 2
+reasoning:
+  mode: "pro"

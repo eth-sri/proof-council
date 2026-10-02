@@ -1,5 +1,5 @@
 workflow: proofstack.agents.proof_cleanup.AuthorCriticCleanupWorkflow
-description: Run Author/Critic unchanged, edit an accepted proof and bibliography, and review both with a fresh critic.
+description: Legacy upstream fallback, not the default write-up node (use cleanup_session / firstproof_batch3). Run Author/Critic unchanged, edit an accepted proof and bibliography, and review both with a fresh critic.
 
 inputs:
   page_limit: 12

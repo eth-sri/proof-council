@@ -35,8 +35,8 @@ _CURRENT_WORKDIR: ContextVar["object | None"] = ContextVar(
 
 
 def new_call_id() -> str:
-    """Short opaque id, sortable enough for debugging."""
-    return secrets.token_hex(3)
+    """Opaque 128-bit identifier, also used to deduplicate accounting."""
+    return secrets.token_hex(16)
 
 
 def _utcnow_iso() -> str:
@@ -78,8 +78,14 @@ class JSONLSink:
             await asyncio.to_thread(self._append, line)
 
     def _append(self, line: str) -> None:
-        with self.events_path.open("a", encoding="utf-8") as f:
-            f.write(line)
+        with self.events_path.open("ab+") as f:
+            if f.tell():
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    # Preserve a crash fragment without swallowing the first
+                    # valid event appended by the resumed process.
+                    f.write(b"\n")
+            f.write(line.encode("utf-8"))
 
     def _spill_payload(self, record: dict[str, Any]) -> dict[str, Any]:
         payload = record.get("payload")

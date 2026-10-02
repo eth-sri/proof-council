@@ -195,6 +195,15 @@ class RunMonitorTests(unittest.TestCase):
     def test_monitor_accepts_relative_config_ref(self) -> None:
         self.assertEqual(normalize_monitor_model_spec("openai/gpt-54-mini"), "models/openai/gpt-54-mini")
 
+    def test_monitor_keeps_standard_astra_aliases_out_of_pro_mode(self) -> None:
+        for alias, expected in (
+            ("gpt-6-astra", "models/openai/gpt-6-astra"),
+            ("gpt-6-astra--max", "models/openai/gpt-6-astra-max"),
+            ("gpt-6-astra-pro", "models/openai/gpt-6-astra-pro"),
+        ):
+            with self.subTest(alias=alias):
+                self.assertEqual(normalize_monitor_model_spec(alias), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

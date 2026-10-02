@@ -1,5 +1,5 @@
 workflow: proofstack.agents.ac.ACDAGWorkflow
-description: 'Long Author/Critic research workflow with Claude Fable 5 on the council: 10 rounds
+description: 'Long Author/Critic research workflow with Claude Fable 5.1 on the council: 10 rounds
   with Pro Author/Critic, a Fable council seat, and compute enabled for serious First Proof-style runs.
 
   '
@@ -8,15 +8,15 @@ inputs:
   full_critic_interval: 3
   enable_council: true
   enable_compute: true
-  compute_model: gpt-5.6-sol
-  compute_reasoning_effort: max
-  compute_cost_config: models/openai/gpt-56-sol-pro
+  compute_model: gpt-6-astra
+  compute_reasoning_effort: xhigh
+  compute_cost_config: models/openai/gpt-6-astra
   compute_sandbox_backend: subprocess
   compute_codex_sandbox: docker-bypass
   enable_final_critic: false
   council_models:
-  - models/openai/gpt-56-sol-pro
-  - models/anthropic/fable_5
+  - models/openai/gpt-6-astra-pro
+  - models/anthropic/fable_51
   - models/gemini/gemini-31-pro
   page_limit: 12
 budget:
@@ -24,9 +24,9 @@ budget:
   max_wallclock_s: 86400
 components:
   Author:
-    model: models/openai/gpt-56-sol-pro
+    model: models/openai/gpt-6-astra-pro
   ACCritic:
-    model: models/openai/gpt-56-sol-pro
+    model: models/openai/gpt-6-astra-pro
 dag:
   nodes:
   - id: problem

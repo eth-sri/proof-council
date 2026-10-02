@@ -17,6 +17,7 @@ from proofstack.agents.ac.ac_workflow import (  # noqa: E402
     _simple_compile_latex,
 )
 from proofstack.budget import BudgetExhausted  # noqa: E402
+from proofstack.context import RunContext  # noqa: E402
 from proofstack.latex_contract import normalize_firstproof_latex  # noqa: E402
 
 
@@ -31,7 +32,7 @@ class ACLatexContractTests(unittest.TestCase):
                     "\\begin{document}X\\end{document}",
                     encoding="utf-8",
                 )
-                workflow = object.__new__(ACWorkflow)
+                workflow = ACWorkflow(RunContext.create(root_workdir=workspace, flat=True))
 
                 def fake_compile(
                     tex_body: str,

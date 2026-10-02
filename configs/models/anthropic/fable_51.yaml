@@ -1,0 +1,34 @@
+model: claude-fable-5-1
+api: anthropic
+max_tokens: 128000
+concurrent_requests: 32
+temperature: null
+top_p: null
+cache_write_cost: 12.5
+# Fable 5.1 cache reads are billed at 0.025x input ($0.25/MTok).
+cache_read_cost: 0.25
+read_cost: 10
+write_cost: 50
+# Fable 5.1 always thinks: adaptive is the only accepted explicit config
+# (budget_tokens or type: disabled are rejected with a 400).
+thinking:
+  type: adaptive
+  display: omitted
+output_config:
+  effort: max
+cache_control:
+  type: ephemeral
+batch_processing: false
+stream_anthropic_messages: true
+anthropic_salvage_empty_max_tokens: true
+anthropic_continue_on_max_tokens: true
+# Use Anthropic streaming for long adaptive-thinking calls, with a
+# 45-minute total cap for the council seat: at effort max Fable 5.1
+# routinely streams 120k+ thinking tokens (25-37 min), and a retry after a
+# mid-stream provider error needs room too.
+timeout: 2700
+max_wallclock_per_call_s: 2700
+max_retries: 1
+max_retries_inner: 1
+sleep_on_error: 10
+sleep_on_error_max: 60

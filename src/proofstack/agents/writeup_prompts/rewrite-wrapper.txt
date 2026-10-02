@@ -1,0 +1,21 @@
+Here is a guide for turning a correct-but-dense mathematical write-up into a paper an
+expert will understand and enjoy:
+
+<writing_guidance>
+{{full text of WRITING_GUIDANCE.md}}
+</writing_guidance>
+
+Here is a mathematics write-up:
+
+<document>
+{{document}}
+</document>
+
+{{research notes block}}
+
+Rewrite the document above following the guidance. Produce the complete rewritten
+document as a single LaTeX file.
+
+There is no human editor in this workflow. Where the guidance says to flag something,
+ask, or mark it, record it as a LaTeX comment beginning %% FLAG: at the relevant point
+in the document; do not omit the flag and do not silently resolve the issue yourself.
