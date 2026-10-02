@@ -6,11 +6,12 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Literal, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Literal, TYPE_CHECKING
 
 from proofstack.budget import BudgetRegistry, BudgetSpec, BudgetTracker
 from proofstack.events import EventEmitter, JSONLSink
 from proofstack.state import ArtifactRegistry
+from proofstack.atomic import write_text_atomic
 
 if TYPE_CHECKING:
     from proofstack.agent import Agent
@@ -64,7 +65,7 @@ class ResumeCache:
 
     def put(self, key: str, value: Any) -> None:
         path = self._path_in(self.write_dir, key)
-        path.write_text(json.dumps(value, ensure_ascii=False, default=str), encoding="utf-8")
+        write_text_atomic(path, json.dumps(value, ensure_ascii=False, default=str))
 
 
 @dataclass
@@ -89,7 +90,12 @@ class RunContext:
     component_configs: dict[str, dict[str, Any]] = field(default_factory=dict)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     monitor: Any | None = None
+    # Optional enclosing-workflow export check; returns feedback for the next Author.
+    author_checkpoint: Callable[[Path, int], Awaitable[str]] | None = None
     _agent_call_counts: dict[str, int] = field(default_factory=dict)
+    _usage_settlement_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Cumulative charges in this process, including failed event-log appends.
+    _provider_usage_charged: dict[str, dict[str, float | int]] = field(default_factory=dict)
 
     @classmethod
     def create(
@@ -194,12 +200,7 @@ class RunContext:
         ``"*"``, then class-level defaults such as ``"Solver"``, then a
         specific instance name such as ``"branch_solver"``.
         """
-        merged: dict[str, Any] = {}
-        for key in ("*", *_agent_lookup_keys(agent)):
-            cfg = self.component_configs.get(key)
-            if isinstance(cfg, dict):
-                merged = _merge_dicts(merged, cfg)
-        return merged
+        return component_config_for_class(self.component_configs, type(agent), agent.name)
 
     def write_metadata(self, extra: dict[str, Any] | None = None) -> Path:
         meta = {
@@ -225,6 +226,16 @@ def _agent_lookup_keys(agent: "Agent") -> tuple[str, ...]:
         cls.__name__,
         agent.name,
     )
+
+
+def component_config_for_class(configs: dict, cls: type, name: str) -> dict[str, Any]:
+    """Resolve component settings without instantiating a paid agent or run."""
+    merged: dict[str, Any] = {}
+    for key in ("*", f"{cls.__module__}.{cls.__qualname__}", cls.__qualname__, cls.__name__, name):
+        cfg = configs.get(key)
+        if isinstance(cfg, dict):
+            merged = _merge_dicts(merged, cfg)
+    return merged
 
 
 def _merge_dicts(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:

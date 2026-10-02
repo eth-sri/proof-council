@@ -14,9 +14,13 @@
   <a href="LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green"></a>
 </p>
 
-ProofCouncil helps you run configurable proof agents, inspect execution traces, review costs, and iterate on workflow presets locally. It was used to create an agent for the Second Batch of First Proof. You may find more information about ProofCouncil in the accompanying paper ProofCouncil.pdf, which can be found in the top folder of this repository.
+ProofCouncil helps you run configurable proof agents, inspect execution traces, review costs, and iterate on workflow presets locally.
 
 ## Quick Start
+
+This repository contains the workflow implementation and generic examples, not
+research inputs or results. See [Public Release](docs/public_release.md) before
+publishing source or building a distribution.
 
 Install dependencies with [`uv`](https://github.com/astral-sh/uv):
 
@@ -55,7 +59,10 @@ The agent editor has many features, including:
 - Visual DAG editor with drag-and-drop nodes, customizable prompts, inputs, outputs, models, and more. The interface is created to work as smoothly as possible, with common actions like copying (Ctrl+C) and pasting (Ctrl+V) nodes, and undo/redo (Ctrl+Z / Ctrl+Y).
 - Agents can directly be used to edit the underlying YAML of an agent, allowing you to instruct your personal agent to edit the workflow you are working on. The DAG editor will automatically update to reflect any changes made to the YAML, and vice versa.
 
-Saved problems live in `problems/`. Run artifacts are written under `outputs/` by default.
+Saved problems live in `problems/`. Only the generic `example.txt` is tracked;
+other local problem files are ignored. Run artifacts are written under `outputs/`
+by default and are also ignored. Keep private research archives outside the
+repository rather than relying on ignore rules when sharing a folder.
 
 ## Run From The CLI
 
@@ -87,6 +94,52 @@ uv run python scripts/run_workflow.py \
 ```
 
 Workflow presets are in `configs/workflows/`. Pass either a preset name such as `author_critic` or a YAML path such as `configs/workflows/author_critic.yaml`.
+
+### Research Model Defaults
+
+The Author/Critic research presets and prescreen use
+`models/openai/gpt-6-astra-pro` for their OpenAI research roles. This sends
+`model: gpt-6-astra` with `reasoning.mode: pro`, `reasoning.effort: max`, and
+automatic reasoning summaries through the Responses API in background mode.
+The Fable Author preset uses `models/anthropic/fable_51_max` (Claude Fable 5.1).
+The default Council is GPT-6 Astra Pro, Claude Fable 5.1
+(`models/anthropic/fable_51`) and Gemini 3.1 Pro; every council seat has the
+provider's code sandbox and web search (OpenAI `code_interpreter` +
+`web_search_preview`, Anthropic `code_execution` + `web_search`, Gemini
+`codeExecution` + `googleSearch`) for independent experiments and literature
+checks. Compute runs `gpt-6-astra` at `xhigh` reasoning effort through the
+Codex CLI, billed with the `models/openai/gpt-6-astra` rates.
+
+`models/openai/gpt-6-astra` and `models/openai/gpt-6-astra-max` select standard
+mode; the `-max` suffix sets maximum reasoning effort without enabling Pro.
+The previous Sol configs remain available for explicitly selecting Sol.
+The Astra Max and Pro configs retain the existing timeout policy: 11,400
+seconds per background attempt, a 14,000-second tool-loop wallclock cap,
+and a retry at `high` effort after a background timeout (still Pro for the
+Pro config). Preset and run budgets remain separate limits.
+
+Two failure modes of long Astra/Sol calls are handled in `APIClient`:
+
+- OpenAI currently kills sol/astra background responses server-side at about
+  60 minutes (`status: failed`, `error.code: server_error`, empty output,
+  `usage: null`). With `background_server_kill_after_s: 3300` such a failure
+  counts as a background timeout, so the retry runs at the downgraded
+  `background_timeout_reasoning_efforts` (`high`) instead of dying again.
+- A response that ends with `status: incomplete` and
+  `incomplete_details.reason: max_output_tokens` is followed by one wrap-up
+  turn (`openai_continue_on_max_output_tokens`, at
+  `openai_max_output_token_continuation_effort: high`): the trailing reasoning
+  items are dropped, the conversation is replayed with a "wrap up now, finish
+  file edits, give the final visible output" user message, and both responses
+  are billed.
+
+Astra token accounting uses $10 input, $1 cached input, $12.50 cache writes,
+and $50 output per million tokens. Above 272,000 input tokens, input rates
+double and output rates increase by 1.5 for the full request. Pro mode bills
+aggregated model work at these token rates; reasoning tokens are included in
+output usage, not charged again separately. See the
+[Astra model documentation](https://developers.openai.com/api/docs/models/gpt-6-astra)
+and [reasoning-mode guide](https://developers.openai.com/api/docs/guides/reasoning#reasoning-mode).
 
 ## Run First Proof
 
@@ -172,7 +225,25 @@ docker run --rm \
 
 A raw container run uses the default First Proof workflow. For smoke testing, prefer `./smoke/run_container.sh` because it selects the cheap workflow and sets the smoke-sized budget, page limit, and round count.
 
-The default submission run uses `configs/workflows/firstproof_submission.yaml` with adaptive continuation stages up to the submission cap. Override `FIRSTPROOF_WORKFLOW` only when you want a different preset.
+The submission image sets `FIRSTPROOF_WORKFLOW=firstproof_batch3` by default.
+Its competition defaults are **10 simultaneous problems** and **$1,050 per
+problem**, including research, council, Compute and cleanup ($10,500 planned
+total for ten problems). These are cooperative spending limits, not a provider
+billing guarantee. `FIRSTPROOF_MAX_PARALLEL` and
+`FIRSTPROOF_BUDGET_USD_PER_QUESTION` override them for smaller tests.
+It selects Astra Pro Author/Critic, one guide-driven rewrite followed by stateful
+criticism and targeted repairs, and an exact-document 16-page submission gate.
+Mathematical flaws return to research; unresolved attempts receive one unreviewed
+partial-results rewrite at the shared 23-hour cutoff, with at most two mechanical
+repairs and a preserved, exportable partial checkpoint. Explicit runtime environment
+variables can select another preset, including `firstproof_smoke_fast` or the
+legacy `firstproof_submission` workflow. The direct Python adapter retains its
+legacy default when `FIRSTPROOF_WORKFLOW` is unset.
+
+See
+[the Batch 3 workflow notes](docs/firstproof_batch3_workflow.md) for phase
+budgets, partial-result handling and remaining pre-submission tests. A container
+run with credentials can incur API charges; use explicitly approved budgets.
 
 Example:
 

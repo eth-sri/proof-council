@@ -64,15 +64,16 @@ from proofstack.kinds.cli import (
 )
 from proofstack.sandbox import resolve_backend
 from proofstack.sandbox.base import Sandbox, SandboxSpec
+from proofstack.sandbox.memory import GiB, MemoryPolicy
 from proofstack.transient_auth import (
     create_codex_auth_parent,
     require_codex_auth_parent_removed,
 )
 
 
-DEFAULT_MODEL = "gpt-5.6-sol"
-DEFAULT_REASONING_EFFORT = "max"
-DEFAULT_COST_CONFIG = "models/openai/gpt-56-sol-pro"
+DEFAULT_MODEL = "gpt-6-astra"
+DEFAULT_REASONING_EFFORT = "xhigh"
+DEFAULT_COST_CONFIG = "models/openai/gpt-6-astra"
 DEFAULT_SOFT_TIMEOUT_S = 7200
 DEFAULT_HARD_TIMEOUT_S = 9000
 DEFAULT_SANDBOX_BACKEND = "docker"
@@ -80,7 +81,7 @@ DEFAULT_DOCKER_IMAGE = "proofstack-pwc-sandbox:latest"
 # ``auto`` resolves to ``--dangerously-bypass-approvals-and-sandbox``
 # under docker and ``--sandbox workspace-write`` under subprocess.
 DEFAULT_CODEX_SANDBOX = "auto"
-MIN_CODEX_VERSION: Final[tuple[int, int, int]] = (0, 144, 0)
+MIN_CODEX_VERSION: Final[tuple[int, int, int]] = (0, 154, 0)
 CODEX_AUTH_TIMEOUT_S: Final[int] = 30
 COMPUTE_HANDOFF_MAX_FILES: Final[int] = 700
 COMPUTE_HANDOFF_MAX_COMPRESSED_BYTES: Final[int] = 200 * 1024 * 1024
@@ -391,6 +392,10 @@ class Compute(CLIAgent):
         cost_config: str = DEFAULT_COST_CONFIG
         soft_timeout_s: int = Field(default=DEFAULT_SOFT_TIMEOUT_S, ge=0)
         hard_timeout_s: int = Field(default=DEFAULT_HARD_TIMEOUT_S, ge=1)
+        memory_gb: int = Field(default=8, ge=1)
+        max_parallel_workers: int = Field(default=0, ge=0)
+        memory_reserve_gb: int = Field(default=16, ge=0)
+        memory_registry_dir: Path | None = None
         workspace_soft_limit_bytes: int = Field(
             default=COMPUTE_WORKSPACE_SOFT_LIMIT_BYTES,
             ge=0,
@@ -586,7 +591,6 @@ class Compute(CLIAgent):
         self._paid_cost_rates = None
         self._handoff_secrets = ()
         soft_timeout_s = int(inp.soft_timeout_s)  # type: ignore[attr-defined]
-        hard_timeout_s = int(inp.hard_timeout_s)  # type: ignore[attr-defined]
         self.SOFT_TIMEOUT_S = soft_timeout_s
         self.WORKSPACE_SOFT_LIMIT_BYTES = int(  # type: ignore[attr-defined]
             inp.workspace_soft_limit_bytes  # type: ignore[attr-defined]
@@ -666,20 +670,9 @@ class Compute(CLIAgent):
             self._host_codex_auth_text,
             additional=(paid_codex_api_key or "",),
         )
-        self.SANDBOX = SandboxSpec(
-            cpu_limit=4,
-            memory_gb=8,
-            timeout_s=hard_timeout_s,
-            backend=str(inp.sandbox_backend or DEFAULT_SANDBOX_BACKEND),  # type: ignore[attr-defined,arg-type]
-            docker_image=str(inp.docker_image or DEFAULT_DOCKER_IMAGE),  # type: ignore[attr-defined]
-            docker_no_new_privileges=False,
+        self.SANDBOX = compute_sandbox_spec(
+            inp, registry_root=self.ctx.root_workdir.parent,
             docker_extra_args=docker_extra_args,
-            # Codex 0.144 does not authenticate from OPENAI_API_KEY merely
-            # being present in its environment. setup() either copies an
-            # existing login or pipes the paid key through `codex login` into
-            # the transient CODEX_HOME. Never expose provider keys to the
-            # model-driven `codex exec` process itself.
-            provider_keys=(),
         )
         self.CLI_CMD = _build_codex_cmd(
             model=inp.model,  # type: ignore[attr-defined]
@@ -700,6 +693,7 @@ class Compute(CLIAgent):
         codex_home.mkdir(parents=True, exist_ok=True)
         await _require_codex_cli_version(sandbox)
         await self._prepare_codex_auth(sandbox, codex_home)
+        self._execution_host_failed = False
         root = sandbox.root
         # ``scratch`` is explicitly ephemeral. Clear leftovers before the
         # parent class performs its pre-spawn quota check so a cancelled or
@@ -1008,7 +1002,15 @@ invocation.
             round=inp.round,  # type: ignore[attr-defined]
             instructions=instructions,
         )
-        text = recovery_banner + text
+        memory_notice = (
+            f"Memory: {inp.memory_gb} GiB resident RAM for your entire process tree. "
+            "The subprocess RSS guard is polled, not a kernel hard quota; leave headroom. "
+            "Shared host pressure can also stop this invocation. "
+            + "Use streaming/chunked algorithms, leave ample overhead, and do not "
+            "run several memory-heavy subprocesses concurrently. After a memory "
+            "stop, reduce batch sizes rather than repeating the same allocation.\n\n"
+        )
+        text = recovery_banner + memory_notice + text
         if not text.endswith("\n"):
             text += "\n"
         return text
@@ -1044,6 +1046,8 @@ invocation.
             )
         response_md = self.sanitize_cli_output(response_md)
         summary = self.sanitize_cli_output(done.summary or "")
+        if getattr(self, "_execution_host_failed", False):
+            summary = "Compute infrastructure failed (code-mode host); results are unverified. " + summary
         await self._reset_scratch(root, inp, phase="collect", strict=False)
 
         zip_path: Path | None = (
@@ -1138,11 +1142,20 @@ invocation.
         return self.Outputs(
             response_md=response_md,
             zip_path=zip_path,
-            status=done.status,
+            status="error" if getattr(self, "_execution_host_failed", False) else done.status,
             summary=summary,
             workspace=root,
             handoff_stats=handoff_stats,
         )
+
+    def cache_output_is_reusable(self, out: BaseModel) -> bool:
+        # Also invalidate old 'partial' entries that misclassified startup
+        # crashes. Their original artifacts remain available for audit.
+        text = out.response_md + "\n" + out.summary
+        return out.status != "error" and (out.status == "done" or not any(signature in text for signature in (
+            "code-mode host closed its stdout",
+            "Failed to reserve the virtual address space for the V8 sandbox",
+        )))
 
     async def record_cli_usage(
         self,
@@ -1150,6 +1163,14 @@ invocation.
         stderr_text: str,
         done: CLIDoneRecord,
     ) -> None:
+        self._execution_host_failed = done.status != "done" and any(marker in stdout_text + stderr_text for marker in (
+            "Failed to reserve the virtual address space for the V8 sandbox",
+            "code-mode host closed its stdout",
+        ))
+        if self._execution_host_failed:
+            await self.events.emit("ac.compute.infrastructure_failure", {
+                "reason": "code_mode_host_failed", "retry_requires_successful_preflight": True,
+            })
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
             if not self._subscription_codex_auth:
@@ -1223,8 +1244,37 @@ def _redact_auth_output(stdout: str, stderr: str, secret: str | None = None) -> 
     return text[:400] or "no output"
 
 
+def compute_sandbox_spec(inp, *, registry_root: Path, docker_extra_args=()) -> SandboxSpec:
+    """Shared by the real worker and the credential-free launch healthcheck."""
+    spec = SandboxSpec(
+        cpu_limit=4, memory_gb=inp.memory_gb, limit_address_space=False,
+        timeout_s=int(inp.hard_timeout_s),
+        backend=str(inp.sandbox_backend or DEFAULT_SANDBOX_BACKEND),
+        docker_image=str(inp.docker_image or DEFAULT_DOCKER_IMAGE),
+        docker_no_new_privileges=False, docker_extra_args=docker_extra_args,
+        provider_keys=(),
+    )
+    if inp.max_parallel_workers:
+        if resolve_backend(spec) != "subprocess":
+            raise ValueError("shared Compute memory guard requires the subprocess backend")
+        registry = inp.memory_registry_dir or Path(".proofcouncil-compute-memory")
+        if not registry.is_absolute():
+            registry = registry_root / registry
+        registry = registry.resolve()
+        if registry.is_relative_to(Path(inp.compute_workspace).resolve()):
+            raise ValueError("memory registry must be outside the Compute workspace")
+        spec.memory_policy = MemoryPolicy(
+            registry=registry, max_workers=inp.max_parallel_workers,
+            worker_bytes=inp.memory_gb * GiB, reserve_bytes=inp.memory_reserve_gb * GiB,
+        )
+    return spec
+
+
 async def _require_codex_cli_version(sandbox: Sandbox) -> None:
-    result = await sandbox.run_command(["codex", "--version"], timeout_s=10)
+    # The first container start after an image (re)build takes ~20-25 s
+    # under rootless podman with --userns=keep-id (layer re-chown); a 10 s
+    # cap can expire before the CLI starts.
+    result = await sandbox.run_command(["codex", "--version"], timeout_s=120)
     output = f"{result.stdout}\n{result.stderr}".strip()
     match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", output)
     if result.returncode != 0 or match is None:
@@ -1233,7 +1283,22 @@ async def _require_codex_cli_version(sandbox: Sandbox) -> None:
     if version < MIN_CODEX_VERSION:
         minimum = ".".join(str(part) for part in MIN_CODEX_VERSION)
         raise RuntimeError(
-            f"Codex CLI {minimum} or newer is required for gpt-5.6-sol with max effort; found {match.group(0)}"
+            f"Codex CLI {minimum} or newer is required for gpt-6-astra; found {match.group(0)}"
+        )
+    await _require_codex_execution_host(sandbox)
+
+
+async def _require_codex_execution_host(sandbox: Sandbox) -> None:
+    from proofstack.sandbox import codex_preflight
+
+    probe = await sandbox.run_command(
+        ["python3", "-c", Path(codex_preflight.__file__).read_text(encoding="utf-8")],
+        timeout_s=20,
+    )
+    if probe.returncode != 0 or "code-mode preflight passed" not in probe.stdout:
+        raise RuntimeError(
+            "Compute infrastructure preflight failed before any model call: "
+            + _redact_auth_output(probe.stdout, probe.stderr)
         )
 
 

@@ -4,6 +4,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -111,6 +112,7 @@ class PromptOverhaulContractTests(unittest.TestCase):
             answer_tex="\\documentclass[12pt]{article}\\begin{document}X\\end{document}",
         )
         critic = object.__new__(ACCritic)
+        critic.ctx = SimpleNamespace(component_config_for=lambda _: {})
         critic_user = critic.render_messages(critic_inputs)[0]["content"]
         self.assertIn("First Proof LaTeX contract", critic_user)
         self.assertIn("wrong document class", critic_user)

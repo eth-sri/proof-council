@@ -47,7 +47,7 @@ class EditorTemplateContractTests(unittest.TestCase):
         editor = (ROOT / "app" / "templates" / "dev_preset_editor.html").read_text()
 
         for template in (run_agent, editor):
-            self.assertIn("codex_model: ['gpt-5.6-sol'", template)
+            self.assertIn("codex_model: ['gpt-6-astra'", template)
             self.assertIn("codex_effort: ['max', 'xhigh'", template)
         self.assertIn("const values = ['', 'low', 'medium', 'high', 'xhigh', 'max'];", editor)
         self.assertIn("const known = executor === 'codex_cli'", editor)

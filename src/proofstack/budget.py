@@ -24,6 +24,10 @@ from pydantic import BaseModel, ConfigDict, Field
 _BUDGET_OVERRUN_DEPTH: ContextVar[int] = ContextVar("budget_overrun_depth", default=0)
 
 
+def budget_overrun_allowed() -> bool:
+    return _BUDGET_OVERRUN_DEPTH.get() > 0
+
+
 @contextmanager
 def allow_budget_overrun() -> Iterator[None]:
     """Temporarily turn hard budget failures into warnings.
@@ -168,7 +172,7 @@ class BudgetTracker:
         just crossed 90% (used so the caller can emit ``budget.warn``).
         """
         warnings: list[tuple[str, str, float, float]] = []
-        allow_overrun = _BUDGET_OVERRUN_DEPTH.get() > 0
+        allow_overrun = budget_overrun_allowed()
         for node in self.chain():
             if node.spec is None:
                 continue

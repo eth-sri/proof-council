@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
+from proofstack.budget import BudgetExhausted
 
 from mathagents.api_client import ProviderAttachmentRejectedError
 
@@ -82,6 +83,10 @@ from proofstack.latex_contract import (
     DEFAULT_FIRSTPROOF_PAGE_LIMIT,
     render_firstproof_latex_contract,
 )
+
+_DOWNLOAD_ATTEMPTS = 3
+_DOWNLOAD_TIMEOUT_S = 90.0
+_DOWNLOAD_RETRY_DELAY_S = 5.0
 
 
 # ----- inline-mode prompts (legacy path) ----------------------------------
@@ -254,6 +259,13 @@ You may additionally emit three control blocks:
     council replies. Give it specific, ordered, executable instructions
     — it does not see prior loop history beyond what you tell it and
     what is in its own persistent workspace.
+
+    Save canonical edits and compact research notes BEFORE expensive experiments.
+    Delegate large symbolic calculations as bounded tasks with explicit time,
+    memory, and output-size limits. If a hosted execution environment fails,
+    do not repeat the same unbounded workload in another container. Reduce the
+    problem size or use Compute. Report failed writes explicitly; never mark
+    an unchanged fallback manuscript ready on the strength of uncommitted work.
 
   - **<ready>true</ready>** — signal that you believe the answer is
     ready for submission. See the readiness rules below.
@@ -561,7 +573,7 @@ class Author(APICallAgent):
     )
     SYSTEM_PROMPT: ClassVar[str] = AUTHOR_LOOP_SYSTEM
     USER_PROMPT: ClassVar[str] = AUTHOR_LOOP_USER
-    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-56-sol-pro"
+    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-6-astra-pro"
     # Generous tool-call budget — Author may run several CI cells (compile,
     # sympy, sanity checks) plus web searches per round.
     MAX_TOOL_CALLS: ClassVar[int] = 30
@@ -574,6 +586,7 @@ class Author(APICallAgent):
 
     class Inputs(BaseModel):
         problem: str
+        recovery_problem: str = ""  # Canonical statement, without continuation instructions.
         round: int
         n_rounds: int
         page_limit: int = DEFAULT_FIRSTPROOF_PAGE_LIMIT
@@ -608,6 +621,12 @@ class Author(APICallAgent):
         # Diagnostic metadata for the container-files path.
         container_id: str | None = None
         via: str = "inline_blocks"
+        # Filled by MultiAuthor: one line per subagent call this turn.
+        delegation_summary: str = ""
+        artifact_status: str = "unknown"
+
+    def cache_output_is_reusable(self, out: BaseModel) -> bool:
+        return out.artifact_status != "failed"
 
     def extra_client_kwargs(self) -> dict[str, Any]:
         # Inline-mode tool config; container-files mode rebuilds the
@@ -698,6 +717,22 @@ class Author(APICallAgent):
         )
         return await super().run(inp)
 
+    async def _download_completed_files(self, bridge, source, *, provider: str) -> dict[str, str]:
+        # One outer deadline covers every attempt and backoff. Do not retry an
+        # externally cancelled/timed-out thread: it may still be downloading.
+        async with asyncio.timeout(_DOWNLOAD_TIMEOUT_S):
+            for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+                try:
+                    return await asyncio.to_thread(bridge.download, source)
+                except Exception as exc:
+                    if attempt == _DOWNLOAD_ATTEMPTS:
+                        raise
+                    await self.events.emit("ac.author.container_download_retry", {
+                        "provider": provider, "attempt": attempt,
+                        "type": type(exc).__name__, "msg": str(exc),
+                    })
+                    await asyncio.sleep(_DOWNLOAD_RETRY_DELAY_S)
+
     async def _run_with_openai_container_files(self, inp: Inputs) -> Outputs:
         # Surface budget warnings the same way APICallAgent.run does.
         for scope, kind, used, limit in self.tracker.check():
@@ -756,9 +791,7 @@ class Author(APICallAgent):
                 )
                 start = time.monotonic()
                 try:
-                    _idx, conversation, cost = await asyncio.to_thread(
-                        _one_shot_query, api_client, messages
-                    )
+                    _idx, conversation, cost = await self._query(api_client, messages, _one_shot_query, call_id=call_id)
                 except Exception as attachment_error:
                     optional_uploads = [
                         upload for upload in bridge.uploaded if not upload.is_canonical
@@ -802,9 +835,7 @@ class Author(APICallAgent):
                         call_id=call_id,
                     )
                     start = time.monotonic()
-                    _idx, conversation, cost = await asyncio.to_thread(
-                        _one_shot_query, api_client, messages
-                    )
+                    _idx, conversation, cost = await self._query(api_client, messages, _one_shot_query, call_id=call_id)
                 elapsed = time.monotonic() - start
 
                 usd = float(cost.get("cost", 0.0))
@@ -817,10 +848,7 @@ class Author(APICallAgent):
                 # propagated explicitly here too — otherwise the
                 # dominant Author Pro calls always log 0.
                 reasoning_tok = int(cost.get("reasoning_tokens", 0) or 0)
-                self.tracker.add_usd(usd)
-                self.tracker.add_tokens(in_tok + out_tok)
-                await self.events.emit(
-                    "model.call",
+                await self._record_model_usage(
                     {
                         "model": getattr(api_client, "model", str(self.MODEL)),
                         "in_tokens": in_tok,
@@ -829,15 +857,11 @@ class Author(APICallAgent):
                         "cost_usd": usd,
                         "duration_s": elapsed,
                         "via": "container_files",
+                        "provider_outcomes": cost.get("provider_outcomes", []),
+                        "usage_unavailable": cost.get("usage_unavailable", False),
                     },
                     call_id=call_id,
                 )
-                for scope, kind, used, limit in self.tracker.check():
-                    await self.events.emit(
-                        "budget.warn",
-                        {"scope": scope, "kind": kind, "used": used, "limit": limit},
-                    )
-
                 raw_text = _assistant_text(conversation)
                 try:
                     (self.workdir / "raw_response.txt").write_text(raw_text, encoding="utf-8")
@@ -845,7 +869,10 @@ class Author(APICallAgent):
                     pass
 
                 container_id = find_container_id(conversation)
+                openai_client.timeout = 15
+                openai_client.max_retries = 0
                 modified: dict[str, str] = {}
+                download_failed = False
                 if container_id is None:
                     await self.events.emit(
                         "ac.author.no_container_id",
@@ -853,8 +880,9 @@ class Author(APICallAgent):
                     )
                 else:
                     try:
-                        modified = await asyncio.to_thread(bridge.download, container_id)
+                        modified = await self._download_completed_files(bridge, container_id, provider="openai")
                     except Exception as e:
+                        download_failed = True
                         await self.events.emit(
                             "ac.author.container_download_failed",
                             {
@@ -872,16 +900,42 @@ class Author(APICallAgent):
                 # the ``try``; on the failure path there is nothing to
                 # download.
                 try:
-                    await asyncio.to_thread(bridge.cleanup)
+                    openai_client.timeout = 15
+                    openai_client.max_retries = 0
+                    await asyncio.wait_for(asyncio.to_thread(bridge.cleanup), timeout=20)
                 except Exception as e:
                     await self.events.emit(
                         "ac.author.cleanup_failed",
                         {"type": type(e).__name__, "msg": str(e)},
                     )
 
-        return self._build_outputs_from_container(
-            inp, raw_text, modified, container_id, via="container_files"
+        output = self._build_outputs_from_container(
+            inp, raw_text, modified, container_id, via="container_files",
+            execution_failed=download_failed or any(
+                item.get("type") == "code_interpreter_call"
+                and item.get("status") in {"failed", "incomplete", "in_progress", "interpreting"}
+                for item in conversation if isinstance(item, dict)
+            ),
         )
+        return await self._check_completed_output(output)
+
+    async def _check_completed_output(self, output: Outputs) -> Outputs:
+        # Retrieval is finalization of already-paid work, not permission for a
+        # further model call. Preserve it even when the completed call crossed a cap.
+        try:
+            warnings = self.tracker.check()
+        except BudgetExhausted as exc:
+            exc.completed_output = output
+            try:
+                (self.workdir / "completed_author.json").write_text(
+                    output.model_dump_json(indent=2), encoding="utf-8"
+                )
+            except OSError:
+                pass  # The exception still carries the complete output to the workflow.
+            raise
+        for scope, kind, used, limit in warnings:
+            await self.events.emit("budget.warn", {"scope": scope, "kind": kind, "used": used, "limit": limit})
+        return output
 
     async def _run_with_anthropic_container_files(self, inp: Inputs) -> Outputs:
         # Surface budget warnings the same way APICallAgent.run does.
@@ -945,9 +999,7 @@ class Author(APICallAgent):
                 )
                 start = time.monotonic()
                 try:
-                    _idx, conversation, cost = await asyncio.to_thread(
-                        _one_shot_query, api_client, messages
-                    )
+                    _idx, conversation, cost = await self._query(api_client, messages, _one_shot_query, call_id=call_id)
                 except Exception as attachment_error:
                     optional_uploads = [
                         upload for upload in bridge.uploaded if not upload.is_canonical
@@ -991,19 +1043,14 @@ class Author(APICallAgent):
                         call_id=call_id,
                     )
                     start = time.monotonic()
-                    _idx, conversation, cost = await asyncio.to_thread(
-                        _one_shot_query, api_client, messages
-                    )
+                    _idx, conversation, cost = await self._query(api_client, messages, _one_shot_query, call_id=call_id)
                 elapsed = time.monotonic() - start
 
                 usd = float(cost.get("cost", 0.0))
                 in_tok = int(cost.get("input_tokens", 0) or 0)
                 out_tok = int(cost.get("output_tokens", 0) or 0)
                 reasoning_tok = int(cost.get("reasoning_tokens", 0) or 0)
-                self.tracker.add_usd(usd)
-                self.tracker.add_tokens(in_tok + out_tok)
-                await self.events.emit(
-                    "model.call",
+                await self._record_model_usage(
                     {
                         "model": getattr(api_client, "model", str(self.MODEL)),
                         "in_tokens": in_tok,
@@ -1012,25 +1059,25 @@ class Author(APICallAgent):
                         "cost_usd": usd,
                         "duration_s": elapsed,
                         "via": "anthropic_container_files",
+                        "provider_outcomes": cost.get("provider_outcomes", []),
+                        "usage_unavailable": cost.get("usage_unavailable", False),
                     },
                     call_id=call_id,
                 )
-                for scope, kind, used, limit in self.tracker.check():
-                    await self.events.emit(
-                        "budget.warn",
-                        {"scope": scope, "kind": kind, "used": used, "limit": limit},
-                    )
-
                 raw_text = _assistant_text(conversation)
                 try:
                     (self.workdir / "raw_response.txt").write_text(raw_text, encoding="utf-8")
                 except OSError:
                     pass
 
+                download_failed = False
                 try:
-                    modified = await asyncio.to_thread(bridge.download, conversation)
+                    anthropic_client.timeout = 15
+                    anthropic_client.max_retries = 0
+                    modified = await self._download_completed_files(bridge, conversation, provider="anthropic")
                 except Exception as e:
                     modified = {}
+                    download_failed = True
                     await self.events.emit(
                         "ac.author.anthropic_download_failed",
                         {"type": type(e).__name__, "msg": str(e)},
@@ -1047,16 +1094,19 @@ class Author(APICallAgent):
                         )
             finally:
                 try:
-                    await asyncio.to_thread(bridge.cleanup)
+                    anthropic_client.timeout = 15
+                    anthropic_client.max_retries = 0
+                    await asyncio.wait_for(asyncio.to_thread(bridge.cleanup), timeout=20)
                 except Exception as e:
                     await self.events.emit(
                         "ac.author.cleanup_failed",
                         {"type": type(e).__name__, "msg": str(e)},
                     )
 
-        return self._build_outputs_from_container(
-            inp, raw_text, modified, None, via="anthropic_container_files"
+        output = self._build_outputs_from_container(
+            inp, raw_text, modified, None, via="anthropic_container_files", execution_failed=download_failed
         )
+        return await self._check_completed_output(output)
 
     def _extra_attachments(self, inp: Inputs) -> list[tuple[Path, str]]:
         extra_attachments: list[tuple[Path, str]] = []
@@ -1198,10 +1248,7 @@ class Author(APICallAgent):
         in_tok = int(cost.get("input_tokens", 0) or 0)
         out_tok = int(cost.get("output_tokens", 0) or 0)
         reasoning_tok = int(cost.get("reasoning_tokens", 0) or 0)
-        self.tracker.add_usd(usd)
-        self.tracker.add_tokens(in_tok + out_tok)
-        await self.events.emit(
-            "model.call",
+        await self._record_model_usage(
             {
                 "model": getattr(api_client, "model", str(self.MODEL)),
                 "in_tokens": in_tok,
@@ -1339,7 +1386,7 @@ class Author(APICallAgent):
             (None, {"type": "web_search_preview"}),
         ]
         cfg["max_tool_calls"] = self.MAX_TOOL_CALLS
-        return self.ctx.api_client_factory(cfg)
+        return self.ctx.api_client_factory(self._limit_client_deadline(cfg))
 
     def _build_anthropic_api_client_with_files(self):
         cfg = self._container_model_config()
@@ -1352,7 +1399,7 @@ class Author(APICallAgent):
         if ANTHROPIC_FILES_BETA not in betas:
             betas.append(ANTHROPIC_FILES_BETA)
         cfg["anthropic_betas"] = betas
-        return self.ctx.api_client_factory(cfg)
+        return self.ctx.api_client_factory(self._limit_client_deadline(cfg))
 
     def _build_outputs_from_container(
         self,
@@ -1362,6 +1409,7 @@ class Author(APICallAgent):
         container_id: str | None,
         *,
         via: str = "container_files",
+        execution_failed: bool = False,
     ) -> Outputs:
         # We still parse the response text for the optional control
         # blocks (council, ready, thinking_summary). Any fenced
@@ -1394,6 +1442,18 @@ class Author(APICallAgent):
             compute_instr = parsed.compute.instructions
 
         warnings = list(parsed.parse_warnings)
+        unsuccessful_edit = not files_changed and (execution_failed or any(
+            phrase in raw_text.lower() for phrase in (
+                "could not write", "failed to write", "unable to write",
+                "python host died", "execution host died", "container died",
+            )
+        ))
+        if unsuccessful_edit:
+            warnings.append(
+                "Hosted execution failed without canonical changes. The previous manuscript "
+                "is preserved, not a new verified candidate. Save edits before heavy work; "
+                "split the failed calculation into bounded Compute tasks before retrying."
+            )
         # Surface a warning if the Author emitted fenced file blocks in
         # container mode (the user should know they were ignored).
         ignored_inline_files = sorted(parsed.files.keys())
@@ -1409,7 +1469,7 @@ class Author(APICallAgent):
             research_notes_tex=research_notes_tex,
             references_bib=references_bib,
             files_changed=sorted(files_changed),
-            ready=parsed.ready,
+            ready=parsed.ready and not unsuccessful_edit,
             council_question=council_q,
             council_to=council_to,
             compute_instructions=compute_instr,
@@ -1418,6 +1478,7 @@ class Author(APICallAgent):
             raw_text=raw_text,
             container_id=container_id,
             via=via,
+            artifact_status="failed" if unsuccessful_edit else ("changed" if files_changed else "unchanged"),
         )
 
 

@@ -1,0 +1,32 @@
+model: gpt-6-astra
+api: openai
+max_tokens: 128000
+cache_read_cost: 1
+cache_write_cost: 12.5
+cache_write_tokens_in_input: true
+read_cost: 10
+write_cost: 50
+long_context_threshold_tokens: 272000
+long_context_input_multiplier: 2
+long_context_output_multiplier: 1.5
+concurrent_requests: 16
+temperature: null
+top_p: null
+batch_processing: false
+background: true
+use_openai_responses_api: true
+timeout: 11400
+throw_error_on_failure: true
+max_wallclock_per_call_s: 14000
+# OpenAI kills sol/astra background calls server-side at ~60 min
+# (status=failed, server_error, empty output). Treat such a failure
+# after 55 min like a background timeout so the retry uses the
+# downgraded effort configured in the -max / -pro configs.
+background_server_kill_after_s: 3300
+# A 128k-output-token cutoff (status=incomplete) is followed by one
+# wrap-up turn at high effort instead of accepting truncated output.
+openai_continue_on_max_output_tokens: true
+openai_max_output_token_continuations: 1
+openai_max_output_token_continuation_effort: high
+reasoning:
+  summary: "auto"

@@ -18,5 +18,10 @@ use_openai_responses_api: true
 timeout: 11400
 throw_error_on_failure: true
 max_wallclock_per_call_s: 14000
+# Same ~60-min server-side kill as gpt-6-astra; see that config.
+background_server_kill_after_s: 3300
+openai_continue_on_max_output_tokens: true
+openai_max_output_token_continuations: 1
+openai_max_output_token_continuation_effort: high
 reasoning:
   summary: "auto"

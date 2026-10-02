@@ -18,6 +18,19 @@ from unittest import mock
 import pytest
 from pydantic import BaseModel
 
+
+@pytest.fixture(autouse=True)
+def _offline_native_host(monkeypatch):
+    # These tests exercise authentication/storage with fake CLI executables.
+    # The real no-API host probe has dedicated failure/success tests.
+    monkeypatch.setattr("proofstack.agents.ac.compute._require_codex_execution_host", mock.AsyncMock())
+    # As with the mocked process-tree cleanup below, macOS cannot enumerate
+    # every same-user process's environment. Memory enforcement is tested
+    # separately with controlled process tables in test_compute_memory.py.
+    monkeypatch.setattr("proofstack.sandbox.subprocess.markers_rss", lambda markers: {
+        marker["token"]: (0, True) for marker in markers
+    })
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -82,6 +95,7 @@ from proofstack.sandbox.subprocess import (  # noqa: E402
     _find_marked_processes,
     _terminate_marked_processes,
 )
+from proofstack.sandbox.memory import GiB, MemoryPolicy  # noqa: E402
 
 
 class FakeSandbox(SimpleNamespace):
@@ -122,7 +136,7 @@ class FakeSandbox(SimpleNamespace):
             )
         return SimpleNamespace(
             returncode=getattr(self, "version_returncode", 0),
-            stdout=getattr(self, "version_stdout", "codex-cli 0.144.0"),
+            stdout=getattr(self, "version_stdout", "codex-cli 0.154.0"),
             stderr="",
         )
 
@@ -158,8 +172,8 @@ def test_compute_codex_command_uses_current_exec_flags() -> None:
     )
 
     assert cmd[:2] == ["codex", "exec"]
-    assert cmd[cmd.index("-m") + 1] == "gpt-5.6-sol"
-    assert cmd[cmd.index("-c") + 1] == 'model_reasoning_effort="max"'
+    assert cmd[cmd.index("-m") + 1] == "gpt-6-astra"
+    assert cmd[cmd.index("-c") + 1] == 'model_reasoning_effort="xhigh"'
     assert "--ignore-user-config" not in cmd
     assert "--ephemeral" not in cmd
     assert "--output-last-message" in cmd
@@ -172,7 +186,7 @@ def test_compute_codex_command_uses_current_exec_flags() -> None:
     assert cmd[-1] == "-"
 
 
-def test_compute_inputs_default_to_sol_max_with_matching_cost_config() -> None:
+def test_compute_inputs_default_to_astra_xhigh_with_matching_cost_config() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         inp = Compute.Inputs(
             problem="P",
@@ -182,9 +196,9 @@ def test_compute_inputs_default_to_sol_max_with_matching_cost_config() -> None:
             compute_workspace=Path(temp_dir),
         )
 
-    assert inp.model == "gpt-5.6-sol"
-    assert inp.reasoning_effort == "max"
-    assert inp.cost_config == "models/openai/gpt-56-sol-pro"
+    assert inp.model == "gpt-6-astra"
+    assert inp.reasoning_effort == "xhigh"
+    assert inp.cost_config == "models/openai/gpt-6-astra"
     assert inp.model == DEFAULT_MODEL
     assert inp.reasoning_effort == DEFAULT_REASONING_EFFORT
     assert inp.cost_config == DEFAULT_COST_CONFIG
@@ -302,6 +316,65 @@ def test_compute_soft_timeout_is_capped_below_remaining_workflow_budget() -> Non
         assert agent._effective_soft_timeout_s(3600) == 1800
 
 
+@pytest.mark.parametrize("remaining_budget", [None, 5000.0])
+def test_cli_recalculates_wrapup_after_shared_admission(tmp_path, monkeypatch, remaining_budget):
+    class ProbeInput(BaseModel):
+        workspace: Path
+
+    class ProbeAgent(CLIAgent):
+        CLI_CMD = ["probe"]
+        SANDBOX = SandboxSpec(
+            backend="subprocess", timeout_s=9000,
+            memory_policy=MemoryPolicy(tmp_path / "registry", 6, 8 * GiB, 16 * GiB),
+        )
+        SOFT_TIMEOUT_S = 7200
+
+        def sandbox_root_for(self, inp):
+            return inp.workspace
+
+        async def _wait_for_done(self, stream, done_path, **kwargs):
+            assert kwargs["soft_timeout_s"] == (500 if remaining_budget else 7200)
+            return CLIDoneRecord(status="partial", summary="offline admission probe")
+
+        async def collect(self, sandbox, inp, done):
+            return done
+
+    stream = SimpleNamespace(
+        proc=SimpleNamespace(stdin=None, returncode=0),
+        remaining_s=1000 if remaining_budget else 9000,
+        worker_stop_state=WorkerStopState.STOPPED, worker_stopped=True,
+        stdout="", stderr="", metering_stdout="",
+        terminate=mock.AsyncMock(),
+    )
+    seen = []
+
+    class QueuedSandbox(SimpleNamespace):
+        async def ensure_workspace_available(self):
+            pass
+
+        async def stream_command(self, *args, **kwargs):
+            seen.append(kwargs)
+            return stream
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = RunContext.create(run_id="test", root_workdir=tmp_path / "run", flat=True)
+    agent = ProbeAgent(ctx)
+    monkeypatch.setattr(agent.tracker, "remaining_wallclock_s", lambda: remaining_budget)
+    monkeypatch.setattr("proofstack.kinds.cli.make_sandbox", lambda *a, **kw: QueuedSandbox(root=workspace))
+    before = time.monotonic()
+    result = asyncio.run(agent.run(ProbeInput(workspace=workspace)))
+    after = time.monotonic()
+    assert result.status == "partial"
+    assert len(seen) == 1
+    if remaining_budget is None:
+        assert "wallclock_deadline" not in seen[0]
+        assert seen[0]["timeout_s"] == 9000
+    else:
+        assert before + remaining_budget <= seen[0]["wallclock_deadline"] <= after + remaining_budget
+        assert seen[0]["timeout_s"] == 5000
+
+
 def test_compute_rejects_old_codex_cli_before_starting_worker() -> None:
     sandbox = FakeSandbox(
         root=Path("."),
@@ -311,7 +384,7 @@ def test_compute_rejects_old_codex_cli_before_starting_worker() -> None:
     try:
         asyncio.run(_require_codex_cli_version(sandbox))
     except RuntimeError as e:
-        assert "0.144.0 or newer" in str(e)
+        assert "0.154.0 or newer" in str(e)
         assert "0.143.0" in str(e)
     else:
         raise AssertionError("old Codex CLI version was accepted")
@@ -328,7 +401,7 @@ def test_dockerfile_pins_and_smokes_codex_cli() -> None:
     )
 
     assert "@openai/codex@${OPENAI_CODEX_VERSION}" in text
-    assert "ARG OPENAI_CODEX_VERSION=0.144.0" in text
+    assert "ARG OPENAI_CODEX_VERSION=0.154.0" in text
     assert 'codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"' in text
     assert "codex exec --help | grep -q -- '--output-last-message'" in text
     assert "gmpy2 python-flint z3-solver cvxpy" in text
@@ -336,7 +409,7 @@ def test_dockerfile_pins_and_smokes_codex_cli() -> None:
     assert "> /usr/local/bin/finish" in text
     assert "FINISH_DONE_PATH" in text
     for runtime_text in (deploy_text, sandbox_text):
-        assert "ARG OPENAI_CODEX_VERSION=0.144.0" in runtime_text
+        assert "ARG OPENAI_CODEX_VERSION=0.154.0" in runtime_text
         assert "@openai/codex@${OPENAI_CODEX_VERSION}" in runtime_text
         assert 'codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"' in runtime_text
     assert "> /usr/local/bin/finish" in pwc_text
@@ -3580,6 +3653,55 @@ def test_teardown_failure_preserves_workspace_and_notifies_next_round() -> None:
         assert any(kind == "cli.teardown_error" for kind, _ in events)
 
 
+@pytest.mark.parametrize("operation", ["active_guard", "recovery_attempts"])
+def test_workspace_state_close_error_does_not_close_reused_fd(tmp_path, monkeypatch, operation):
+    from proofstack.kinds import cli as cli_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = Compute(RunContext.create(run_id="test", root_workdir=tmp_path / "run", flat=True))
+    if operation == "active_guard":
+        path = agent.workspace_active_guard_path_for(workspace)
+        _write_workspace_active_guard(path, workspace, backend="subprocess")
+        update = lambda: cli_module._update_workspace_active_guard(path, workspace, phase="launch_pending")
+    else:
+        agent._write_workspace_recovery_attempts(workspace, 1)
+        path = agent.workspace_recovery_state_path_for(workspace)
+        update = lambda: agent._write_workspace_recovery_attempts(workspace, 2)
+    before = path.read_bytes()
+    real_mkstemp, real_close = tempfile.mkstemp, os.close
+    temporary_fd = []
+    replacement = []
+
+    def track_temp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        temporary_fd.append(fd)
+        return fd, name
+
+    def close_then_reuse(fd):
+        real_close(fd)
+        if temporary_fd and fd == temporary_fd[0] and not replacement:
+            opened = os.open(tmp_path / "replacement", os.O_CREAT | os.O_RDWR, 0o600)
+            if opened != fd:
+                os.dup2(opened, fd)
+                real_close(opened)
+            replacement.append(fd)
+            raise OSError("synthetic close error after reuse")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(cli_module.tempfile, "mkstemp", track_temp)
+            patch.setattr(cli_module.os, "close", close_then_reuse)
+            with pytest.raises(OSError, match="after reuse"):
+                update()
+            assert path.read_bytes() == before
+            os.fstat(replacement[0])
+        assert not list(path.parent.glob(f".{path.name}.*"))
+    finally:
+        for fd in replacement:
+            real_close(fd)
+
+
 def test_pending_workspace_guard_refuses_automatic_recovery() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp = Path(temp_dir)
@@ -4642,7 +4764,7 @@ def test_compute_suppresses_artifacts_when_final_auth_is_unreadable() -> None:
         fake_codex.write_text(
             f"""#!/bin/sh
 if [ "${{1:-}}" = "--version" ]; then
-  printf 'codex-cli 0.144.0\n'
+  printf 'codex-cli 0.154.0\n'
   exit 0
 fi
 if [ "${{1:-}}" = "login" ] && [ "${{2:-}}" = "status" ]; then
@@ -4748,7 +4870,7 @@ def test_compute_run_captures_codex_last_message_with_finish_signal() -> None:
         fake_codex.write_text(
             """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'codex-cli 0.144.0\n'
+  printf 'codex-cli 0.154.0\n'
   exit 0
 fi
 out=""
@@ -4815,7 +4937,7 @@ def test_compute_finish_survives_nested_login_shell_path_reset() -> None:
         fake_codex.write_text(
             """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'codex-cli 0.144.0\n'
+  printf 'codex-cli 0.154.0\n'
   exit 0
 fi
 cat >/dev/null
@@ -4872,7 +4994,7 @@ def test_compute_setup_removes_stale_codex_last_message() -> None:
         fake_codex.write_text(
             """#!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-  printf 'codex-cli 0.144.0\n'
+  printf 'codex-cli 0.154.0\n'
   exit 0
 fi
 cat >/dev/null
@@ -4927,3 +5049,45 @@ exit 0
             "no current result"
         )
         assert not stale_path.exists()
+
+
+def test_docker_cmd_adds_userns_keep_id_only_under_podman() -> None:
+    from proofstack.sandbox import docker as docker_module
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir) / "compute"
+        root.mkdir()
+        sandbox = DockerSandbox(SandboxSpec(backend="docker"), root=root)
+
+        def build() -> list[str]:
+            return sandbox._build_docker_cmd(
+                ["probe"],
+                env_extra=None,
+                extra_path=[],
+                cwd=None,
+                interactive=False,
+                container_name=sandbox.container_name,
+            )
+
+        with mock.patch.object(docker_module, "_docker_is_podman", return_value=True):
+            podman_cmd = build()
+        with mock.patch.object(docker_module, "_docker_is_podman", return_value=False):
+            docker_cmd = build()
+
+    assert podman_cmd.index("--userns=keep-id") == podman_cmd.index("--user") + 2
+    assert "--userns=keep-id" not in docker_cmd
+    assert [a for a in podman_cmd if a != "--userns=keep-id"] == docker_cmd
+
+
+def test_docker_is_podman_detects_the_shim_and_tolerates_missing_docker() -> None:
+    from proofstack.sandbox import docker as docker_module
+
+    docker_module._docker_is_podman.cache_clear()
+    with mock.patch.object(
+        docker_module.subprocess, "check_output", return_value="podman version 5.8.2"
+    ):
+        assert docker_module._docker_is_podman() is True
+    docker_module._docker_is_podman.cache_clear()
+    with mock.patch.object(docker_module.subprocess, "check_output", side_effect=FileNotFoundError):
+        assert docker_module._docker_is_podman() is False
+    docker_module._docker_is_podman.cache_clear()

@@ -1,4 +1,7 @@
-"""File-backed cleanup workflows with non-destructive failure handling."""
+"""File-backed cleanup workflows with non-destructive failure handling.
+
+Older upstream approach, kept as a fallback; ``CleanupSession`` is the default write-up node.
+"""
 from __future__ import annotations
 
 from pathlib import Path

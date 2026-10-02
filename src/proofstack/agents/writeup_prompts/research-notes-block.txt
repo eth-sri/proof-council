@@ -1,0 +1,6 @@
+Here are the author's research notes, supplied for background and motivation only; the
+document above is the sole text being rewritten:
+
+<research_notes>
+{{research notes}}
+</research_notes>

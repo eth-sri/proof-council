@@ -1,0 +1,27 @@
+Here is a guide for turning a correct-but-dense mathematical write-up into a paper an
+expert will understand and enjoy:
+
+<writing_guidance>
+{{full text of WRITING_GUIDANCE.md}}
+</writing_guidance>
+
+Here is a mathematics write-up:
+
+<document>
+{{document}}
+</document>
+
+A referee reviewed it and reported:
+
+<referee_report>
+{{referee findings}}
+</referee_report>
+
+Fix the errors the referee identified, making minimal targeted edits; do not otherwise
+rewrite the document. Produce the complete corrected document as a single LaTeX file.
+Finally, list the errors the referee marked critical, one per line, each line beginning
+with FIXED: or UNABLE: according to whether your edits fix it.
+
+There is no human editor in this workflow. Where the guidance says to flag something,
+ask, or mark it, record it as a LaTeX comment beginning %% FLAG: at the relevant point
+in the document; do not omit the flag and do not silently resolve the issue yourself.

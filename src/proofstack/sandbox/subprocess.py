@@ -34,6 +34,7 @@ from proofstack.sandbox.base import (
     SandboxSpawnError,
     WorkerStopState,
 )
+from proofstack.sandbox.memory import MemoryLease, markers_rss
 
 
 STREAM_CAPTURE_MAX_CHARS = 16 * 1024 * 1024
@@ -46,6 +47,7 @@ PROCESS_MARKER_CLOCK_SKEW_S = 2.0
 PROCESS_MARKER_TERM_GRACE_S = 1.0
 PROCESS_MARKER_EXIT_TIMEOUT_S = 1.0
 PROCESS_MARKER_EMPTY_SCANS = 3
+MEMORY_GAP_GRACE_S = 3.0
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,78 @@ def _new_process_marker() -> _ProcessMarker:
     return _ProcessMarker(token=uuid.uuid4().hex, created_at=time.time())
 
 
+def _process_exited(process: psutil.Process) -> bool:
+    try:
+        return not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return True
+    except (OSError, psutil.Error):
+        return False
+
+
+def _foreign_process(process: psutil.Process, current_uid: int,
+                     markers: dict[str, _ProcessMarker]) -> bool:
+    """True when a live same-uid process we may not inspect cannot be ours.
+
+    Reading another process's environment needs ptrace access, which a
+    user-namespace sandbox (``codex-linux-sandbox``, ``bwrap``), a setgid
+    binary (``ssh-agent``, ``crontab``) or a privilege drop (``sshd-session``
+    for a fresh login) all deny, even to the same user. Such a process is only
+    an accounting gap for this worker when it may descend from the worker: it
+    has a marked ancestor, or it was orphaned and adopted by pid 1 or by a
+    same-uid daemon that may be a subreaper. A process whose parent is an
+    ordinary live process outside our tree, or another user's process, is a
+    bystander from a different session.
+    """
+    try:
+        parent = process.parent()
+        if parent is None:
+            return True
+        ancestor = parent
+        while ancestor is not None:
+            if ancestor.pid == os.getpid():
+                return False
+            # Shared admission also scans workers owned by sibling controllers.
+            # Their marked descendants are not bystanders of this scan.
+            if ancestor.uids().real == current_uid:
+                marker = markers.get(ancestor.environ().get(PROCESS_MARKER_ENV))
+                if marker is not None and ancestor.create_time() >= marker.created_at - PROCESS_MARKER_CLOCK_SKEW_S:
+                    return False
+            ancestor = ancestor.parent()
+        if parent.pid == 1:
+            return False
+        if parent.uids().real != current_uid:
+            return True
+        return parent.ppid() != 1
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return _process_exited(process)
+    except (AttributeError, OSError, psutil.Error):
+        return False
+
+
+def _best_effort(read):
+    try:
+        return read()
+    except Exception:
+        return None
+
+
+def _scan_gap(process, error: str) -> dict:
+    info = _best_effort(lambda: process.info) or {}
+    return {
+        "pid": _best_effort(lambda: process.pid) or info.get("pid"),
+        "name": _best_effort(lambda: process.name()),
+        "ppid": _best_effort(lambda: process.ppid()),
+        "status": _best_effort(lambda: process.status()),
+        "create_time": info.get("create_time") or _best_effort(lambda: process.create_time()),
+        "error": error[:200],
+    }
+
+
+def _exc_text(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _find_marked_processes(
     marker: _ProcessMarker,
 ) -> tuple[list[psutil.Process], bool]:
@@ -71,16 +145,33 @@ def _find_marked_processes(
     Any process-table inspection gap makes the result incomplete so callers
     fail closed instead of claiming that the worker stopped.
     """
+    found, complete, _ = _find_processes_by_marker([marker])
+    return found[marker.token], complete
+
+
+def _find_processes_by_marker(
+    markers: Iterable[_ProcessMarker],
+) -> tuple[dict[str, list[psutil.Process]], bool, list[dict]]:
+    """Inspect the process table once for all requested invocation markers.
+
+    ``gaps`` describes each process that made the scan incomplete.
+    """
+    markers_by_token = {marker.token: marker for marker in markers}
+    found: dict[str, list[psutil.Process]] = {token: [] for token in markers_by_token}
+    gaps: list[dict] = []
+    if not markers_by_token:
+        return found, True, gaps
+    earliest = min(marker.created_at for marker in markers_by_token.values())
     try:
         current_uid = os.getuid()
         candidates = psutil.process_iter(
             attrs=["pid", "uids", "create_time"],
             ad_value=None,
         )
-    except (AttributeError, OSError, psutil.Error):
-        return [], False
+    except (AttributeError, OSError, psutil.Error) as exc:
+        gaps.append(_scan_gap(None, _exc_text(exc)))
+        return found, False, gaps
 
-    found: list[psutil.Process] = []
     complete = True
     try:
         for candidate in candidates:
@@ -90,27 +181,59 @@ def _find_marked_processes(
                     continue
                 uids = info.get("uids")
                 if uids is None:
-                    complete = False
+                    if not _process_exited(candidate):
+                        complete = False
+                        gaps.append(_scan_gap(candidate, "uids unavailable"))
                     continue
                 if getattr(uids, "real", None) != current_uid:
                     continue
                 created_at = info.get("create_time")
                 if not isinstance(created_at, (int, float)):
-                    complete = False
+                    if not _process_exited(candidate):
+                        complete = False
+                        gaps.append(_scan_gap(candidate, "create_time unavailable"))
                     continue
-                if created_at < marker.created_at - PROCESS_MARKER_CLOCK_SKEW_S:
+                if created_at < earliest - PROCESS_MARKER_CLOCK_SKEW_S:
                     continue
                 environment = candidate.environ()
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 continue
-            except (OSError, psutil.AccessDenied, psutil.Error):
+            except (OSError, psutil.AccessDenied, psutil.Error) as exc:
+                # process_iter's cached attributes can outlive a process. A
+                # disappearing sibling is not an accounting gap for this worker.
+                if _process_exited(candidate):
+                    continue
+                if isinstance(exc, psutil.AccessDenied) and _foreign_process(candidate, current_uid, markers_by_token):
+                    continue
                 complete = False
+                gaps.append(_scan_gap(candidate, _exc_text(exc)))
                 continue
-            if environment.get(PROCESS_MARKER_ENV) == marker.token:
-                found.append(candidate)
-    except (OSError, psutil.Error):
-        return found, False
-    return found, complete
+            marker = markers_by_token.get(environment.get(PROCESS_MARKER_ENV))
+            if marker is not None and created_at >= marker.created_at - PROCESS_MARKER_CLOCK_SKEW_S:
+                found[marker.token].append(candidate)
+    except (OSError, psutil.Error) as exc:
+        gaps.append(_scan_gap(None, _exc_text(exc)))
+        return found, False, gaps
+    return found, complete, gaps
+
+
+async def _memory_operation(operation):
+    # Cancellation cannot stop a thread. Settle admission before its caller
+    # closes the lease, otherwise the thread could acquire a slot after cleanup.
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()
+        raise asyncio.CancelledError
+    return task.result()
 
 
 def _signal_marked_processes(
@@ -157,7 +280,7 @@ async def _terminate_marked_processes(marker: _ProcessMarker) -> bool:
         await asyncio.sleep(min(PROCESS_GROUP_EXIT_POLL_S, remaining))
 
 
-def _make_preexec(memory_gb: int, cpu_limit: int, cpu_seconds: int):
+def _make_preexec(memory_gb: int, cpu_limit: int, cpu_seconds: int, *, limit_address_space: bool = True):
     """Returns a preexec_fn that applies soft setrlimit limits.
 
     Linux-only; returns ``None`` on platforms without ``resource``.
@@ -178,7 +301,9 @@ def _make_preexec(memory_gb: int, cpu_limit: int, cpu_seconds: int):
     def _apply() -> None:
         try:
             mem_bytes = memory_gb * 1024 * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+            if limit_address_space:
+                resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
         except (ValueError, OSError):
             pass
         try:
@@ -333,7 +458,7 @@ class SubprocessSandbox(Sandbox):
                 stdin=(asyncio.subprocess.PIPE if input_bytes is not None else None),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                preexec_fn=_make_preexec(self.spec.memory_gb, self.spec.cpu_limit, int(timeout)),
+                preexec_fn=_make_preexec(self.spec.memory_gb, self.spec.cpu_limit, int(timeout), limit_address_space=self.spec.limit_address_space),
                 start_new_session=True,
                 pass_fds=self.inherited_fds,
             )
@@ -425,6 +550,8 @@ class SubprocessSandbox(Sandbox):
         timeout_s: int | None = None,
         env_extra: Mapping[str, str] | None = None,
         extra_path: Iterable[Path] = (),
+        queue_timeout_s: float | None = None,
+        wallclock_deadline: float | None = None,
     ) -> "_StreamingProcess":
         """Spawn a long-running command and return a handle.
 
@@ -434,6 +561,9 @@ class SubprocessSandbox(Sandbox):
         DockerSandbox equivalent does the same. Without this, codex
         inherits the parent's stdin, sees EOF immediately, and exits
         with code 1 before doing any work.
+
+        Queue waiting is bounded separately (by ``timeout_s`` unless overridden).
+        ``wallclock_deadline`` caps both admission and execution in monotonic time.
         """
         cwd_path = self.root / cwd if cwd else self.root
         env = self.spec.build_env(sandbox_root=self.root, extra_path=extra_path)
@@ -442,6 +572,52 @@ class SubprocessSandbox(Sandbox):
         process_marker = _new_process_marker()
         env[PROCESS_MARKER_ENV] = process_marker.token
         timeout = timeout_s if timeout_s is not None else self.spec.timeout_s
+        memory_lease = None
+        queue_deadline = time.monotonic() + (
+            timeout if queue_timeout_s is None else queue_timeout_s
+        )
+        if wallclock_deadline is not None:
+            queue_deadline = min(queue_deadline, wallclock_deadline)
+        emit_memory = getattr(self, "emit_memory_event", None)
+        if self.spec.memory_policy is not None:
+            memory_lease = MemoryLease(self.spec.memory_policy, process_marker)
+            queued = False
+            try:
+                while True:
+                    if time.monotonic() >= queue_deadline:
+                        raise SandboxSpawnError("timed out waiting for a shared Compute slot")
+                    acquired = await _memory_operation(memory_lease.try_acquire)
+                    if emit_memory is not None and (event := memory_lease.quarantine_event()) is not None:
+                        await emit_memory("cli.memory_registry_quarantine", event)
+                    if acquired:
+                        break
+                    if not queued and emit_memory is not None:
+                        await emit_memory("cli.memory_queued", {
+                            "max_workers": self.spec.memory_policy.max_workers,
+                            "worker_limit_bytes": self.spec.memory_policy.worker_bytes,
+                            "queue_timeout_s": timeout if queue_timeout_s is None else queue_timeout_s,
+                        })
+                    queued = True
+                    await asyncio.sleep(min(1.0, max(0.0, queue_deadline - time.monotonic())))
+                if emit_memory is not None:
+                    await emit_memory("cli.memory_admitted", {
+                        "max_workers": self.spec.memory_policy.max_workers,
+                        "worker_limit_bytes": self.spec.memory_policy.worker_bytes,
+                        "reserve_bytes": self.spec.memory_policy.reserve_bytes,
+                    })
+                if time.monotonic() >= queue_deadline:
+                    raise SandboxSpawnError("Compute deadline expired before worker launch")
+            except BaseException:
+                memory_lease.close()
+                raise
+        started_at = time.monotonic()
+        deadline = started_at + timeout
+        if wallclock_deadline is not None:
+            deadline = min(deadline, wallclock_deadline)
+        if deadline <= started_at:
+            if memory_lease is not None:
+                memory_lease.close()
+            raise SandboxSpawnError("Compute deadline expired before worker launch")
         self._mark_worker_launch_pending()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -454,12 +630,17 @@ class SubprocessSandbox(Sandbox):
                 preexec_fn=_make_preexec(
                     self.spec.memory_gb,
                     self.spec.cpu_limit,
-                    int(timeout),
+                    int(deadline - started_at),
+                    limit_address_space=self.spec.limit_address_space,
                 ),
                 start_new_session=True,
-                pass_fds=self.inherited_fds,
+                pass_fds=self.inherited_fds + (
+                    (memory_lease.fd,) if memory_lease is not None else ()
+                ),
             )
         except (OSError, ValueError) as e:
+            if memory_lease is not None:
+                memory_lease.close()
             self._set_worker_lifecycle(
                 WorkerStopState.STOPPED,
                 launch_settled=True,
@@ -468,7 +649,10 @@ class SubprocessSandbox(Sandbox):
             raise SandboxSpawnError(
                 f"could not spawn sandbox command {executable!r}: {e}"
             ) from e
-        deadline = time.monotonic() + timeout
+        except BaseException:
+            if memory_lease is not None:
+                memory_lease.close()
+            raise
         self._set_worker_lifecycle(
             WorkerStopState.SURVIVING,
             launch_settled=True,
@@ -479,6 +663,9 @@ class SubprocessSandbox(Sandbox):
             deadline=deadline,
             process_marker=process_marker,
             lifecycle_callback=self._set_worker_lifecycle,
+            memory_lease=memory_lease,
+            resident_limit_bytes=(self.spec.memory_gb * 1024**3 if not self.spec.limit_address_space else None),
+            emit_memory=emit_memory,
         )
 
 
@@ -623,12 +810,13 @@ class _JsonUsageCapture:
         usage = event.get("usage")
         if event_type == "turn.completed" and isinstance(usage, dict):
             compact = {"type": event_type, "usage": usage}
-        elif event_type == "result" and isinstance(usage, dict):
+        elif event_type == "result":
             compact = {
                 "type": event_type,
                 "usage": usage,
                 "num_turns": event.get("num_turns"),
                 "total_cost_usd": event.get("total_cost_usd"),
+                "modelUsage": event.get("modelUsage"),
             }
         elif event_type == "assistant":
             message = event.get("message")
@@ -648,6 +836,7 @@ class _JsonUsageCapture:
                 "usage": usage,
                 "num_turns": event.get("num_turns"),
                 "total_cost_usd": event.get("total_cost_usd"),
+                "modelUsage": event.get("modelUsage"),
             }
 
         if compact is None:
@@ -674,6 +863,9 @@ class _StreamingProcess:
         max_capture_chars: int = STREAM_CAPTURE_MAX_CHARS,
         process_marker: _ProcessMarker | None = None,
         lifecycle_callback: Callable[..., None] | None = None,
+        memory_lease: MemoryLease | None = None,
+        resident_limit_bytes: int | None = None,
+        emit_memory=None,
     ):
         self.proc = proc
         self.cmd = cmd
@@ -683,11 +875,83 @@ class _StreamingProcess:
         self._stderr_buf = _BoundedTextBuffer(max_capture_chars)
         self._process_group_stop_state = WorkerStopState.SURVIVING
         self._process_lifecycle_callback = lifecycle_callback
+        self._memory_lease = memory_lease
+        self._resident_limit_bytes = resident_limit_bytes
+        self._emit_memory = emit_memory
+        self.memory_failure: str | None = None
+        self.memory_sample: dict = {}
+        self._terminate_lock = asyncio.Lock()
         self._stdout_usage = _JsonUsageCapture()
         self._stdout_task = asyncio.create_task(
             self._drain(proc.stdout, self._stdout_buf, self._stdout_usage)
         )
         self._stderr_task = asyncio.create_task(self._drain(proc.stderr, self._stderr_buf))
+        self._memory_task = (
+            asyncio.create_task(self._watch_memory()) if memory_lease is not None or resident_limit_bytes is not None else None
+        )
+
+    async def _watch_memory(self) -> None:
+        last_event = 0.0
+        last_gap_event = 0.0
+        gap_since: float | None = None
+        try:
+            while self._process_group_stop_state is not WorkerStopState.STOPPED:
+                try:
+                    if self._memory_lease is not None:
+                        self.memory_sample = await _memory_operation(self._memory_lease.sample)
+                    else:
+                        marker = self._process_marker
+                        usage = await _memory_operation(lambda: markers_rss([
+                            {"token": marker.token, "created_at": marker.created_at}
+                        ]))
+                        rss = usage[marker.token][0]
+                        self.memory_sample = {
+                            "rss_bytes": rss,
+                            "worker_limit_bytes": self._resident_limit_bytes,
+                            "reason": "worker_memory_limit" if rss > self._resident_limit_bytes else None,
+                        }
+                    reason = self.memory_sample["reason"]
+                    gap_since = None
+                except Exception as exc:
+                    reason = "memory_accounting_unavailable"
+                    self.memory_sample = {
+                        "reason": reason, "error_type": type(exc).__name__, "error": str(exc)[:600],
+                    }
+                    now = time.monotonic()
+                    if gap_since is None:
+                        gap_since = now
+                    # A process hidden for under MEMORY_GAP_GRACE_S cannot have
+                    # grown far past the last good sample, while a spurious kill
+                    # wastes an hour-long paid editor.
+                    if now - gap_since < MEMORY_GAP_GRACE_S:
+                        if self._emit_memory is not None and now - last_gap_event >= 5:
+                            await self._emit_memory("cli.memory_accounting_gap", self.memory_sample)
+                            last_gap_event = now
+                        await asyncio.sleep(self._memory_lease.policy.poll_seconds if self._memory_lease is not None else 1.0)
+                        continue
+                if reason:
+                    self.memory_failure = reason
+                    # Kill before logging and without the normal five-second
+                    # grace; an allocating child can consume that headroom fast.
+                    await self.terminate()
+                if (self._emit_memory is not None and self._memory_lease is not None
+                        and self.memory_sample.get("unreadable_slots")):
+                    event = self._memory_lease.quarantine_event()
+                    if event is not None:
+                        await self._emit_memory("cli.memory_registry_quarantine", event)
+                if reason:
+                    if self._emit_memory is not None:
+                        await self._emit_memory("cli.memory_limit_exceeded", self.memory_sample)
+                    return
+                if self._emit_memory is not None and time.monotonic() - last_event >= 30:
+                    await self._emit_memory("cli.memory_usage", self.memory_sample)
+                    last_event = time.monotonic()
+                await asyncio.sleep(self._memory_lease.policy.poll_seconds if self._memory_lease is not None else 1.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.memory_failure = "memory_monitor_failed"
+            await self.terminate()
 
     @staticmethod
     async def _drain(
@@ -746,12 +1010,16 @@ class _StreamingProcess:
         return self.proc.returncode or 0
 
     async def terminate(self) -> None:
+        async with self._terminate_lock:
+            await self._terminate_locked()
+
+    async def _terminate_locked(self) -> None:
         if self._process_group_stop_state is WorkerStopState.STOPPED:
             await self._drain_pipes(timeout_s=5.0)
             return
         cleanup_succeeded = await _terminate_process_group_uninterruptibly(
             self.proc,
-            grace_s=5.0,
+            grace_s=0.0 if self.memory_failure else 5.0,
             process_marker=self._process_marker,
         )
         self._process_group_stop_state = (
@@ -764,6 +1032,12 @@ class _StreamingProcess:
                 self._process_group_stop_state,
                 launch_settled=True,
             )
+        if self._memory_task is not None and self._memory_task is not asyncio.current_task():
+            self._memory_task.cancel()
+            # Do not await while holding the terminate lock: the monitor may
+            # itself be waiting for that lock to enforce a pressure stop.
+        if self._memory_lease is not None:
+            self._memory_lease.close()
         await self._drain_pipes(timeout_s=5.0)
 
     async def _drain_pipes(self, *, timeout_s: float) -> None:

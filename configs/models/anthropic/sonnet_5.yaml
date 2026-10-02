@@ -1,0 +1,23 @@
+model: claude-sonnet-5
+api: anthropic
+max_tokens: 32000
+concurrent_requests: 16
+temperature: null
+top_p: null
+cache_write_cost: 2.5
+cache_read_cost: 0.2
+read_cost: 2
+write_cost: 10
+# Sonnet 5 rejects budget_tokens; adaptive is the only explicit config.
+thinking:
+  type: adaptive
+  display: omitted
+output_config:
+  effort: medium
+cache_control:
+  type: ephemeral
+batch_processing: false
+timeout: 900
+max_wallclock_per_call_s: 1200
+sleep_on_error: 10
+sleep_on_error_max: 60

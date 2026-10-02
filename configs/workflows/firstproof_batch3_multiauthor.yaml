@@ -1,0 +1,68 @@
+workflow: proofstack.agents.firstproof_batch3.FirstProofBatch3Workflow
+description: "Batch 3 with author_parallelism=4: asynchronous helpers run alongside the Author and critic, with durable versioned handoffs. Otherwise identical to firstproof_batch3."
+
+# Planning defaults, not permission to launch a paid run.
+budget:
+  max_usd: 1050.0
+  max_wallclock_s: 86100
+
+inputs:
+  author_parallelism: 4
+  n_rounds: 50
+  full_critic_interval: 3
+  page_limit: 16
+  enable_council: true
+  council_models:
+    - models/openai/gpt-6-astra-pro
+    - models/anthropic/fable_51
+    - models/gemini/gemini-31-pro
+  enable_compute: true
+  compute_model: gpt-6-astra
+  compute_reasoning_effort: xhigh
+  compute_cost_config: models/openai/gpt-6-astra
+  compute_sandbox_backend: subprocess
+  # Conservative starting policy for the 64 GB host; override after measurement.
+  compute_memory_gb: 8
+  compute_max_parallel_workers: 4
+  compute_memory_reserve_gb: 16
+  compute_codex_sandbox: docker-bypass
+  # Smaller than generic research defaults: all workers share the disk.
+  compute_workspace_soft_limit_bytes: 6442450944
+  compute_workspace_hard_limit_bytes: 8589934592
+  compute_filesystem_reservation_bytes: 8589934592
+  compute_filesystem_min_free_bytes: 10737418240
+  research_seconds: 82800
+  # Reserve 90 min editing, 25 min finishing/repairs, and 5 min export.
+  partial_cleanup_seconds: 7200
+  partial_cleanup_reserve_fraction: 0.15
+  max_cleanup_repairs: 8
+  # Persistent Claude Code editor; override with api to use the API editor.
+  cleanup_backend: claude_code
+
+components:
+  Author:
+    model: models/openai/gpt-6-astra-pro
+    # Used when author_parallelism > 1; see docs/multi_agent_author.md.
+    # Set subagent_model: null to use the lead's model, or role_models per role.
+    delegation:
+      asynchronous: true
+      max_tasks_per_turn: null
+      helper_timeout_s: null    # use the research deadline, not a 50-minute cutoff
+      synthesis_reserve_s: 1500  # stop helpers before the research deadline
+      subagent_model: models/openai/gpt-6-astra-pro
+      seat_max_tool_calls: null
+  ACCritic:
+    model: models/openai/gpt-6-astra-pro
+    # Missing background-note receipts must not veto a positive proof review.
+    # Detected integrity mismatches still block acceptance.
+    research_notes_transport: file
+    research_notes_verification: advisory
+    # Pro rejects explicit containers; checker-last mitigates auto-container expiry.
+    research_notes_container: auto
+    max_hosted_tool_calls: 30
+  Batch3CleanupCritic:
+    model: models/openai/gpt-6-astra-pro
+  RewriteSeat:
+    model: models/openai/gpt-6-astra-pro
+  RepairSeat:
+    model: models/openai/gpt-6-astra-pro

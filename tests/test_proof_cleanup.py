@@ -98,26 +98,26 @@ def test_presets_validate(name):
     assert report["ok"], report["errors"]
 
 
-def test_file_changes_invalidate_editors_but_unchanged_content_is_reused(offline):
+def test_file_changes_invalidate_editor_but_unchanged_content_is_reused(offline):
     execute, calls, _, original, bib, _ = offline
     first = execute()
     assert first["error"] is None
     assert first["status"] == "done"
-    assert first["answer_tex"] == "ORIGINAL PROOF EDITED EDITED"
+    assert first["answer_tex"] == "ORIGINAL PROOF EDITED"
     assert original.read_text() == "ORIGINAL PROOF"
     Path(first["answer_tex_path"]).unlink()
     repeated = execute()
     assert Path(repeated["answer_tex_path"]).read_text() == first["answer_tex"]
-    assert calls == {"scholarship_audit_editor": 1, "writing_editor": 1}
+    assert calls == {"scholarship_audit_editor": 1}
 
     original.write_text("UPDATED PROOF")
     updated = execute()
-    assert updated["answer_tex"] == "UPDATED PROOF EDITED EDITED"
-    assert calls == {"scholarship_audit_editor": 2, "writing_editor": 2}
+    assert updated["answer_tex"] == "UPDATED PROOF EDITED"
+    assert calls == {"scholarship_audit_editor": 2}
 
     bib.write_text("@book{b,title={Updated}}")
     assert execute()["references_bib"] == bib.read_text()
-    assert calls == {"scholarship_audit_editor": 3, "writing_editor": 3}
+    assert calls == {"scholarship_audit_editor": 3}
 
 
 @pytest.mark.parametrize("field", ["answer_tex_path", "references_bib_path"])
@@ -133,18 +133,18 @@ def test_missing_file_can_be_repaired_and_retried(offline, tmp_path, field):
     result = execute(**{field: missing})
     assert result["error"] is None
     assert result["status"] == "done"
-    assert calls == {"scholarship_audit_editor": 1, "writing_editor": 1}
+    assert calls == {"scholarship_audit_editor": 1}
 
 
 def test_inline_proof_and_empty_bibliography(offline):
     execute, _, _, _, _, _ = offline
     result = execute(answer_tex_path="", references_bib_path="", answer_tex="INLINE", references_bib="")
-    assert result["answer_tex"] == "INLINE EDITED EDITED"
+    assert result["answer_tex"] == "INLINE EDITED"
     assert result["references_bib"] == ""
     assert result["status"] == "done"
 
 
-@pytest.mark.parametrize("stage", ["scholarship_audit_editor", "writing_editor", "fresh_critic"])
+@pytest.mark.parametrize("stage", ["scholarship_audit_editor", "fresh_critic"])
 def test_editor_and_critic_errors_are_resumable_without_repeating_successful_edits(offline, stage):
     execute, calls, failures, original, _, _ = offline
     failures[stage] = RuntimeError("temporary provider outage")
@@ -161,9 +161,10 @@ def test_editor_and_critic_errors_are_resumable_without_repeating_successful_edi
     assert result["error"] is None
     assert result["final_critic_answer_ready"] is True
     assert calls[stage] == 2
-    for earlier in ["scholarship_audit_editor", "writing_editor"]:
-        if earlier != stage:
-            assert calls[earlier] == 1
+    if stage == "fresh_critic":
+        assert calls["scholarship_audit_editor"] == 1
+    else:
+        assert calls["fresh_critic"] == 1
     assert original.read_text() == "ORIGINAL PROOF"
 
 

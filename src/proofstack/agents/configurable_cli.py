@@ -26,6 +26,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from proofstack.cli_usage import (
+    cost_for_claude_usage,
     cost_for_codex_usage,
     load_cost_rates,
     parse_claude_json,
@@ -99,7 +100,25 @@ class ConfigurableCLIAgent(CLIAgent):
         self.COMPLETION_SIGNAL = completion_signal
 
         self._paid_codex_cost_rates: dict[str, Any] | None = None
+        self._paid_claude_cost_rates: dict[str, Any] | None = None
         usage_cfg = self.component_config.get("usage") or {}
+        if isinstance(usage_cfg, dict) and usage_cfg.get("type") == "claude_json":
+            auth_mode = usage_cfg.get("auth_mode", "subscription")
+            if not isinstance(auth_mode, str) or auth_mode not in {"subscription", "api"}:
+                raise ValueError("Claude usage.auth_mode must be 'subscription' or 'api'")
+            if auth_mode == "api":
+                cfg_ref = usage_cfg.get("cost_config")
+                if not isinstance(cfg_ref, str) or not cfg_ref.strip():
+                    raise ValueError("Paid Claude usage requires a model cost_config")
+                try:
+                    self._paid_claude_cost_rates = load_cost_rates(
+                        cfg_ref, require_cache_rates=True
+                    )
+                except (KeyError, OSError, TypeError, ValueError) as e:
+                    raise ValueError(
+                        "Paid Claude cost configuration must be valid before the "
+                        f"component starts ({cfg_ref}): {type(e).__name__}: {e}"
+                    ) from e
         if (
             isinstance(usage_cfg, dict)
             and usage_cfg.get("type") == "codex_jsonl"
@@ -488,6 +507,31 @@ class ConfigurableCLIAgent(CLIAgent):
             if state is None:
                 raise RuntimeError("Codex authentication was not prepared before process spawn")
             env["CODEX_HOME"] = state[1]
+        if self._claude_api_auth_enabled():
+            if resolve_backend(sandbox.spec) == "docker":
+                effective_env = {
+                    key: os.environ[key]
+                    for key in sandbox.spec.provider_keys if key in os.environ
+                }
+                effective_env.update(env)
+                effective_env.update(sandbox.spec.extra_env)
+            else:
+                effective_env = sandbox.spec.build_env(sandbox_root=sandbox.root)
+                effective_env.update(env)
+            if not str(effective_env.get("ANTHROPIC_API_KEY", "")).strip():
+                raise RuntimeError(
+                    "Paid Claude API authentication requires ANTHROPIC_API_KEY "
+                    "in the sandbox environment before process spawn"
+                )
+            for key in (
+                "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+            ):
+                value = str(effective_env.get(key, "")).strip()
+                disabled = key.startswith("CLAUDE_CODE_USE_") and value.lower() in {"0", "false"}
+                if value and not disabled:
+                    raise RuntimeError(f"Paid Claude API authentication conflicts with {key}")
         return env
 
     async def collect(
@@ -566,15 +610,17 @@ class ConfigurableCLIAgent(CLIAgent):
 
     def cli_usage_must_succeed(self) -> bool:
         usage_cfg = self.component_config.get("usage")
-        return bool(
+        return self._claude_api_auth_enabled() or bool(
             isinstance(usage_cfg, dict)
             and usage_cfg.get("type") == "codex_jsonl"
             and not self._copied_codex_auth
         )
 
     def _claude_model_name(self) -> str:
+        usage_cfg = self.component_config.get("usage") or {}
         return str(
-            self.component_config.get("model") or _model_from_cmd(self.CLI_CMD) or "claude"
+            self.component_config.get("model") or usage_cfg.get("model")
+            or _model_from_cmd(self.CLI_CMD) or "claude"
         )
 
     def _codex_model_name(self, usage_cfg: dict[str, Any] | None = None) -> str:
@@ -590,15 +636,24 @@ class ConfigurableCLIAgent(CLIAgent):
 
     async def _record_claude_usage(self, stdout_text: str) -> None:
         usage = parse_claude_json(stdout_text)
+        paid = self._claude_api_auth_enabled()
+        cost = usage.total_cost_usd
+        cfg_ref = None
+        if paid:
+            cfg_ref = self.component_config["usage"]["cost_config"]
+            if self._paid_claude_cost_rates is None:
+                raise RuntimeError("Paid Claude cost configuration was not validated")
+            cost = cost_for_claude_usage(usage, expected_model=self._claude_model_name(),
+                                        **self._paid_claude_cost_rates)
+        tokens = usage.metered_tokens
+        if usage.has_result:
+            cost, tokens = self._claude_process_share(usage, cost, tokens)
+        if paid:
+            self.tracker.add_usd(cost)
         if not usage.found:
             return
-        # Charge tokens (gated by max_tokens) but NOT usd: a subscription run has
-        # no API spend, and add_usd would trip the max_usd: 0.0 gate. Tokens are
-        # the real subscription limit (Anthropic's rolling token window). We meter
-        # the full throughput (input + cache create + cache read + output): cache
-        # reads dominate an agentic loop and counting only input+output undercounts
-        # ~40x. All categories are recorded below so the weighting stays visible.
-        self.tracker.add_tokens(usage.metered_tokens)
+        # Cache reads/writes are separate token categories in Claude usage.
+        self.tracker.add_tokens(tokens)
         model = self._claude_model_name()
         await self.events.emit(
             "model.call",
@@ -608,12 +663,22 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cache_creation_in_tokens": usage.cache_creation_input_tokens,
                 "cached_in_tokens": usage.cache_read_input_tokens,
                 "out_tokens": usage.output_tokens,
-                "metered_tokens": usage.metered_tokens,
-                "cost_usd": usage.total_cost_usd,
+                "metered_tokens": tokens,
+                "cost_usd": cost,
+                "cost_estimated": paid and usage.cost_estimated,
+                "cli_reported_cost_usd": usage.total_cost_usd,
+                "cost_config": cfg_ref,
+                "auth_mode": "api" if paid else "subscription",
                 "n_turns": usage.num_turns,
                 "via": "claude_exec_json",
             },
         )
+        # The CLI lifecycle checks limits after collecting completed artifacts.
+        # A fully recorded overrun is not an accounting failure.
+
+    def _claude_process_share(self, usage, cost, tokens):
+        """Hook for resumed sessions, whose result totals are cumulative."""
+        return cost, tokens
 
     def _command_for(self, inp: BaseModel) -> list[str]:
         fields = self._fields(inp)
@@ -664,12 +729,23 @@ class ConfigurableCLIAgent(CLIAgent):
     def _copy_codex_auth_enabled(self) -> bool:
         return bool(self.component_config.get("copy_codex_auth"))
 
+    def _claude_api_auth_enabled(self) -> bool:
+        usage = self.component_config.get("usage")
+        return bool(
+            isinstance(usage, dict)
+            and usage.get("type") == "claude_json"
+            and usage.get("auth_mode", "subscription") == "api"
+        )
+
     def _subscription_api_key_envs(self) -> set[str]:
         keys: set[str] = set()
         if self._copy_codex_auth_enabled():
             keys.add("OPENAI_API_KEY")
         usage = self.component_config.get("usage")
-        if isinstance(usage, dict) and usage.get("type") == "claude_json":
+        if (
+            isinstance(usage, dict) and usage.get("type") == "claude_json"
+            and not self._claude_api_auth_enabled()
+        ):
             keys.add("ANTHROPIC_API_KEY")
         return keys
 

@@ -20,10 +20,12 @@ image from ``deploy/sandbox/Dockerfile``.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import os
 import re
 import stat
+import subprocess
 import tempfile
 import time
 import uuid
@@ -42,6 +44,19 @@ from proofstack.sandbox.subprocess import _StreamingProcess
 
 class DockerSandboxError(RuntimeError):
     """Raised when docker is missing / image is not built / etc."""
+
+
+@functools.lru_cache(maxsize=1)
+def _docker_is_podman() -> bool:
+    """True when the local ``docker`` binary is the podman docker-CLI shim
+    (e.g. the ETH ada hosts), which needs ``--userns=keep-id``."""
+    try:
+        out = subprocess.check_output(
+            ["docker", "--version"], text=True, stderr=subprocess.DEVNULL, timeout=2
+        )
+    except Exception:
+        return False
+    return "podman" in out.lower()
 
 
 class DockerSandboxSpawnError(DockerSandboxError, SandboxSpawnError):
@@ -707,6 +722,13 @@ class DockerSandbox(Sandbox):
             "--cap-drop", "ALL",
             "--network", self.spec.docker_network,
             "--user", f"{os.getuid()}:{os.getgid()}",
+        ]
+        # Rootless podman + --user host_uid:gid fails with
+        # ``crun: setgroups: Invalid argument`` unless the user namespace
+        # keeps the host id; real docker rejects the flag.
+        if _docker_is_podman():
+            args += ["--userns=keep-id"]
+        args += [
             # Docker treats relative source paths as named volumes, so
             # resolve to an absolute host path. RunContext.create can keep
             # the workdir relative (e.g. `--output outputs`), which would

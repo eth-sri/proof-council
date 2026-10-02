@@ -1,0 +1,65 @@
+# Standalone preset for the WriteupLoop node — live testing through the
+# normal workflow CLI (this exact form is what the smoke runs used):
+#
+#   uv run python scripts/run_workflow.py --workflow writeup_loop \
+#     --problem-text "" --problem-id demo \
+#     --input document_text="$(cat /path/to/note.tex)"
+#
+# In competition use the node is meant to be composed into the FirstProof
+# submission DAG between the AC loop's answer.tex and submission; this
+# preset exists so the node can be exercised and smoked on its own.
+#
+# Seat implementation: `api` (default — OpenAI Responses API, billed to an
+# API key) or `cli` (codex exec on the ChatGPT subscription, $0). Same
+# frozen prompts, same gates, same model family either way. To run the
+# subscription variant without editing this file:
+#
+#   uv run python scripts/run_workflow.py --workflow writeup_loop \
+#     --problem-text "" --problem-id demo \
+#     --component WriteupLoop.seat=cli \
+#     --input document_text="$(cat /path/to/note.tex)"
+workflow: proofstack.agents.dag_workflow.DAGWorkflow
+description: 'Fallback, not the default write-up node (use cleanup_session / firstproof_batch3). Guide-driven rewrite + cold-referee/repair loop for a single write-up.'
+budget:
+  max_usd: 20.0
+  max_wallclock_s: 7200
+components:
+  WriteupLoop:
+    # api | cli. Changing this default changes what every existing caller bills.
+    seat: api
+    # Read only when seat: cli. cli_model is a plain string, so moving to a
+    # future model is a one-line change.
+    # David 2026-09-06: GPT-6 for every subsequent proof-council GPT call.
+    cli_model: gpt-6-astra
+    cli_reasoning_effort: max
+    cli_codex_bin: ~/.local/bin/codex
+    cli_web_search: true
+    # Ignore ~/.codex/config.toml: keeps its `personality` directive out of a
+    # frozen-prompt writing task, and pins the seat to the ChatGPT login so a
+    # codex-billing switch to the API provider cannot make this run billable.
+    cli_ignore_user_config: true
+dag:
+  nodes:
+  - id: polish
+    kind: agent
+    agent: proofstack.agents.writeup_loop.WriteupLoop
+    name: writeup_loop
+    inputs:
+      document_text: $input.document_text
+      bib_text: $input.bib_text
+      research_notes_text: $input.research_notes_text
+      page_limit: $input.page_limit
+      rounds: $input.rounds
+  outputs:
+    document_text: $node.polish.document_text
+    shipped: $node.polish.shipped
+    improved: $node.polish.improved
+    steps: $node.polish.steps
+    flags: $node.polish.flags
+    error: $node.polish.error
+    usd_total: $node.polish.usd_total
+inputs:
+  bib_text: null
+  research_notes_text: null
+  page_limit: null
+  rounds: 2

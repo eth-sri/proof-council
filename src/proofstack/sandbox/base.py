@@ -11,6 +11,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Literal, Mapping
 
+from proofstack.sandbox.memory import MemoryPolicy
+
 
 SandboxBackend = Literal["subprocess", "docker"]
 
@@ -49,6 +51,10 @@ class SandboxSpec:
 
     cpu_limit: int = 2
     memory_gb: int = 4
+    # V8 reserves far more virtual address space than resident memory. CLI
+    # runtimes opting out of RLIMIT_AS use the process-tree RSS monitor instead.
+    limit_address_space: bool = True
+    memory_policy: MemoryPolicy | None = None
     timeout_s: int = 900
     env_allowlist: tuple[str, ...] = DEFAULT_ENV_ALLOWLIST
     extra_env: Mapping[str, str] = field(default_factory=dict)

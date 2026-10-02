@@ -24,8 +24,9 @@ RUN apt-get update \
         poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Codex CLI. GPT-5.6 Sol and max effort require a current runtime.
-ARG OPENAI_CODEX_VERSION=0.144.0
+# Codex CLI. GPT-6 Astra (xhigh) requires a current runtime; 0.152 still
+# rejected the model, 0.154.0 accepts it.
+ARG OPENAI_CODEX_VERSION=0.154.0
 RUN npm install -g @openai/codex@${OPENAI_CODEX_VERSION} \
     && codex --version | grep -q -- "${OPENAI_CODEX_VERSION}"
 

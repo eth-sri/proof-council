@@ -1,0 +1,5 @@
+base: models/openai/gpt-6-astra
+model: gpt-6-astra--max
+background_timeout_downgrade_after: 1
+background_timeout_reasoning_efforts:
+  - high

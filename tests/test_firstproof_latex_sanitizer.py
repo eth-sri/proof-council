@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -36,6 +37,38 @@ def _load_module():
 
 
 ep = _load_module()
+
+
+class SubmissionNormalizationTests(unittest.TestCase):
+    def test_whitespace_runs_reach_a_fixed_point(self) -> None:
+        for whitespace in ("", " ", "\t", " \t "):
+            for count in (1, 2, 4, 7, 31, 128):
+                with self.subTest(whitespace=whitespace, count=count):
+                    tex = (
+                        "\\documentclass[12pt]{article}\n\\begin{document}\nA.\n"
+                        + (whitespace + "\n") * count
+                        + "B.\n\\end{document}"
+                    )
+                    normalized = ep.normalize_submission_latex(tex)
+                    self.assertEqual(ep.normalize_submission_latex(normalized), normalized)
+                    self.assertIn("A.", normalized)
+                    self.assertIn("B.", normalized)
+
+    def test_package_repair_and_removals_are_stable_together(self) -> None:
+        tex = (
+            "\\documentclass[10pt]{article}\n\\usepackage{geometry}\n"
+            "\\begin{document}\nA.\n \n \n \n \n"
+            "\\textcolor{red}{B.}\\end{document}"
+        )
+        removals = []
+        normalized = ep.normalize_submission_latex(tex, removals=removals)
+        self.assertIn("\\documentclass[12pt]{article}", normalized)
+        self.assertNotIn("geometry", normalized)
+        self.assertEqual(normalized.count("\\usepackage{xcolor}"), 1)
+        self.assertTrue(removals)
+        second_removals = []
+        self.assertEqual(ep.normalize_submission_latex(normalized, removals=second_removals), normalized)
+        self.assertEqual(second_removals, [])
 
 
 class StripForbiddenPackagesTests(unittest.TestCase):
@@ -272,6 +305,102 @@ class FinalSubmissionCompileTests(unittest.TestCase):
             output_tex_path=output_dir / "prob-001.tex",
             run_id="firstproof-prob-001",
         )
+
+    def test_final_compile_resolves_references_before_counting_pages(self) -> None:
+        tex = "exact source bytes\n"
+        calls = []
+
+        def run(cmd, **kwargs):
+            work = kwargs["cwd"]
+            self.assertEqual((work / "solution.tex").read_text(), tex)
+            if calls:
+                self.assertEqual(work, calls[0]["cwd"])
+                self.assertEqual((work / "solution.aux").read_text(), "labels")
+            (work / "solution.aux").write_text("labels")
+            (work / "solution.pdf").write_text("17" if not calls else "16")
+            calls.append(kwargs)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch.object(ep, "_run_validation_command", side_effect=run), patch.object(
+            ep, "_count_pdf_pages", side_effect=lambda path, **kwargs: int(path.read_text())
+        ) as count_pages, patch.object(ep.time, "monotonic", side_effect=[100, 140]):
+            ok, detail = ep._compile_exact_latex(tex, page_limit=16)
+
+        self.assertTrue(ok, detail)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call["deadline"] for call in calls], [220, 220])
+        count_pages.assert_called_once()
+
+    def test_final_compile_rejects_failed_pass_even_with_previous_pdf(self) -> None:
+        for failed_pass in (1, 2):
+            with self.subTest(failed_pass=failed_pass):
+                calls = []
+
+                def run(cmd, **kwargs):
+                    calls.append(cmd)
+                    work = kwargs["cwd"]
+                    (work / "solution.pdf").write_text("stale PDF")
+                    (work / "solution.log").write_text("compile failure")
+                    return subprocess.CompletedProcess(cmd, int(len(calls) == failed_pass))
+
+                with patch.object(ep, "_run_validation_command", side_effect=run), patch.object(
+                    ep, "_count_pdf_pages", return_value=1
+                ) as count_pages:
+                    ok, detail = ep._compile_exact_latex("source", page_limit=16)
+
+                self.assertFalse(ok)
+                self.assertIn("exited with 1", detail)
+                self.assertEqual(len(calls), failed_pass)
+                count_pages.assert_not_called()
+
+    def test_final_compile_stops_when_shared_timeout_is_exhausted(self) -> None:
+        from proofstack.agents.writeup_loop import _kill_compiler  # noqa: F401
+
+        clock = [100.0]
+        def communicate(*, timeout):
+            self.assertEqual(timeout, 120)
+            clock[0] = 221
+            return b"", b""
+
+        with patch.object(
+            ep.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(ep.subprocess, "Popen") as spawn:
+            spawn.return_value.communicate.side_effect = communicate
+            spawn.return_value.returncode = 0
+            ok, detail = ep._compile_exact_latex("source", page_limit=16)
+
+        self.assertFalse(ok)
+        self.assertIn("timed out", detail)
+        spawn.assert_called_once()
+
+    @unittest.skipIf(shutil.which("pdflatex") is None, "pdflatex not installed")
+    def test_adapter_retains_workflow_validated_manuscript_at_page_limit(self) -> None:
+        from proofstack.agents.writeup_loop import _compile_raw
+
+        tex = ep.normalize_submission_latex(
+            r"\documentclass[12pt]{article}" + "\n"
+            + r"\begin{document}\newcounter{claim}\refstepcounter{claim}\label{claim}" + "\n"
+            + (r"Fixed page.\newpage" + "\n") * 10
+            + (r"Reference \ref{claim}. ") * 1200
+            + "\n" + r"\end{document}"
+        )
+        compiled, pages, note = _compile_raw(tex, None, secure=True, pass_timeout=20)
+        self.assertTrue(compiled, note)
+        self.assertEqual(pages, 16)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            solution = output_dir / "accepted.tex"
+            solution.write_text(tex)
+            settings = replace(self._settings(output_dir), page_limit=16)
+            latex, status, _, rejected = asyncio.run(ep._verified_solution_or_fallback(
+                self._problem(output_dir), settings, solution_path=solution,
+                reason="run ended", fallback_status="fallback", solution_status="ok",
+                log_context="page-limit regression",
+            ))
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(latex, tex)
+        self.assertIsNone(rejected)
 
     @unittest.skipIf(shutil.which("pdflatex") is None, "pdflatex not installed")
     def test_adapter_recompiles_normalized_final_tex_before_ok_status(self) -> None:

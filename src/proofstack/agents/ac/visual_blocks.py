@@ -101,7 +101,7 @@ class ACInitBlock(ACWorkflow):
         )
         if resume_state is not None:
             self._restore_workspace_from_resume(workspace, resume_state)
-            self._apply_resume_budget_offset()
+            await self._apply_resume_budget_offset()
             await self.events.emit(
                 "ac.resume",
                 {
@@ -193,6 +193,8 @@ class ACInitBlock(ACWorkflow):
             "early_stopped": early_stopped,
             "awaiting_review_round": awaiting_review_round,
             "awaiting_review_kind": str((resume_state or {}).get("awaiting_review_kind", "") or ""),
+            "awaiting_review_context": (resume_state or {}).get("awaiting_review_context"),
+            "n_rounds_at_checkpoint": (resume_state or {}).get("n_rounds_at_checkpoint"),
             "awaiting_author": (resume_state or {}).get("awaiting_author"),
             "awaiting_finalization": awaiting_finalization,
             "finalize_without_rounds": finalize_without_rounds,
@@ -296,6 +298,7 @@ class ACAuthorBlock(_ACVisualStep):
         if state.get("loop_done"):
             return self.Outputs(state=state)
         ac_inp = self._inp(state)
+        self.author.author_parallelism = ac_inp.author_parallelism
         workspace = self._workspace(state)
 
         awaiting_review_round = state.get("awaiting_review_round")
@@ -330,7 +333,7 @@ class ACAuthorBlock(_ACVisualStep):
                 prev_compute = str(state.get("pending_compute_text") or "")
                 compute_zip_path = self._decode_run_path(state.get("pending_compute_zip_path"))
 
-            author = await self.author(
+            author = await self._call_author(workspace,
                 **self._author_inputs(
                     inp=ac_inp,
                     workspace=workspace,
@@ -365,6 +368,8 @@ class ACAuthorBlock(_ACVisualStep):
                 critic_conversation=list(state.get("critic_conversation") or []),
                 critic_instance_turn=int(state.get("critic_instance_turn", 0) or 0),
                 awaiting_review_kind=str(state.get("awaiting_review_kind") or ""),
+                pending_review=state.get("awaiting_review_context"),
+                previous_n_rounds=state.get("n_rounds_at_checkpoint"),
             )
         elif k <= 0:
             mode, conversation, instance_turn, omit_thinking = "fresh", [], 0, False
@@ -502,6 +507,7 @@ class ACFreshCriticBlock(_ACVisualStep):
             stateful = self._review(state.get("stateful_review"))
             should_force = (
                 stateful is not None
+                and stateful.mode == "stateful"
                 and author.ready
                 and stateful.answer_ready
                 and not bool(state.get("run_compute"))
@@ -671,7 +677,9 @@ class ACReviewJoinBlock(_ACVisualStep):
         reviews.append(review)
         state["review_history"] = [item.model_dump(mode="json") for item in reviews]
         state["critic_conversation"] = list(review.messages_after)
-        state["critic_instance_turn"] = int(state.get("critic_instance_turn", 0) or 0) + 1
+        state["critic_instance_turn"] = (
+            1 if review.mode == "fresh" else int(state.get("critic_instance_turn", 0) or 0) + 1
+        )
         self._write_review_artifacts(workspace, review, round=k)
 
         compute_blocks_ship = compute_out is not None
@@ -685,8 +693,8 @@ class ACReviewJoinBlock(_ACVisualStep):
 
         ready_for_gate = False
         if author.ready and review.answer_ready and not compute_blocks_ship and not state.get("terminal_auxiliary_blocked"):
-            if review.mode == "stateful":
-                forced = self._review(state.get("forced_fresh_review"))
+            forced = self._review(state.get("forced_fresh_review"))
+            if review.mode == "stateful" or forced is not None:
                 if forced is not None and not forced.answer_ready:
                     state["critic_conversation"] = list(forced.messages_after)
                     state["critic_instance_turn"] = 1

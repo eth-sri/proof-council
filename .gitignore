@@ -8,11 +8,32 @@ outputs/
 smoke-input/
 smoke-output/
 private_problems/
+# Research inputs and archives stay private; only a generic example is shipped.
+/problems/*
+!/problems/example.txt
+/archive/
+/lean/
+/PRIVATE_DEVELOPMENT.md
+/ProofCouncil.pdf
+/test_run_problems/
+/output/
 uv.lock
 brainstorming
 .claude
 .codex
 .env
+# Private credentials, local run configuration, and diagnostic artifacts.
+.env.*
+*.env
+secrets.env*
+!.env.example
+!*.env.example
+!secrets.env.example
+auth.json
+*.pem
+*.key
+*.log
+/local-artifacts/
 # Local smoke secrets (real API keys). The .example template is tracked;
 # the filled-in copy must not be.
 smoke/secrets.env

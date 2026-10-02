@@ -17,6 +17,14 @@ Good examples to copy:
 - `configs/workflows/author_critic.yaml` for a repeat loop, council/compute branches, and compile gating.
 - `configs/workflows/firstproof_smoke_fast.yaml` for a cheap harness smoke preset built from the same Author/Critic blocks.
 
+## Write-up / cleanup nodes: which to use
+
+In order of preference (class, module and preset names are unchanged, so older references still work):
+
+- **`CleanupSession`** (`proofstack.agents.cleanup_session`; preset `cleanup_session`, and inside `firstproof_batch3` / `firstproof_batch3_multiauthor` with `cleanup_backend: claude_code`) — the default, as submitted to First Proof Batch 3. Use it for any new write-up or cleanup work; see `docs/cleanup_session.md`.
+- **`WriteupLoop`** (`proofstack.agents.writeup_loop`; presets `writeup_loop`, `writeup_loop_chain4`; its `RewriteSeat`/`RepairSeat` also back `cleanup_backend: api`) — cheaper fallback without a Claude Code session: rewrite, then cold referee and repair. Use it when CleanupSession is too expensive or Claude Code is unavailable.
+- **`ProofCleanupWorkflow` / `AuthorCriticCleanupWorkflow`** (`proofstack.agents.proof_cleanup`; presets `proof_cleanup`, `author_critic_cleanup`) — older upstream approaches. Use them only to reproduce or compare with upstream runs.
+
 ## References
 
 - Workflow inputs: `$input.problem`, `$input.solution`, etc.

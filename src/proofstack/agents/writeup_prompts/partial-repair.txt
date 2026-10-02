@@ -1,0 +1,23 @@
+The following is an UNSOLVED attempt, not an accepted proof:
+
+<document>
+{{document}}
+</document>
+
+The harness compiled this exact candidate and checked its page count:
+
+<mechanical_report>
+{{mechanical findings}}
+</mechanical_report>
+
+Make only the smallest changes needed to fix the reported LaTeX errors or to
+shorten the manuscript below the page target. Remove repetition and nonessential
+exposition, never essential arguments, hypotheses, conditions or unresolved gaps.
+Keep the visible unreviewed-partial notice. Do not research the problem, add new
+mathematics, or turn conditional or incomplete results into a claimed solution.
+This is a mechanical repair, not a mathematical review; no critic follows it.
+
+Return the complete corrected standalone LaTeX document. If the requested changes
+would require new mathematics or dropping essential content, return UNABLE: with
+the reason. Lack of access to a compiler is not a reason to return UNABLE:; the
+harness, not you, compiles the result and measures its pages.

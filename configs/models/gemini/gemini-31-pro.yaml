@@ -15,6 +15,11 @@ timeout: 900
 max_wallclock_per_call_s: 1200
 sleep_on_error: 10
 sleep_on_error_max: 60
+# Calls whose tools are all provider-managed (code_interpreter ->
+# codeExecution, web search -> googleSearch) use the native generateContent
+# endpoint; tool-less calls and calls with local function tools keep going
+# through the OpenAI-compatible endpoint.
+use_gdm_tools: true
 extra_body:
   extra_body:
     google:

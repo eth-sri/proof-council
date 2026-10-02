@@ -584,7 +584,7 @@ async def amain() -> int:
     print(f"output: {ctx.root_workdir}")
     print("outputs:")
     print(json.dumps(out_json, ensure_ascii=False, indent=2, default=str))
-    return 0
+    return 1 if status == "error" else 0
 
 
 async def _drain_monitor(ctx: RunContext) -> None:
@@ -607,7 +607,31 @@ def _run_metadata(ctx: RunContext, extra: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> int:
-    return asyncio.run(amain())
+    return asyncio.run(_run_with_stop_signals(amain))
+
+
+async def _run_with_stop_signals(run):
+    import signal
+
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    stopping = False
+
+    def stop():
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, stop)
+    try:
+        return await run()
+    except asyncio.CancelledError:
+        if stopping:
+            return 128 + signal.SIGTERM
+        raise
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 def _workflow_structure_for_monitor(raw: dict[str, Any]) -> dict[str, Any]:

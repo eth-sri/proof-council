@@ -329,6 +329,9 @@ def normalize_monitor_model_spec(model: ModelSpec) -> ModelSpec:
         return model
     raw = model.strip()
     aliases = {
+        "gpt-6-astra": "models/openai/gpt-6-astra",
+        "gpt-6-astra--max": "models/openai/gpt-6-astra-max",
+        "gpt-6-astra-pro": "models/openai/gpt-6-astra-pro",
         "gpt-5.6": "models/openai/gpt-56-sol",
         "gpt-5.6-sol": "models/openai/gpt-56-sol",
         "gpt-5.6-sol--max": "models/openai/gpt-56-sol-max",

@@ -1,12 +1,20 @@
 # ProofCouncil — project description
 
-This repository will be the implementation of ProofCouncil, an autonomous
-math-research agent system targeting the **First Proof Foundation, Second Batch**
-benchmark (June 2026). Beyond the benchmark, the same system is intended
-to grow into a human-in-the-loop research assistant for mathematicians.
+## Repository scope
+
+ProofCouncil is an autonomous math-research agent system for First Proof and
+human-in-the-loop mathematical research. Keep private problem statements,
+manuscripts, run transcripts, credentials, and infrastructure notes outside
+version control. Use synthetic fixtures for tests and generic examples in docs.
+See `docs/public_release.md` before publishing source: removing a file from the
+current tree does not remove its history. Do not publish to another remote or
+change repository visibility without explicit authorization. Paid runs require
+an explicitly authorized budget.
 
 `configs/workflows/instructions.md` is the current source of truth for
-workflow syntax and reusable YAML components.
+workflow syntax and reusable YAML components. For write-ups, `CleanupSession`
+is the default node; the others are fallbacks (see "Write-up / cleanup nodes"
+there).
 
 ---
 
@@ -37,7 +45,7 @@ src/proofstack/      # Workflow/agent runtime
 configs/             # YAML configs (models/, tools/, workflows/)
 app/                 # Flask developer dashboard
 scripts/             # CLI entry points
-problems/            # Plain-text problem files
+problems/            # Local problems (ignored except the generic example)
 outputs/             # Run artifacts (JSON; gitignored)
 solutions/           # Plain-text final answers (gitignored)
 ```

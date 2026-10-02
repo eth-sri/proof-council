@@ -373,19 +373,22 @@ class AnthropicContainerFileBridge:
 
 
 def find_container_id(conversation: Iterable[dict]) -> str | None:
-    """Walk a matharena conversation log and return the first
+    """Walk a matharena conversation log and return the last
     ``code_interpreter_call`` entry's ``container_id``.
 
-    All ``code_interpreter_call`` items in a single Responses-API turn
-    share the same container id (until OpenAI changes that), so the
-    first hit is sufficient.
+    Within one Responses request all ``code_interpreter_call`` items
+    share a container. A local function tool (MultiAuthor's ``delegate``)
+    splits the turn into several requests; if the container expired while
+    the tool ran, later requests get a fresh one, and the final file
+    writes live there.
     """
+    last: str | None = None
     for msg in conversation:
         if isinstance(msg, dict) and msg.get("type") == "code_interpreter_call":
             cid = msg.get("container_id")
             if cid:
-                return str(cid)
-    return None
+                last = str(cid)
+    return last
 
 
 def _attachment_upload_failure(

@@ -8,6 +8,11 @@ import tempfile
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import ContextVar, copy_context
+import threading
+from queue import Queue, Empty
+import math
+from dataclasses import dataclass
 from datetime import datetime
 
 import anthropic
@@ -22,13 +27,27 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from mathagents.request_logger import request_logger
+from mathagents.provider_trace import ProviderTrace, ProviderAccountingError, active_trace, active_attempt, COUNTS
 from mathagents.utils import check_for_extra_keys
 
+# Ask for the visible reply, not extraction of private reasoning. The latter
+# can trigger stop_details.category=reasoning_extraction even when replaying
+# a valid thinking block.
 _ANTHROPIC_FINAL_ANSWER_SALVAGE_PROMPT = (
-    "Your previous turn appears to have used its generation budget before producing visible text. "
-    "Use the reasoning represented in that previous assistant turn and now output only the final visible response. "
-    "Target at most 1000 words. If more is genuinely necessary, include it rather than stopping early. "
-    "Do not include scratchwork, hidden reasoning, tool requests, or full generated file bodies."
+    "Your previous turn ended without any visible reply. Please now write your reply to the "
+    "request above, in the format the task requires. Target at most 1000 words unless the task "
+    "genuinely needs more (for example complete file contents). If you are unsure about a point, say so."
+)
+
+_OPENAI_MAX_OUTPUT_TOKENS_WRAPUP_PROMPT = (
+    "Your previous turn stopped because it reached the maximum output-token limit "
+    "(incomplete_details.reason=max_output_tokens), so its visible output is missing or truncated "
+    "and will be discarded; only this reply is read. Do not redo research or tool work that is "
+    "already done above - build on it. Wrap up now: finish any pending file edits (if your work is "
+    "transmitted via files, write the complete final versions), then write your complete, "
+    "self-contained final response in the exact output format the task requires. Everything the "
+    "format needs, including any full file contents, must appear in this single reply; do not write "
+    "a continuation fragment. Keep any further reasoning brief."
 )
 
 try:
@@ -120,6 +139,26 @@ class _ProviderWallclockTimeout(TimeoutError):
     pass
 
 
+class RequiredHostedToolUnavailable(ValueError):
+    """A retry cannot perform mandatory tool work within its remaining allowance."""
+
+
+@dataclass
+class _ResponsesRetryState:
+    owner: object
+    started_at: float
+    pro_failures: int = 0
+    background_timeouts: int = 0
+    hosted_tool_calls_used: int = 0
+
+
+# One state per logical query, shared by its inner/outer retries but not by
+# concurrent queries using the same APIClient (or by nested tool calls).
+_responses_retry_state: ContextVar[_ResponsesRetryState | None] = ContextVar(
+    "responses_retry_state", default=None,
+)
+
+
 def _estimate_salvaged_usage(
     payload: dict, output_items: list
 ) -> tuple[int, int]:
@@ -193,6 +232,31 @@ def _openai_responses_tool_descriptor(tool_desc):
     return desc
 
 
+def _openai_response_hit_max_output_tokens(response) -> bool:
+    if getattr(response, "status", None) != "incomplete":
+        return False
+    details = getattr(response, "incomplete_details", None)
+    if isinstance(details, dict):
+        reason = details.get("reason")
+    else:
+        reason = getattr(details, "reason", None)
+    return reason == "max_output_tokens"
+
+
+def _drop_trailing_reasoning_items(conversation: list) -> int:
+    """Remove reasoning items at the tail of a Responses conversation.
+
+    A truncated (``max_output_tokens``) response typically ends in
+    reasoning items with no following message or tool call; the API
+    rejects such a tail when it is replayed as input.
+    """
+    dropped = 0
+    while conversation and conversation[-1].get("type") == "reasoning":
+        conversation.pop()
+        dropped += 1
+    return dropped
+
+
 _TERMINAL_API_ERROR_HINTS: tuple[str, ...] = (
     "401",
     "invalid_api_key",
@@ -204,13 +268,28 @@ _TERMINAL_API_ERROR_HINTS: tuple[str, ...] = (
     "permission_denied",
     "permission denied",
     "unauthorized",
+    "insufficient_quota",
+    "billing_hard_limit_reached",
     "array_above_max_length",
     "container has too many files",
     "maximum of 1000 files",
 )
 
 
-def _is_terminal_api_error(exc: BaseException) -> bool:
+class _ToolRecoveryFailed(RuntimeError):
+    """Do not restart an exhausted hosted-tool loop after its one wrap-up."""
+
+
+def _is_context_length_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(hint in text for hint in (
+        "maximum context length", "input token count", "context_length_exceeded",
+    ))
+
+
+def _is_terminal_api_error(
+    exc: BaseException, *, response_poll: bool = False, context_length_recovery: bool = False,
+) -> bool:
     """True when an SDK error is bad-key / missing-model / forbidden.
 
     Provider SDKs surface these inconsistently — sometimes as raw HTTP
@@ -221,11 +300,370 @@ def _is_terminal_api_error(exc: BaseException) -> bool:
     raises out of the loop immediately instead of sleeping 60s per
     inner retry before the outer supervisor sees it.
     """
+    if isinstance(exc, (_ClientTerminated, _ProviderWallclockTimeout, ProviderAccountingError,
+                        _ToolRecoveryFailed, RequiredHostedToolUnavailable)):
+        return True
     text = str(exc).lower()
+    # A just-created background response can briefly be absent from the GET
+    # replica. This exception applies only to polling, never model creation.
+    if response_poll and (getattr(exc, "status_code", None) == 404 or "error code: 404" in text):
+        return False
+    if context_length_recovery and _is_context_length_error(exc) and getattr(exc, "status_code", None) in (None, 400):
+        return False
+    # Failed background Responses have no HTTP status on their ValueError.
+    # Neither retries nor Pro -> standard fallback can fix the same input.
+    if _is_context_length_error(exc):
+        return True
+    if getattr(exc, "status_code", None) in (400, 401, 403, 404, 422):
+        return True
+    if any(hint in text for hint in ("error code: 400", "error: 400", "invalid_request_error")):
+        return True
     return any(hint in text for hint in _TERMINAL_API_ERROR_HINTS)
 
 
 class APIClient:
+    def _report_attempt_failure(self, ts, idx, exc, *, retry_decision):
+        trace = active_trace.get()
+        if trace is not None:
+            trace.failure(
+                (ts, idx), error_type=type(exc).__name__,
+                error_code="context_length_exceeded" if _is_context_length_error(exc) else getattr(exc, "code", None),
+                error_message=str(exc)[:500],
+                retry_decision=retry_decision,
+            )
+
+    def _provider_response_dict(self, response):
+        if hasattr(response, "model_dump"):
+            return response.model_dump()
+        return {"id": getattr(response, "id", None), "status": getattr(response, "status", None),
+                "usage": getattr(response, "usage", None)}
+
+    def _cancel_background_response(self, client, response_id, ts, idx):
+        trace = active_trace.get()
+        if trace is not None:
+            trace.update((ts, idx), response_id=response_id, cancellation_requested=True)
+        # Independent of self.terminated: cleanup must still GET the same ID.
+        # A daemon bounds SDK retries/transport hangs as well as socket timeouts.
+        deadline = time.monotonic() + 2.5
+
+        def bounded(operation):
+            results = Queue(maxsize=1)
+            def run():
+                try:
+                    results.put(operation())
+                except Exception:
+                    results.put(None)
+            threading.Thread(target=run, daemon=True).start()
+            try:
+                return results.get(timeout=max(0.001, min(1.2, deadline - time.monotonic())))
+            except Empty:
+                return None
+
+        receipt = bounded(lambda: client.responses.cancel(response_id, timeout=1.0))
+        if trace is not None:
+            trace.update((ts, idx), cancellation_acknowledged=receipt is not None)
+        if receipt is not None:
+            self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(receipt))
+        data = self._provider_response_dict(receipt) if receipt is not None else {}
+        if (data.get("status") not in {"cancelled", "failed", "incomplete"}
+                or data.get("usage") is None):
+            fetched = bounded(lambda: client.responses.retrieve(
+                response_id, timeout=1.0, include=["code_interpreter_call.outputs"]))
+            if fetched is not None:
+                receipt = fetched
+                self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(receipt))
+        data = self._provider_response_dict(receipt) if receipt is not None else {}
+        terminal = data.get("status") in {"completed", "cancelled", "failed", "incomplete"}
+        if trace is not None:
+            trace.update((ts, idx), reconciliation_pending=not terminal)
+            if not terminal or data.get("usage") is None:
+                trace.update((ts, idx), usage_unavailable=True)
+        if not terminal:
+            logger.warning(f"Background response {response_id} remains unresolved after bounded cancellation reconciliation")
+        return receipt
+
+    def _sleep(self, seconds):
+        remaining = max(0.0, float(seconds))
+        while remaining:
+            if self.terminated:
+                raise _ClientTerminated("Cancelled during provider retry backoff")
+            step = min(1.0, remaining)
+            time.sleep(step)
+            remaining -= step
+
+    def _log_provider_request(self, *, ts, batch_idx, request, **info):
+        trace = active_trace.get()
+        if trace is not None:
+            trace.request(self, ts, batch_idx, request)
+            info.update(trace.metadata, invocation_id=trace.id)
+        try:
+            request_logger.log_request(ts=ts, batch_idx=batch_idx, request=request, **info)
+        except OSError as exc:
+            logger.warning(f"Provider debug request log failed: {type(exc).__name__}")
+
+    def _log_provider_response(self, *, ts, batch_idx, response=None, **info):
+        trace = active_trace.get()
+        if trace is not None:
+            trace.response(self, ts, batch_idx, response or info)
+            if "cancellation_acknowledged" in info:
+                trace.update((ts, batch_idx), cancellation_acknowledged=info["cancellation_acknowledged"])
+        try:
+            request_logger.log_response(ts=ts, batch_idx=batch_idx, response=response, **info)
+        except OSError as exc:
+            logger.warning(f"Provider debug response log failed: {type(exc).__name__}")
+
+    def _bounded_provider_operation(self, operation, *, timeout, cancel=None, on_abandoned_result=None):
+        """Bound wall time even when an SDK blocks between stream events.
+
+        SDK I/O runs in a daemon, never the asyncio executor's shutdown path.
+        Closing a broken transport is best-effort and must not block the caller.
+        """
+        results = Queue(maxsize=1)
+        context = copy_context()
+        ownership = threading.Lock()
+        abandoned = False
+
+        def abandon_result(value):
+            if on_abandoned_result is not None:
+                try:
+                    on_abandoned_result(value)
+                except Exception as exc:
+                    logger.warning(f"Late provider response cleanup failed: {type(exc).__name__}")
+
+        def run():
+            try:
+                result = (True, operation())
+            except BaseException as exc:
+                result = (False, exc)
+            with ownership:
+                if not abandoned:
+                    results.put(result)
+                    return
+            if result[0]:
+                abandon_result(result[1])
+
+        threading.Thread(target=lambda: context.run(run), daemon=True).start()
+        deadline = time.monotonic() + float(timeout) if timeout is not None else float("inf")
+        while True:
+            remaining = deadline - time.monotonic()
+            if self.terminated or remaining <= 0:
+                with ownership:
+                    abandoned = True
+                    try:
+                        completed = results.get_nowait()
+                    except Empty:
+                        completed = None
+                if completed is not None and completed[0]:
+                    cleanup_context = copy_context()
+                    threading.Thread(target=lambda: cleanup_context.run(abandon_result, completed[1]), daemon=True).start()
+                if cancel is not None:
+                    def close():
+                        try:
+                            cancel()
+                        except Exception:
+                            pass
+                    threading.Thread(target=close, daemon=True).start()
+                if self.terminated:
+                    raise _ClientTerminated("Provider operation cancelled")
+                raise _ProviderWallclockTimeout("Provider wall-clock deadline exceeded")
+            try:
+                ok, value = results.get(timeout=min(0.05, remaining))
+            except Empty:
+                continue
+            if ok:
+                return value
+            raise value
+
+    def reconcile_background_response(self, response_id, *, timeout=15.0, on_response=None):
+        """Retrieve, then boundedly cancel an existing response; never create one."""
+        if self.api != "openai" or not self.use_openai_responses_api:
+            raise ValueError("Background reconciliation requires OpenAI Responses")
+
+        def reconcile():
+            deadline = time.monotonic() + timeout
+            terminal = {"completed", "failed", "cancelled", "incomplete"}
+            with OpenAI(api_key=self.api_key, base_url=self.base_url,
+                        timeout=min(3.0, timeout), max_retries=0) as client:
+                data = {}
+                for operation in ("retrieve", "retrieve", "cancel", "retrieve"):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    if operation == "cancel" and data.get("status") in terminal:
+                        continue
+                    kwargs = {"timeout": min(3.0, left)}
+                    if operation == "retrieve":
+                        kwargs["include"] = ["code_interpreter_call.outputs"]
+                    try:
+                        response = getattr(client.responses, operation)(response_id, **kwargs)
+                    except Exception:
+                        continue
+                    data = self._provider_response_dict(response)
+                    if data.get("id") != response_id:
+                        raise ValueError("Provider returned a different response during reconciliation")
+                    if on_response is not None:
+                        on_response(data)
+                    if data.get("status") in terminal and data.get("usage") is not None:
+                        return data
+                return data
+
+        return self._bounded_provider_operation(reconcile, timeout=timeout)
+
+    def attach_code_interpreter_file(self, path, *, timeout=120.0):
+        """Upload an expiring snapshot and attach it to this client's Python tool.
+
+        Uses the same credentials/base URL as model requests. This is storage
+        I/O only; model usage remains accounted by run_queries/ProviderTrace.
+        """
+        if self.api != "openai" or not self.use_openai_responses_api:
+            raise ValueError("File-backed critic notes require OpenAI Responses with Code Interpreter")
+        python_tools = [desc for desc in self.tool_descriptions if desc.get("type") == "code_interpreter"]
+        container = python_tools[0].get("container") if len(python_tools) == 1 else None
+        if not isinstance(container, dict) or container.get("type") != "auto":
+            raise ValueError("File-backed notes require exactly one automatic Code Interpreter container")
+
+        def upload():
+            with OpenAI(api_key=self.api_key, base_url=self.base_url,
+                        timeout=timeout, max_retries=0) as client:
+                with open(path, "rb") as source:
+                    return client.files.create(
+                        file=source, purpose="user_data",
+                        # extra_body also supports SDKs predating the typed option.
+                        extra_body={"expires_after": {"anchor": "created_at", "seconds": 172800}},
+                    )
+
+        uploaded = self._bounded_provider_operation(upload, timeout=timeout)
+        if not uploaded.id:
+            raise ValueError("Notes upload returned no file ID")
+        python_tools[0]["container"] = {"type": "auto", "file_ids": [uploaded.id]}
+        return uploaded.id
+
+    def discard_code_interpreter_container(self, container_id):
+        """Best-effort cleanup of an owned container that never reached a model."""
+        def discard():
+            try:
+                with OpenAI(api_key=self.api_key, base_url=self.base_url,
+                            timeout=5.0, max_retries=0) as client:
+                    client.containers.delete(container_id)
+            except Exception as exc:
+                logger.warning("Unused notes container cleanup failed: {}", type(exc).__name__)
+
+        # Cleanup must also work after terminate(), without extending shutdown.
+        threading.Thread(target=discard, daemon=True).start()
+
+    def create_code_interpreter_container_with_file(self, path, *, timeout=120.0):
+        """Bind notes to an explicit container whose ID is known before reasoning."""
+        if self.api != "openai" or not self.use_openai_responses_api:
+            raise ValueError("File-backed critic notes require OpenAI Responses with Code Interpreter")
+        python_tools = [desc for desc in self.tool_descriptions if desc.get("type") == "code_interpreter"]
+        container = python_tools[0].get("container") if len(python_tools) == 1 else None
+        if not isinstance(container, dict) or container.get("type") != "auto":
+            raise ValueError("File-backed notes require exactly one unbound Code Interpreter container")
+        deadline = time.monotonic() + timeout
+
+        def remaining():
+            left = deadline - time.monotonic()
+            if left <= 0 or self.terminated:
+                raise TimeoutError("Notes container setup deadline exceeded")
+            return left
+
+        def create():
+            container_id = None
+            try:
+                with OpenAI(api_key=self.api_key, base_url=self.base_url,
+                            timeout=remaining(), max_retries=0) as client:
+                    created = client.containers.create(
+                        name="critic-notes", expires_after={"anchor": "last_active_at", "minutes": 20},
+                        timeout=remaining())
+                    container_id = created.id
+                    if not container_id:
+                        raise ValueError("Notes container creation returned no ID")
+                    with open(path, "rb") as source:
+                        uploaded = client.containers.files.create(
+                            container_id, file=(os.path.basename(path), source), timeout=remaining())
+                    if not uploaded.id:
+                        raise ValueError("Notes upload returned no file ID")
+                    return container_id, uploaded.id
+            except BaseException:
+                if container_id:
+                    self.discard_code_interpreter_container(container_id)
+                raise
+
+        container_id, file_id = self._bounded_provider_operation(
+            create, timeout=timeout,
+            on_abandoned_result=lambda result: self.discard_code_interpreter_container(result[0]))
+        python_tools[0]["container"] = container_id
+        return container_id, file_id
+
+    def touch_code_interpreter_container(self, container_id, *, timeout=15.0):
+        """Refresh an existing container's idle timer without a model request."""
+        if self.api != "openai" or not self.use_openai_responses_api:
+            raise ValueError("Container keepalive requires OpenAI Responses")
+
+        def touch():
+            with OpenAI(api_key=self.api_key, base_url=self.base_url,
+                        timeout=timeout, max_retries=0) as client:
+                return client.containers.retrieve(container_id).status
+
+        return self._bounded_provider_operation(touch, timeout=timeout)
+
+    def read_code_interpreter_file(self, container_id, path, *, timeout=15.0, max_bytes=4096):
+        """Read one bounded artifact from an existing container; never run a model."""
+        if self.api != "openai" or not self.use_openai_responses_api:
+            raise ValueError("Container file retrieval requires OpenAI Responses")
+        if not container_id or not path.startswith("/mnt/data/") or max_bytes <= 0:
+            raise ValueError("Invalid container artifact request")
+
+        def download():
+            deadline = time.monotonic() + timeout
+
+            def remaining():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise TimeoutError("Container artifact retrieval deadline exceeded")
+                return min(5.0, left)
+
+            with OpenAI(api_key=self.api_key, base_url=self.base_url,
+                        timeout=remaining(), max_retries=0) as client:
+                matches, after = [], None
+                for _ in range(10):
+                    kwargs = {"limit": 100, "timeout": remaining()}
+                    if after is not None:
+                        kwargs["after"] = after
+                    page = client.containers.files.list(container_id, **kwargs)
+                    matches.extend(item for item in page.data if item.path == path)
+                    if page.has_more is False:
+                        break
+                    if page.has_more is not True:
+                        raise ValueError("Incomplete container artifact listing")
+                    if not page.data or page.data[-1].id == after:
+                        raise ValueError("Incomplete container artifact listing")
+                    after = page.data[-1].id
+                else:
+                    raise ValueError("Container artifact listing exceeded its limit")
+                if len(matches) != 1 or not matches[0].id:
+                    raise ValueError("Container artifact missing or ambiguous")
+                if matches[0].container_id != container_id:
+                    raise ValueError("Container artifact belongs to a different container")
+                # Provider-created files can omit their size. The stream limit
+                # below remains authoritative even when metadata is absent.
+                declared_bytes = getattr(matches[0], "bytes", None)
+                if declared_bytes is not None and declared_bytes > max_bytes:
+                    raise ValueError("Container artifact exceeded its size limit")
+                file_id = matches[0].id
+                data = bytearray()
+                with client.containers.files.content.with_streaming_response.retrieve(
+                        file_id, container_id=container_id, timeout=remaining()) as response:
+                    for chunk in response.iter_bytes(chunk_size=max_bytes + 1):
+                        remaining()
+                        if len(data) + len(chunk) > max_bytes:
+                            raise ValueError("Container artifact exceeded its size limit")
+                        data.extend(chunk)
+                return {"container_id": container_id, "file_id": file_id,
+                        "path": path, "content": data.decode("utf-8")}
+
+        return self._bounded_provider_operation(download, timeout=timeout)
+
     """A client that queries various LLM APIs."""
 
     def __init__(
@@ -264,6 +702,10 @@ class APIClient:
         anthropic_max_token_continuations=3,
         anthropic_max_server_tool_continuations=5,
         max_tool_calls=float("inf"),
+        max_hosted_tool_calls=None,
+        required_hosted_tool_types=(),
+        required_hosted_tool_validator=None,
+        tool_wrapup_reserve_s=0,
         cache_write_cost=0,
         cache_write_tokens_in_input=False,
         long_context_threshold_tokens=None,
@@ -271,6 +713,11 @@ class APIClient:
         long_context_output_multiplier=1,
         background_timeout_downgrade_after=0,
         background_timeout_reasoning_efforts=None,
+        background_server_kill_after_s=None,
+        openai_pro_fallback_after_failures=0,
+        openai_continue_on_max_output_tokens=False,
+        openai_max_output_token_continuations=1,
+        openai_max_output_token_continuation_effort=None,
         tools=None,
         **kwargs,
     ):
@@ -309,6 +756,14 @@ class APIClient:
             max_tool_calls (int|float|dict, optional): The maximum number of tool calls to make.
                 Defaults to unlimited.
                 Could also be a dict that specifies max calls per tool name.
+            max_hosted_tool_calls (int, optional): Total hosted-tool allowance across
+                an OpenAI Responses query and its continuations/retries. Zero disables
+                hosted tools; None leaves them uncapped. Local functions are separate.
+            required_hosted_tool_types (iterable[str], optional): Fail rather than
+                submit a tool-less retry if mandatory hosted work has not yet
+                produced a completed tool item. Does not certify that item's result.
+            required_hosted_tool_validator (callable, optional): A stricter local
+                evidence gate for satisfying mandatory hosted work. No API calls.
             cache_write_tokens_in_input (bool, optional): Whether reported cache-write
                 tokens are already included in the input-token total.
             long_context_threshold_tokens (int, optional): Input-token threshold above
@@ -320,6 +775,21 @@ class APIClient:
                 background poll timeouts before using background_timeout_reasoning_efforts.
             background_timeout_reasoning_efforts (list[str], optional): Reasoning efforts
                 to use on subsequent OpenAI Responses background retries after timeout.
+            background_server_kill_after_s (float, optional): Treat an OpenAI Responses
+                background response that ends ``status=failed`` with no output after at
+                least this many seconds of polling as a server-side duration kill, i.e.
+                like a background timeout (so the effort downgrade applies to the retry).
+            openai_pro_fallback_after_failures (int, optional): Retryable failed Pro
+                requests before switching this query to reasoning.mode=standard.
+                Zero disables fallback. New independent queries start in Pro again.
+            openai_continue_on_max_output_tokens (bool, optional): When an OpenAI
+                Responses call ends ``status=incomplete`` with reason ``max_output_tokens``,
+                send one follow-up turn asking the model to wrap up instead of accepting
+                the truncated output.
+            openai_max_output_token_continuations (int, optional): Maximum number of such
+                wrap-up turns per call.
+            openai_max_output_token_continuation_effort (str, optional): Reasoning effort
+                for the wrap-up turn(s); None keeps the call's configured effort.
             tools (list, optional): A list of tools to use. Defaults to None.
             **kwargs: Additional keyword arguments for the API.
         """
@@ -359,6 +829,20 @@ class APIClient:
             self.max_tool_calls_mode = "per_tool"
             if has_local_tools and sum(self.max_tool_calls.values()) > 0:
                 self.tool_calls_allowed = True
+        if max_hosted_tool_calls is not None:
+            if isinstance(max_hosted_tool_calls, bool) or not isinstance(max_hosted_tool_calls, int) or max_hosted_tool_calls < 0:
+                raise ValueError("max_hosted_tool_calls must be a nonnegative integer or None")
+            if api not in {"openai", "openrouter", "together", "custom"} or not use_openai_responses_api or batch_processing:
+                raise ValueError("max_hosted_tool_calls requires the OpenAI Responses API without batch processing")
+        self.max_hosted_tool_calls = max_hosted_tool_calls
+        if isinstance(required_hosted_tool_types, str) or not isinstance(required_hosted_tool_types, (list, tuple, set, frozenset)):
+            raise ValueError("required_hosted_tool_types must be a collection of tool types")
+        if any(kind not in {"code_interpreter", "web_search", "web_search_preview"} for kind in required_hosted_tool_types):
+            raise ValueError("Unsupported required hosted tool type")
+        self.required_hosted_tool_types = frozenset(required_hosted_tool_types)
+        if required_hosted_tool_validator is not None and not callable(required_hosted_tool_validator):
+            raise ValueError("required_hosted_tool_validator must be callable")
+        self.required_hosted_tool_validator = required_hosted_tool_validator
 
         # Adapt model name and other args to the model
         if "--" in model:
@@ -367,9 +851,13 @@ class APIClient:
         if (api not in ["anthropic", "openai"] or self.tool_calls_allowed) and batch_processing:
             logger.warning("Batch processing is only supported for the Anthropic API and OpenAI API without tool calling.")
             batch_processing = False
-        if ("o1" in model or "o3" in model or "o4" in model or "gpt-5" in model) and api == "openai":
-            logger.info("Not using system messages for o1/o3/o4 model.")
-            no_system_messages = True  # o1 model cannot handle system messages
+        is_astra = model == "gpt-6-astra" or model.startswith("gpt-6-astra-")
+        if api == "openai" and is_astra and (not use_openai_responses_api or batch_processing):
+            if tools or (kwargs.get("reasoning") or {}).get("mode") == "pro":
+                raise ValueError("GPT-6 Astra tools and Pro mode require the Responses API with batch_processing=False.")
+        if ("o1" in model or "o3" in model or "o4" in model or "gpt-5" in model or is_astra) and api == "openai":
+            logger.info(f"Preserving developer messages for {model}.")
+            no_system_messages = True
             if not use_openai_responses_api:
                 max_tokens_param = "max_completion_tokens"
         if use_openai_responses_api and not batch_processing:
@@ -389,6 +877,9 @@ class APIClient:
         self.max_retries = max_retries
         self.max_retries_inner = max_retries_inner
         self.max_wallclock_per_call_s = max_wallclock_per_call_s
+        self.tool_wrapup_reserve_s = float(tool_wrapup_reserve_s)
+        if not math.isfinite(self.tool_wrapup_reserve_s) or self.tool_wrapup_reserve_s < 0:
+            raise ValueError("tool_wrapup_reserve_s must be finite and nonnegative")
         self.throw_error_on_failure = throw_error_on_failure
         self.concurrent_requests = concurrent_requests
         self.no_system_messages = no_system_messages
@@ -418,6 +909,13 @@ class APIClient:
         self.long_context_output_multiplier = long_context_output_multiplier
         self.background_timeout_downgrade_after = max(0, int(background_timeout_downgrade_after or 0))
         self.background_timeout_reasoning_efforts = list(background_timeout_reasoning_efforts or [])
+        self.background_server_kill_after_s = (
+            None if background_server_kill_after_s is None else float(background_server_kill_after_s)
+        )
+        self.openai_pro_fallback_after_failures = max(0, int(openai_pro_fallback_after_failures or 0))
+        self.openai_continue_on_max_output_tokens = bool(openai_continue_on_max_output_tokens)
+        self.openai_max_output_token_continuations = max(0, int(openai_max_output_token_continuations or 0))
+        self.openai_max_output_token_continuation_effort = openai_max_output_token_continuation_effort
         self.background = background
         if max_tokens is not None:
             self.max_tokens_param = max_tokens_param
@@ -461,7 +959,11 @@ class APIClient:
         return self.background_timeout_reasoning_efforts[idx]
 
     def _kwargs_for_background_timeout_retry(self, timeout_count):
-        effort = self._background_timeout_retry_reasoning_effort(timeout_count)
+        return self._kwargs_with_reasoning_effort(
+            self._background_timeout_retry_reasoning_effort(timeout_count)
+        )
+
+    def _kwargs_with_reasoning_effort(self, effort):
         if effort is None:
             return self.kwargs
         kwargs = self.kwargs.copy()
@@ -469,6 +971,40 @@ class APIClient:
         reasoning["effort"] = effort
         kwargs["reasoning"] = reasoning
         return kwargs
+
+    def _responses_request_kwargs(self, state, *, wrapup=False):
+        if wrapup and self.openai_max_output_token_continuation_effort is not None:
+            kwargs = self._kwargs_with_reasoning_effort(self.openai_max_output_token_continuation_effort)
+        else:
+            kwargs = self._kwargs_for_background_timeout_retry(state.background_timeouts)
+        if (
+            self.openai_pro_fallback_after_failures
+            and state.pro_failures >= self.openai_pro_fallback_after_failures
+            and (kwargs.get("reasoning") or {}).get("mode") == "pro"
+        ):
+            kwargs = {**kwargs, "reasoning": {**kwargs["reasoning"], "mode": "standard"}}
+        return kwargs
+
+    def _record_pro_failure(self, state, *, pro_attempt, idx):
+        if not pro_attempt or not self.openai_pro_fallback_after_failures:
+            return
+        state.pro_failures += 1
+        if state.pro_failures == self.openai_pro_fallback_after_failures:
+            logger.warning(
+                f"OpenAI Pro fallback on call idx={idx}: {state.pro_failures} failed Pro attempts; "
+                f"subsequent requests use {self.model} reasoning.mode=standard within the existing deadline."
+            )
+
+    def _is_background_server_kill(self, err_code, elapsed_s):
+        """OpenAI kills long sol/astra background calls at ~60 min with
+        ``status=failed``, ``error.code=server_error``, empty output and
+        ``usage=None``. Classify that like a background timeout so the
+        retry runs at the downgraded effort instead of dying again."""
+        if self.background_server_kill_after_s is None:
+            return False
+        if str(err_code or "server_error").lower() != "server_error":
+            return False
+        return elapsed_s >= self.background_server_kill_after_s
 
     def _initialize_vllm(self):
             if LLM is None:
@@ -514,6 +1050,13 @@ class APIClient:
             del kwargs["use_openai_responses_api_tools"]
         if any([kw in model for kw in ["o1", "o3", "o4"]]) and "temperature" in kwargs:
             del kwargs["temperature"]
+        if api == "openai" and (model == "gpt-6-astra" or model.startswith("gpt-6-astra-")):
+            for kwarg in ("temperature", "top_p", "top_logprobs", "logprobs"):
+                kwargs.pop(kwarg, None)
+            if kwargs.get("include") is not None:
+                kwargs["include"] = [
+                    item for item in kwargs["include"] if item != "message.output_text.logprobs"
+                ]
         for kwarg in ["top_p", "top_k", "temperature"]:
             if kwarg in kwargs and kwargs[kwarg] is None:
                 del kwargs[kwarg]
@@ -544,9 +1087,25 @@ class APIClient:
             self.base_url = "https://api.together.xyz/v1"
         elif self.api == "google":
             self.api_key = os.getenv("GOOGLE_API_KEY")
-            if self.tool_calls_allowed and (
-                "gdm-eval-model-bcn" in self.model
-                or self.use_gdm_tools
+            # The native generateContent path records but does not execute
+            # local function tools, so ``use_gdm_tools`` only routes calls
+            # whose tools are all provider-managed (codeExecution /
+            # googleSearch); local function tools keep the Chat Completions
+            # tool loop. The legacy BCN model keeps its original routing.
+            provider_tools_only = bool(self.tool_descriptions) and not self.tool_calls_allowed
+            has_provider_managed_tools = any(
+                desc.get("type") in ("code_interpreter", "web_search_preview", "web_search")
+                for desc in self.tool_descriptions
+            )
+            if self.use_gdm_tools and has_provider_managed_tools and self.tool_calls_allowed:
+                raise ValueError(
+                    "Gemini provider-managed tools (code_interpreter / web_search) cannot be "
+                    "combined with local function tools: the native generateContent path does "
+                    "not execute local functions and the OpenAI-compatible endpoint rejects the "
+                    "provider tools."
+                )
+            if (self.tool_calls_allowed and "gdm-eval-model-bcn" in self.model) or (
+                self.use_gdm_tools and provider_tools_only
             ):
                 self.use_google_internal_tools = True
                 self.api = "google"
@@ -623,7 +1182,7 @@ class APIClient:
 
         Yields:
             tuple: An (idx, conversation, detailed_cost) tuple.
-                idx: Integer index of the query this response corresponds to in [0, len(queries)-1].
+                idx: Query index, or its supplied custom_indices value.
                 conversation: Full list of messages (including those from the query) in the API format (incl. CoT).
                 detailed_cost: A dict with total "cost" ($), "input_tokens", "output_tokens", and "time" (seconds).
         """
@@ -642,8 +1201,9 @@ class APIClient:
         # Case 1: VLLM
         if self.api == "vllm":
             # Bypass threading and batch everything into one local generate
-            # TODO indices and request logger
-            yield from self._run_vllm_queries(queries)
+            # TODO request logger
+            for idx, conversation, detailed in self._run_vllm_queries(queries):
+                yield indices[idx], conversation, detailed
             return
 
         # Case 2: Batch API
@@ -670,26 +1230,26 @@ class APIClient:
                     "time": end_time - start_time,
                     "n_retries": result.n_retries,
                 }
-                yield idx, result.conversation, detailed_cost
+                yield indices[idx], result.conversation, detailed_cost
             return
 
         # Case 3: Standard API; parallelize manually
         start_time = time.time()
         with ThreadPoolExecutor(max_workers=self.concurrent_requests) as executor:
-            future_to_index = {
-                executor.submit(self._run_query_with_retry, idx, query, ignore_tool_calls): idx
+            future_to_query = {
+                executor.submit(copy_context().run, self._run_query_with_retry, idx, query, ignore_tool_calls): (idx, query)
                 for idx, query in zip(indices, queries)
             }
 
-            iterator = as_completed(future_to_index)
+            iterator = as_completed(future_to_query)
             if not no_tqdm:
-                iterator = tqdm(iterator, total=len(future_to_index))
+                iterator = tqdm(iterator, total=len(future_to_query))
 
             for future in iterator:
-                idx = future_to_index[future]
+                idx, query = future_to_query[future]
                 result = future.result()
                 if result is None:
-                    conversation = [m.copy() for m in queries[idx]] + [{"role": "assistant", "content": ""}]
+                    conversation = [m.copy() for m in query] + [{"role": "assistant", "content": ""}]
                     result = self.InternalRequestResult(conversation, input_tokens=0, output_tokens=0)
                 detailed_cost = {
                     "cost": result.cost_usd if result.cost_usd is not None else self._get_cost(
@@ -706,6 +1266,8 @@ class APIClient:
                     "n_retries": result.n_retries,
                     "time": time.time() - start_time,
                     "request_time": result.time,
+                    "provider_outcomes": getattr(result, "provider_outcomes", []),
+                    "usage_unavailable": getattr(result, "usage_unavailable", False),
                 }
                 yield idx, result.conversation, detailed_cost
 
@@ -910,8 +1472,8 @@ class APIClient:
             if value is None:
                 return None
             if isinstance(value, dict):
-                return _coerce(value.get("reasoning_tokens"))
-            return _coerce(getattr(value, "reasoning_tokens", None))
+                return _coerce(value.get("reasoning_tokens", value.get("thinking_tokens")))
+            return _coerce(getattr(value, "reasoning_tokens", getattr(value, "thinking_tokens", None)))
 
         # OpenAI Responses + Chat-Completions reasoning fields live under
         # different nested objects; check both.
@@ -1018,18 +1580,31 @@ class APIClient:
                 tool_context.update(m["tool_context"])
         return tool_context
 
-    def _execute_tool_function(self, tool_name, arguments, messages):
+    def _tool_call_deadline(self, inner_start):
+        if self.max_wallclock_per_call_s is None:
+            return None
+        state = _responses_retry_state.get()
+        if state is not None and state.owner is self:
+            inner_start = min(inner_start, state.started_at)
+        remaining = self.max_wallclock_per_call_s - (time.time() - inner_start)
+        return time.monotonic() + max(0.0, remaining)
+
+    def _execute_tool_function(self, tool_name, arguments, messages, *, call_deadline_monotonic_s=None):
         tool_func = self.tool_functions[tool_name]
         try:
             signature = inspect.signature(tool_func)
             arguments = arguments.copy()
             for param_name, param in signature.parameters.items():
-                if param_name in arguments:
-                    continue
                 if param.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
                     continue
+                if param_name == "call_deadline_monotonic_s":
+                    arguments[param_name] = call_deadline_monotonic_s
+                    continue
                 if param_name == "messages":
+                    # Execution provenance must come from the harness, not model arguments.
                     arguments["messages"] = messages
+                    continue
+                if param_name in arguments:
                     continue
                 tool_context = self._get_tool_context(messages)
                 if param_name in tool_context:
@@ -1159,7 +1734,7 @@ class APIClient:
                 )
             if batch.status == "completed":
                 break
-            time.sleep(10)
+            self._sleep(10)
 
         results = [None for _ in range(len(queries))]
         repeat_indices = []
@@ -1172,7 +1747,7 @@ class APIClient:
                 break
             except Exception as e:
                 logger.error(f"Error connecting to batch OpenAI. Retrying in 10s. Exception: {e}")
-                time.sleep(10)
+                self._sleep(10)
                 continue
 
         json_response = []
@@ -1260,7 +1835,7 @@ class APIClient:
                 "custom_id": f"apiquery-{idx}",
                 "params": {"model": self.model, "messages": self._drop_cot(query), **kwargs_here},
             }
-            request_logger.log_request(ts=ts, batch_idx=idx, request=payload)
+            self._log_provider_request(ts=ts, batch_idx=idx, request=payload)
             request = Request(
                 custom_id=f"apiquery-{idx}",
                 params=MessageCreateParamsNonStreaming(model=self.model, messages=self._drop_cot(query), **kwargs_here),
@@ -1294,7 +1869,7 @@ class APIClient:
                 )
             if message_batch.processing_status == "ended":
                 break
-            time.sleep(10)
+            self._sleep(10)
 
         results = []
         repeat_indices = []
@@ -1307,10 +1882,10 @@ class APIClient:
                 break
             except Exception as e:
                 logger.error(f"Error connecting to batch Anthropic. Retrying in 10 seconds. Exception: {e}")
-                time.sleep(10)
+                self._sleep(10)
 
         for i, raw_result in enumerate(raw_results):
-            request_logger.log_response(ts=ts, batch_idx=i, response=raw_result.model_dump())
+            self._log_provider_response(ts=ts, batch_idx=i, response=raw_result.model_dump())
             if raw_result.result.type == "succeeded":
                 new_messages = self._get_messages_from_anthropic_content(raw_result.result.message.content)
                 conversation = [m.copy() for m in queries[i]] + new_messages
@@ -1368,6 +1943,33 @@ class APIClient:
         Returns:
             InternalRequestResult or None
         """
+        state = _ResponsesRetryState(owner=self, started_at=time.time())
+        token = _responses_retry_state.set(state)
+        trace = active_trace.get() or ProviderTrace()
+        trace_token = active_trace.set(trace)
+        try:
+            result = self._run_query_retry_loop(idx, query, ignore_tool_calls=ignore_tool_calls)
+            totals = trace.totals(idx)
+            if result is None and totals["provider_attempts"]:
+                result = self.InternalRequestResult(query + [{"role": "assistant", "content": ""}], 0, 0)
+            if result is not None and totals["provider_attempts"]:
+                result.provider_outcomes = totals["provider_outcomes"]
+                result.usage_unavailable = totals["usage_unavailable"]
+                result_cost = result.cost_usd if result.cost_usd is not None else self._get_cost(
+                    result.input_tokens, result.output_tokens, result.cached_input_tokens, result.cached_write_tokens,
+                )
+                for name in COUNTS:
+                    setattr(result, name, max(getattr(result, name), totals[name]))
+                result.cost_usd = max(result_cost, totals["cost"])
+            return result
+        except Exception as exc:
+            exc.partial_usage = trace.totals(idx)
+            raise
+        finally:
+            active_trace.reset(trace_token)
+            _responses_retry_state.reset(token)
+
+    def _run_query_retry_loop(self, idx, query, ignore_tool_calls=False):
         retry_idx = 0
         total_retries = 0
         start_time = time.time()
@@ -1394,7 +1996,7 @@ class APIClient:
                 result = self._run_query(idx, query, ignore_tool_calls=ignore_tool_calls)
                 result.n_retries += total_retries
                 result.time = time.time() - start_time
-                time.sleep(self.sleep_after_request)
+                self._sleep(self.sleep_after_request)
                 return result
             except Exception as e:
                 # These are control-flow outcomes, not retryable provider
@@ -1476,7 +2078,7 @@ class APIClient:
                     f"Backing off {backoff_sleep_s}s before outer-retry "
                     f"{retry_idx + 1} on call idx={idx}."
                 )
-                time.sleep(backoff_sleep_s)
+                self._sleep(backoff_sleep_s)
                 # if api error is not due to rate limit, try again
                 if "rate limit" not in str(e).lower() and "429" not in str(e):
                     retry_idx += 1
@@ -1517,6 +2119,9 @@ class APIClient:
         return self._anthropic_query_with_tools(idx, query, ignore_tool_calls=True)
 
     def _anthropic_request_timeout(self, inner_start: float):
+        state = _responses_retry_state.get()
+        if state is not None and state.owner is self:
+            inner_start = state.started_at
         if self.max_wallclock_per_call_s is None:
             return self.timeout
 
@@ -1554,23 +2159,71 @@ class APIClient:
         if not self.stream_anthropic_messages:
             return messages_api.create(**payload)
 
-        start_usage = None
-        with messages_api.stream(**payload) as stream:
-            for event in stream:
-                if getattr(event, "type", None) == "message_start":
-                    message = getattr(event, "message", None)
-                    start_usage = getattr(message, "usage", None)
-                if self.max_wallclock_per_call_s is None:
-                    continue
-                elapsed = time.time() - inner_start
-                if elapsed >= self.max_wallclock_per_call_s:
-                    raise _ProviderWallclockTimeout(
-                        f"Wallclock budget ({self.max_wallclock_per_call_s}s) "
-                        f"exhausted while streaming Anthropic response after {elapsed:.0f}s."
-                    )
-            response = stream.get_final_message()
-        self._merge_anthropic_stream_start_usage(response, start_usage)
-        return response
+        opened = []
+        trace, attempt = active_trace.get(), active_attempt.get()
+        stopped = threading.Event()
+        partial_text = []
+        partial_chars = 0
+        partial_lock = threading.Lock()
+
+        def consume():
+            nonlocal partial_chars
+            start_usage = None
+            usage = {}
+            response_id = None
+            with messages_api.stream(**payload) as stream:
+                opened.append(stream)
+                if stopped.is_set():
+                    raise _ClientTerminated("Stream opened after cancellation")
+                for event in stream:
+                    if stopped.is_set():
+                        raise _ClientTerminated("Stream cancelled")
+                    if getattr(event, "type", None) == "message_start":
+                        message = getattr(event, "message", None)
+                        start_usage = getattr(message, "usage", None)
+                        response_id = getattr(message, "id", None)
+                        usage.update(self._usage_to_dict(start_usage))
+                    elif getattr(event, "type", None) == "message_delta":
+                        usage.update(self._usage_to_dict(getattr(event, "usage", None)))
+                    elif getattr(event, "type", None) == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if getattr(delta, "type", None) == "text_delta":
+                            text = getattr(delta, "text", "")
+                            with partial_lock:
+                                if partial_chars < 65536:
+                                    partial_text.append(text[:65536 - partial_chars])
+                                partial_chars += len(text)
+                    if trace is not None and attempt is not None and getattr(event, "type", None) in ("message_start", "message_delta"):
+                        trace.response(self, *attempt, {"id": response_id, "usage": usage, "usage_partial": True})
+                response = stream.get_final_message()
+            self._merge_anthropic_stream_start_usage(response, start_usage)
+            if trace is not None and attempt is not None:
+                trace.response(self, *attempt, response.model_dump())
+            return response
+
+        def cancel():
+            stopped.set()
+            for stream in opened:
+                stream.close()
+
+        try:
+            return self._bounded_provider_operation(
+                consume, timeout=self._anthropic_request_timeout(inner_start), cancel=cancel,
+            )
+        except Exception as exc:
+            if trace is not None and attempt is not None:
+                trace.update(attempt, outcome=type(exc).__name__)
+                with partial_lock:
+                    text = "".join(partial_text)
+                    truncated = partial_chars > 65536
+                # An audit artifact only: never promote an interrupted fragment
+                # into a completed council reply or manuscript.
+                self._log_provider_response(ts=attempt[0], batch_idx=attempt[1],
+                                            partial_text=text, partial_text_truncated=truncated,
+                                            exception={"type": type(exc).__name__, "msg": str(exc)})
+            raise
+        finally:
+            stopped.set()
 
     def _merge_anthropic_stream_start_usage(self, response, start_usage) -> None:
         if start_usage is None:
@@ -1664,7 +2317,7 @@ class APIClient:
                 if system_message is not anthropic.NOT_GIVEN:
                     payload["system"] = system_message
                 payload = self._anthropic_payload_with_betas(payload)
-                request_logger.log_request(
+                self._log_provider_request(
                     ts=ts,
                     batch_idx=idx,
                     request=payload,
@@ -1675,12 +2328,12 @@ class APIClient:
                 )
                 request_logged = True
                 response = self._create_anthropic_message(client, payload, inner_start=inner_start)
-                request_logger.log_response(ts=ts, batch_idx=idx, response=response.model_dump())
+                self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(response))
             except Exception as e:
                 if "rate limit" not in str(e).lower() and "429" not in str(e):
                     total_retries += 1
                 if request_logged:
-                    request_logger.log_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                    self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
                 logger.error(f"Got Anthropic error in final-answer salvage. Exception: {e}")
                 if (
                     isinstance(e, _ProviderWallclockTimeout)
@@ -1691,7 +2344,7 @@ class APIClient:
                     or _is_terminal_api_error(e)
                 ):
                     raise
-                time.sleep(60)
+                self._sleep(60)
         if response is None:
             raise ValueError("Max inner retries reached during Anthropic final-answer salvage.")
         return response, total_retries
@@ -1952,15 +2605,15 @@ class APIClient:
                         "n_retries": n_retries,
                         "stream_anthropic_messages": self.stream_anthropic_messages,
                     }
-                    request_logger.log_request(ts=ts, batch_idx=idx, request=payload, **info)
+                    self._log_provider_request(ts=ts, batch_idx=idx, request=payload, **info)
                     request_logged = True
                     response = self._create_anthropic_message(client, payload, inner_start=inner_start)
-                    request_logger.log_response(ts=ts, batch_idx=idx, response=response.model_dump())
+                    self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(response))
                 except Exception as e:
                     if "rate limit" not in str(e).lower() and "429" not in str(e):
                         total_retries += 1
                     if request_logged:
-                        request_logger.log_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                        self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
                     logger.error(f"Got Anthropic error in tools inner loop. Exception: {e}")
                     if (
                         isinstance(e, _ProviderWallclockTimeout)
@@ -1976,7 +2629,7 @@ class APIClient:
                     # CouncilReply(error=...) rather than blank text).
                     if _is_terminal_api_error(e):
                         raise
-                    time.sleep(60)
+                    self._sleep(60)
                     continue
             if response is None:
                 raise ValueError("Max inner retries reached.")
@@ -2016,6 +2669,16 @@ class APIClient:
                 text_joined = "\n\n".join(text_blocks)
                 conversation.append({"role": "assistant", "content": text_joined})
                 continued_text_chunks.append(text_joined)
+            # A truncated server-tool call is not a resumable tool result.
+            # Remove the incomplete tail, never fabricate an execution result.
+            unresolved_server_tool = False
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                results = {block.get("tool_use_id") for block in assistant_blocks if block.get("tool_use_id")}
+                for index, block in enumerate(assistant_blocks):
+                    if block.get("type") == "server_tool_use" and block.get("id") not in results:
+                        assistant_blocks = assistant_blocks[:index]
+                        unresolved_server_tool = True
+                        break
             if len(assistant_blocks) > 0:
                 self._append_anthropic_message(anthropic_messages, "assistant", assistant_blocks)
 
@@ -2030,7 +2693,7 @@ class APIClient:
                 continue
 
             if len(tool_uses) == 0:
-                if self._anthropic_response_needs_continuation(response, text_blocks):
+                if not unresolved_server_tool and self._anthropic_response_needs_continuation(response, text_blocks):
                     if max_token_continuations >= self.anthropic_max_token_continuations:
                         logger.warning(
                             "Anthropic response stopped at max_tokens after "
@@ -2044,7 +2707,7 @@ class APIClient:
                         "Please continue exactly from where you left off. Do not repeat earlier text.",
                     )
                     continue
-                if self._anthropic_response_needs_final_answer_salvage(response, text_blocks):
+                if unresolved_server_tool or self._anthropic_response_needs_final_answer_salvage(response, text_blocks):
                     salvage_response, salvage_retries = self._anthropic_fetch_final_answer_salvage(
                         client,
                         idx,
@@ -2096,7 +2759,10 @@ class APIClient:
                         output = f"Error: Tool call after exceeding max # of tool calls ({max_tool_calls[tool_key]})."
                     else:
                         try:
-                            output = self._execute_tool_function(tool_name, arguments, conversation)
+                            output = self._execute_tool_function(
+                                tool_name, arguments, conversation,
+                                call_deadline_monotonic_s=self._tool_call_deadline(inner_start),
+                            )
                         except Exception as e:
                             logger.error(f"Error executing tool {tool_name}. Exception: {e}")
                             output = f"Error executing tool {tool_name}. Exception: {e}"
@@ -2238,12 +2904,23 @@ class APIClient:
         reasoning_tokens = 0
         cost_usd = 0.0
         total_retries = 0
-        background_timeout_count = 0
-        inner_start = time.time()
+        retry_state = _responses_retry_state.get()
+        if retry_state is None or retry_state.owner is not self:
+            retry_state = _ResponsesRetryState(owner=self, started_at=time.time())
+        max_output_token_continuations = 0
+        in_wrapup = False
+        inner_start = retry_state.started_at
+        delivery_notice_sent = False
+
+        def delivery_only():
+            return (self.tool_wrapup_reserve_s > 0 and self.max_wallclock_per_call_s is not None
+                    and time.time() >= inner_start + max(0, self.max_wallclock_per_call_s - self.tool_wrapup_reserve_s))
 
         def _tool_is_available_for_request(tool):
+            if delivery_only() and tool.get("name") not in {"read_context", "publish_artifact", "publish_sandbox_artifact"}:
+                return False
             if tool.get("type") != "function":
-                return True
+                return self.max_hosted_tool_calls is None or retry_state.hosted_tool_calls_used < self.max_hosted_tool_calls
             if max_tool_calls_mode == "total":
                 return nb_executed_tool_calls.get("any", 0) < max_tool_calls.get("any", 0)
             name = str(tool.get("name", ""))
@@ -2251,6 +2928,7 @@ class APIClient:
 
         while not self.terminated:
             # Inner retry to get a response
+            deadline_recovered = False
             response = None
             n_retries = -1
             while response is None and n_retries < self.max_retries_inner:
@@ -2264,27 +2942,72 @@ class APIClient:
                 # "No usage info in response" before this cap.
                 if self.max_wallclock_per_call_s is not None:
                     if time.time() - inner_start >= self.max_wallclock_per_call_s:
+                        if in_wrapup:
+                            break
                         raise ValueError(
                             f"Wallclock budget ({self.max_wallclock_per_call_s}s) "
                             f"exhausted in inner openai responses retry loop after "
                             f"{n_retries} attempts."
                         )
+                pro_attempt = False
+                request_tools = [tool for tool in response_tools if _tool_is_available_for_request(tool)]
+                available = {tool.get("type") for tool in request_tools}
+                completed = {item.get("type", "").removesuffix("_call") for item in conversation
+                             if item.get("status") == "completed"}
+                if "web_search" in completed:
+                    completed.add("web_search_preview")
+                if self.required_hosted_tool_validator is not None:
+                    completed = self.required_hosted_tool_types if self.required_hosted_tool_validator() else set()
+                if self.required_hosted_tool_types - available - completed:
+                    raise RequiredHostedToolUnavailable(
+                        "Mandatory hosted tools are unavailable; reconcile prior work before retrying")
                 try:
-                    request_tools = [tool for tool in response_tools if _tool_is_available_for_request(tool)]
+                    if delivery_only() and not delivery_notice_sent:
+                        conversation.append({"role": "user", "content": (
+                            "The remaining time is reserved for delivery. Do not start new research. "
+                            "Publish existing findings/artifacts now, state outstanding gaps, and return your final report. "
+                            "The original hard deadline still applies."
+                        )})
+                        delivery_notice_sent = True
+                    request_kwargs = self._responses_request_kwargs(retry_state, wrapup=in_wrapup)
                     payload = {
                         "model": self.model,
                         "tools": request_tools,
                         "input": self._drop_cot(conversation),  # Drop CoT here to save cost (stays in convo)
                         "timeout": self.timeout,
-                        **self._kwargs_for_background_timeout_retry(background_timeout_count),
+                        **request_kwargs,
                     }
+                    hosted_allowance = 0
+                    if self.max_hosted_tool_calls is not None and any(tool.get("type") != "function" for tool in request_tools):
+                        hosted_allowance = max(0, self.max_hosted_tool_calls - retry_state.hosted_tool_calls_used)
+                        payload["max_tool_calls"] = hosted_allowance
                     if self.background:
                         payload["background"] = self.background
+                    if any(tool.get("type") == "code_interpreter" for tool in request_tools):
+                        payload["include"] = list(dict.fromkeys([*payload.get("include", []), "code_interpreter_call.outputs"]))
                     ts = time.strftime("%m%d-%H:%M:%S", time.localtime(time.time()))
                     ts += f".{datetime.now().microsecond:06d}"
                     info = {"nb_executed_tool_calls": nb_executed_tool_calls, "n_retries": n_retries}
-                    request_logger.log_request(ts=ts, batch_idx=idx, request=payload, **info)
-                    response = client.responses.create(**payload)
+                    self._log_provider_request(ts=ts, batch_idx=idx, request=payload, **info)
+                    pro_attempt = (request_kwargs.get("reasoning") or {}).get("mode") == "pro"
+                    # An interrupted request may already have executed tools remotely.
+                    # Return unused allowance only after receiving its final output.
+                    retry_state.hosted_tool_calls_used += hosted_allowance
+                    def create_response(payload=payload, ts=ts):
+                        created = client.responses.create(**payload)
+                        self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(created))
+                        return created
+
+                    def cancel_late_response(created, ts=ts):
+                        if self.background and getattr(created, "id", None):
+                            self._cancel_background_response(client, created.id, ts, idx)
+
+                    create_timeout = self._anthropic_request_timeout(inner_start)
+                    if self.background:
+                        payload["timeout"] = min(60.0, create_timeout)
+                    response = self._bounded_provider_operation(
+                        create_response, timeout=create_timeout, on_abandoned_result=cancel_late_response,
+                    )
                     if self.background:
                         time_start = time.time()
                         # Absolute per-attempt deadline: min of the
@@ -2307,33 +3030,68 @@ class APIClient:
                             # Sleep in short slices so terminate() can
                             # interrupt the up-to-hours-long poll promptly.
                             for _ in range(60):
-                                if self.terminated:
+                                if self.terminated or time.time() >= attempt_deadline_at:
                                     break
                                 time.sleep(1)
                             if self.terminated:
                                 response_id = getattr(response, "id", None)
                                 if response_id is not None:
-                                    try:
-                                        client.responses.cancel(response_id)
-                                    except Exception as cancel_exc:
-                                        logger.warning(
-                                            f"Could not cancel terminated OpenAI background response "
-                                            f"{response_id}: {cancel_exc}"
-                                        )
+                                    recovered = self._cancel_background_response(client, response_id, ts, idx)
+                                    if getattr(recovered, "status", None) == "completed":
+                                        response, deadline_recovered = recovered, True
+                                        break
                                 raise _ClientTerminated("APIClient terminated while polling background response.")
-                            response = client.responses.retrieve(response.id)
-                            if time.time() > attempt_deadline_at:
+                            if time.time() >= attempt_deadline_at:
+                                recovered = self._cancel_background_response(client, response.id, ts, idx)
+                                if getattr(recovered, "status", None) == "completed":
+                                    response, deadline_recovered = recovered, True
+                                    break
+                                raise _BackgroundResponseTimeout("Timeout waiting for background response.")
+                            try:
+                                retrieve_kwargs = {"include": payload["include"]} if "include" in payload else {}
+                                remaining = max(0.01, attempt_deadline_at - time.time())
+                                response_id = response.id
+                                retrieve_kwargs["timeout"] = min(30.0, remaining)
+
+                                def retrieve_response(response_id=response_id, kwargs=retrieve_kwargs, ts=ts):
+                                    retrieved = client.responses.retrieve(response_id, **kwargs)
+                                    self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(retrieved))
+                                    return retrieved
+
+                                response = self._bounded_provider_operation(
+                                    retrieve_response, timeout=remaining,
+                                )
+                            except (_ClientTerminated, _ProviderWallclockTimeout) as interrupted:
+                                recovered = self._cancel_background_response(client, response_id, ts, idx)
+                                if getattr(recovered, "status", None) == "completed":
+                                    response, deadline_recovered = recovered, True
+                                    break
+                                if isinstance(interrupted, _ClientTerminated):
+                                    raise
+                                raise _BackgroundResponseTimeout("Timeout waiting for background response.") from interrupted
+                            except Exception as poll_exc:
+                                if _is_terminal_api_error(poll_exc, response_poll=True):
+                                    raise
+                                # A failed GET does not mean generation failed.
+                                # Keep polling this ID, bounded by the same deadline.
+                                logger.warning(
+                                    f"OpenAI background poll failed for {response.id}; "
+                                    f"retaining the response for retry: {poll_exc}"
+                                )
+                                self._log_provider_response(
+                                    ts=ts, batch_idx=idx,
+                                    exception={"poll_exception": str(poll_exc), "response_id": response.id},
+                                )
+                            if time.time() > attempt_deadline_at and response.status in {"queued", "in_progress"}:
                                 response_id = getattr(response, "id", None)
                                 if response_id is not None:
-                                    try:
-                                        client.responses.cancel(response_id)
-                                    except Exception as cancel_exc:
-                                        logger.warning(
-                                            f"Could not cancel timed-out OpenAI background response "
-                                            f"{response_id}: {cancel_exc}"
-                                        )
+                                    recovered = self._cancel_background_response(client, response_id, ts, idx)
+                                    if getattr(recovered, "status", None) == "completed":
+                                        response, deadline_recovered = recovered, True
+                                        break
                                 raise _BackgroundResponseTimeout("Timeout waiting for background response.")
-                        request_logger.log_response(ts=ts, batch_idx=idx, response=response.model_dump())
+                        deadline_recovered |= self.terminated or time.time() >= attempt_deadline_at
+                        self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(response))
                         # Resilience: handle status="failed" without losing
                         # the partial output. The Responses API marks the
                         # WHOLE response as failed when the LAST tool call
@@ -2350,8 +3108,16 @@ class APIClient:
                         # wire. Only retry if the output is actually empty.
                         if response.status == "failed":
                             err = getattr(response, "error", None)
-                            err_code = getattr(err, "code", None) if err else None
-                            err_msg = getattr(err, "message", "") if err else ""
+                            err_code = err.get("code") if isinstance(err, dict) else getattr(err, "code", None)
+                            err_msg = (err.get("message", "") if isinstance(err, dict) else getattr(err, "message", "")) or ""
+                            failed_error = ValueError(
+                                f"OpenAI response.status=failed. Error: {err_code} {err_msg[:200]}"
+                            )
+                            if _is_context_length_error(failed_error):
+                                # Do not replay partial tool output into another
+                                # oversized request. Usage/output are retained
+                                # in the provider trace and raw response log.
+                                raise failed_error
                             output_items = getattr(response, "output", None) or []
                             file_limit_error = (
                                 str(err_code or "").lower() == "array_above_max_length"
@@ -2424,6 +3190,12 @@ class APIClient:
                                 )
                                 if response.usage is None:
                                     response.usage = _SalvageUsage(est_in, est_out)
+                            elif self._is_background_server_kill(err_code, time.time() - time_start):
+                                raise _BackgroundResponseTimeout(
+                                    f"OpenAI background response {getattr(response, 'id', '?')} failed "
+                                    f"server-side with no output after {time.time() - time_start:.0f}s "
+                                    f"(error={err_code}); treating as a duration kill."
+                                )
                             elif err_code == "rate_limit_exceeded" and n_retries < self.max_retries_inner:
                                 sleep_s = max(_parse_retry_after_seconds(err_msg) + 1.0, 5.0)
                                 logger.warning(
@@ -2431,7 +3203,9 @@ class APIClient:
                                     f"output items; sleeping {sleep_s:.1f}s before retry. "
                                     f"Message: {err_msg[:200]}"
                                 )
-                                time.sleep(sleep_s)
+                                self._record_pro_failure(retry_state, pro_attempt=pro_attempt, idx=idx)
+                                self._report_attempt_failure(ts, idx, ValueError(err_code), retry_decision="retry")
+                                self._sleep(sleep_s)
                                 response = None
                                 continue
                             else:
@@ -2445,7 +3219,13 @@ class APIClient:
                             except:
                                 raise ValueError("No usage info in response -> if in background, this mean exception occured.")
                     else:
-                        request_logger.log_response(ts=ts, batch_idx=idx, response=response.model_dump())
+                        self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(response))
+                    if hosted_allowance:
+                        hosted_used = sum(
+                            getattr(item, "type", "") in {"code_interpreter_call", "web_search_call"}
+                            for item in response.output
+                        )
+                        retry_state.hosted_tool_calls_used += hosted_used - hosted_allowance
                 except Exception as e:
                     if isinstance(
                         e,
@@ -2453,23 +3233,39 @@ class APIClient:
                     ):
                         raise
                     if isinstance(e, _BackgroundResponseTimeout):
-                        background_timeout_count += 1
-                        next_effort = self._background_timeout_retry_reasoning_effort(background_timeout_count)
+                        retry_state.background_timeouts += 1
+                        next_effort = self._background_timeout_retry_reasoning_effort(retry_state.background_timeouts)
                         if next_effort is not None:
                             logger.warning(
-                                f"OpenAI background response timed out {background_timeout_count} time(s); "
+                                f"OpenAI background response timed out {retry_state.background_timeouts} time(s); "
                                 f"retrying with reasoning.effort={next_effort}."
                             )
                     if "rate limit" not in str(e).lower() and "429" not in str(e):
                         total_retries += 1
-                    request_logger.log_response(ts=ts, batch_idx=idx, exception={"exception": str(e)})
+                    self._log_provider_response(ts=ts, batch_idx=idx, exception={"exception": str(e)})
                     logger.error(f"Got OpenAI error in responses api inner. Exception: {e}")
-                    if _is_terminal_api_error(e):
+                    terminal = _is_terminal_api_error(e)
+                    self._report_attempt_failure(ts, idx, e, retry_decision="stop" if terminal else "retry")
+                    if terminal:
+                        if in_wrapup:
+                            response = None
+                            break
                         raise
-                    time.sleep(60)
+                    self._record_pro_failure(retry_state, pro_attempt=pro_attempt, idx=idx)
+                    self._sleep(60)
                     response = None
                     continue
             if response is None:
+                if in_wrapup:
+                    # Keep the usage and partial output already accrued
+                    # instead of raising into an outer retry that would
+                    # redo the whole (expensive) call from scratch.
+                    logger.warning(
+                        "OpenAI max_output_tokens wrap-up turn failed; accepting the truncated output."
+                    )
+                    if conversation and conversation[-1].get("role") == "user":
+                        conversation.pop()
+                    break
                 raise ValueError("Max inner retries reached.")
 
             # Update state: token counts and conversation (potentially execute tool calls)
@@ -2497,8 +3293,15 @@ class APIClient:
                     conversation.append({"role": "assistant", "content": all_messages, "id": out.id})
                 elif out.type == "code_interpreter_call":
                     status = getattr(out, "status", None) or "completed"
-                    if status not in {"in_progress", "interpreting", "completed"}:
-                        status = "completed"
+                    if status not in {"in_progress", "interpreting", "completed", "incomplete", "failed"}:
+                        status = "failed"
+                    outputs = getattr(out, "outputs", None)
+                    if outputs is not None:
+                        outputs = [item.model_dump() if hasattr(item, "model_dump") else dict(item) for item in outputs]
+                        outputs = [{"type": item["type"], field: item[field]}
+                                   for item in outputs for field in ("logs", "url")
+                                   if item.get("type") == {"logs": "logs", "url": "image"}[field]
+                                   and isinstance(item.get(field), str)]
                     conversation.append(
                         {
                             "type": "code_interpreter_call",
@@ -2506,6 +3309,7 @@ class APIClient:
                             "code": out.code,
                             "container_id": out.container_id,
                             "status": status,
+                            "outputs": outputs,
                         }
                     )
                 elif out.type == "web_search_call":
@@ -2514,15 +3318,22 @@ class APIClient:
                         status = "completed"
                     conversation.append({"type": "web_search_call", "id": out.id, "status": status})
                 elif out.type == "function_call":
+                    if deadline_recovered or self.terminated:
+                        continue  # Retain usage/output, but never execute post-deadline work.
                     function_name = out.name
                     arguments = json.loads(out.arguments)
                     tool_func = self.tool_functions[function_name]
                     tool_key = "any" if max_tool_calls_mode == "total" else function_name
-                    if nb_executed_tool_calls[tool_key] >= max_tool_calls[tool_key]:
+                    if delivery_only() and function_name not in {"read_context", "publish_artifact", "publish_sandbox_artifact"}:
+                        output = "Delivery interval: new research is disabled. Publish existing work and finish."
+                    elif nb_executed_tool_calls[tool_key] >= max_tool_calls[tool_key]:
                         output = f"Error: Tool call after exceeding max # of tool calls ({max_tool_calls[tool_key]})."
                     else:
                         try:
-                            output = self._execute_tool_function(function_name, arguments, conversation)
+                            output = self._execute_tool_function(
+                                function_name, arguments, conversation,
+                                call_deadline_monotonic_s=self._tool_call_deadline(inner_start),
+                            )
                         except Exception as e:
                             logger.error(f"Error executing tool {function_name}. Exception: {e}")
                             output = f"Error executing tool {function_name}. Exception: {e}"
@@ -2586,13 +3397,40 @@ class APIClient:
                 else:
                     raise ValueError(f"Unknown output type {out.type}")
 
+            if deadline_recovered:
+                _drop_trailing_reasoning_items(conversation)
+                break
+            if _openai_response_hit_max_output_tokens(response):
+                dropped = _drop_trailing_reasoning_items(conversation)
+                if (
+                    self.openai_continue_on_max_output_tokens
+                    and max_output_token_continuations < self.openai_max_output_token_continuations
+                    and not self.terminated
+                ):
+                    max_output_token_continuations += 1
+                    in_wrapup = True
+                    logger.warning(
+                        f"OpenAI response hit max_output_tokens; dropped {dropped} trailing reasoning "
+                        f"item(s), requesting wrap-up turn {max_output_token_continuations}/"
+                        f"{self.openai_max_output_token_continuations}."
+                    )
+                    conversation.append({"role": "user", "content": _OPENAI_MAX_OUTPUT_TOKENS_WRAPUP_PROMPT})
+                    continue
+                logger.warning(
+                    f"OpenAI response hit max_output_tokens after {max_output_token_continuations} "
+                    f"wrap-up turn(s); accepting the truncated output."
+                )
+                break
+
             # If nothing was run this was the last iteration, stop
             if not was_tool_call_executed or self.terminated:
                 break
-        
+
         if conversation[-1].get("type", "") == "reasoning":
             raise ValueError("Conversation ended with reasoning block.")
-        if len(conversation) == len(messages):
+        # Recovery prompts and tool items do not constitute a new answer.
+        # Prevent consumers from falling back to an earlier invocation's reply.
+        if not any(m.get("role") == "assistant" for m in conversation[len(messages):]):
             conversation.append({"role": "assistant", "content": ""})
         return self.InternalRequestResult(
             conversation,
@@ -2672,26 +3510,28 @@ class APIClient:
                     ts = time.strftime("%m%d-%H:%M:%S", time.localtime(time.time()))
                     ts += f".{datetime.now().microsecond:06d}"
                     info = {"nb_executed_tool_calls": nb_executed_tool_calls, "n_retries": n_retries}
-                    request_logger.log_request(ts=ts, batch_idx=idx, request=payload, **info)
+                    self._log_provider_request(ts=ts, batch_idx=idx, request=payload, **info)
                     response = client.chat.completions.create(**payload)
-                    request_logger.log_response(ts=ts, batch_idx=idx, response=response.model_dump())
+                    self._log_provider_response(ts=ts, batch_idx=idx, response=self._provider_response_dict(response))
                 except Exception as e:
                     if "rate limit" not in str(e).lower() and "429" not in str(e):
                         total_retries += 1
-                    request_logger.log_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                    self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
                     if isinstance(e, RateLimitError):
                         logger.info(f"Got OpenAI CC rate limit error. Sleeping for 60 seconds. Exception: {e}")
-                        time.sleep(60)
+                        self._sleep(60)
                         continue
-                    if _is_terminal_api_error(e):
+                    if _is_terminal_api_error(e, context_length_recovery=True):
                         raise
-                    if "maximum context length" in str(e).lower() or "input token count" in str(e).lower():
+                    if _is_context_length_error(e):
+                        if max_output_tokens is None or max_output_tokens <= 1:
+                            raise
                         max_output_tokens = max_output_tokens // 2
                         logger.info(
                             f"Got OpenAI CC max context length error. Reducing max output tokens to {max_output_tokens} and retrying. Exception: {e}"
                         )
                     logger.info(f"Got OpenAI CC non ratelimit error. Sleeping for 20 seconds: {e}")
-                    time.sleep(60)
+                    self._sleep(60)
                     continue
             if response is None:
                 raise ValueError("Max inner retries reached.")
@@ -2776,7 +3616,10 @@ class APIClient:
                         # Execute tool
                         arguments = json.loads(tool_call.function.arguments)
                         try:
-                            output = self._execute_tool_function(function_name, arguments, conversation)
+                            output = self._execute_tool_function(
+                                function_name, arguments, conversation,
+                                call_deadline_monotonic_s=self._tool_call_deadline(inner_start),
+                            )
                         except Exception as e:
                             logger.error(f"Error executing tool {function_name}. Exception: {e}")
                             output = f"Error executing tool {function_name}. Exception: {e}"
@@ -2869,26 +3712,27 @@ class APIClient:
                 }
                 ts = time.strftime("%m%d-%H:%M:%S", time.localtime(time.time()))
                 ts += f".{datetime.now().microsecond:06d}"
-                request_logger.log_request(ts=ts, batch_idx=idx, request=payload, n_retries=n_retries)
+                self._log_provider_request(ts=ts, batch_idx=idx, request=payload, n_retries=n_retries)
                 response = client.chat.completions.create(**payload)
             except Exception as e:
                 if "rate limit" not in str(e).lower() and "429" not in str(e):
                     total_retries += 1
-                request_logger.log_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
                 if isinstance(e, RateLimitError):
                     logger.info(f"Got OpenAI CC rate limit error. Sleeping for 60 seconds. Exception: {e}")
-                    time.sleep(60)
+                    self._sleep(60)
                     continue
-                if _is_terminal_api_error(e):
+                if _is_terminal_api_error(e, context_length_recovery=True):
                     raise
-                if "maximum context length" in str(e).lower() or "input token count" in str(e).lower():
-                    if max_output_tokens is not None:
-                        max_output_tokens = max_output_tokens // 2
-                        logger.info(
-                            f"Got OpenAI CC max context length error. Reducing max output tokens to {max_output_tokens} and retrying. Exception: {e}"
-                        )
+                if _is_context_length_error(e):
+                    if max_output_tokens is None or max_output_tokens <= 1:
+                        raise
+                    max_output_tokens = max_output_tokens // 2
+                    logger.info(
+                        f"Got OpenAI CC max context length error. Reducing max output tokens to {max_output_tokens} and retrying. Exception: {e}"
+                    )
                 logger.info(f"Got OpenAI CC non ratelimit error. Sleeping for 20 seconds: {e}")
-                time.sleep(60)
+                self._sleep(60)
                 continue
         if response is None:
             raise ValueError("Max inner retries reached.")
@@ -2919,7 +3763,7 @@ class APIClient:
             )
             reasoning_tokens = self._extract_reasoning_tokens(final_usage)
 
-        request_logger.log_response(
+        self._log_provider_response(
             ts=ts,
             batch_idx=idx,
             response={
@@ -2960,12 +3804,52 @@ class APIClient:
             cleaned_conversation.append(new_message)
         return cleaned_conversation
 
-    def _google_query_with_internal_tools(self, idx, messages):
-        """Queries Google for BCN.
-        InternalRequestResult or None
+    def _google_generation_config(self):
+        """``generationConfig`` for the native generateContent path.
+
+        Model configs carry the thinking settings in the OpenAI-compatible
+        ``extra_body.extra_body.google.thinking_config`` (snake_case) form;
+        the native API wants them camelCased under ``thinkingConfig``.
         """
-        # NOTE: expect single turn (since internal tool calls) and don't reprompt
-        assert len(messages) == 1 and messages[0]["role"] == "user"
+        config = {}
+        if self.max_tokens is not None:
+            config["maxOutputTokens"] = int(self.max_tokens)
+        extra_body = self.kwargs.get("extra_body") or {}
+        google_extra = (extra_body.get("extra_body") or {}).get("google") or {}
+        thinking = google_extra.get("thinking_config") or google_extra.get("thinkingConfig")
+        if isinstance(thinking, dict) and thinking:
+            config["thinkingConfig"] = {
+                re.sub(r"_([a-z])", lambda m: m.group(1).upper(), str(k)): v
+                for k, v in thinking.items()
+            }
+        return config
+
+    def _google_query_with_internal_tools(self, idx, messages, *, _final_answer_only=False):
+        """Query native generateContent, including prior conversation turns."""
+        system_messages = [m for m in messages if m.get("role") in ("developer", "system")]
+        contents = []
+        for msg in messages:
+            role = msg.get("role")
+            if role in ("developer", "system"):
+                continue
+            if "google_parts" in msg:
+                role, parts = "model", msg["google_parts"]
+            elif role in ("user", "assistant"):
+                content = msg.get("content", "")
+                if not isinstance(content, str):
+                    raise ValueError("Native Gemini history requires text message content.")
+                role = "model" if role == "assistant" else "user"
+                parts = [{"text": content}]
+            else:
+                raise ValueError(f"Unsupported native Gemini history role: {role!r}")
+            if not parts:
+                continue
+            if contents and contents[-1]["role"] == role:
+                contents[-1]["parts"].extend(parts)
+            else:
+                contents.append({"role": role, "parts": list(parts)})
+        if not contents or contents[-1]["role"] != "user":
+            raise ValueError("Native Gemini history must end with a user request.")
 
         conversation = [m.copy() for m in messages]
 
@@ -2987,9 +3871,11 @@ class APIClient:
                         "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
                     }
                 )
-            elif tool_desc.get("type") == "web_search":
+            elif tool_desc.get("type") in ("web_search", "web_search_preview"):
                 google_tools.append({"googleSearch": {}})
                 has_web_search = True
+            elif tool_desc.get("type") == "code_interpreter":
+                google_tools.append({"codeExecution": {}})
             elif "google_search" in tool_desc:
                 google_tools.append({"googleSearch": tool_desc["google_search"]})
                 has_web_search = True
@@ -3000,27 +3886,30 @@ class APIClient:
         if function_declarations:
             google_tools.append({"functionDeclarations": function_declarations})
 
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": messages[0]["content"]}]}],
-        }
+        payload = {"contents": contents}
+        if system_messages:
+            payload["systemInstruction"] = {
+                "parts": [{"text": m["content"]} for m in system_messages]
+            }
         if google_tools:
             payload["tools"] = google_tools
+        if _final_answer_only:
+            payload.pop("tools", None)
+        generation_config = self._google_generation_config()
+        if generation_config:
+            payload["generationConfig"] = generation_config
 
         ts = time.strftime("%m%d-%H:%M:%S", time.localtime(time.time()))
         ts += f".{datetime.now().microsecond:06d}"
-        request_logger.log_request(ts=ts, batch_idx=idx, request=payload)
+        self._log_provider_request(ts=ts, batch_idx=idx, request=payload)
 
-        response = requests.post(
-            self.base_url,
-            headers=headers,
-            json=payload,
-            # Bound the synchronous HTTP call so a hung Gemini request
-            # respects the same wallclock budget as the SDK paths;
-            # otherwise this can block ``asyncio.to_thread`` past the
-            # outer ``max_wallclock_per_call_s`` indefinitely.
-            timeout=self.timeout,
-        )
-        request_logger.log_response(ts=ts, batch_idx=idx, response=response.json())
+        timeout = self._anthropic_request_timeout(time.time())
+        def generate():
+            response = requests.post(self.base_url, headers=headers, json=payload, timeout=timeout)
+            self._log_provider_response(ts=ts, batch_idx=idx, response=response.json())
+            return response
+
+        response = self._bounded_provider_operation(generate, timeout=timeout)
 
         if response.status_code != 200:
             raise Exception(f"Error: {response.status_code} - {response.text}")
@@ -3030,19 +3919,71 @@ class APIClient:
             raise Exception(f"Error: {json_response}")
 
         candidate = json_response["candidates"][0]
-        message = candidate["content"]
-        parts = message["parts"]
-        role = message["role"]
+        message = candidate.get("content") or {}
+        parts = message.get("parts") or []
+        role = message.get("role", "model")
         assert role == "model"
+        finish_reason = candidate.get("finishReason", "UNKNOWN")
+        if _final_answer_only and not any(part.get("text", "").strip() for part in parts if not part.get("thought")):
+            raise _ToolRecoveryFailed(f"Gemini wrap-up returned no final text ({finish_reason})")
 
-        input_tokens = json_response["usageMetadata"]["promptTokenCount"]
-        output_tokens = json_response["usageMetadata"]["candidatesTokenCount"]
+        if finish_reason == "TOO_MANY_TOOL_CALLS" and not _final_answer_only:
+            # One bounded wrap-up request, with hosted tools physically absent.
+            # Reuse actual findings, not a claim that the tool loop succeeded.
+            findings = []
+            size = 0
+            for part in reversed(parts):
+                encoded_size = len(json.dumps(part))
+                if size + encoded_size > 120_000:
+                    continue
+                findings.insert(0, part)
+                size += encoded_size
+            recovery_messages = [*messages]
+            if findings:
+                recovery_messages.append({"role": "assistant", "google_parts": findings})
+            recovery_messages.append({"role": "user", "content": (
+                "The hosted-tool limit ended the previous attempt. Tools are disabled. "
+                "Using only results actually obtained, write the requested final council reply now. "
+                "State any remaining gaps; do not claim unexecuted computations succeeded."
+            )})
+            try:
+                recovered = self._google_query_with_internal_tools(idx, recovery_messages, _final_answer_only=True)
+            except Exception as exc:
+                raise _ToolRecoveryFailed(f"Gemini tools-disabled recovery failed: {exc}") from exc
+            usage = json_response.get("usageMetadata") or {}
+            inputs = int(usage.get("promptTokenCount", 0) or 0) + int(usage.get("toolUsePromptTokenCount", 0) or 0)
+            reasoning = int(usage.get("thoughtsTokenCount", 0) or 0)
+            outputs = int(usage.get("candidatesTokenCount", 0) or 0) + reasoning
+            cached = int(usage.get("cachedContentTokenCount", 0) or 0)
+            recovered.cost_usd = (recovered.cost_usd if recovered.cost_usd is not None else self._get_cost(
+                recovered.input_tokens, recovered.output_tokens, recovered.cached_input_tokens,
+            )) + self._get_cost(inputs, outputs, cached)
+            recovered.input_tokens += inputs
+            recovered.output_tokens += outputs
+            recovered.cached_input_tokens += cached
+            recovered.reasoning_tokens += reasoning
+            return recovered
+
+        usage_metadata = json_response.get("usageMetadata") or {}
+        input_tokens = int(usage_metadata.get("promptTokenCount", 0) or 0)
+        # Built-in tool rounds (codeExecution / googleSearch) re-prompt the
+        # model; Gemini bills those tokens as input but reports them apart
+        # from promptTokenCount (a council seat showed 727k such tokens next
+        # to a 56k prompt).
+        input_tokens += int(usage_metadata.get("toolUsePromptTokenCount", 0) or 0)
+        output_tokens = int(usage_metadata.get("candidatesTokenCount", 0) or 0)
+        # Gemini bills thinking tokens at the output rate but reports them
+        # separately from candidatesTokenCount; fold them into the billable
+        # output total (reasoning_tokens below keeps the separate metric).
+        output_tokens += int(usage_metadata.get("thoughtsTokenCount", 0) or 0)
+        # cachedContentTokenCount is the cache-hit subset of promptTokenCount.
+        cached_input_tokens = int(usage_metadata.get("cachedContentTokenCount", 0) or 0)
         # Google's native API reports thinking budget as a separate
         # ``thoughtsTokenCount`` field (NOT included in
         # candidatesTokenCount, unlike OpenAI's output_tokens). Surface
         # it so the First-Proof token report can record reasoning per
         # call for Gemini just like the other providers.
-        reasoning_tokens = int(json_response["usageMetadata"].get("thoughtsTokenCount", 0) or 0)
+        reasoning_tokens = int(usage_metadata.get("thoughtsTokenCount", 0) or 0)
 
         def _clear_buffer(conversation, buffer, mode):
             if buffer is None or len(buffer) == 0:
@@ -3078,6 +4019,30 @@ class APIClient:
                         "name": part["functionCall"]["name"],
                     }
                 )
+            elif "executableCode" in part:
+                _clear_buffer(conversation, buffer, mode)
+                buffer = ""
+                mode = None
+                conversation.append(
+                    {
+                        "type": "code_interpreter_call",
+                        "role": "assistant",
+                        "language": part["executableCode"].get("language", ""),
+                        "code": part["executableCode"].get("code", ""),
+                    }
+                )
+            elif "codeExecutionResult" in part:
+                _clear_buffer(conversation, buffer, mode)
+                buffer = ""
+                mode = None
+                conversation.append(
+                    {
+                        "type": "code_interpreter_result",
+                        "role": "tool",
+                        "outcome": part["codeExecutionResult"].get("outcome", ""),
+                        "content": part["codeExecutionResult"].get("output", ""),
+                    }
+                )
             elif "functionResponse" in part:
                 _clear_buffer(conversation, buffer, mode)
                 buffer = ""
@@ -3099,9 +4064,18 @@ class APIClient:
                 buffer += f"{part['text']}"
         _clear_buffer(conversation, buffer, mode)
 
+        if len(conversation) == len(messages) or conversation[-1].get("type") != "response":
+            conversation.append({"role": "assistant", "type": "response", "content": ""})
+        # Display traces are not separate native turns. Replay the original
+        # parts once, unchanged (including tool parts and thought signatures).
+        for msg in conversation[len(messages):]:
+            msg["google_parts"] = []
+        conversation[-1]["google_parts"] = parts
+
         return self.InternalRequestResult(
             conversation=conversation,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
             reasoning_tokens=reasoning_tokens,
         )

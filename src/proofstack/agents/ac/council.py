@@ -2,9 +2,10 @@
 
 The Council is invoked when the Author emits a ``<council>...</council>``
 block in its turn. Each council member is a single API call to a
-strong model (gpt-5.6-sol in Pro mode, claude-opus-4.x,
-gemini-3.x-pro, …) given
-the same workspace files plus the Author's question. Members run in
+strong model (gpt-6-astra in Pro mode, claude-fable-5.1,
+gemini-3.x-pro, …) with the provider's code sandbox and web search
+tools, given the same workspace files plus the Author's question.
+Members run in
 parallel; a placeholder ``synthesizer_model`` field is reserved for a
 future Pro-vetted summarizer (the user prefers raw replies for now to
 preserve entropy).
@@ -46,6 +47,13 @@ is right/wrong".
 Read the current `answer.tex`, `research_notes.tex`, and
 `references.bib` for context, then engage with the Author's
 question.
+
+You have a code sandbox (code_interpreter / code_execution) and a
+web search tool. Use them when they sharpen your answer: run a
+quick independent experiment or numerical sanity check, or look up
+the literature you are pointing at (verify a citation exists before
+naming it). Keep tool use focused; you are advising, not writing
+the paper.
 
 Be opinionated where you have a real angle to offer. If you are
 not sure, say "uncertain" rather than confabulating. Keep your
@@ -100,7 +108,10 @@ class CouncilMember(APICallAgent):
     )
     SYSTEM_PROMPT: ClassVar[str] = COUNCIL_MEMBER_SYSTEM
     USER_PROMPT: ClassVar[str] = COUNCIL_MEMBER_USER
-    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-56-sol-pro"
+    MODEL: ClassVar[ModelSpec] = "models/openai/gpt-6-astra-pro"
+    # Enough for a few experiments plus literature checks; provider-managed
+    # tools are forwarded to the provider, local function tools are capped.
+    MAX_TOOL_CALLS: ClassVar[int] = 12
 
     class Inputs(BaseModel):
         author_question: str
@@ -110,6 +121,18 @@ class CouncilMember(APICallAgent):
 
     class Outputs(BaseModel):
         text: str = ""
+
+    def extra_client_kwargs(self) -> dict[str, Any]:
+        # Same descriptors as Author/Critic; APIClient maps them per provider
+        # (OpenAI Responses tools, Anthropic code_execution/web_search,
+        # Gemini codeExecution/googleSearch).
+        return {
+            "tools": [
+                (None, {"type": "code_interpreter", "container": {"type": "auto"}}),
+                (None, {"type": "web_search_preview"}),
+            ],
+            "max_tool_calls": self.MAX_TOOL_CALLS,
+        }
 
     def __init__(
         self,
@@ -136,6 +159,9 @@ class CouncilMember(APICallAgent):
 
     def parse_output(self, raw_text: str, inp: BaseModel) -> BaseModel:
         return self.Outputs(text=_strip_visible_thought_blocks(raw_text))
+
+    def cache_output_is_reusable(self, out: BaseModel) -> bool:
+        return bool(out.text.strip())
 
 
 class Council(Agent):
@@ -250,7 +276,7 @@ class Council(Agent):
 def _short_label(model_ref: str) -> str:
     """Best-effort short label for an event-log column.
 
-    ``models/openai/gpt-56-sol-pro`` -> ``gpt-56-sol-pro``;
+    ``models/openai/gpt-6-astra-pro`` -> ``gpt-6-astra-pro``;
     ``models/anthropic/opus_47_max`` -> ``opus_47_max``;
     fallback: the ref itself.
     """
