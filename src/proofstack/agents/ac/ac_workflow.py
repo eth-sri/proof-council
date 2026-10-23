@@ -50,7 +50,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Self, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -415,6 +415,10 @@ class ACWorkflow(Agent):
     DEFAULT_FULL_CRITIC_INTERVAL: ClassVar[int] = 3
 
     class Inputs(BaseModel):
+        execution_backend: Literal["api", "subscription"] = "api"
+        subscription_planning_usd: float = Field(default=1000, gt=0, allow_inf_nan=False)
+        subscription_max_parallel: int = Field(default=2, ge=1, le=16)
+        subscription_call_seconds: int = Field(default=5400, ge=1)
         problem: str
         problem_id: str
         n_rounds: int = Field(default=5, ge=1, le=500)
@@ -1519,7 +1523,7 @@ class ACWorkflow(Agent):
         node = self.tracker
         while node.parent is not None:
             node = node.parent
-        used = float(node.counters.usd)
+        used = float(node.planning_usd)
         max_usd = (
             float(node.spec.max_usd)
             if node.spec is not None and node.spec.max_usd is not None

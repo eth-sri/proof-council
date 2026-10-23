@@ -7,6 +7,8 @@ budget:
   max_wallclock_s: 86100
 
 inputs:
+  # Subscription mode currently requires author_parallelism=1.
+  execution_backend: api
   author_parallelism: 4
   n_rounds: 50
   full_critic_interval: 3

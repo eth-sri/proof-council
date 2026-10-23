@@ -38,6 +38,10 @@ GOOGLE_API_KEY=...
 
 Other supported key names include `XAI_API_KEY`, `GLM_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `OPENROUTER_API_KEY`, `TOGETHER_API_KEY`, `STEPFUN_API_KEY`, and `TIIUAE_API_KEY`. You only need keys for the models used by your selected workflow.
 
+API execution remains the default. The single-author research/cleanup workflow
+also has an opt-in [subscription-only mode](docs/subscription_mode.md), using
+Codex and Claude Code logins with paid API fallback disabled.
+
 ## Use The App
 
 The app is the main way to use ProofCouncil.

@@ -62,7 +62,7 @@ class CleanupUnavailable(RuntimeError):
 
 
 def _remaining_usd(tracker):
-    amounts = [t.spec.max_usd - t.counters.usd for t in tracker.chain()
+    amounts = [t.spec.max_usd - t.planning_usd for t in tracker.chain()
                if t.spec and t.spec.max_usd is not None and t.spec.max_usd >= 0]
     if not amounts or not math.isfinite(min(amounts)) or min(amounts) <= 0:
         raise ValueError("cleanup requires a positive finite remaining USD budget")
@@ -73,8 +73,8 @@ def _top_up_review_budget(helper, invocation, parent, *, episode_remaining, max_
     parent.check()
     # Preserve every dollar already promised to the still-running editor and
     # linear reader, including usage that has not arrived in the ledger yet.
-    committed = max(invocation.spec.max_usd, invocation.counters.usd)
-    unspent = committed - invocation.counters.usd
+    committed = max(invocation.spec.max_usd, invocation.planning_usd)
+    unspent = committed - invocation.planning_usd
     grant = max(0.0, min(max_topup, episode_remaining - committed,
                          _remaining_usd(parent) - unspent))
     if grant:
@@ -157,6 +157,7 @@ def cleanup_accounting_unresolved(run_root: Path) -> bool:
 
 
 class CleanupSettings(BaseModel):
+    execution_backend: Literal["api", "subscription"] = "api"
     model: str = "claude-fable-5-1"
     effort: str = "xhigh"
     cost_config: str = "models/anthropic/fable_51"
@@ -200,6 +201,10 @@ async def check_cleanup_available(settings: CleanupSettings):
         load_cost_rates(settings.linear_read_model)
         if settings.codex_budget_fraction + settings.linear_read_budget_fraction >= 1:
             raise ValueError("cleanup helper budget fractions leave nothing for the editor")
+    if settings.execution_backend == "subscription":
+        from proofstack.subscription import preflight
+        preflight()
+        return await asyncio.to_thread(check_cleanup_runtime, require_codex=bool(settings.codex_budget_fraction))
     if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
         raise CleanupUnavailable("cleanup requires ANTHROPIC_API_KEY; subscription fallback is disabled")
     if settings.codex_budget_fraction and not os.environ.get("OPENAI_API_KEY", "").strip():
@@ -222,10 +227,11 @@ def cleanup_memory_policy(settings: CleanupSettings, registry_root: Path, role: 
 
 
 async def check_cleanup_launch(inputs: dict, components: dict, registry_root: Path):
-    if inputs.get("cleanup_backend", "claude_code") != "claude_code":
+    if inputs.get("cleanup_backend", "claude_code") != "claude_code" and inputs.get("execution_backend") != "subscription":
         return []
     config = component_config_for_class(components, CleanupSession, "CleanupSession")
     settings = CleanupSettings.model_validate(config.get("cleanup", {}))
+    settings = settings.model_copy(update={"execution_backend": inputs.get("execution_backend", "api")})
     probes = []
     for role in ("editors", "codex") if settings.codex_budget_fraction else ("editors",):
         policy = cleanup_memory_policy(settings, registry_root, role)
@@ -254,7 +260,7 @@ class _MeteredTurn(ConfigurableCLIAgent):
         return max(0.0, cost - base_usd), own_tokens
     def extra_env(self, sandbox, inp):
         env = super().extra_env(sandbox, inp)
-        if self.component_config["usage"]["type"] == "codex_jsonl":
+        if self.component_config["usage"]["type"] == "codex_jsonl" and self.ctx.execution_backend != "subscription":
             # Noninteractive Codex reads CODEX_API_KEY, not OPENAI_API_KEY.
             # Bind only in the child environment; never persist the key in config.
             key = sandbox.spec.build_env(sandbox_root=sandbox.root).get("OPENAI_API_KEY", "")
@@ -397,6 +403,8 @@ class CleanupSession(Agent):
     def _turn(self, cfg, name, usd, seconds, *, ctx=None):
         # Do not inherit generic '*' CLI configuration or subscription auth.
         parent = ctx.budgets.root() if ctx is not None else self.tracker
+        if self.ctx.execution_backend == "subscription":
+            cfg = self._subscription_turn_config(cfg)
         ctx = replace(ctx or self.ctx, component_configs={name: cfg})
         turn = _MeteredTurn(ctx, name=name, budget=BudgetSpec(max_usd=usd, max_wallclock_s=seconds))
         turn.tracker.parent = parent
@@ -405,6 +413,22 @@ class CleanupSession(Agent):
         turn.final_usage = False
         turn.proven_not_started = False
         return turn
+
+    @staticmethod
+    def _subscription_turn_config(cfg):
+        from proofstack.subscription import CODEX_MODEL, CLAUDE_MODEL, CODEX_COST, CLAUDE_COST
+        cfg = {**cfg, "usage": dict(cfg["usage"]), "sandbox": dict(cfg["sandbox"]), "env": dict(cfg.get("env", {}))}
+        cfg["sandbox"].update(provider_keys=[], env_allowlist=["PATH", "LANG", "LC_ALL"], extra_env={})
+        if cfg["usage"]["type"] == "codex_jsonl":
+            cfg["cmd"] = [arg.replace('forced_login_method="api"', 'forced_login_method="chatgpt"') for arg in cfg["cmd"]]
+            cfg.update(copy_codex_auth=True, model=CODEX_MODEL, model_reasoning_effort="xhigh")
+            cfg["env"].pop("CODEX_HOME", None)
+            cfg["usage"].update(model=CODEX_MODEL, cost_config=CODEX_COST)
+        else:
+            cfg.update(copy_claude_auth=True, model=CLAUDE_MODEL)
+            cfg["usage"].update(auth_mode="subscription", model=CLAUDE_MODEL, cost_config=CLAUDE_COST)
+            cfg["env"].pop("CLAUDE_CONFIG_DIR", None)
+        return cfg
 
     def _sandbox(self, settings, seconds, provider):
         role = "editors" if provider == "ANTHROPIC_API_KEY" else "codex"
@@ -419,6 +443,12 @@ class CleanupSession(Agent):
         if cleanup_accounting_unresolved(self.ctx.root_workdir):
             raise CleanupAccountingUncertain("cleanup usage is unresolved; reconcile it before continuing this run")
         settings = CleanupSettings.model_validate(self.component_config.get("cleanup", {}))
+        settings = settings.model_copy(update={"execution_backend": self.ctx.execution_backend})
+        if self.ctx.execution_backend == "subscription":
+            from proofstack.subscription import CODEX_MODEL, CLAUDE_MODEL, CODEX_COST, CLAUDE_COST
+            settings = settings.model_copy(update={"execution_backend": "subscription", "model": CLAUDE_MODEL,
+                "cost_config": CLAUDE_COST, "codex_model": CODEX_MODEL, "codex_cost_config": CODEX_COST,
+                "codex_effort": "xhigh", "effort": "xhigh"})
         await self._preflight(settings)
         self.tracker.check()
         _remaining_usd(self.tracker)
@@ -548,7 +578,7 @@ class CleanupSession(Agent):
                     raise CleanupAccountingUncertain("cleanup helper shutdown or usage is unresolved")
                 if (purpose == "attribution" and not reviews.attribution_retrieved() and not review_topup_used
                         and helper_allowance > 0
-                        and helper_tracker.spec.max_usd - helper_tracker.counters.usd <= helper_allowance * 0.25
+                        and helper_tracker.spec.max_usd - helper_tracker.planning_usd <= helper_allowance * 0.25
                         and any(r["purpose"] == "attribution" and r["status"] == "failed"
                                 for r in reviews.records.values())):
                     grant = _top_up_review_budget(
@@ -659,11 +689,12 @@ class CleanupSession(Agent):
                             if not worker.metered:
                                 # Only a stopped review can be settled by an estimate.
                                 # Use the normal cost ledger for resume and usage export.
-                                recorded = worker.tracker.counters.usd
+                                recorded = worker.tracker.planning_usd
                                 charge = max(0.0, usd - recorded)
-                                worker.tracker.add_usd(charge)
+                                worker.tracker.add_planning_usd(charge)
                                 await worker.events.emit("model.call", {
-                                    "model": settings.codex_model, "cost_usd": charge,
+                                    "model": settings.codex_model, "cost_usd": 0 if worker.tracker.is_subscription else charge,
+                                    "api_equivalent_usd": charge, "subscription": worker.tracker.is_subscription,
                                     "cost_estimated": True, "usage_unavailable": True,
                                     "via": "cleanup_codex_allowance_estimate",
                                     "cost_config": settings.codex_cost_config, "review_id": review_id,
@@ -687,6 +718,11 @@ class CleanupSession(Agent):
 
             async def linear_read():
                 from mathagents.provider_trace import COUNTS, ProviderTrace, active_trace
+
+                if self.ctx.execution_backend == "subscription":
+                    from proofstack.subscription import linear_read_subscription
+                    async with linear_lock:
+                        return await linear_read_subscription(self, linear_tracker, workspace, deadline)
 
                 async with linear_lock:
                     if any(key.startswith("linear-") for key in unsettled_helpers):
@@ -874,6 +910,8 @@ class CleanupSession(Agent):
                         transcript = _claude_transcript(workspace, state["session_id"])
                         transcript_offset = transcript.stat().st_size if transcript is not None else 0
                         prompt = (PROMPTS / "cleanup-session.txt").read_text()
+                        if self.ctx.execution_backend == "subscription":
+                            prompt += "\nAll dollar allowances below are API-equivalent planning units, not charges. Use only the supplied subscription tools.\n"
                         prompt += (f"\nThis invocation has up to {int(remaining)} seconds (deadline Unix {time.time() + remaining:.0f}) "
                                    f"and ${lead_allowance:.2f} for you and native reviewers, plus ${helper_allowance:.2f} reserved for Codex.\n")
                         prompt += ("Finishing stage is active now. " if finishing_only else
@@ -967,16 +1005,17 @@ class CleanupSession(Agent):
                     if saved is not None:
                         claude_total = saved
                         known = max(0.0, saved[0] - turn._claude_baseline_for(saved[0])[0])
-                    recorded = turn.tracker.counters.usd
+                    recorded = turn.tracker.planning_usd
                     estimated = max(0.0, max(lead_allowance, known) - recorded)
                     observation = {
                         "session_id": state["session_id"], "charged_usd": estimated, "recorded_usd": recorded,
                         "saved_usage_usd": known if saved is not None else None,
                         "unreported_allowance_usd": max(0.0, lead_allowance - max(recorded, known)),
                     }
-                    turn.tracker.add_usd(estimated)
+                    turn.tracker.add_planning_usd(estimated)
                     await turn.events.emit("model.call", {
-                        "model": settings.model, "cost_usd": estimated,
+                        "model": settings.model, "cost_usd": 0 if turn.tracker.is_subscription else estimated,
+                        "api_equivalent_usd": estimated, "subscription": turn.tracker.is_subscription,
                         "cost_estimated": True, "usage_unavailable": True,
                         "via": "cleanup_editor_allowance_estimate",
                         "cost_config": settings.cost_config, "session_id": state["session_id"],
@@ -994,7 +1033,7 @@ class CleanupSession(Agent):
                     claude_total = turn.claude_total
                 state.update(in_flight=False, resumable=resumable,
                              claude_session_usd=claude_total[0], claude_session_tokens=claude_total[1],
-                             recorded_usd=state["recorded_usd"] + invocation_tracker.counters.usd,
+                             recorded_usd=state["recorded_usd"] + invocation_tracker.planning_usd,
                              estimated_usd=state.get("estimated_usd", 0.0) + estimated)
                 _save(state_path, state)
 

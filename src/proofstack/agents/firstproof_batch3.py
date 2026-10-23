@@ -142,7 +142,7 @@ class FirstProofBatch3Workflow(Agent):
         error_retryable: bool = True
 
     def _remaining_usd(self) -> float:
-        limits = [n.spec.max_usd - n.counters.usd for n in self.tracker.chain()
+        limits = [n.spec.max_usd - n.planning_usd for n in self.tracker.chain()
                   if n.spec is not None and n.spec.max_usd is not None and n.spec.max_usd >= 0]
         if not limits or not math.isfinite(min(limits)):
             raise ValueError("Batch 3 requires an explicit finite run USD budget")
@@ -232,7 +232,9 @@ class FirstProofBatch3Workflow(Agent):
                 raise TimeoutError(f"{name} deadline reached")
             return result
         finally:
-            await self.events.emit("batch3.phase_end", {"phase": name, "cost_usd": ctx.budgets.root().counters.usd})
+            tracker = ctx.budgets.root()
+            await self.events.emit("batch3.phase_end", {"phase": name, "cost_usd": tracker.counters.usd,
+                **({"api_equivalent_usd": tracker.planning_usd, "subscription": True} if tracker.is_subscription else {})})
 
     def _workspace(self, inp):
         return self.ctx.root_workdir / "ac_workspaces" / f"{_safe_id(inp.problem_id)}-{_problem_hash(inp.problem)}"
@@ -363,7 +365,7 @@ class FirstProofBatch3Workflow(Agent):
         else:
             state = FinalReviewState(
                 key=key, review_input=review_input, max_usd=inp.final_review_reserve_usd,
-                initial_spend=self.tracker.counters.usd,
+                initial_spend=self.tracker.planning_usd,
                 deadline_unix_s=time.time() + min(inp.final_review_seconds,
                     deadline - inp.final_review_export_seconds - time.monotonic()),
             )
@@ -376,7 +378,7 @@ class FirstProofBatch3Workflow(Agent):
         phase_end = min(deadline - inp.final_review_export_seconds,
                         time.monotonic() + state.deadline_unix_s - time.time())
         allowance = min(self._remaining_usd(),
-                        state.max_usd - max(0.0, self.tracker.counters.usd - state.initial_spend))
+                        state.max_usd - max(0.0, self.tracker.planning_usd - state.initial_spend))
 
         async def call(ctx):
             critic = FinalStatelessCritic(ctx, name="final_stateless_critic")
@@ -643,7 +645,7 @@ class FirstProofBatch3Workflow(Agent):
             state = SimplificationState(
                 source_sha256=source, rounds=inp.simplification_rounds,
                 document=document, notes=notes, review_md=report,
-                max_usd=available / 2, initial_spend=self.tracker.counters.usd,
+                max_usd=available / 2, initial_spend=self.tracker.planning_usd,
                 deadline_unix_s=time.time() + seconds / 2,
             )
             _save_json(path, state.model_dump(mode="json"))
@@ -666,7 +668,7 @@ class FirstProofBatch3Workflow(Agent):
             return state.document, state.notes, None
         phase_end = min(deadline, time.monotonic() + state.deadline_unix_s - time.time())
         allowance = min(self._remaining_usd() - reserve,
-                        state.max_usd - max(0.0, self.tracker.counters.usd - state.initial_spend))
+                        state.max_usd - max(0.0, self.tracker.planning_usd - state.initial_spend))
         try:
             await self._phase(
                 "proof_simplification", usd=allowance, deadline=phase_end,
@@ -709,7 +711,7 @@ class FirstProofBatch3Workflow(Agent):
                         answer_tex=state.document, research_notes_tex=state.notes,
                         workflow_feedback=SIMPLIFICATION_INSTRUCTIONS,
                         prev_critique=state.feedback,
-                        budget_used_usd=ctx.budgets.root().counters.usd,
+                        budget_used_usd=ctx.budgets.root().planning_usd,
                         budget_max_usd=ctx.budgets.root().spec.max_usd,
                     )
                 except BudgetExhausted as exc:
@@ -1157,11 +1159,12 @@ class FirstProofBatch3Workflow(Agent):
             research_end = min(research_end, now + schedule.research_deadline_unix_s - unix_now)
             research_end = min(research_end, deadline - inp.partial_cleanup_seconds - final_window)
             reserve = schedule.partial_reserve_usd
-            from proofstack.provider_accounting import settle_provider_usage
-            spent = await settle_provider_usage(self.ctx, self.tracker)
-            self.tracker.counters.usd = max(self.tracker.counters.usd, spent)
+            if self.ctx.execution_backend != "subscription":
+                from proofstack.provider_accounting import settle_provider_usage
+                spent = await settle_provider_usage(self.ctx, self.tracker)
+                self.tracker.counters.usd = max(self.tracker.counters.usd, spent)
             self.tracker.spec = (self.tracker.spec or BudgetSpec()).model_copy(
-                update={"max_usd": min(schedule.initial_usd, self._remaining_usd() + self.tracker.counters.usd)})
+                update={"max_usd": min(schedule.initial_usd, self._remaining_usd() + self.tracker.planning_usd)})
         else:
             if final_required and (self._remaining_usd() <= reserve + final_reserve
                                    or deadline - now <= final_window):

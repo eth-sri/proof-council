@@ -278,6 +278,8 @@ class APICallAgent(Agent):
         return cfg
 
     async def _get_client(self) -> Any:
+        if self.ctx.execution_backend == "subscription":
+            raise RuntimeError("Paid API clients are forbidden in subscription mode")
         if self._client is not None:
             return self._client
         spec = self.ctx.model_for(self, self.MODEL)

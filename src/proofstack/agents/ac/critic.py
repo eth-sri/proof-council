@@ -292,6 +292,8 @@ class ACCritic(APICallAgent):
         return value
 
     def _notes_transport(self):
+        if getattr(self.ctx, "execution_backend", "api") == "subscription":
+            return "inline"
         value = self.ctx.component_config_for(self).get("research_notes_transport", "file")
         if value not in {"file", "inline"}:
             raise ValueError("research_notes_transport must be file or inline")
@@ -880,6 +882,8 @@ class ACCritic(APICallAgent):
         identity_input["problem"] = inp.recovery_problem or inp.problem
         def path(fields):
             identity = json.dumps([fields, model, self.ctx.component_config_for(self)], sort_keys=True)
+            if self.ctx.execution_backend == "subscription":
+                identity += json.dumps(self.ctx.subscription_config, sort_keys=True) + "subscription"
             digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             return self.ctx.root_workdir / "critic_context" / f"{digest}.json"
 
