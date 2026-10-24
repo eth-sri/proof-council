@@ -182,7 +182,7 @@ def cli_config(provider, seconds):
               "output_files": {"text": "report.md"}, "done_outputs": {"status": "status"}}
     if provider == "codex":
         return {**common, "cmd": ["codex", "exec", "--ignore-user-config", "--ephemeral",
-                                  "--skip-git-repo-check", "--json", "--output-last-message", "report.md",
+                                  "--skip-git-repo-check", "--json", "--output-last-message", "last-message.txt",
                                   "-c", 'forced_login_method="chatgpt"', "-c", 'model_provider="openai"',
                                   "-c", "tools.web_search=true"],
                 "model": CODEX_MODEL, "model_reasoning_effort": "xhigh", "codex_sandbox": "auto",
@@ -223,7 +223,8 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
         with attachment.open("rb") as stream:
             attachment_hash = hashlib.file_digest(stream, "sha256").hexdigest()
         config["input_files"]["compute-workspace.zip"] = {"from_binary_path_input": "attachment"}
-    identity = json.dumps([key or agent.name, packet, files or {}, outputs, provider,
+    # Older Codex receipts may contain a final chat summary that overwrote report.md.
+    identity = json.dumps((["separate-report-v2"] if provider == "codex" else []) + [key or agent.name, packet, files or {}, outputs, provider,
                            attachment_hash, tools, agent.ctx.subscription_config], sort_keys=True)
     digest = hashlib.sha256(identity.encode()).hexdigest()
     receipt = agent.ctx.root_workdir / "subscription_calls" / f"{digest}.json"

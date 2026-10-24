@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sys
 from contextlib import asynccontextmanager
@@ -87,6 +88,9 @@ assert not any(k.endswith('API_KEY') or k == 'ANTHROPIC_AUTH_TOKEN' for k in os.
                          "inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 0,
                          "cacheCreationInputTokens": 0, "costUSD": 0.01}}}
         script += f"Path('report.md').write_text({reply!r})\n"
+        if cmd[0] == "codex":
+            last_message = cmd[cmd.index("--output-last-message") + 1]
+            script += f"Path({last_message!r}).write_text('The full report is in report.md.')\n"
         script += f"Path('answer.tex').write_text({tex!r})\n"
         script += "Path('feedback.md').write_text('Synthetic editorial report')\n"
         script += "Path('completion.json').write_text(json.dumps({'status':'ready','summary':'Synthetic completed edit'}))\n"
@@ -109,6 +113,32 @@ def test_api_remains_default_without_subscription_preflight(tmp_path, monkeypatc
     assert sub.configure_workflow(agent, inp) is inp
     assert agent.ctx.execution_backend == "api"
     assert not agent.tracker.is_subscription
+
+
+def test_codex_final_message_cannot_overwrite_report(configured, fake_cli):
+    workflow, _ = configured
+    result = asyncio.run(sub.run_packet(workflow, "Return the complete review", key="report-handoff"))
+    assert result["text"] == REPLY
+    cmd, config, _ = fake_cli[0]
+    report = config["output_files"]["text"]
+    last_message = cmd[cmd.index("--output-last-message") + 1]
+    assert report == "report.md" and last_message != report
+    workspace = Path(result["workspace"])
+    assert (workspace / report).read_text() == REPLY
+    assert (workspace / last_message).read_text() == "The full report is in report.md."
+    assert workflow.tracker.counters.usd == 0
+
+
+def test_codex_does_not_reuse_overwritten_legacy_report(configured, fake_cli):
+    workflow, _ = configured
+    identity = json.dumps(["legacy", "Review", {}, None, "codex", None, True,
+                           workflow.ctx.subscription_config], sort_keys=True)
+    receipt = workflow.ctx.root_workdir / "subscription_calls" / (hashlib.sha256(identity.encode()).hexdigest() + ".json")
+    receipt.parent.mkdir()
+    receipt.write_text(json.dumps({"status": "completed", "output": {
+        "status": "done", "text": "The full report is in report.md."}}))
+    result = asyncio.run(sub.run_packet(workflow, "Review", key="legacy"))
+    assert result["text"] == REPLY and len(fake_cli) == 1
 
 
 def test_configures_all_roles_and_preserves_api_ledger(configured):
