@@ -45,7 +45,12 @@ pythonpath = [".", "src"]
 testpaths = ["tests"]
 
 [dependency-groups]
+evaluation = [
+    "pandas>=2.2,<3",
+    "pyarrow>=18",
+]
 dev = [
+    {include-group = "evaluation"},
     "playwright>=1.61.0",
     "pytest>=8.3.0",
 ]

@@ -1,0 +1,80 @@
+{
+  "schema_version": 2,
+  "dataset": "INSAIT-Institute/OPC",
+  "source_url": "https://huggingface.co/datasets/INSAIT-Institute/OPC",
+  "revision": "dcc3b4804e2d126ea34b13e3e0cd998c3302644b",
+  "requested_revision": "dcc3b4804e2d126ea34b13e3e0cd998c3302644b",
+  "retrieved_at": "2026-10-26T21:01:35.430789+00:00",
+  "license": "CC-BY-NC-SA-4.0",
+  "license_url": "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+  "reference_source_field": "ground_truth_solution",
+  "transformations": "Deduplicate by problem_id; keep only problems with a nonempty author reference; preserve exact texts and all reference variants; aggregate metadata and issue notes; exclude generated attempts and grades.",
+  "counts": {
+    "source_rows": 4934,
+    "source_problems": 976,
+    "excluded_without_reference": 102,
+    "problems": 874,
+    "problems_with_reference": 874,
+    "reference_texts": 875,
+    "reference_status": {
+      "available": 744,
+      "needs_review": 130
+    }
+  },
+  "sources": [
+    {
+      "path": "data/best_of_n-00000-of-00001.parquet",
+      "split": "best_of_n",
+      "rows": 252,
+      "bytes": 705048,
+      "sha256": "958fe27cec19738e0d3149b11c01b7420e1b527d27a8e9ee06f63af204a500b4"
+    },
+    {
+      "path": "data/generic-00000-of-00001.parquet",
+      "split": "generic",
+      "rows": 3039,
+      "bytes": 17894629,
+      "sha256": "50edf6b6527ca247ca713bd8e3796b87120b31641eb6203408008c419f8591bd"
+    },
+    {
+      "path": "data/matharena-00000-of-00001.parquet",
+      "split": "matharena",
+      "rows": 310,
+      "bytes": 712478,
+      "sha256": "9e06ac4fc7890e8c14c305815e69988912ba75e705442472582d90e84dca48d0"
+    },
+    {
+      "path": "data/pass_at_n-00000-of-00001.parquet",
+      "split": "pass_at_n",
+      "rows": 477,
+      "bytes": 1081400,
+      "sha256": "33e377738ab4e597fe3725ba7bd6c0eea3113e0e6025afcb03405cab105b69c3"
+    },
+    {
+      "path": "data/putnambench-00000-of-00001.parquet",
+      "split": "putnambench",
+      "rows": 564,
+      "bytes": 1632589,
+      "sha256": "8aa35265c467c2c3c16141a2f8e55ee0b523d83ee616678934c6d0ccf63808df"
+    },
+    {
+      "path": "data/test-00000-of-00001.parquet",
+      "split": "test",
+      "rows": 292,
+      "bytes": 1119883,
+      "sha256": "eb54afc65eefdebf47f0db2fcb95987fdc008d3ecb491b693bb623e99c3bdcec"
+    }
+  ],
+  "outputs": {
+    "problems.parquet": {
+      "rows": 874,
+      "bytes": 123416,
+      "sha256": "b35bac8b6c1219bcd37b0153c0fd8f4bb1c7f5234906bf0bdb130dd4dbaecf0c"
+    },
+    "reference_solutions.parquet": {
+      "rows": 874,
+      "bytes": 650300,
+      "sha256": "78ede2c4edb746c2aa971ce0ca8ca2f84dfa057ac980e76b46d50a2628101636"
+    }
+  }
+}
