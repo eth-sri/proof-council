@@ -115,6 +115,9 @@ class Agent(ABC):
 
     async def __call__(self, **kwargs: Any) -> BaseModel:
         inp = self.Inputs(**kwargs)
+        if hasattr(inp, "execution_backend"):
+            from proofstack.subscription import configure_workflow
+            inp = configure_workflow(self, inp)
         call_id = new_call_id()
         cache_key = self._cache_key(inp)
         # Capture the caller's call_id BEFORE we shadow it; events
@@ -160,7 +163,17 @@ class Agent(ABC):
         token_path = _AGENT_PATH.set(_AGENT_PATH.get() + (self.name,))
         try:
             try:
-                out = await self.run(inp)
+                from mathagents.execution_policy import subscription_only
+                with subscription_only(self.ctx.execution_backend == "subscription"):
+                    if self.ctx.execution_backend == "subscription":
+                        from proofstack.kinds.api_call import APICallAgent
+                        from proofstack.subscription import run_model_role
+                        if isinstance(self, APICallAgent):
+                            out = await run_model_role(self, inp)
+                        else:
+                            out = await self.run(inp)
+                    else:
+                        out = await self.run(inp)
             except BudgetExhausted as e:
                 # Reset contextvars first so error event records the
                 # caller as parent_call_id.
@@ -302,6 +315,9 @@ class Agent(ABC):
 
     def _cache_config_snapshot(self) -> dict[str, Any]:
         snapshot: dict[str, Any] = {}
+        if getattr(getattr(self, "ctx", None), "execution_backend", "api") == "subscription":
+            snapshot["execution_backend"] = "subscription"
+            snapshot["subscription_config"] = self.ctx.subscription_config
         if self.component_config:
             snapshot["component_config"] = self.component_config
         for attr in _CACHE_CONFIG_ATTRS:

@@ -1618,6 +1618,7 @@ class CLIAgent(Agent):
         # finally knows whether it still owes a partial-usage metering (see the
         # cancellation note in the finally block).
         usage_recorded = False
+        done = None
         # The retained metering task once the run produced a done record. The
         # finally awaits THIS task rather than re-running metering, so a cancel
         # landing mid-metering neither loses it nor double-counts it (A7).
@@ -2623,6 +2624,20 @@ class CLIAgent(Agent):
                             )
                         except Exception:
                             pass
+            settlement_path = self.component_config.get("subscription_settlement_path")
+            if settlement_path and self.ctx.execution_backend == "subscription":
+                from proofstack.atomic import write_text_atomic
+                # Partial metering cannot price an interrupted last model turn.
+                # Only a terminal invocation (or a proven no-spawn) is settled.
+                settled = (process_stopped and required_usage_error is None
+                           and storage_lease_error is None and workspace_guard_error is None
+                           and (not stream_spawn_attempted or
+                                (usage_recorded and done is not None and done.status == "done")))
+                write_text_atomic(Path(settlement_path), json.dumps({
+                    "settled": settled, "process_stopped": process_stopped,
+                    "spawn_attempted": stream_spawn_attempted,
+                    "workdir": str(self.workdir.relative_to(self.ctx.root_workdir)),
+                }))
             if required_usage_error is not None:
                 raise RuntimeError(
                     "required CLI usage accounting failed; downstream "

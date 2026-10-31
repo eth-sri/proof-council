@@ -292,6 +292,8 @@ class ACCritic(APICallAgent):
         return value
 
     def _notes_transport(self):
+        if getattr(self.ctx, "execution_backend", "api") == "subscription":
+            return "inline"
         value = self.ctx.component_config_for(self).get("research_notes_transport", "file")
         if value not in {"file", "inline"}:
             raise ValueError("research_notes_transport must be file or inline")
@@ -880,6 +882,8 @@ class ACCritic(APICallAgent):
         identity_input["problem"] = inp.recovery_problem or inp.problem
         def path(fields):
             identity = json.dumps([fields, model, self.ctx.component_config_for(self)], sort_keys=True)
+            if self.ctx.execution_backend == "subscription":
+                identity += json.dumps(self.ctx.subscription_config, sort_keys=True) + "subscription"
             digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
             return self.ctx.root_workdir / "critic_context" / f"{digest}.json"
 
@@ -1057,21 +1061,8 @@ class ACCritic(APICallAgent):
 
     @staticmethod
     def _provider_attempt_terminal(row):
-        provider = row.get("provider", "openai")
-        if provider == "openai":
-            return row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
-        if provider == "anthropic":
-            return row.get("stop_reason") in {
-                "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal",
-                "model_context_window_exceeded",
-            }
-        if provider == "google":
-            return row.get("finish_reason") in {
-                "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER", "BLOCKLIST",
-                "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
-                "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION",
-            }
-        return False
+        from proofstack.provider_accounting import provider_attempt_terminal
+        return provider_attempt_terminal(row)
 
     async def _reconcile_recovery(self, trace_path, rows, *, require_tool_evidence=False):
         terminal = {"failed", "cancelled", "incomplete", "completed"}

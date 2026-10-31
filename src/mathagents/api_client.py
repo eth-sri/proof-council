@@ -793,6 +793,8 @@ class APIClient:
             tools (list, optional): A list of tools to use. Defaults to None.
             **kwargs: Additional keyword arguments for the API.
         """
+        from mathagents.execution_policy import require_api_allowed
+        require_api_allowed()
         if not isinstance(cache_write_tokens_in_input, bool):
             raise ValueError("cache_write_tokens_in_input must be a boolean")
         if cache_write_tokens_in_input:
@@ -1186,6 +1188,8 @@ class APIClient:
                 conversation: Full list of messages (including those from the query) in the API format (incl. CoT).
                 detailed_cost: A dict with total "cost" ($), "input_tokens", "output_tokens", and "time" (seconds).
         """
+        from mathagents.execution_policy import require_api_allowed
+        require_api_allowed()
         if not no_tqdm:
             logger.info(f"Running {len(queries)} queries.")
 

@@ -1492,9 +1492,10 @@ def test_publication_check_cannot_read_host_files(tmp_path):
     assert not ok and "PRIVATE-HOST-CONTENT" not in detail
 
 
-def test_completed_acceptance_survives_cost_exhaustion(pipeline):
+@pytest.mark.parametrize("kind", ["usd", "api_equivalent_usd"])
+def test_completed_acceptance_survives_cost_exhaustion(pipeline, kind):
     execute, calls, seen, options, ctx, _ = pipeline
-    options["review_error"] = BudgetExhausted("candidate", "usd", 2, 3)
+    options["review_error"] = BudgetExhausted("candidate", kind, 2, 3)
     out = asyncio.run(execute())
     assert out.submission_approved and not out.partial_ready
     assert out.answer_tex.read_text() == seen["review_inputs"][-1].answer_tex

@@ -2681,6 +2681,8 @@ async def _run_healthcheck(settings: Settings) -> Settings:
                 inputs, preset.component_configs, settings.output_dir / "workflow_runs")
             report["ok"] = True
         except CleanupUnavailable as exc:
+            if inputs.get("execution_backend") == "subscription":
+                raise
             report.update(ok=False, reason=str(exc), backend="api" if mode != "strict" else "claude_code")
             if mode == "strict":
                 raise
@@ -2702,7 +2704,14 @@ async def _startup_checks(settings: Settings) -> Settings:
         raise asyncio.CancelledError("operator stop during startup")
 
     async def checks():
-        bootstrap_done, bootstrap_warning = await _bootstrap_codex_auth()
+        from proofstack.registry import load_preset
+        subscription = load_preset(settings.workflow).inputs.get("execution_backend") == "subscription"
+        if subscription:
+            from proofstack.subscription import preflight
+            preflight()
+            bootstrap_done, bootstrap_warning = False, None
+        else:
+            bootstrap_done, bootstrap_warning = await _bootstrap_codex_auth()
         if bootstrap_done:
             print("FirstProof adapter: codex CLI authenticated via OPENAI_API_KEY.")
         if bootstrap_warning:

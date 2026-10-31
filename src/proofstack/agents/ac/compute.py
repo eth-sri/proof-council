@@ -564,6 +564,9 @@ class Compute(CLIAgent):
         return usage
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
+        if self.ctx.execution_backend != "subscription":
+            from mathagents.execution_policy import require_api_allowed
+            require_api_allowed()
         auth_parent = self._ensure_codex_auth_parent()
         try:
             return await self._run_with_auth_parent(inp)
@@ -636,12 +639,14 @@ class Compute(CLIAgent):
         # absent->present race in which ChatGPT auth and a paid env key
         # reach codex simultaneously while accounting says subscription/$0.
         try:
-            self._host_codex_auth_text = (
-                Path.home() / ".codex" / "auth.json"
-            ).read_text(encoding="utf-8")
+            from proofstack.subscription import codex_auth_path
+            auth_path = codex_auth_path() if self.ctx.execution_backend == "subscription" else Path.home() / ".codex" / "auth.json"
+            self._host_codex_auth_text = auth_path.read_text(encoding="utf-8")
         except OSError:
             self._host_codex_auth_text = None
         auth_class = classify_codex_auth(self._host_codex_auth_text)
+        if self.ctx.execution_backend == "subscription" and auth_class != "subscription":
+            raise RuntimeError("Compute requires subscription authentication; paid API fallback is forbidden")
         if auth_class == "unknown":
             raise RuntimeError(
                 "Codex authentication is invalid or uses an unrecognized schema: "
@@ -680,6 +685,9 @@ class Compute(CLIAgent):
             sandbox=self.SANDBOX,
             codex_sandbox=str(inp.codex_sandbox or DEFAULT_CODEX_SANDBOX),  # type: ignore[attr-defined]
         )
+        if self.ctx.execution_backend == "subscription":
+            self.CLI_CMD[2:2] = ["--ignore-user-config", "-c", 'model_provider="openai"',
+                                "-c", 'forced_login_method="chatgpt"']
         try:
             return await super().run(inp)
         finally:
@@ -763,7 +771,11 @@ class Compute(CLIAgent):
 
     def extra_env(self, sandbox: Sandbox, inp: BaseModel) -> dict[str, str]:
         self._ensure_codex_home(inp)
-        return {"CODEX_HOME": self._codex_home_env or str(self._codex_home_host)}
+        env = {"CODEX_HOME": self._codex_home_env or str(self._codex_home_host)}
+        if self.ctx.execution_backend == "subscription":
+            from proofstack.subscription import check_cli_environment
+            check_cli_environment(sandbox.spec.build_env(sandbox_root=sandbox.root) | env)
+        return env
 
     def sanitize_cli_output(self, text: str) -> str:
         return redact_codex_secrets(text, self._handoff_secrets)
@@ -1173,7 +1185,7 @@ invocation.
             })
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
-            if not self._subscription_codex_auth:
+            if not self._subscription_codex_auth or self.ctx.execution_backend == "subscription":
                 raise RuntimeError(
                     "paid Codex call produced no parseable usage record"
                 )
@@ -1186,6 +1198,8 @@ invocation.
             try:
                 rates = load_cost_rates(cfg_ref)
             except (KeyError, FileNotFoundError, ValueError) as e:
+                if self.ctx.execution_backend == "subscription":
+                    raise
                 await self.events.emit(
                     "cli.cost_lookup_failed",
                     {"config_ref": cfg_ref, "error": f"{type(e).__name__}: {e}"},
@@ -1210,6 +1224,8 @@ invocation.
             cost = nominal
             self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
+        if self.ctx.execution_backend == "subscription":
+            self.tracker.add_api_equivalent_usd(nominal)
         await self.events.emit(
             "model.call",
             {
@@ -1231,7 +1247,7 @@ invocation.
         )
 
     def cli_usage_must_succeed(self) -> bool:
-        return not self._subscription_codex_auth
+        return self.ctx.execution_backend == "subscription" or not self._subscription_codex_auth
 
 # --- helpers ----------------------------------------------------------------
 

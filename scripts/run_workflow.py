@@ -452,6 +452,8 @@ async def amain() -> int:
 
     raw_inputs = dict(preset.inputs)
     raw_inputs.update(cli_inputs)
+    if raw_inputs.get("execution_backend") == "subscription" and args.monitor:
+        raise SystemExit("--monitor uses the paid API and is unavailable in subscription mode")
     budget = _budget_with_input_overrides(preset.budget, raw_inputs)
     if args.budget_usd is not None:
         base = budget.model_dump() if budget else {}

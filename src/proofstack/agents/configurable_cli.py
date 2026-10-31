@@ -43,6 +43,7 @@ from proofstack.sandbox.base import Sandbox, SandboxSpec
 from proofstack.transient_auth import (
     create_codex_auth_parent,
     remove_codex_auth_parent,
+    require_codex_auth_parent_removed,
 )
 
 
@@ -64,6 +65,10 @@ _CALL_CODEX_HOME: ContextVar[tuple[Path, str] | None] = ContextVar(
 _CALL_CODEX_SECRETS: ContextVar[tuple[str, ...]] = ContextVar(
     "cli_call_codex_secrets", default=()
 )
+_CALL_CLAUDE_PARENT: ContextVar[Path | None] = ContextVar("cli_call_claude_parent", default=None)
+_CALL_CLAUDE_HOME: ContextVar[Path | None] = ContextVar("cli_call_claude_home", default=None)
+_CALL_CLAUDE_SECRETS: ContextVar[tuple[str, ...]] = ContextVar("cli_call_claude_secrets", default=())
+_CALL_CLAUDE_RESULT: ContextVar[dict[str, str] | None] = ContextVar("cli_call_claude_result", default=None)
 _CODEX_AUTH_CONTAINER_ROOT = "/proofstack-codex-home"
 
 
@@ -102,6 +107,12 @@ class ConfigurableCLIAgent(CLIAgent):
         self._paid_codex_cost_rates: dict[str, Any] | None = None
         self._paid_claude_cost_rates: dict[str, Any] | None = None
         usage_cfg = self.component_config.get("usage") or {}
+        if self.ctx.execution_backend == "subscription":
+            allowed = ((usage_cfg.get("type") == "codex_jsonl" and self._copy_codex_auth_enabled()) or
+                       (usage_cfg.get("type") == "claude_json" and self.component_config.get("copy_claude_auth")
+                        and usage_cfg.get("auth_mode") == "subscription"))
+            if not allowed:
+                raise RuntimeError("Subscription workflows require explicitly subscription-authenticated CLI workers")
         if isinstance(usage_cfg, dict) and usage_cfg.get("type") == "claude_json":
             auth_mode = usage_cfg.get("auth_mode", "subscription")
             if not isinstance(auth_mode, str) or auth_mode not in {"subscription", "api"}:
@@ -239,7 +250,48 @@ class ConfigurableCLIAgent(CLIAgent):
     def _codex_secrets(self, value: tuple[str, ...]) -> None:
         _CALL_CODEX_SECRETS.set(tuple(value))
 
+    @property
+    def _claude_auth_parent(self):
+        return _CALL_CLAUDE_PARENT.get()
+
+    @_claude_auth_parent.setter
+    def _claude_auth_parent(self, value):
+        _CALL_CLAUDE_PARENT.set(value)
+
+    @property
+    def _claude_auth_home(self):
+        return _CALL_CLAUDE_HOME.get()
+
+    @_claude_auth_home.setter
+    def _claude_auth_home(self, value):
+        _CALL_CLAUDE_HOME.set(value)
+
+    @property
+    def _claude_auth_secrets(self):
+        return _CALL_CLAUDE_SECRETS.get()
+
+    @_claude_auth_secrets.setter
+    def _claude_auth_secrets(self, value):
+        _CALL_CLAUDE_SECRETS.set(tuple(value))
+
+    @property
+    def _claude_result_text(self):
+        return (_CALL_CLAUDE_RESULT.get() or {}).get("text", "")
+
+    @_claude_result_text.setter
+    def _claude_result_text(self, value):
+        # The usage callback runs in a shielded child task. Its result must
+        # reach collect(), while remaining isolated from concurrent calls.
+        result = _CALL_CLAUDE_RESULT.get()
+        if result is None:
+            result = {}
+            _CALL_CLAUDE_RESULT.set(result)
+        result["text"] = value
+
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
+        if self.ctx.execution_backend != "subscription":
+            from mathagents.execution_policy import require_api_allowed
+            require_api_allowed()
         # ContextVars inherit the caller's context. Reset every invocation so
         # state left by a completed/manual call cannot bleed into the next
         # agent instance created in the same task.
@@ -248,20 +300,31 @@ class ConfigurableCLIAgent(CLIAgent):
         self._copied_codex_auth = False
         self._codex_home = None
         self._codex_secrets = ()
+        self._claude_auth_parent = None
+        self._claude_auth_home = None
+        self._claude_auth_secrets = ()
+        _CALL_CLAUDE_RESULT.set({})
         self.CLI_CMD = self._command_for(inp)
         if "soft_timeout_s" in self.component_config:
             self.SOFT_TIMEOUT_S = int(self.component_config["soft_timeout_s"] or 0)
         try:
             return await super().run(inp)
         finally:
-            state = self._codex_home
             try:
-                if state is not None:
-                    self._remove_call_codex_home(state[0])
+                if self._claude_auth_parent is not None:
+                    require_codex_auth_parent_removed(self._claude_auth_parent, self.ctx.root_workdir)
             finally:
-                self._codex_home = None
-                self._copied_codex_auth = False
-                self._codex_secrets = ()
+                self._claude_auth_parent = None
+                self._claude_auth_home = None
+                self._claude_auth_secrets = ()
+                state = self._codex_home
+                try:
+                    if state is not None:
+                        self._remove_call_codex_home(state[0])
+                finally:
+                    self._codex_home = None
+                    self._copied_codex_auth = False
+                    self._codex_secrets = ()
 
     def sandbox_root_for(self, inp: BaseModel) -> Path | None:
         fields = self._fields(inp)
@@ -290,7 +353,8 @@ class ConfigurableCLIAgent(CLIAgent):
             self._copied_codex_auth = False
             self._codex_home = None
             self._codex_secrets = ()
-            host_auth = Path.home() / ".codex" / "auth.json"
+            from proofstack.subscription import codex_auth_path
+            host_auth = codex_auth_path() if self.ctx.execution_backend == "subscription" else Path.home() / ".codex" / "auth.json"
             if not host_auth.is_file():
                 raise RuntimeError(
                     "Codex subscription authentication is unavailable: "
@@ -330,7 +394,28 @@ class ConfigurableCLIAgent(CLIAgent):
                 pass
             self._copied_codex_auth = True
 
+        if self.component_config.get("copy_claude_auth"):
+            from proofstack.subscription import read_claude_auth
+            if self.ctx.execution_backend != "subscription" or resolve_backend(sandbox.spec) != "subprocess":
+                raise RuntimeError("Claude subscription copying requires a subscription subprocess workflow")
+            auth = read_claude_auth()
+            parent = create_codex_auth_parent(self.ctx.root_workdir)
+            self._claude_auth_parent = parent
+            self._claude_auth_home = Path(tempfile.mkdtemp(prefix="claude-", dir=parent))
+            self._claude_auth_home.chmod(0o700)
+            (self._claude_auth_home / ".credentials.json").write_text(auth)
+            (self._claude_auth_home / ".credentials.json").chmod(0o600)
+            oauth = json.loads(auth)["claudeAiOauth"]
+            self._claude_auth_secrets = tuple(v for k, v in oauth.items() if "token" in k.lower() and isinstance(v, str))
+            # Session rollouts persist without copying any login into run artifacts.
+            (sandbox.root / ".claude" / "projects").mkdir(parents=True, exist_ok=True)
+            (self._claude_auth_home / "projects").symlink_to((sandbox.root / ".claude" / "projects").resolve(), target_is_directory=True)
+
     async def teardown(self, sandbox: Sandbox, inp: BaseModel) -> None:
+        parent = getattr(self, "_claude_auth_parent", None)
+        if parent is not None:
+            require_codex_auth_parent_removed(parent, self.ctx.root_workdir)
+            self._claude_auth_parent = None
         if self._copy_codex_auth_enabled():
             state = self._codex_home
             if state is not None:
@@ -344,13 +429,18 @@ class ConfigurableCLIAgent(CLIAgent):
         self._completion_record_path = None
 
     def sanitize_cli_output(self, text: str) -> str:
-        return redact_codex_secrets(text, self._codex_secrets)
+        return redact_codex_secrets(text, (*self._codex_secrets, *getattr(self, "_claude_auth_secrets", ())))
 
     async def refresh_sensitive_state(
         self,
         sandbox: Sandbox,
         inp: BaseModel,
     ) -> None:
+        home = getattr(self, "_claude_auth_home", None)
+        if home is not None and (home / ".credentials.json").exists():
+            oauth = json.loads((home / ".credentials.json").read_text())["claudeAiOauth"]
+            self._claude_auth_secrets = tuple(set((*getattr(self, "_claude_auth_secrets", ()),
+                *(v for k, v in oauth.items() if "token" in k.lower() and isinstance(v, str)))))
         if self._copy_codex_auth_enabled():
             # setup() can fail before a transient credential is installed. In
             # that case there is no rotated state to refresh; teardown still
@@ -532,6 +622,11 @@ class ConfigurableCLIAgent(CLIAgent):
                 disabled = key.startswith("CLAUDE_CODE_USE_") and value.lower() in {"0", "false"}
                 if value and not disabled:
                     raise RuntimeError(f"Paid Claude API authentication conflicts with {key}")
+        if self.component_config.get("copy_claude_auth"):
+            env["CLAUDE_CONFIG_DIR"] = str(self._claude_auth_home)
+        if self.ctx.execution_backend == "subscription":
+            from proofstack.subscription import check_cli_environment
+            check_cli_environment(sandbox.spec.build_env(sandbox_root=sandbox.root) | env)
         return env
 
     async def collect(
@@ -544,8 +639,12 @@ class ConfigurableCLIAgent(CLIAgent):
         data.update(self._constant_outputs(inp, sandbox))
         data.update(self._done_outputs(done))
         await self._collect_file_outputs(sandbox, data)
+        if field := self.component_config.get("claude_result_output"):
+            data[field] = getattr(self, "_claude_result_text", "")
         if self._copy_codex_auth_enabled():
             data = _sanitize_output_value(data, self._codex_secrets)
+        if getattr(self, "_claude_auth_secrets", ()):
+            data = _sanitize_output_value(data, self._claude_auth_secrets)
         return self.Outputs.model_validate(data)
 
     async def record_cli_usage(
@@ -565,9 +664,9 @@ class ConfigurableCLIAgent(CLIAgent):
             return
         usage = parse_codex_jsonl(stdout_text)
         if usage.n_turns == 0:
-            if not self._copied_codex_auth:
+            if not self._copied_codex_auth or self.ctx.execution_backend == "subscription":
                 raise RuntimeError(
-                    "paid Codex call produced no parseable usage record"
+                    "Codex call produced no parseable usage record"
                 )
             return
         cost = 0.0
@@ -593,6 +692,13 @@ class ConfigurableCLIAgent(CLIAgent):
             cost = cost_for_codex_usage(usage, **rates)
             self.tracker.add_usd(cost)
         self.tracker.add_tokens(usage.input_tokens + usage.output_tokens)
+        nominal = cost
+        if self.ctx.execution_backend == "subscription":
+            if not self._copied_codex_auth:
+                raise RuntimeError("Subscription Codex authentication was not verified")
+            cfg_ref = usage_cfg["cost_config"]
+            nominal = cost_for_codex_usage(usage, **load_cost_rates(cfg_ref))
+            self.tracker.add_api_equivalent_usd(nominal)
         await self.events.emit(
             "model.call",
             {
@@ -603,6 +709,8 @@ class ConfigurableCLIAgent(CLIAgent):
                 "reasoning_out_tokens": usage.reasoning_output_tokens,
                 "cost_usd": cost,
                 "n_turns": usage.n_turns,
+                "api_equivalent_usd": nominal,
+                "subscription": self.ctx.execution_backend == "subscription",
                 "via": "codex_exec_json",
                 "cost_config": cfg_ref,
             },
@@ -610,7 +718,7 @@ class ConfigurableCLIAgent(CLIAgent):
 
     def cli_usage_must_succeed(self) -> bool:
         usage_cfg = self.component_config.get("usage")
-        return self._claude_api_auth_enabled() or bool(
+        return self.ctx.execution_backend == "subscription" or self._claude_api_auth_enabled() or bool(
             isinstance(usage_cfg, dict)
             and usage_cfg.get("type") == "codex_jsonl"
             and not self._copied_codex_auth
@@ -636,15 +744,26 @@ class ConfigurableCLIAgent(CLIAgent):
 
     async def _record_claude_usage(self, stdout_text: str) -> None:
         usage = parse_claude_json(stdout_text)
+        if self.component_config.get("claude_result_output"):
+            self._claude_result_text = ""
+            for line in stdout_text.splitlines():
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("type") == "result" and not record.get("is_error"):
+                    self._claude_result_text = record.get("result", "")
+        if self.ctx.execution_backend == "subscription" and not usage.found:
+            raise RuntimeError("Claude call produced no parseable usage record")
         paid = self._claude_api_auth_enabled()
         cost = usage.total_cost_usd
         cfg_ref = None
-        if paid:
+        if paid or self.ctx.execution_backend == "subscription":
             cfg_ref = self.component_config["usage"]["cost_config"]
-            if self._paid_claude_cost_rates is None:
+            if paid and self._paid_claude_cost_rates is None:
                 raise RuntimeError("Paid Claude cost configuration was not validated")
             cost = cost_for_claude_usage(usage, expected_model=self._claude_model_name(),
-                                        **self._paid_claude_cost_rates)
+                                        **(self._paid_claude_cost_rates or load_cost_rates(cfg_ref, require_cache_rates=True)))
         tokens = usage.metered_tokens
         if usage.has_result:
             cost, tokens = self._claude_process_share(usage, cost, tokens)
@@ -655,6 +774,16 @@ class ConfigurableCLIAgent(CLIAgent):
         # Cache reads/writes are separate token categories in Claude usage.
         self.tracker.add_tokens(tokens)
         model = self._claude_model_name()
+        nominal = cost
+        if self.ctx.execution_backend == "subscription":
+            if paid or not self.component_config.get("copy_claude_auth"):
+                raise RuntimeError("Subscription Claude authentication was not verified")
+            # Claude's reported cost is a nominal estimate even on a subscription.
+            if nominal is None:
+                nominal = cost_for_claude_usage(usage, expected_model=model,
+                                                **load_cost_rates(self.component_config["usage"]["cost_config"]))
+            self.tracker.add_api_equivalent_usd(nominal)
+            cost = 0.0
         await self.events.emit(
             "model.call",
             {
@@ -667,6 +796,8 @@ class ConfigurableCLIAgent(CLIAgent):
                 "cost_usd": cost,
                 "cost_estimated": paid and usage.cost_estimated,
                 "cli_reported_cost_usd": usage.total_cost_usd,
+                "api_equivalent_usd": nominal,
+                "subscription": self.ctx.execution_backend == "subscription",
                 "cost_config": cfg_ref,
                 "auth_mode": "api" if paid else "subscription",
                 "n_turns": usage.num_turns,
@@ -820,6 +951,12 @@ class ConfigurableCLIAgent(CLIAgent):
             target = sandbox.root / rel
             if target.exists() and not overwrite:
                 continue
+            if isinstance(spec, dict) and "from_binary_path_input" in spec:
+                source = Path(fields[spec["from_binary_path_input"]])
+                if not source.resolve().is_relative_to(self.ctx.root_workdir.resolve()) or source.stat().st_size > 512 * 1024**2:
+                    raise ValueError("Invalid binary input attachment")
+                await sandbox.write_file(rel, source.read_bytes())
+                continue
             content = _file_content(spec, fields)
             await sandbox.write_file(rel, content)
 
@@ -864,6 +1001,11 @@ class ConfigurableCLIAgent(CLIAgent):
             relpath, kind, default = _output_file_spec(spec)
             rel = _safe_relpath(relpath)
             path = sandbox.root / rel
+            if self.ctx.execution_backend == "subscription" and path.exists():
+                if not path.resolve().is_relative_to(sandbox.root.resolve()) or path.is_symlink():
+                    raise RuntimeError("Subscription output must remain inside its workspace")
+                if path.is_file() and path.stat().st_size > 32 * 1024**2:
+                    raise RuntimeError("Subscription output exceeds the artifact size limit")
             if kind == "path":
                 value: Any = str(path)
             elif kind == "exists":

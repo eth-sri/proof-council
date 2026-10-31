@@ -229,6 +229,8 @@ class Council(Agent):
                     error=f"BudgetExhausted({e.scope}): {e}",
                 )
             except Exception as e:
+                if getattr(e, "requires_reconciliation", False):
+                    raise
                 return CouncilReply(
                     member=seat.seat_label,
                     model_ref=model_ref,

@@ -7,6 +7,8 @@ budget:
   max_wallclock_s: 86100
 
 inputs:
+  # Subscription mode currently requires author_parallelism=1.
+  execution_backend: api
   author_parallelism: 4
   n_rounds: 50
   full_critic_interval: 3
@@ -36,6 +38,13 @@ inputs:
   partial_cleanup_seconds: 7200
   partial_cleanup_reserve_fraction: 0.15
   max_cleanup_repairs: 8
+  # Opt in with 3: accepted proof -> Author/fresh-Critic simplification -> cleanup.
+  simplification_rounds: 0
+  # Mandatory with simplification; can also be enabled independently.
+  final_stateless_review: false
+  final_review_reserve_usd: 100
+  final_review_seconds: 5400
+  final_review_export_seconds: 300
   # Persistent Claude Code editor; override with api to use the API editor.
   cleanup_backend: claude_code
 

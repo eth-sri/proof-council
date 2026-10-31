@@ -90,6 +90,9 @@ class RunContext:
     component_configs: dict[str, dict[str, Any]] = field(default_factory=dict)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     monitor: Any | None = None
+    execution_backend: Literal["api", "subscription"] = "api"
+    subscription_config: dict[str, Any] = field(default_factory=dict)
+    subscription_limiter: Any | None = None
     # Optional enclosing-workflow export check; returns feedback for the next Author.
     author_checkpoint: Callable[[Path, int], Awaitable[str]] | None = None
     _agent_call_counts: dict[str, int] = field(default_factory=dict)

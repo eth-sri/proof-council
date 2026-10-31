@@ -12,6 +12,7 @@ is no preemption.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -89,6 +90,12 @@ class SubscriptionParked(BudgetExhausted):
         )
 
 
+def monetary_limit_exhausted(exc: BaseException) -> bool:
+    """A completed, charged result survives either monetary accounting mode."""
+    return (isinstance(exc, BudgetExhausted) and not isinstance(exc, SubscriptionParked)
+            and exc.limit_kind in {"usd", "api_equivalent_usd"})
+
+
 # Env keys a run may persist into resume.json and have re-injected on resume.
 # Both the writer (run_workflow._write_resume_spec) and the reader (the
 # dashboard's resume route) filter on this so a hand-edited resume.json cannot
@@ -111,6 +118,7 @@ class BudgetSpec(BaseModel):
 @dataclass
 class _Counters:
     usd: float = 0.0
+    api_equivalent_usd: float = 0.0
     tokens: int = 0
     tool_calls: int = 0
     paused_s: float = 0.0
@@ -132,8 +140,32 @@ class BudgetTracker:
     parent: "BudgetTracker | None" = None
     counters: _Counters = field(default_factory=_Counters)
     warned: dict[str, bool] = field(default_factory=dict)
+    subscription_mode: bool = False
+
+    @property
+    def is_subscription(self) -> bool:
+        return any(node.subscription_mode for node in self.chain())
+
+    @property
+    def planning_usd(self) -> float:
+        return self.counters.api_equivalent_usd if self.is_subscription else self.counters.usd
+
+    def add_api_equivalent_usd(self, amount: float) -> None:
+        if not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount < 0:
+            raise ValueError("API-equivalent usage must be finite and nonnegative")
+        self.counters.api_equivalent_usd += amount
+        if self.parent is not None:
+            self.parent.add_api_equivalent_usd(amount)
+
+    def add_planning_usd(self, amount: float) -> None:
+        if self.is_subscription:
+            self.add_api_equivalent_usd(amount)
+        else:
+            self.add_usd(amount)
 
     def add_usd(self, amount: float) -> None:
+        if amount and self.is_subscription:
+            raise RuntimeError("Paid usage is forbidden in subscription mode")
         self.counters.usd += amount
         if self.parent is not None:
             self.parent.add_usd(amount)
@@ -177,7 +209,7 @@ class BudgetTracker:
             if node.spec is None:
                 continue
             for kind, used, limit in (
-                ("usd", node.counters.usd, node.spec.max_usd),
+                ("api_equivalent_usd" if node.is_subscription else "usd", node.planning_usd, node.spec.max_usd),
                 ("tokens", node.counters.tokens, node.spec.max_tokens),
                 ("wallclock_s", node.counters.wallclock_s(), node.spec.max_wallclock_s),
                 ("tool_calls", node.counters.tool_calls, node.spec.max_tool_calls),

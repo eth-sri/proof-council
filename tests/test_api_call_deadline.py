@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -38,8 +39,38 @@ def test_cancelled_query_preserves_stop_when_accounting_fails(tmp_path, monkeypa
         assert isinstance(raised.value.__cause__, OSError)
         assert raised.value.completed_report == "Paid review before cancellation"
         assert ctx.budgets.root().counters.usd == 2
+        assert not json.loads((agent.workdir / "provider-settlement.json").read_text())["settled"]
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("status,usage_unavailable,settled", [
+    ("completed", False, True), ("cancelled", False, True),
+    ("completed", True, False), ("in_progress", False, False),
+])
+def test_cancelled_query_only_settles_terminal_accounted_attempts(tmp_path, status, usage_unavailable, settled):
+    ctx = RunContext.create(root_workdir=tmp_path, flat=True)
+    agent = ACCritic(ctx)
+    entered, stopped = threading.Event(), threading.Event()
+    client = SimpleNamespace(model="fake", terminate=stopped.set)
+
+    def query(client, messages):
+        active_trace.get().update(("request", 0), response_id="saved", status=status, cost=2,
+                                  usage_unavailable=usage_unavailable)
+        entered.set()
+        assert stopped.wait(5)
+
+    async def exercise():
+        task = asyncio.create_task(agent._query(client, [], query))
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as error:
+            await task
+        assert error.value.provider_usage_resolved is settled
+
+    asyncio.run(exercise())
+    assert ctx.budgets.root().counters.usd == 2
+    assert json.loads((agent.workdir / "provider-settlement.json").read_text())["settled"] is settled
 
 
 def test_cancelled_query_terminates_provider_polling(tmp_path):
