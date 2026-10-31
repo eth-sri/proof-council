@@ -15,6 +15,30 @@ USAGE_FIELDS = ("cost_usd", "in_tokens", "out_tokens", "reasoning_tokens")
 logger = logging.getLogger(__name__)
 
 
+def provider_attempt_terminal(row):
+    provider = row.get("provider", "openai")
+    if provider == "openai":
+        return row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
+    if provider == "anthropic":
+        return row.get("stop_reason") in {
+            "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal",
+            "model_context_window_exceeded",
+        }
+    if provider == "google":
+        return row.get("finish_reason") in {
+            "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER", "BLOCKLIST",
+            "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
+            "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION",
+        }
+    return False
+
+
+def provider_attempts_settled(rows):
+    return all(provider_attempt_terminal(row) and not row.get("reconciliation_pending")
+               and (not row.get("usage_unavailable", True) or row.get("cost_estimated", False))
+               for row in rows)
+
+
 def _normalized_usage(payload):
     normalized = {}
     for key in (*USAGE_FIELDS, "metered_tokens"):

@@ -90,6 +90,12 @@ class SubscriptionParked(BudgetExhausted):
         )
 
 
+def monetary_limit_exhausted(exc: BaseException) -> bool:
+    """A completed, charged result survives either monetary accounting mode."""
+    return (isinstance(exc, BudgetExhausted) and not isinstance(exc, SubscriptionParked)
+            and exc.limit_kind in {"usd", "api_equivalent_usd"})
+
+
 # Env keys a run may persist into resume.json and have re-injected on resume.
 # Both the writer (run_workflow._write_resume_spec) and the reader (the
 # dashboard's resume route) filter on this so a hand-edited resume.json cannot

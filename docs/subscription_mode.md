@@ -73,6 +73,13 @@ review conversations. There is no automatic switch back to Pro, Gemini or an
 API editor. CLI tools replace hosted API tools; their individual tool limits
 and context-management behavior are not identical to the API models'.
 
+Fresh packets are conversation-isolated, not a guarantee of filesystem read
+isolation. Native CLI tools can have access beyond the invocation directory;
+use a dedicated execution account/container with no unrelated private files.
+Compute uses `codex_sandbox: auto`, which selects `workspace-write` on a native
+host and only bypasses the inner sandbox inside the Docker backend. Subscription
+mode overrides API presets' Compute bypass setting.
+
 ## Limits, accounting and resume
 
 - `subscription_planning_usd` defaults to 1000. This is a nominal API-equivalent
@@ -101,9 +108,40 @@ and context-management behavior are not identical to the API models'.
 - Completed invocations have content-keyed receipts in `subscription_calls/`
   and can be reused without another model call. An interrupted invocation is
   blocked on replay or resume, even with changed inputs, until its
-  worker/output/usage is reconciled; the harness
-  does not blindly repeat it. In-place resume restores cumulative nominal
-  usage from the event ledger and keeps the Batch 3 absolute deadline.
+  worker/output/usage is reconciled. Confirmed no-spawn failures and terminal
+  workers with settled usage become `failed`, with at most one retry of the
+  same packet. Cancellation with only partial usage remains unresolved.
+  Council failures that need reconciliation propagate instead of being hidden
+  in a textual reply. The guard is checked before subsequent packet calls too,
+  not only when entering a workflow.
+- Atomic metering receipts in `subscription_usage/` back the event ledger.
+  Resume deduplicates the two sources and can recover charges even if a crash
+  truncated `events.jsonl`. Legacy runs without full receipt coverage still
+  fail closed on a damaged usage log. The original allowance and absolute
+  Batch 3 deadline are not replenished.
 
 Do not delete a pending receipt or an accounting guard merely to force a retry.
 Preserve the CLI logs, inspect worker termination and reconcile usage first.
+
+For a crash that left no terminal worker receipt, stop every controller,
+worker and descendant first. Then use the explicit operator command:
+
+```bash
+uv run python scripts/reconcile_subscription.py /path/to/run RECEIPT_ID \
+  --confirm-workers-stopped --unreported-allowance-usd 100
+```
+
+The amount is an **additional conservative API-equivalent debit** for any
+unreported work, not a new budget. Choose it from the interrupted call's saved
+allowance; use zero only when inspection establishes that no unreported work
+occurred. The command refuses an active controller lock, records the debit
+idempotently per attempt, marks the invocation failed and never launches anything.
+Repeating reconciliation for the same attempt does not charge again; if its
+bounded retry is also interrupted, that attempt needs its own additional debit.
+The command does not infer from the absence of a controller that its children stopped.
+Normal resume remains an explicit, separate action, within the original limits.
+
+Temporary credential copies are not written back to the source account on
+shutdown. Long-running OAuth refresh/rotation compatibility therefore still
+needs live validation; expired source credentials require re-authentication,
+never a paid-key fallback.

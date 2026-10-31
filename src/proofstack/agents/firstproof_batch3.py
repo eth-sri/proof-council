@@ -31,7 +31,7 @@ from proofstack.agents.writeup_loop import (
     RewriteSeat, RepairSeat, _assemble, _extract_tex, _defuse_proof_sectioning, _declares,
     _compile_raw, _GateCanceller,
 )
-from proofstack.budget import BudgetExhausted, BudgetRegistry, BudgetSpec, SubscriptionParked
+from proofstack.budget import BudgetExhausted, BudgetRegistry, BudgetSpec, SubscriptionParked, monetary_limit_exhausted
 from proofstack.latex_contract import normalize_submission_latex, render_firstproof_latex_contract
 from proofstack.registry import load_preset
 
@@ -81,6 +81,7 @@ class _AcceptedBaseline(BaseModel):
     source_bib_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     review_md: str
     round: int = Field(ge=0)
+    simplified: bool = False
 
 
 class FirstProofBatch3Workflow(Agent):
@@ -137,6 +138,9 @@ class FirstProofBatch3Workflow(Agent):
         early_stopped: bool = False
         final_critic_answer_ready: bool = False
         final_critic_review_md: str = ""
+        accepted_baseline_pending: bool = False
+        accepted_baseline_path: Path | None = None
+        accepted_baseline_sha256: str | None = None
         cleanup_errors: list[str] = Field(default_factory=list)
         error: str | None = None
         error_retryable: bool = True
@@ -197,16 +201,29 @@ class FirstProofBatch3Workflow(Agent):
             path = published_document_path(self.ctx.root_workdir, inp.problem_id, partial=partial,
                                            digest=digest, version=out.publication_version)
             text = _read(path) if path is not None else ""
-            if (out.problem_id == inp.problem_id and out.compiled and 0 < out.pages <= inp.page_limit
+            if (out.problem_id == inp.problem_id and out.compiled and out.pages > 0
                     and (partial or out.submission_approved) and text
                     and hashlib.sha256(text.encode("utf-8")).hexdigest() == digest
                     and normalize_submission_latex(text) == text):
-                if out.submission_approved and self._requires_final_review(inp) and not self._final_approval(inp, text):
-                    out = self.Outputs(problem_id=inp.problem_id)
-                    _save_json(self.ctx.root_workdir / "batch3-output.json", out.model_dump(mode="json"))
-                    return out
+                if out.pages > inp.page_limit:
+                    if out.submission_approved:
+                        raise FinalReviewBlocked(
+                            "Requested page-limit configuration excludes the saved approved manuscript; "
+                            "preserved the artifact and manifest. Reconcile before resuming."
+                        )
+                    raise ValueError("Saved partial exceeds the requested page limit")
+                if out.submission_approved and self._requires_final_review(inp):
+                    try:
+                        approval = self._final_approval(inp, text)
+                    except (ValueError, OSError) as exc:
+                        raise FinalReviewBlocked("Saved final approval is unreadable; preserved the approved manifest") from exc
+                    if not approval:
+                        raise FinalReviewBlocked(
+                            "Saved approval does not match the current final-review configuration; "
+                            "preserved the approved artifact and manifest. Reconcile before resuming."
+                        )
                 return out.model_copy(update={"answer_tex": path})
-        except (ValueError, FinalReviewBlocked):
+        except ValueError:
             pass
         out = self.Outputs(problem_id=inp.problem_id)
         if self._requires_final_review(inp):
@@ -374,19 +391,28 @@ class FirstProofBatch3Workflow(Agent):
         if state.status == "completed":
             if state.review is None:
                 raise FinalReviewBlocked("Completed final review is missing its verdict")
-            return state.review
+            if not state.review.parse_failed or state.attempt >= 1:
+                return state.review
         phase_end = min(deadline - inp.final_review_export_seconds,
                         time.monotonic() + state.deadline_unix_s - time.time())
         allowance = min(self._remaining_usd(),
                         state.max_usd - max(0.0, self.tracker.planning_usd - state.initial_spend))
+        if state.status == "completed":
+            if allowance <= 0 or phase_end <= time.monotonic():
+                return state.review
+            state.previous_review = state.review
+            state.attempt += 1
+            state.status, state.review = "pending", None
+            _save_json(path, state.model_dump(mode="json"))
 
         async def call(ctx):
             critic = FinalStatelessCritic(ctx, name="final_stateless_critic")
+            critic.verdict_attempt = state.attempt
             try:
                 review = await critic(**state.review_input.model_dump())
             except BudgetExhausted as exc:
                 completed = getattr(exc, "completed_output", None) or getattr(critic, "_completed_review", None)
-                if (isinstance(exc, SubscriptionParked) or exc.limit_kind != "usd"
+                if (not monetary_limit_exhausted(exc)
                         or not isinstance(completed, ACCritic.Outputs)):
                     raise
                 review = completed
@@ -401,7 +427,10 @@ class FirstProofBatch3Workflow(Agent):
             })
             return review
 
-        return await self._phase("final_stateless_review", usd=allowance, deadline=phase_end, call=call)
+        review = await self._phase("final_stateless_review", usd=allowance, deadline=phase_end, call=call)
+        if review.parse_failed and state.attempt == 0:
+            return await self._review_final(inp, document, deadline=deadline)
+        return review
 
     async def _finish_final_candidate(self, inp, out, document, *, deadline):
         try:
@@ -558,7 +587,7 @@ class FirstProofBatch3Workflow(Agent):
             completed = getattr(exc, "completed_output", None)
             # A partial needs no further paid review. Keep its already charged
             # reply, but still run the normal parsing and deterministic gates.
-            if (not partial or isinstance(exc, SubscriptionParked) or exc.limit_kind != "usd"
+            if (not partial or not monetary_limit_exhausted(exc)
                     or not isinstance(completed, seat.Outputs)):
                 raise
             reply = completed
@@ -619,9 +648,118 @@ class FirstProofBatch3Workflow(Agent):
         baseline = baseline.model_copy(update={
             "document": state.document, "sha256": hashlib.sha256(state.document.encode()).hexdigest(),
             "review_md": state.review_md,
+            "simplified": baseline.simplified or hashlib.sha256(state.document.encode()).hexdigest() != state.source_sha256,
         })
         _save_json(self._accepted_checkpoint(), baseline.model_dump())
         self._accepted_baseline = baseline
+
+    def _recover_simplification_call(self, inp, state, path):
+        """Reconcile saved local evidence without issuing another model call."""
+        if state.stage in {"author", "critic"} or state.call_pending:
+            role = state.call_role or state.stage
+            folders = list((self.ctx.root_workdir / "agents").glob(f"{state.call_agent}-c*")) if state.call_agent else []
+            settled = False
+            subscription_output = None
+            if len(folders) == 1:
+                folder = folders[0]
+                for name in ("provider-settlement.json", "subscription-settlement.json"):
+                    if (folder / name).exists():
+                        evidence = json.loads(_read(folder / name))
+                        settled = evidence.get("settled") is True
+                        if name == "subscription-settlement.json" and evidence.get("receipt_id"):
+                            from proofstack.subscription import recover_packet
+                            settled, subscription_output = recover_packet(self.ctx.root_workdir, evidence["receipt_id"])
+                if role == "critic":
+                    raw = _read(folder / "completed_review.json") or _read(folder / "output.json")
+                    if raw:
+                        state.review = Batch3CleanupCritic.Outputs.model_validate_json(raw)
+                    elif subscription_output is not None:
+                        critic = SimplificationCritic(self.ctx, name=state.call_agent)
+                        review_input = critic.Inputs.model_validate_json(_read(folder / "input.json"))
+                        state.review = critic.parse_output(subscription_output["text"], review_input)
+                    elif (folder / "provider-attempts.jsonl").exists():
+                        from mathagents.provider_trace import latest_attempts
+                        rows = latest_attempts(folder / "provider-attempts.jsonl")
+                        if rows:
+                            report_path = folder / f"provider-completed-{rows[-1]['invocation_id']}.json"
+                            if report_path.exists():
+                                report = json.loads(_read(report_path))["report"]
+                                critic = SimplificationCritic(self.ctx, name=state.call_agent)
+                                review_input = critic.Inputs.model_validate_json(_read(folder / "input.json"))
+                                state.review = critic.parse_output(report, review_input)
+                elif settled:
+                    raw = _read(folder / "completed_author.json") or _read(folder / "output.json")
+                    if raw:
+                        state.candidate = Author.Outputs.model_validate_json(raw)
+            # A completed rejection matters even if accounting is still pending.
+            if (self._accepted_baseline is not None and state.review is not None and not state.review.parse_failed
+                    and state.review.disposition == "research"):
+                self._handoff(inp, state.document,
+                              normalize_submission_latex(state.candidate.answer_tex) if state.candidate else state.document,
+                              state.review)
+            if not settled:
+                raise SimplificationInterrupted(
+                    f"Interrupted simplification {state.stage} call; reconcile provider work before paid retries: {path}"
+                )
+            state.call_pending = False
+            state.stop_reason = "Interrupted call settled; optional simplification stopped"
+            state.stage = "reviewed" if state.review is not None else "done"
+        if state.stage in {"reviewed", "rejected"}:
+            review = state.review
+            if review is not None and not review.parse_failed and review.disposition == "research":
+                state.stage = "rejected"
+                _save_json(path, state.model_dump(mode="json"))
+                if self._accepted_baseline is not None:
+                    self._handoff(inp, state.document,
+                                  normalize_submission_latex(state.candidate.answer_tex) if state.candidate else state.document,
+                                  review)
+                return
+            if state.stage == "rejected":
+                raise SimplificationInterrupted("Rejected simplification checkpoint has no valid verdict")
+            if review is not None and review.answer_ready and not review.parse_failed and review.disposition == "accept":
+                if state.candidate is None:
+                    raise SimplificationInterrupted("Accepted simplification checkpoint is missing its candidate")
+                state.document = normalize_submission_latex(state.candidate.answer_tex)
+                state.notes, state.review_md = state.candidate.research_notes_tex, review.review_md
+            state.completed += 1
+            state.stage, state.candidate, state.review = "ready", None, None
+            if state.stop_reason:
+                state.stage = "done"
+        _save_json(path, state.model_dump(mode="json"))
+        if self._accepted_baseline is not None:
+            self._retain_simplified(state)
+
+    def _reconcile_simplifications(self, inp):
+        for path in sorted((self.ctx.root_workdir / "proof_simplification").glob("*/state.json")):
+            state = SimplificationState.model_validate_json(path.read_text(encoding="utf-8"))
+            baseline = self._accepted_baseline
+            same_baseline = (baseline is not None and path.parent.name.startswith(f"{baseline.round}-")
+                             and baseline.sha256 in {state.source_sha256, hashlib.sha256(state.document.encode()).hexdigest()})
+            if state.stage in {"reviewed", "rejected"} and not same_baseline and not state.call_pending:
+                continue
+            if (state.stage in {"author", "critic"} or state.call_pending) and baseline is not None and not same_baseline:
+                raise SimplificationInterrupted("Unresolved simplification belongs to another accepted baseline")
+            if state.stage in {"author", "critic", "reviewed", "rejected"} or state.call_pending:
+                self._recover_simplification_call(inp, state, path)
+
+    def _preserve_pending_baseline(self, inp, out, error):
+        baseline = self._accepted_baseline
+        if baseline is not None:
+            path = self.ctx.root_workdir / "accepted_pending" / f"{baseline.sha256}.tex"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(baseline.document, encoding="utf-8")
+            # This is a previously accepted proof, not a final-approved submission
+            # or an unreviewed partial. Keep it outside both export directories.
+            out = out.model_copy(update={
+                "answer_tex": path, "submission_approved": False, "submission_sha256": None,
+                "partial_ready": False, "partial_sha256": None, "abstained": True,
+                "final_critic_answer_ready": False, "output_kind": "accepted_baseline_needs_final_review",
+                "accepted_baseline_pending": True, "accepted_baseline_path": path,
+                "accepted_baseline_sha256": baseline.sha256,
+            })
+        out.error, out.partial_reason, out.error_retryable = str(error), str(error), False
+        _save_json(self.ctx.root_workdir / "batch3-output.json", out.model_dump(mode="json"))
+        return out
 
     async def _simplify_accepted(self, inp, document, notes, report, out, *, deadline, reserve):
         if not inp.simplification_rounds or self._accepted_baseline is None:
@@ -634,6 +772,8 @@ class FirstProofBatch3Workflow(Agent):
             state = SimplificationState.model_validate_json(path.read_text(encoding="utf-8"))
             if state.source_sha256 != source:
                 raise ValueError("Simplification checkpoint belongs to another manuscript")
+            if state.stage in {"author", "critic", "reviewed", "rejected"} or state.call_pending:
+                self._recover_simplification_call(inp, state, path)
         else:
             seconds = deadline - time.monotonic()
             available = self._remaining_usd() - reserve
@@ -677,11 +817,10 @@ class FirstProofBatch3Workflow(Agent):
         except SubscriptionParked:
             raise
         except Exception as exc:
-            if state.stage in {"author", "critic"}:
-                raise SimplificationInterrupted(
-                    f"Simplification stopped during {state.stage}; provider usage may be unresolved: {path}"
-                ) from exc
-            if not isinstance(exc, (BudgetExhausted, TimeoutError)):
+            interrupted_call = state.stage in {"author", "critic"} or state.call_pending
+            if interrupted_call:
+                self._recover_simplification_call(inp, state, path)
+            if not interrupted_call and not isinstance(exc, (BudgetExhausted, TimeoutError)):
                 raise
             state.stop_reason = f"{type(exc).__name__}: {exc}"
             out.cleanup_errors.append("proof simplification: " + state.stop_reason)
@@ -702,8 +841,10 @@ class FirstProofBatch3Workflow(Agent):
             if state.stage == "ready":
                 await self.events.emit("batch3.simplification_round", {"round": attempt, "rounds": state.rounds})
                 state.stage = "author"
+                state.call_pending, state.call_role = True, "author"
+                state.call_agent = f"simplification_author-{path.parent.name}-{attempt}"
                 _save_json(path, state.model_dump(mode="json"))
-                author = Author(ctx, name=f"simplification_author-{attempt}")
+                author = Author(ctx, name=state.call_agent)
                 try:
                     state.candidate = await author(
                         problem=inp.problem, recovery_problem=inp.problem,
@@ -719,9 +860,11 @@ class FirstProofBatch3Workflow(Agent):
                     if isinstance(completed, Author.Outputs):
                         state.candidate = completed
                         state.stage = "candidate"
+                        state.call_pending = False
                         _save_json(path, state.model_dump(mode="json"))
                     raise
                 state.stage = "candidate"
+                state.call_pending = False
                 _save_json(path, state.model_dump(mode="json"))
             candidate = state.candidate
             if candidate is None:
@@ -741,8 +884,10 @@ class FirstProofBatch3Workflow(Agent):
             stopped = None
             if not reason and state.stage != "reviewed":
                 state.stage = "critic"
+                state.call_pending, state.call_role = True, "critic"
+                state.call_agent = f"simplification_critic-{path.parent.name}-{attempt}"
                 _save_json(path, state.model_dump(mode="json"))
-                critic = SimplificationCritic(ctx, name=f"simplification_critic-{attempt}")
+                critic = SimplificationCritic(ctx, name=state.call_agent)
                 try:
                     state.review = await critic(
                         problem=inp.problem, answer_tex=document, baseline_tex=state.document,
@@ -761,6 +906,7 @@ class FirstProofBatch3Workflow(Agent):
                     else:
                         raise
                 state.stage = "reviewed"
+                state.call_pending = False
                 _save_json(path, state.model_dump(mode="json"))
             review = state.review if not reason else None
             if review is not None and not review.parse_failed and review.disposition == "research":
@@ -791,8 +937,13 @@ class FirstProofBatch3Workflow(Agent):
 
     async def _candidate_loop(self, ctx, inp, baseline, notes, *, episode, deadline):
         history = list(self._research_state(inp).get("critic_conversation") or [])
-        if inp.simplification_rounds and self._accepted_baseline is not None:
-            history.append({"role": "assistant", "content": self._accepted_baseline.review_md})
+        provenance = ""
+        if getattr(self, "_accepted_baseline", None) is not None and self._accepted_baseline.simplified:
+            provenance = (
+                "Baseline provenance: the baseline supplied below is the retained accepted manuscript. "
+                "Earlier conversation may concern a different version. Its separate review follows "
+                "for context, not as proof of correctness:\n" + self._accepted_baseline.review_md
+            )
         session_key = "solved-" + hashlib.sha256(baseline.encode()).hexdigest()
         editor_feedback = []
         _, baseline_pages, _ = await self._check(baseline, inp, deadline)
@@ -810,14 +961,14 @@ class FirstProofBatch3Workflow(Agent):
                 review = await critic(
                     problem=inp.problem, answer_tex=candidate, page_limit=inp.page_limit,
                     baseline_tex=baseline, prior_messages=history,
+                    baseline_provenance=provenance,
                     mode="stateful", compile_feedback=feedback, editor_response="\n\n".join(editor_feedback),
                 )
             except BaseException as exc:
                 completed = critic.completed_review or getattr(exc, "completed_output", None)
                 if isinstance(completed, Batch3CleanupCritic.Outputs) and completed.disposition == "research":
                     self._handoff(inp, baseline, candidate, completed)
-                if (isinstance(exc, BudgetExhausted) and not isinstance(exc, SubscriptionParked)
-                        and exc.limit_kind == "usd" and ok
+                if (monetary_limit_exhausted(exc) and ok
                         and isinstance(completed, Batch3CleanupCritic.Outputs)
                         and completed.disposition == "accept"):
                     review = completed
@@ -904,6 +1055,7 @@ class FirstProofBatch3Workflow(Agent):
             partial_ready=partial, submission_approved=not partial,
             partial_sha256=digest if partial else None, submission_sha256=None if partial else digest,
             early_stopped=not partial, final_critic_answer_ready=not partial,
+            accepted_baseline_pending=False, accepted_baseline_path=None, accepted_baseline_sha256=None,
         )
         if not partial:
             updates.update(partial_reason="", error=None)
@@ -1126,6 +1278,11 @@ class FirstProofBatch3Workflow(Agent):
         out = self.Outputs(problem_id=inp.problem_id)
         self._accepted_baseline = self._restore_accepted(inp) if inp.resume_run else None
         self._reconcile_accepted(inp)
+        if inp.resume_run:
+            try:
+                self._reconcile_simplifications(inp)
+            except SimplificationInterrupted as exc:
+                return self._preserve_pending_baseline(inp, out, exc)
         accounting_blocked = (self.ctx.root_workdir / "cleanup-accounting-uncertain.json").exists()
         if not accounting_blocked and (self.ctx.root_workdir / "cleanup_sessions").exists():
             from proofstack.agents.cleanup_session import cleanup_accounting_unresolved
@@ -1167,7 +1324,7 @@ class FirstProofBatch3Workflow(Agent):
                 update={"max_usd": min(schedule.initial_usd, self._remaining_usd() + self.tracker.planning_usd)})
         else:
             if final_required and (self._remaining_usd() <= reserve + final_reserve
-                                   or deadline - now <= final_window):
+                                   or deadline - now <= inp.partial_cleanup_seconds + final_window):
                 raise ValueError("Run budget/time must exceed the final-review and cleanup reserves")
             schedule = _Schedule(
                 problem_hash=_problem_hash(inp.problem),
@@ -1302,6 +1459,8 @@ class FirstProofBatch3Workflow(Agent):
                     error = out.partial_reason
                     out.error = error
                     out.error_retryable = False
+                    if isinstance(exc, SimplificationInterrupted):
+                        return self._preserve_pending_baseline(inp, out, exc)
                     state = self._research_state(inp)
                     out.rounds_completed = max(out.rounds_completed, int(state.get("last_round_run") or 0))
                     _save_json(self.ctx.root_workdir / "batch3-output.json", out.model_dump(mode="json"))

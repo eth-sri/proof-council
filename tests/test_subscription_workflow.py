@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -296,6 +297,26 @@ def test_stateless_review_has_no_history_and_stays_distinct(configured, fake_cli
         assert "# assistant" not in inp.packet
 
 
+def test_final_verdict_retry_uses_new_packet_without_changing_model_config(configured, fake_cli):
+    workflow, _ = configured
+    workflow.ctx.component_configs["final_stateless_critic"] = {"max_hosted_tool_calls": 7}
+    first = FinalStatelessCritic(workflow.ctx, name="final_stateless_critic")
+    retry = FinalStatelessCritic(workflow.ctx, name="final_stateless_critic")
+    retry.verdict_attempt = 1
+    assert first.component_config == retry.component_config
+    assert retry.component_config["max_hosted_tool_calls"] == 7
+    inp = first.Inputs(problem="P", answer_tex=TEX, mode="fresh")
+    assert first._recovery_checkpoint(inp) != retry._recovery_checkpoint(inp)
+
+    async def run():
+        await first(**inp.model_dump())
+        await retry(**inp.model_dump())
+        await retry(**inp.model_dump())
+
+    asyncio.run(run())
+    assert len(fake_cli) == 2
+
+
 def test_interrupted_receipt_blocks_retry(configured, fake_cli, monkeypatch):
     workflow, _ = configured
     async def interrupted(self, inp):
@@ -305,7 +326,7 @@ def test_interrupted_receipt_blocks_retry(configured, fake_cli, monkeypatch):
             m.setattr(ConfigurableCLIAgent, "run", interrupted)
             with pytest.raises(asyncio.CancelledError):
                 await sub.run_packet(workflow, "request")
-        with pytest.raises(sub.SubscriptionBlocked, match="Interrupted"):
+        with pytest.raises(sub.SubscriptionBlocked, match="Unresolved"):
             await sub.run_packet(workflow, "request")
     asyncio.run(run())
     assert not fake_cli
@@ -406,7 +427,8 @@ def test_rejects_any_injected_paid_child_environment(key):
         sub.check_cli_environment({key: "injected"})
 
 
-def test_complete_batch3_research_simplification_cleanup_and_final_gate(configured, fake_cli, monkeypatch):
+@pytest.mark.parametrize("fresh_context", [False, True])
+def test_complete_batch3_research_simplification_cleanup_and_final_gate(configured, fake_cli, monkeypatch, fresh_context):
     from proofstack.agents import cleanup_session as cleanup
     from proofstack.agents.ac import ac_workflow as ac
     from proofstack.agents.firstproof_batch3 import FirstProofBatch3Workflow
@@ -424,7 +446,12 @@ def test_complete_batch3_research_simplification_cleanup_and_final_gate(configur
         yield {"mcpServers": {}}
     monkeypatch.setattr(cleanup, "cleanup_tools", tools)
 
-    agent = FirstProofBatch3Workflow(workflow.ctx)
+    ctx = workflow.ctx
+    if fresh_context:
+        ctx = RunContext.create(run_id="fresh", root_workdir=ctx.root_workdir.parent / "fresh", flat=True,
+                                run_budget=BudgetSpec(max_usd=1050, max_wallclock_s=120))
+        assert ctx.execution_backend == "api"
+    agent = FirstProofBatch3Workflow(ctx)
     result = asyncio.run(agent(problem="Synthetic question", problem_id="synthetic", execution_backend="subscription",
         n_rounds=2, full_critic_interval=1, enable_compute=False, enable_council=False,
         research_seconds=60, partial_cleanup_seconds=0, final_review_seconds=10, final_review_export_seconds=1,
@@ -434,7 +461,8 @@ def test_complete_batch3_research_simplification_cleanup_and_final_gate(configur
     assert result.final_critic_answer_ready
     assert result.answer_tex.is_file()
     assert any(cmd[0] == "claude" for cmd, _, _ in fake_cli)
-    events = [json.loads(line) for line in (workflow.ctx.root_workdir / "events.jsonl").read_text().splitlines()]
+    assert agent.ctx.execution_backend == "subscription"
+    events = [json.loads(line) for line in (agent.ctx.root_workdir / "events.jsonl").read_text().splitlines()]
     agents = [r["agent"] for r in events if r["kind"] == "agent.start"]
     assert any("simplif" in name.lower() for name in agents)
     assert "final_stateless_critic" in agents
@@ -462,7 +490,7 @@ def test_subscription_error_blocks_instead_of_falling_back(configured, fake_cli,
     async def run():
         with pytest.raises(sub.SubscriptionBlocked, match="no API fallback"):
             await sub.run_packet(workflow, "request")
-        with pytest.raises(sub.SubscriptionBlocked, match="Interrupted"):
+        with pytest.raises(sub.SubscriptionBlocked, match="Unresolved"):
             await sub.run_packet(workflow, "request")
     asyncio.run(run())
     assert worker.await_count == 1
@@ -483,7 +511,8 @@ def test_completed_receipt_reuse_survives_new_worker_instance(configured, fake_c
     workflow, _ = configured
     async def run():
         first = await sub.run_packet(workflow, "same", key="receipt")
-        second = await sub.run_packet(SimpleNamespace(ctx=workflow.ctx, tracker=workflow.tracker, name=workflow.name),
+        second = await sub.run_packet(SimpleNamespace(ctx=workflow.ctx, tracker=workflow.tracker, name=workflow.name,
+                                                     workdir=workflow.workdir),
                                       "same", key="receipt")
         assert first == second
     asyncio.run(run())
@@ -545,3 +574,304 @@ def test_adapter_cannot_choose_api_cleanup_when_subscription_unavailable(tmp_pat
     with pytest.raises(cleanup.CleanupUnavailable):
         asyncio.run(fp._run_healthcheck(settings))
     assert settings.cleanup_disabled_reason is None
+
+
+def test_first_entry_replaces_host_compute_bypass(tmp_path, credentials):
+    from proofstack.agents.ac.compute import _build_codex_cmd
+    from proofstack.sandbox.base import SandboxSpec
+    ctx = RunContext.create(run_id="new", root_workdir=tmp_path / "fresh", flat=True,
+                            run_budget=BudgetSpec(max_usd=100, max_wallclock_s=120))
+    workflow = ACWorkflow(ctx)
+    inp = ACWorkflow.Inputs(problem="P", problem_id="p", execution_backend="subscription",
+                           compute_sandbox_backend="subprocess", compute_codex_sandbox="docker-bypass")
+    configured_input = sub.configure_workflow(workflow, inp)
+    command = _build_codex_cmd(model=sub.CODEX_MODEL, reasoning_effort="xhigh",
+                              sandbox=SandboxSpec(backend="subprocess"),
+                              codex_sandbox=configured_input.compute_codex_sandbox)
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert command[command.index("--sandbox") + 1] == "workspace-write"
+    assert workflow.ctx.execution_backend == "subscription"
+    assert workflow.author.ctx is workflow.ctx and workflow.compute.ctx is workflow.ctx
+
+
+def test_confirmed_spawn_failure_allows_only_one_bounded_retry(configured, fake_cli, monkeypatch):
+    workflow, _ = configured
+    monkeypatch.setattr(ConfigurableCLIAgent, "_command_for", lambda *a: ["/nonexistent/worker"])
+    async def run():
+        for _ in range(2):
+            with pytest.raises(sub.SubscriptionCallFailed, match="stopped and accounted"):
+                await sub.run_packet(workflow, "request")
+            sub.check_pending_calls(workflow.ctx.root_workdir)
+        with pytest.raises(sub.SubscriptionCallFailed, match="bounded retry"):
+            await sub.run_packet(workflow, "request")
+    asyncio.run(run())
+    receipt = next((workflow.ctx.root_workdir / "subscription_calls").glob("*.json"))
+    assert json.loads(receipt.read_text())["attempts"] == 2
+    assert json.loads(sub._settlement_path(receipt).read_text())["spawn_attempted"] is False
+    assert workflow.tracker.planning_usd == 0
+
+
+@pytest.mark.parametrize("provider", ["codex", "claude"])
+def test_unreadable_login_is_settled_no_spawn_failure(configured, fake_cli, credentials, provider):
+    workflow, _ = configured
+    path = credentials[0] / "auth.json" if provider == "codex" else credentials[1] / ".credentials.json"
+    path.unlink()
+    with pytest.raises(sub.SubscriptionCallFailed, match="stopped and accounted"):
+        asyncio.run(sub.run_packet(workflow, "request", provider=provider))
+    sub.check_pending_calls(workflow.ctx.root_workdir)
+    receipt = next((workflow.ctx.root_workdir / "subscription_calls").glob("*.json"))
+    assert json.loads(receipt.read_text())["status"] == "failed"
+    assert json.loads(sub._settlement_path(receipt).read_text())["spawn_attempted"] is False
+    assert workflow.tracker.planning_usd == 0
+
+
+def test_missing_report_with_settled_usage_is_terminal_failure(configured, fake_cli, monkeypatch):
+    workflow, _ = configured
+    command = ConfigurableCLIAgent._command_for
+    def remove_report(self, inp):
+        cmd = command(self, inp)
+        cmd[-1] += "\nPath('report.md').unlink()\n"
+        return cmd
+    monkeypatch.setattr(ConfigurableCLIAgent, "_command_for", remove_report)
+    with pytest.raises(sub.SubscriptionCallFailed):
+        asyncio.run(sub.run_packet(workflow, "request"))
+    sub.check_pending_calls(workflow.ctx.root_workdir)
+    receipt = next((workflow.ctx.root_workdir / "subscription_calls").glob("*.json"))
+    assert json.loads(receipt.read_text())["status"] == "failed"
+    assert workflow.tracker.planning_usd > 0
+
+
+def test_council_propagates_unresolved_work(configured, monkeypatch):
+    from proofstack.agents.ac.council import CouncilMember
+    workflow, inp = configured
+    async def blocked(*a, **kw):
+        raise sub.SubscriptionBlocked("usage unresolved")
+    monkeypatch.setattr(CouncilMember, "__call__", blocked)
+    with pytest.raises(sub.SubscriptionBlocked, match="usage unresolved"):
+        asyncio.run(Council(workflow.ctx)(author_question="Q", member_models=inp.council_models))
+
+
+def test_in_process_pending_guard_blocks_changed_packet(configured, fake_cli, monkeypatch):
+    workflow, _ = configured
+    monkeypatch.setattr(ConfigurableCLIAgent, "run", AsyncMock(side_effect=RuntimeError("unknown stop")))
+    with pytest.raises(sub.SubscriptionBlocked):
+        asyncio.run(sub.run_packet(workflow, "first"))
+    with pytest.raises(sub.SubscriptionBlocked, match="Unresolved"):
+        asyncio.run(sub.run_packet(workflow, "different"))
+    assert not fake_cli
+
+
+@pytest.mark.parametrize("torn", [b'{"kind":"model.call","pay', b'{"kind":"agent.end","payload":"\xe2'])
+def test_torn_event_log_restores_usage_from_independent_receipts(configured, torn):
+    workflow, _ = configured
+    asyncio.run(workflow.events.emit("model.call", {"subscription": True, "api_equivalent_usd": 4,
+                                                   "cost_usd": 0, "in_tokens": 20, "out_tokens": 3}))
+    (workflow.ctx.root_workdir / "events.jsonl").write_bytes(torn)
+    tracker = BudgetTracker("resumed", subscription_mode=True)
+    sub.restore_usage(workflow.ctx, tracker)
+    sub.restore_usage(workflow.ctx, tracker)
+    assert tracker.planning_usd == 4 and tracker.counters.tokens == 23
+
+
+def test_legacy_damaged_ledger_is_not_silently_undercharged(configured):
+    workflow, _ = configured
+    path = workflow.ctx.root_workdir / "execution-backend.json"
+    saved = json.loads(path.read_text())
+    saved.pop("usage_receipts")
+    path.write_text(json.dumps(saved))
+    (workflow.ctx.root_workdir / "events.jsonl").write_text('{"kind":"model.call","pay')
+    with pytest.raises(sub.SubscriptionBlocked, match="legacy"):
+        sub.restore_usage(workflow.ctx, BudgetTracker("resumed", subscription_mode=True))
+
+
+def test_operator_reconciliation_charges_once_and_never_changes_limits(configured, monkeypatch):
+    workflow, _ = configured
+    monkeypatch.setattr(ConfigurableCLIAgent, "run", AsyncMock(side_effect=RuntimeError("unknown stop")))
+    with pytest.raises(sub.SubscriptionBlocked):
+        asyncio.run(sub.run_packet(workflow, "first"))
+    root = workflow.ctx.root_workdir
+    receipt = next((root / "subscription_calls").glob("*.json"))
+    settings = (root / "execution-backend.json").read_bytes()
+    with pytest.raises(sub.SubscriptionBlocked, match="Confirm"):
+        sub.reconcile_stopped_call(root, receipt.stem, unreported_allowance_usd=10)
+    for _ in range(2):
+        sub.reconcile_stopped_call(root, receipt.stem, workers_stopped=True, unreported_allowance_usd=10)
+    sub.check_pending_calls(root)
+    tracker = BudgetTracker("resumed", subscription_mode=True)
+    sub.restore_usage(workflow.ctx, tracker)
+    assert tracker.planning_usd == 10 and tracker.counters.usd == 0
+    assert (root / "execution-backend.json").read_bytes() == settings
+
+
+def test_reconciliation_refuses_active_controller(configured, monkeypatch):
+    import fcntl
+    workflow, _ = configured
+    monkeypatch.setattr(ConfigurableCLIAgent, "run", AsyncMock(side_effect=RuntimeError("unknown stop")))
+    with pytest.raises(sub.SubscriptionBlocked):
+        asyncio.run(sub.run_packet(workflow, "first"))
+    root = workflow.ctx.root_workdir
+    receipt = next((root / "subscription_calls").glob("*.json"))
+    with receipt.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with pytest.raises(sub.SubscriptionBlocked, match="still running"):
+            sub.reconcile_stopped_call(root, receipt.stem, workers_stopped=True, unreported_allowance_usd=10)
+    assert json.loads(receipt.read_text())["status"] == "started"
+
+
+def test_linear_reader_runs_prefix_workers_and_reuses_reports(configured, fake_cli, tmp_path, monkeypatch):
+    workflow, _ = configured
+    monkeypatch.setattr(sys.modules[__name__], "REPLY", '{"undefined": [], "unclear": []}')
+    workspace = tmp_path / "editor"
+    workspace.mkdir()
+    first = "First passage. " * 30
+    second = "Later notation appears here."
+    (workspace / "answer.tex").write_text(
+        r"\documentclass{article}\begin{document}" + first + "\n\n" + second + r"\end{document}")
+
+    async def run():
+        result = await sub.linear_read_subscription(workflow, workflow.tracker, workspace, time.monotonic() + 30)
+        assert (workspace / result["path"]).read_text() == result["report"]
+        assert result["findings"] == 0 and result["cost_usd"] == 0
+        sub.check_pending_calls(workflow.ctx.root_workdir)
+        assert await sub.linear_read_subscription(
+            workflow, workflow.tracker, workspace, time.monotonic() + 30) == result
+
+    asyncio.run(run())
+    assert len(fake_cli) == 2
+    assert second not in fake_cli[0][2].packet
+    assert first.strip() in fake_cli[1][2].packet and second in fake_cli[1][2].packet
+    for cmd, config, _ in fake_cli:
+        assert cmd[cmd.index("--tools") + 1] == cmd[cmd.index("--allowedTools") + 1] == ""
+        assert config["claude_result_output"] == "text"
+    settlements = list((workflow.workdir / "linear_read").glob("*/subscription-settlement.json"))
+    assert len(settlements) == 2
+    assert len({json.loads(path.read_text())["receipt_id"] for path in settlements}) == 2
+    assert all(json.loads(path.read_text())["settled"] for path in settlements)
+    assert workflow.tracker.counters.usd == 0
+
+
+@pytest.mark.parametrize("second_allowance", [10, 7])
+def test_reconciling_two_interrupted_attempts_debits_both(configured, monkeypatch, second_allowance):
+    workflow, _ = configured
+    monkeypatch.setattr(ConfigurableCLIAgent, "run", AsyncMock(side_effect=RuntimeError("interrupted")))
+    root = workflow.ctx.root_workdir
+    settings = (root / "execution-backend.json").read_bytes()
+    for attempt, allowance in enumerate((10, second_allowance), 1):
+        with pytest.raises(sub.SubscriptionBlocked):
+            asyncio.run(sub.run_packet(workflow, "same packet"))
+        [receipt] = (root / "subscription_calls").glob("*.json")
+        assert json.loads(receipt.read_text())["attempts"] == attempt
+        for _ in range(2):
+            sub.reconcile_stopped_call(root, receipt.stem, unreported_allowance_usd=allowance, workers_stopped=True)
+        sub.check_pending_calls(root)
+    tracker = BudgetTracker("resumed", subscription_mode=True)
+    sub.restore_usage(workflow.ctx, tracker)
+    sub.restore_usage(workflow.ctx, tracker)
+    assert tracker.planning_usd == 10 + second_allowance and tracker.counters.usd == 0
+    assert len(list((root / "subscription_usage").glob("*.json"))) == 2
+    assert (root / "execution-backend.json").read_bytes() == settings
+    with pytest.raises(sub.SubscriptionCallFailed, match="bounded retry"):
+        asyncio.run(sub.run_packet(workflow, "same packet"))
+
+
+@pytest.mark.parametrize("attempt", [1, 2])
+def test_reconciliation_crash_reuses_only_current_attempt_debit(configured, monkeypatch, attempt):
+    workflow, _ = configured
+    root = workflow.ctx.root_workdir
+    monkeypatch.setattr(ConfigurableCLIAgent, "run", AsyncMock(side_effect=RuntimeError("interrupted")))
+    for number in range(1, attempt + 1):
+        with pytest.raises(sub.SubscriptionBlocked):
+            asyncio.run(sub.run_packet(workflow, "same packet"))
+        [receipt] = (root / "subscription_calls").glob("*.json")
+        if number < attempt:
+            sub.reconcile_stopped_call(root, receipt.stem, workers_stopped=True, unreported_allowance_usd=10)
+    write = sub.write_text_atomic
+
+    def crash_before_settlement(path, text):
+        if path == sub._settlement_path(receipt):
+            raise OSError("synthetic crash after debit")
+        write(path, text)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sub, "write_text_atomic", crash_before_settlement)
+        with pytest.raises(OSError, match="after debit"):
+            sub.reconcile_stopped_call(root, receipt.stem, workers_stopped=True, unreported_allowance_usd=12)
+    assert json.loads(receipt.read_text())["status"] == "started"
+    with pytest.raises(sub.SubscriptionBlocked, match="cannot change"):
+        sub.reconcile_stopped_call(root, receipt.stem, workers_stopped=True, unreported_allowance_usd=13)
+    for _ in range(2):
+        sub.reconcile_stopped_call(root, receipt.stem, workers_stopped=True, unreported_allowance_usd=12)
+    tracker = BudgetTracker("resumed", subscription_mode=True)
+    sub.restore_usage(workflow.ctx, tracker)
+    assert tracker.planning_usd == (attempt - 1) * 10 + 12
+    assert len(list((root / "subscription_usage").glob("*.json"))) == attempt
+
+
+@pytest.mark.parametrize("verdict", ["research", "accept", "repair", "invalid"])
+@pytest.mark.parametrize("promoted", [False, True])
+def test_completed_subscription_critic_is_recovered_after_cancellation(configured, fake_cli, monkeypatch, verdict, promoted):
+    from proofstack.agents.ac.ac_workflow import _problem_hash
+    from proofstack.agents.firstproof_batch3 import FirstProofBatch3Workflow, _AcceptedBaseline
+    from proofstack.agents.proof_simplification import SimplificationState
+    from proofstack.latex_contract import normalize_submission_latex
+
+    workflow, _ = configured
+    ctx = workflow.ctx
+    problem = "Synthetic question"
+    document = TEX.replace("synthetic proof", "simpler synthetic proof")
+    digest = hashlib.sha256(TEX.encode()).hexdigest()
+    name = f"simplification_critic-3-{digest}-1"
+    monkeypatch.setattr(sys.modules[__name__], "REPLY", f"Review\n<cleanup_verdict>{verdict}</cleanup_verdict>")
+
+    async def cancel_after_worker_saved(self, **kwargs):
+        if kwargs["status"] == "ok":
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(ConfigurableCLIAgent, "_record_monitor_end", cancel_after_worker_saved)
+    critic = SimplificationCritic(ctx, name=name)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(critic(problem=problem, baseline_tex=TEX, answer_tex=document, mode="fresh"))
+    [critic_folder] = (ctx.root_workdir / "agents").glob(f"{name}-c*")
+    assert not (critic_folder / "completed_review.json").exists()
+    assert not (critic_folder / "output.json").exists()
+    [receipt] = (ctx.root_workdir / "subscription_calls").glob("*.json")
+    saved = json.loads(receipt.read_text())
+    assert saved["status"] == "completed"
+    assert saved["output"]["text"] == f"Review\n<cleanup_verdict>{verdict}</cleanup_verdict>"
+    if not promoted:
+        saved["status"] = "started"
+        saved.pop("output")
+        receipt.write_text(json.dumps(saved))
+        (critic_folder / "subscription-settlement.json").write_text(json.dumps({
+            "settled": False, "receipt_id": receipt.stem}))
+
+    parent = FirstProofBatch3Workflow(ctx)
+    inp = parent.Inputs(problem=problem, problem_id="p")
+    parent._accepted_baseline = _AcceptedBaseline(
+        problem_hash=_problem_hash(problem), problem_id="p", document=TEX,
+        sha256=digest, review_md="Old approval", round=3)
+    research_state = parent._workspace(inp) / ".ac" / "resume-state.json"
+    research_state.parent.mkdir(parents=True)
+    research_state.write_text(json.dumps({"last_round_run": 3, "early_stopped": True}))
+    state = SimplificationState(
+        source_sha256=digest, rounds=1, document=TEX, notes="", review_md="Old approval",
+        max_usd=10, initial_spend=0, deadline_unix_s=time.time() + 30,
+        stage="critic", call_pending=True, call_role="critic", call_agent=name,
+        candidate=Author.Outputs(answer_tex=document, ready=True))
+    path = ctx.root_workdir / "proof_simplification" / f"3-{digest}" / "state.json"
+    spent = workflow.tracker.planning_usd
+    parent._recover_simplification_call(inp, state, path)
+    assert json.loads(receipt.read_text())["status"] == "completed"
+    assert not state.call_pending
+    assert state.stage == ("rejected" if verdict == "research" else "done")
+    if verdict == "research":
+        assert parent._accepted_baseline is None
+        assert json.loads(parent._accepted_checkpoint().read_text())["revoked"]
+        assert "<cleanup_verdict>research</cleanup_verdict>" in json.loads(
+            research_state.read_text())["pending_critique"]
+    else:
+        expected = normalize_submission_latex(document) if verdict == "accept" else TEX
+        assert parent._accepted_baseline.document == expected
+        assert state.document == expected and state.completed == 1
+    parent._recover_simplification_call(inp, state, path)
+    assert len(fake_cli) == 1 and workflow.tracker.planning_usd == spent

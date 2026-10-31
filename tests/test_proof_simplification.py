@@ -209,8 +209,10 @@ def test_interrupting_call_keeps_baseline_and_blocks_further_paid_work(simplific
     execute, calls, _, options, ctx, agent = simplification
     options["author_error"] = RuntimeError("provider poll failed")
     out = asyncio.run(execute(simplification_rounds=3))
-    assert not out.submission_approved and out.partial_ready
-    assert not out.error_retryable and "usage may be unresolved" in out.error
+    assert not out.submission_approved and not out.partial_ready
+    assert out.accepted_baseline_pending and out.answer_tex.read_text() == TEX
+    assert out.output_kind == "accepted_baseline_needs_final_review"
+    assert not out.error_retryable and "reconcile provider work" in out.error
     assert calls["rewrite"] == calls["final_critic"] == 0 and calls["simplify_author"] == 1
     inp = FirstProofBatch3Workflow.Inputs(problem=ORIGINAL, problem_id="p", simplification_rounds=3)
     with pytest.raises(SimplificationInterrupted, match="reconcile provider work"):
@@ -342,3 +344,112 @@ def test_critic_configuration_inherits_cleanup_limits(pipeline):
     critic = SimplificationCritic(ctx)
     assert critic.component_config["context_window_tokens"] == 500000
     assert critic.component_config["max_hosted_tool_calls"] == 19
+
+
+@pytest.mark.parametrize("stage", ["author", "critic"])
+@pytest.mark.parametrize("settled", [False, True])
+def test_real_simplification_timeout_preserves_baseline(simplification, monkeypatch, stage, settled):
+    execute, calls, _, _, ctx, agent = simplification
+    phase = agent._phase
+
+    async def short_phase(name, *, usd, deadline, call):
+        if name == "proof_simplification":
+            deadline = time.monotonic() + 0.1
+        return await phase(name, usd=usd, deadline=deadline, call=call)
+
+    async def slow(self, inp):
+        calls["slow"] += 1
+        try:
+            await asyncio.Event().wait()
+        finally:
+            (self.workdir / "provider-settlement.json").write_text(json.dumps({"settled": settled}))
+
+    monkeypatch.setattr(agent, "_phase", short_phase)
+    monkeypatch.setattr(Author if stage == "author" else SimplificationCritic, "run", slow)
+    out = asyncio.run(execute(simplification_rounds=3))
+    assert calls["slow"] == 1
+    if settled:
+        assert out.submission_approved
+        assert calls["rewrite"] == calls["final_critic"] == 1
+        assert json.loads(states(ctx)[0].read_text())["document"] == TEX
+    else:
+        assert out.accepted_baseline_pending and out.answer_tex.read_text() == TEX
+        assert not out.partial_ready and not out.submission_approved
+        assert calls["rewrite"] == calls["final_critic"] == calls["partial"] == 0
+
+
+@pytest.mark.parametrize("after_cutoff", [False, True])
+def test_resume_checks_unresolved_simplification_even_when_disabled(simplification, after_cutoff):
+    execute, calls, _, options, ctx, _ = simplification
+    options["author_error"] = RuntimeError("transport lost")
+    asyncio.run(execute(simplification_rounds=1))
+    if after_cutoff:
+        path = ctx.root_workdir / "batch3-schedule.json"
+        saved = json.loads(path.read_text())
+        saved["research_deadline_unix_s"] = time.time() - 1
+        path.write_text(json.dumps(saved))
+    before = dict(calls)
+    out = asyncio.run(execute(resume_run=True, simplification_rounds=0))
+    assert out.accepted_baseline_pending and not out.error_retryable
+    assert dict(calls) == before
+
+
+def test_operator_settlement_unblocks_parent_simplification_checkpoint(simplification):
+    from proofstack.subscription import reconcile_stopped_call
+
+    execute, calls, _, options, ctx, _ = simplification
+    options["author_error"] = RuntimeError("worker interrupted")
+    assert asyncio.run(execute(simplification_rounds=1)).accepted_baseline_pending
+    state = json.loads(states(ctx)[0].read_text())
+    [folder] = (ctx.root_workdir / "agents").glob(f"{state['call_agent']}-c*")
+    receipt_id = "b" * 64
+    receipts = ctx.root_workdir / "subscription_calls"
+    receipts.mkdir()
+    (receipts / f"{receipt_id}.json").write_text('{"status":"started","attempts":1}')
+    (folder / "subscription-settlement.json").write_text(json.dumps({"settled": False, "receipt_id": receipt_id}))
+    reconcile_stopped_call(ctx.root_workdir, receipt_id, unreported_allowance_usd=5, workers_stopped=True)
+    out = asyncio.run(execute(resume_run=True, simplification_rounds=0))
+    assert out.submission_approved
+    assert calls["simplify_author"] == 1
+    assert calls["rewrite"] == calls["final_critic"] == 1
+    assert json.loads(states(ctx)[0].read_text())["stage"] == "done"
+
+
+@pytest.mark.parametrize("verdict", ["accept", "research"])
+def test_resume_processes_saved_review_before_cutoff_shortcut(simplification, monkeypatch, verdict):
+    execute, calls, _, _, ctx, _ = simplification
+
+    async def interrupted(self, inp):
+        self._on_response(f"Found issue\n<cleanup_verdict>{verdict}</cleanup_verdict>", inp)
+        (self.workdir / "provider-settlement.json").write_text('{"settled":true}')
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(SimplificationCritic, "run", interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(execute(simplification_rounds=1))
+    path = ctx.root_workdir / "batch3-schedule.json"
+    saved = json.loads(path.read_text())
+    saved["research_deadline_unix_s"] = time.time() - 1
+    path.write_text(json.dumps(saved))
+    out = asyncio.run(execute(resume_run=True, simplification_rounds=0))
+    assert calls["research"] == 1
+    if verdict == "accept":
+        assert out.submission_approved and "Simpler proof 1" in out.answer_tex.read_text()
+    else:
+        assert not out.submission_approved and calls["final_critic"] == 0
+        assert json.loads((ctx.root_workdir / "batch3-accepted-baseline.json").read_text())["revoked"]
+
+
+@pytest.mark.parametrize("unchanged", [True, False])
+def test_cleanup_history_uses_explicit_baseline_provenance(simplification, unchanged):
+    execute, _, seen, options, ctx, _ = simplification
+    options["unchanged"] = unchanged
+    asyncio.run(execute(simplification_rounds=1))
+    inp = seen["review_inputs"][0]
+    from test_firstproof_batch3 import HISTORY
+    from proofstack.agents.batch3_critic import Batch3CleanupCritic
+    assert inp.prior_messages == HISTORY
+    assert bool(inp.baseline_provenance) is not unchanged
+    rendered = Batch3CleanupCritic(ctx).render_messages(inp)
+    if not unchanged:
+        assert "Baseline provenance" in rendered[-1]["content"]

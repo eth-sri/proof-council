@@ -14,6 +14,9 @@ from proofstack.context import component_config_for_class
 class FinalStatelessCritic(ACCritic):
     cache_enabled = False
 
+    def _cache_config_snapshot(self):
+        return {**super()._cache_config_snapshot(), "verdict_attempt": getattr(self, "verdict_attempt", 0)}
+
     def __init__(self, ctx, **kwargs):
         defaults = component_config_for_class(ctx.component_configs, ACCritic, "ACCritic")
         configured = _deep_merge({"FinalStatelessCritic": defaults}, ctx.component_configs)
@@ -24,7 +27,10 @@ class FinalStatelessCritic(ACCritic):
 
     def _recovery_checkpoint(self, inp):
         path = super()._recovery_checkpoint(inp)
-        return self.ctx.root_workdir / "final_stateless_review" / "critic_receipts" / path.name
+        root = self.ctx.root_workdir / "final_stateless_review" / "critic_receipts"
+        if attempt := getattr(self, "verdict_attempt", 0):
+            root = root / f"verdict-retry-{attempt}"
+        return root / path.name
 
 
 class FinalReviewBlocked(RuntimeError):
@@ -39,3 +45,5 @@ class FinalReviewState(BaseModel):
     max_usd: float = Field(gt=0, allow_inf_nan=False)
     initial_spend: float = Field(ge=0, allow_inf_nan=False)
     deadline_unix_s: float = Field(gt=0, allow_inf_nan=False)
+    attempt: int = Field(default=0, ge=0, le=1)
+    previous_review: ACCritic.Outputs | None = None

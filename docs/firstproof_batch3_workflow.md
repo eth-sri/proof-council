@@ -843,3 +843,22 @@ Before competition deployment:
 
 No paid API call, Ada job, Docker launch or submission is performed by preparing
 this workflow.
+
+## Recovery of Optional Phases
+
+A settled simplification timeout or failed call stops optional simplification
+and retains the last accepted baseline for cleanup and the final stateless
+gate. An unresolved call blocks all further model work, including resume after
+the research cutoff or with simplification disabled. Its accepted manuscript
+is retained under `accepted_pending/` with output kind
+`accepted_baseline_needs_final_review`, not mislabelled as an unreviewed partial
+or published as a final-approved submission. Saved critic rejections are
+processed before deciding which phase the remaining clock/budget permits.
+
+Completed charged results are retained at both USD and subscription nominal
+monetary limits. A final critic's malformed verdict permits one fresh retry
+within the same saved allowance and deadline; a mathematical rejection is not
+a parse retry. Completed approvals are bound to the exact packet/configuration.
+Changing that configuration on resume fails closed without erasing the prior
+approved manuscript or manifest. Fresh launches must leave time for research
+after reserving both cleanup and final-review/export windows.

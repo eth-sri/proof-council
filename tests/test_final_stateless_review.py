@@ -81,6 +81,53 @@ def test_insufficient_initial_reserve_fails_before_paid_work(simplification, ove
     assert calls["research"] == calls["final_critic"] == 0
 
 
+def test_cleanup_and_final_windows_both_count_in_launch_preflight(simplification):
+    execute, calls, _, _, _, _ = simplification
+    with pytest.raises(ValueError, match="reserves"):
+        asyncio.run(execute(final_stateless_review=True, partial_cleanup_seconds=900))
+    assert not calls
+
+
+@pytest.mark.parametrize("kind", ["usd", "api_equivalent_usd"])
+def test_completed_final_verdict_survives_both_money_limits(simplification, kind):
+    execute, calls, _, options, _, _ = simplification
+    options["final_error"] = BudgetExhausted("run", kind, 1, 2)
+    out = asyncio.run(execute(final_stateless_review=True))
+    assert out.submission_approved and calls["final_critic"] == 1
+
+
+def test_malformed_final_verdict_has_one_budgeted_retry(simplification):
+    execute, calls, seen, options, ctx, _ = simplification
+    options["final_verdicts"] = ["missing", True]
+    out = asyncio.run(execute(final_stateless_review=True))
+    assert out.submission_approved and calls["final_critic"] == 2
+    assert seen["final_caps"] == [10, 8]
+    saved = json.loads(receipts(ctx)[0].read_text())
+    assert saved["attempt"] == 1 and saved["previous_review"]["parse_failed"]
+    before = dict(calls)
+    assert asyncio.run(execute(resume_run=True)).submission_approved
+    assert calls == before
+
+
+@pytest.mark.parametrize("change", ["critic", "page_limit"])
+def test_resume_with_changed_final_config_preserves_approved_output(simplification, change):
+    execute, calls, _, options, ctx, _ = simplification
+    options["pages"] = 2
+    out = asyncio.run(execute(final_stateless_review=True))
+    manifest = (ctx.root_workdir / "batch3-output.json").read_bytes()
+    manuscript = out.answer_tex.read_bytes()
+    before = dict(calls)
+    overrides = {}
+    if change == "critic":
+        ctx.component_configs["FinalStatelessCritic"] = {"max_hosted_tool_calls": 1}
+    else:
+        overrides["page_limit"] = 1
+    with pytest.raises(FinalReviewBlocked, match="configuration"):
+        asyncio.run(execute(resume_run=True, **overrides))
+    assert (ctx.root_workdir / "batch3-output.json").read_bytes() == manifest
+    assert out.answer_tex.read_bytes() == manuscript and dict(calls) == before
+
+
 def test_final_rejection_returns_to_research_then_rechecks_new_bytes(simplification):
     execute, calls, seen, options, _, _ = simplification
     options["final_verdicts"] = [False, True]
@@ -106,7 +153,8 @@ def test_invalid_final_verdict_blocks_approval_and_paid_retries(simplification, 
     options["final_verdicts"] = [verdict]
     out = asyncio.run(execute(simplification_rounds=1))
     assert not out.submission_approved and out.partial_ready and not out.error_retryable
-    assert calls["research"] == calls["rewrite"] == calls["final_critic"] == 1
+    assert calls["research"] == calls["rewrite"] == 1
+    assert calls["final_critic"] == 2
     assert calls["partial"] == 0
 
 
@@ -155,8 +203,10 @@ def test_legacy_accepted_output_does_not_bypass_new_gate(simplification):
     out = asyncio.run(execute())
     assert out.submission_approved
     inp = agent.Inputs(problem=ORIGINAL, problem_id="p", final_stateless_review=True)
-    assert not agent._restore_output(inp).submission_approved
-    assert not json.loads((ctx.root_workdir / "batch3-output.json").read_text())["submission_approved"]
+    before = (ctx.root_workdir / "batch3-output.json").read_bytes()
+    with pytest.raises(FinalReviewBlocked, match="preserved"):
+        agent._restore_output(inp)
+    assert (ctx.root_workdir / "batch3-output.json").read_bytes() == before
 
 
 def test_resume_does_not_disable_gate_or_repeat_completed_review(simplification):

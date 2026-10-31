@@ -1061,21 +1061,8 @@ class ACCritic(APICallAgent):
 
     @staticmethod
     def _provider_attempt_terminal(row):
-        provider = row.get("provider", "openai")
-        if provider == "openai":
-            return row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
-        if provider == "anthropic":
-            return row.get("stop_reason") in {
-                "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal",
-                "model_context_window_exceeded",
-            }
-        if provider == "google":
-            return row.get("finish_reason") in {
-                "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER", "BLOCKLIST",
-                "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
-                "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION",
-            }
-        return False
+        from proofstack.provider_accounting import provider_attempt_terminal
+        return provider_attempt_terminal(row)
 
     async def _reconcile_recovery(self, trace_path, rows, *, require_tool_evidence=False):
         terminal = {"failed", "cancelled", "incomplete", "completed"}

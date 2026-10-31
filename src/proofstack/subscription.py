@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import math
 import os
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +26,121 @@ COUNCIL_MODELS = [CODEX_COST, CLAUDE_COST]
 
 class SubscriptionBlocked(RuntimeError):
     requires_reconciliation = True
+
+
+class SubscriptionCallFailed(RuntimeError):
+    """The worker is stopped and accounted, but did not deliver a usable report."""
+
+
+_active_receipts: set[Path] = set()
+
+
+def _read_receipt(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("not an object")
+        return value
+    except (OSError, ValueError) as exc:
+        raise SubscriptionBlocked(f"Invalid subscription receipt: {path.name}") from exc
+
+
+def _completed(saved):
+    output = saved.get("output")
+    return (saved.get("status") == "completed" and isinstance(output, dict)
+            and output.get("status") == "done" and isinstance(output.get("text"), str)
+            and bool(output["text"].strip()))
+
+
+def _settlement_path(receipt):
+    return receipt.parent / "settlements" / receipt.name
+
+
+def _settled(receipt):
+    path = _settlement_path(receipt)
+    return path.exists() and _read_receipt(path).get("settled") is True
+
+
+def recover_packet(root, receipt_id):
+    """Return settlement and any completed raw output without starting a worker."""
+    if not isinstance(receipt_id, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt_id):
+        raise SubscriptionBlocked("Invalid subscription receipt identifier")
+    receipt = root / "subscription_calls" / f"{receipt_id}.json"
+    saved = reconcile_receipt(receipt)
+    if _completed(saved):
+        return True, saved["output"]
+    return saved.get("status") == "failed" and _settled(receipt), None
+
+
+def reconcile_receipt(receipt):
+    saved = _read_receipt(receipt)
+    if _completed(saved):
+        return saved
+    if saved.get("status") in {"started", "failed"} and _settled(receipt):
+        settlement = _read_receipt(_settlement_path(receipt))
+        folder = (receipt.parent.parent / settlement["workdir"]).resolve()
+        if not folder.is_relative_to((receipt.parent.parent / "agents").resolve()):
+            raise SubscriptionBlocked("Invalid subscription worker artifact path")
+        output_path = folder / "output.json"
+        recovered = {**saved, "status": "completed", "output": _read_receipt(output_path)} if output_path.exists() else {}
+        saved = recovered if _completed(recovered) else {**saved, "status": "failed"}
+        write_text_atomic(receipt, json.dumps(saved))
+    return saved
+
+
+def reconcile_stopped_call(root, receipt_id, *, unreported_allowance_usd, workers_stopped=False):
+    """Explicit operator recovery; never starts workers or changes a run limit."""
+    if not workers_stopped:
+        raise SubscriptionBlocked("Confirm all workers and descendants are stopped before reconciliation")
+    if not re.fullmatch(r"[0-9a-f]{64}", receipt_id):
+        raise ValueError("Expected the 64-character subscription receipt identifier")
+    if (type(unreported_allowance_usd) not in (int, float)
+            or not math.isfinite(unreported_allowance_usd) or unreported_allowance_usd < 0):
+        raise ValueError("Unreported allowance must be a finite nonnegative planning charge")
+    root = Path(root).resolve()
+    receipt = root / "subscription_calls" / f"{receipt_id}.json"
+    with receipt.with_suffix(".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SubscriptionBlocked("Subscription controller is still running") from exc
+        if receipt.resolve() in _active_receipts:
+            raise SubscriptionBlocked("Subscription controller is still running")
+        saved = _read_receipt(receipt)
+        if _completed(saved) or (saved.get("status") == "failed" and _settled(receipt)):
+            return saved
+        if saved.get("status") != "started":
+            raise SubscriptionBlocked("Only an interrupted invocation can be reconciled manually")
+        attempt = saved.get("attempts", 1)
+        if type(attempt) is not int or attempt < 1:
+            raise SubscriptionBlocked("Invalid subscription attempt number")
+        # Debit each attempt once, even across a crash before guard release.
+        # Keep the first attempt's legacy id to avoid charging it again.
+        usage_id = "reconciliation-" + receipt_id
+        if attempt > 1:
+            usage_id += f"-attempt-{attempt}"
+        usage = root / "subscription_usage" / f"{usage_id}.json"
+        usage.parent.mkdir(exist_ok=True)
+        if usage.exists():
+            if _read_receipt(usage)["payload"]["api_equivalent_usd"] != unreported_allowance_usd:
+                raise SubscriptionBlocked("Saved reconciliation allowance cannot change")
+        else:
+            write_text_atomic(usage, json.dumps({
+                "kind": "model.call", "subscription_usage_id": usage_id,
+                "payload": {"subscription": True, "cost_usd": 0, "metered_tokens": 0,
+                            "api_equivalent_usd": unreported_allowance_usd, "cost_estimated": True,
+                            "via": "operator_reconciliation", "receipt_id": receipt_id, "attempt": attempt},
+            }))
+        settlement = _settlement_path(receipt)
+        settlement.parent.mkdir(exist_ok=True)
+        # No fabricated output is recovered from this synthetic directory.
+        write_text_atomic(settlement, json.dumps({
+            "settled": True, "process_stopped": True, "operator_confirmed": True,
+            "workdir": f"agents/reconciled-{receipt_id}",
+        }))
+        saved = {**saved, "status": "failed", "operator_reconciled": True}
+        write_text_atomic(receipt, json.dumps(saved))
+        return saved
 
 
 def deny_api(*args, **kwargs):
@@ -101,8 +218,8 @@ def configure_workflow(agent, inp):
               "call_seconds": inp.subscription_call_seconds, "planning_usd": inp.subscription_planning_usd}
     if path.exists() and saved.get("settings") != config:
         raise SubscriptionBlocked("Subscription settings/allowance cannot change on resume")
+    check_pending_calls(agent.ctx.root_workdir)
     if current != "subscription":
-        check_pending_calls(agent.ctx.root_workdir)
         preflight()
         root = agent.tracker
         while root.parent is not None:
@@ -121,9 +238,11 @@ def configure_workflow(agent, inp):
             child = getattr(agent, name, None)
             if child is not None:
                 child.ctx = agent.ctx
-        write_text_atomic(path, json.dumps({"backend": requested, "settings": config}))
+        write_text_atomic(path, json.dumps({"backend": requested, "settings": config,
+                                           "usage_receipts": 1 if not path.exists() else saved.get("usage_receipts", 0)}))
     updates = {"council_models": COUNCIL_MODELS, "compute_model": CODEX_MODEL,
-               "compute_reasoning_effort": "xhigh", "compute_cost_config": CODEX_COST}
+               "compute_reasoning_effort": "xhigh", "compute_cost_config": CODEX_COST,
+               "compute_codex_sandbox": "auto"}
     if hasattr(inp, "cleanup_backend"):
         updates["cleanup_backend"] = "claude_code"
     return inp.model_copy(update=updates)
@@ -133,13 +252,14 @@ def check_pending_calls(root):
     # Check the whole run, not just the next packet's hash: changed inputs must
     # not bypass unresolved work left behind by a crashed process.
     for receipt in (root / "subscription_calls").glob("*.json"):
+        if receipt.resolve() in _active_receipts:
+            continue
         try:
-            saved = json.loads(receipt.read_text(encoding="utf-8"))
-            output = saved["output"]
-            if saved["status"] == "completed" and output["status"] == "done" and output["text"].strip():
-                continue
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
-            pass
+            saved = reconcile_receipt(receipt)
+        except SubscriptionBlocked as exc:
+            raise SubscriptionBlocked(f"Unresolved subscription invocation ({receipt.name}): {exc}") from exc
+        if _completed(saved) or (saved.get("status") == "failed" and _settled(receipt)):
+            continue
         raise SubscriptionBlocked(
             f"Unresolved subscription invocation ({receipt.name}); reconcile before resuming this run"
         )
@@ -147,14 +267,30 @@ def check_pending_calls(root):
 
 def restore_usage(ctx, root):
     path = ctx.root_workdir / "events.jsonl"
-    if not path.exists():
-        return
     nominal = tokens = 0
-    for line in path.read_text().splitlines():
+    events, damaged = [], False
+    for line in path.read_bytes().splitlines() if path.exists() else []:
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
         except ValueError:
-            raise SubscriptionBlocked("Incomplete subscription usage log; reconcile before resume")
+            damaged = True
+            continue
+        if not isinstance(event, dict):
+            damaged = True
+            continue
+        if event.get("subscription_usage_id"):
+            receipt = ctx.root_workdir / "subscription_usage" / f"{event['subscription_usage_id']}.json"
+            if not receipt.exists():
+                raise SubscriptionBlocked("Missing subscription usage receipt")
+            continue
+        events.append(event)
+    backend_path = ctx.root_workdir / "execution-backend.json"
+    if damaged and (not backend_path.exists() or _read_receipt(backend_path).get("usage_receipts") != 1):
+        raise SubscriptionBlocked("Incomplete legacy subscription usage log; reconcile before resume")
+    events.extend(_read_receipt(p) for p in (ctx.root_workdir / "subscription_usage").glob("*.json"))
+    for event in events:
         p = event.get("payload", {})
         if event.get("kind") != "model.call" or not p.get("subscription"):
             continue
@@ -229,12 +365,22 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
     digest = hashlib.sha256(identity.encode()).hexdigest()
     receipt = agent.ctx.root_workdir / "subscription_calls" / f"{digest}.json"
     receipt.parent.mkdir(parents=True, exist_ok=True)
+    check_pending_calls(agent.ctx.root_workdir)
+    previous = None
     if receipt.exists():
-        saved = json.loads(receipt.read_text())
-        if saved["status"] == "completed":
-            return saved["output"]
-        raise SubscriptionBlocked("Interrupted subscription invocation; reconcile saved CLI artifacts before retrying")
+        previous = reconcile_receipt(receipt)
+        if _completed(previous):
+            write_text_atomic(agent.workdir / "subscription-settlement.json",
+                              json.dumps({"settled": True, "receipt_id": digest}))
+            return previous["output"]
+        if previous.get("status") != "failed" or not _settled(receipt):
+            raise SubscriptionBlocked("Interrupted subscription invocation; reconcile saved CLI artifacts before retrying")
+        if previous.get("attempts", 1) >= 2:
+            raise SubscriptionCallFailed("Subscription invocation failed twice; bounded retry exhausted; no API fallback")
     name = f"subscription-{provider}-{digest[:16]}"
+    settlement = _settlement_path(receipt)
+    settlement.parent.mkdir(exist_ok=True)
+    config["subscription_settlement_path"] = str(settlement)
     ctx = replace(agent.ctx, component_configs={name: config}, model_overrides={})
     worker = ConfigurableCLIAgent(ctx, name=name, parent_budget_scope=agent.tracker.scope)
     worker.tracker.parent = agent.tracker
@@ -249,31 +395,58 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
     async with asyncio.timeout(seconds):
         async with agent.ctx.subscription_limiter:
             agent.tracker.check()
-            # Exclusive creation closes the race with another identical invocation.
+            lock = receipt.with_suffix(".lock").open("a")
             try:
-                with receipt.open("x") as stream:
-                    json.dump({"status": "started", "worker": name}, stream)
-            except FileExistsError:
-                saved = json.loads(receipt.read_text())
-                if saved["status"] == "completed":
-                    return saved["output"]
-                raise SubscriptionBlocked("Subscription invocation is already running or requires reconciliation")
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                lock.close()
+                raise SubscriptionBlocked("Subscription invocation is already running") from exc
             try:
+                if receipt.exists():
+                    saved = reconcile_receipt(receipt)
+                    if _completed(saved):
+                        write_text_atomic(agent.workdir / "subscription-settlement.json",
+                                          json.dumps({"settled": True, "receipt_id": digest}))
+                        return saved["output"]
+                    if saved != previous:
+                        raise SubscriptionBlocked("Subscription invocation changed while queued")
+                settlement.unlink(missing_ok=True)
+                started = {"status": "started", "worker": name,
+                           "attempts": (previous or {}).get("attempts", 0) + 1}
+                write_text_atomic(receipt, json.dumps(started))
+                write_text_atomic(agent.workdir / "subscription-settlement.json",
+                                  json.dumps({"settled": False, "receipt_id": digest}))
+                _active_receipts.add(receipt.resolve())
                 out = await worker(prompt=prompt, packet=packet, attachment=str(attachment) if attachment else "",
                                    **{f"file_{i}": value for i, value in enumerate((files or {}).values())})
             except BudgetExhausted as exc:
                 out = getattr(exc, "completed_output", None)
                 if out is not None and getattr(out, "text", "").strip() and getattr(out, "status", None) == "done":
-                    write_text_atomic(receipt, json.dumps({"status": "completed", "output": out.model_dump(mode="json")}))
+                    write_text_atomic(receipt, json.dumps({**started, "status": "completed", "output": out.model_dump(mode="json")}))
                 raise
             except Exception as exc:
+                if receipt.exists() and _settled(receipt):
+                    reconcile_receipt(receipt)
+                    raise SubscriptionCallFailed(
+                        f"Subscription worker failed ({type(exc).__name__}), stopped and accounted; no API fallback"
+                    ) from exc
                 raise SubscriptionBlocked(
                     f"Subscription worker failed ({type(exc).__name__}); inspect {name} and reconcile before retrying; no API fallback"
                 ) from exc
+            finally:
+                _active_receipts.discard(receipt.resolve())
+                lock.close()
+                if receipt.exists():
+                    saved = reconcile_receipt(receipt)
+                    write_text_atomic(agent.workdir / "subscription-settlement.json",
+                                      json.dumps({"settled": _completed(saved) or _settled(receipt), "receipt_id": digest}))
             if out.status != "done" or not (out.text or "").strip():
-                raise SubscriptionBlocked("Subscription CLI did not deliver a completed report; no API fallback")
+                error = SubscriptionCallFailed if _settled(receipt) else SubscriptionBlocked
+                raise error("Subscription CLI did not deliver a completed report; no API fallback")
             result = out.model_dump(mode="json")
-            write_text_atomic(receipt, json.dumps({"status": "completed", "output": result}))
+            write_text_atomic(receipt, json.dumps({**started, "status": "completed", "output": result}))
+            write_text_atomic(agent.workdir / "subscription-settlement.json",
+                              json.dumps({"settled": True, "receipt_id": digest}))
             try:
                 agent.tracker.check()
             except BudgetExhausted as exc:
@@ -335,13 +508,14 @@ async def linear_read_subscription(agent, tracker, workspace, deadline):
     # Each fresh worker sees only its prefix, never the later manuscript.
     preamble, blocks = split_document((workspace / "answer.tex").read_text())
     results = {}
-    proxy = SimpleNamespace(ctx=agent.ctx, tracker=tracker, name="cleanup-linear-read")
     for i, block in enumerate(blocks):
         tracker.check()
         if time.monotonic() >= deadline:
             raise TimeoutError("Linear-reader deadline reached")
         messages = build_query(preamble, blocks[:i], block, i)
         packet = "\n\n".join(f"# {m['role']}\n{m['content']}" for m in messages)
+        folder = agent.workdir / "linear_read" / hashlib.sha256(packet.encode()).hexdigest()
+        proxy = SimpleNamespace(ctx=agent.ctx, tracker=tracker, name="cleanup-linear-read", workdir=folder)
         raw = await run_packet(proxy, packet, provider="claude", key=f"linear-{i}", tools=False)
         results[i] = parse_reply(raw["text"])
         if "parse_error" in results[i]:

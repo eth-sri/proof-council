@@ -104,3 +104,6 @@ class SimplificationState(BaseModel):
     initial_spend: float = Field(ge=0, allow_inf_nan=False)
     deadline_unix_s: float = Field(gt=0, allow_inf_nan=False)
     stop_reason: str = ""
+    call_agent: str = ""
+    call_pending: bool = False
+    call_role: Literal["", "author", "critic"] = ""

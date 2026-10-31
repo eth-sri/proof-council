@@ -206,6 +206,7 @@ class APICallAgent(Agent):
         trace = ProviderTrace(self.workdir / "provider-attempts.jsonl",
                               run_id=self.ctx.root_workdir.name, agent=self.workdir.name, call_id=call_id,
                               on_failure=attempt_failed, on_response=self._on_provider_response)
+        self._save_provider_settlement(False)
         token = active_trace.set(trace)
         task = asyncio.create_task(asyncio.to_thread(query, client, messages))
         try:
@@ -226,6 +227,9 @@ class APICallAgent(Agent):
                 # Cancellation was already delivered before settlement began.
                 # A failed append must not turn this stop into a retryable error.
                 raise exc from accounting_error
+            from proofstack.provider_accounting import provider_attempts_settled
+            exc.provider_usage_resolved = task.done() and provider_attempts_settled(trace.attempts.values())
+            self._save_provider_settlement(exc.provider_usage_resolved)
             with contextlib.suppress(Exception):
                 await self.events.emit("model.call.cancelled", {
                     "model": getattr(client, "model", str(self.MODEL)),
@@ -243,12 +247,21 @@ class APICallAgent(Agent):
                         exc.cost[name] = max(exc.cost[name] or 0, value)
             else:
                 await self._charge_failed_provider_trace(trace, client, call_id, "failed")
+                from proofstack.provider_accounting import provider_attempts_settled
+                exc.provider_usage_resolved = task.done() and provider_attempts_settled(trace.attempts.values())
+                self._save_provider_settlement(exc.provider_usage_resolved)
             raise
         finally:
+            from proofstack.provider_accounting import provider_attempts_settled
+            self._provider_query_settled = task.done() and provider_attempts_settled(trace.attempts.values())
             self._provider_tool_evidence = trace.tool_evidence()
             active_trace.reset(token)
             # Retrieve a late exception without making shutdown await that task.
             task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+
+    def _save_provider_settlement(self, settled):
+        from proofstack.atomic import write_text_atomic
+        write_text_atomic(self.workdir / "provider-settlement.json", json.dumps({"settled": bool(settled)}))
 
     async def _charge_failed_provider_trace(self, trace, client, call_id, status):
         totals = trace.totals()
@@ -265,6 +278,9 @@ class APICallAgent(Agent):
 
     async def _record_model_usage(self, payload, *, call_id):
         await record_provider_usage(self.ctx, self.tracker, payload, call_id=call_id, emitter=self.events)
+        if payload.get("status") not in {"failed", "cancelled"}:
+            self._save_provider_settlement(
+                getattr(self, "_provider_query_settled", False) and not payload.get("usage_unavailable", False))
 
     def _limit_client_deadline(self, cfg):
         remaining = self.tracker.remaining_wallclock_s()
