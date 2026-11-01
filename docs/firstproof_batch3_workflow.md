@@ -850,9 +850,12 @@ A settled simplification timeout or failed call stops optional simplification
 and retains the last accepted baseline for cleanup and the final stateless
 gate. An unresolved call blocks all further model work, including resume after
 the research cutoff or with simplification disabled. Its accepted manuscript
-is retained under `accepted_pending/` with output kind
-`accepted_baseline_needs_final_review`, not mislabelled as an unreviewed partial
-or published as a final-approved submission. Saved critic rejections are
+is retained under `accepted_pending/`, not mislabelled as an unreviewed partial
+or published as a final-approved submission. A separately published partial, if
+one already exists, remains available to the adapter with its original bytes,
+hash and `partial_unreviewed` output kind. Otherwise the output kind is
+`accepted_baseline_needs_final_review`. This also applies to reconciliation stops
+during cleanup. Saved critic rejections are
 processed before deciding which phase the remaining clock/budget permits.
 
 Completed charged results are retained at both USD and subscription nominal
@@ -862,3 +865,28 @@ a parse retry. Completed approvals are bound to the exact packet/configuration.
 Changing that configuration on resume fails closed without erasing the prior
 approved manuscript or manifest. Fresh launches must leave time for research
 after reserving both cleanup and final-review/export windows.
+
+API recovery re-reads the durable provider attempts, not just the supplementary
+settlement marker. Explicit failed creates without a response ID or usage settle
+at zero; timeouts and connection failures remain unresolved. Successful retries
+do not erase an earlier open response. A preflight
+failure with no request evidence is safe to leave. Completed final verdicts are
+recovered before applying the allowance for a new call.
+
+For genuinely unresolved API work, stop all local controllers and descendants
+and independently retrieve or cancel any remote response IDs and reconcile their
+charges. Then record the result without editing workflow checkpoints:
+
+```bash
+uv run python scripts/reconcile_api_call.py /path/to/run /path/to/run/agents/CALL \
+  --confirm-workers-stopped --confirm-provider-work-terminal \
+  --unreported-allowance-usd 100
+```
+
+The amount is an additional conservative USD debit for unreported work, not a
+replacement for known usage or a budget increase. Zero requires evidence that
+no unreported charge remains. Confirmation is on operator trust: this command
+does not contact the provider or infer stopped remote work from a stopped local
+process. It binds reconciliation to the current input and attempt-log hashes,
+records each debit once, and starts no calls. Changed evidence requires renewed
+reconciliation; the original budget and deadline still govern a separate resume.

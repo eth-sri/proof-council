@@ -860,7 +860,7 @@ def test_completed_subscription_critic_is_recovered_after_cancellation(configure
         candidate=Author.Outputs(answer_tex=document, ready=True))
     path = ctx.root_workdir / "proof_simplification" / f"3-{digest}" / "state.json"
     spent = workflow.tracker.planning_usd
-    parent._recover_simplification_call(inp, state, path)
+    asyncio.run(parent._recover_simplification_call(inp, state, path))
     assert json.loads(receipt.read_text())["status"] == "completed"
     assert not state.call_pending
     assert state.stage == ("rejected" if verdict == "research" else "done")
@@ -873,5 +873,5 @@ def test_completed_subscription_critic_is_recovered_after_cancellation(configure
         expected = normalize_submission_latex(document) if verdict == "accept" else TEX
         assert parent._accepted_baseline.document == expected
         assert state.document == expected and state.completed == 1
-    parent._recover_simplification_call(inp, state, path)
+    asyncio.run(parent._recover_simplification_call(inp, state, path))
     assert len(fake_cli) == 1 and workflow.tracker.planning_usd == spent

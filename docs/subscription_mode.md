@@ -110,10 +110,18 @@ mode overrides API presets' Compute bypass setting.
   blocked on replay or resume, even with changed inputs, until its
   worker/output/usage is reconciled. Confirmed no-spawn failures and terminal
   workers with settled usage become `failed`, with at most one retry of the
-  same packet. Cancellation with only partial usage remains unresolved.
-  Council failures that need reconciliation propagate instead of being hidden
-  in a textual reply. The guard is checked before subsequent packet calls too,
-  not only when entering a workflow.
+  same packet, including non-zero exits with parsed usage. After cancellation,
+  confirmed shutdown charges the remainder of the call's saved nominal allowance
+  conservatively for its unpriced last turn. This estimate is recorded separately
+  in `subscription_usage/`; it consumes the interrupted phase's allowance, not
+  reserved cleanup/final-review funds. Concurrent critic/Council/Compute roles
+  divide the remaining phase allowance, and Council seats divide their role's
+  share, so overlapping cancellations cannot each reserve the entire phase.
+  An unknown stop or terminal call with
+  missing usage still blocks. Council and Compute failures that need reconciliation
+  propagate instead of being hidden in a textual reply. Compute also leaves a
+  durable settlement receipt. The guard is checked after queue admission as well
+  as before subsequent packet calls, not only when entering a workflow.
 - Atomic metering receipts in `subscription_usage/` back the event ledger.
   Resume deduplicates the two sources and can recover charges even if a crash
   truncated `events.jsonl`. Legacy runs without full receipt coverage still
@@ -135,7 +143,10 @@ The amount is an **additional conservative API-equivalent debit** for any
 unreported work, not a new budget. Choose it from the interrupted call's saved
 allowance; use zero only when inspection establishes that no unreported work
 occurred. The command refuses an active controller lock, records the debit
-idempotently per attempt, marks the invocation failed and never launches anything.
+idempotently per attempt, marks an unresolved invocation failed and never launches
+anything. A recoverable completed report is restored first, without an extra debit.
+If saved evidence explicitly says the worker did not stop, independently verify
+that it has since stopped and additionally pass `--override-stop-evidence`.
 Repeating reconciliation for the same attempt does not charge again; if its
 bounded retry is also interrupted, that attempt needs its own additional debit.
 The command does not infer from the absence of a controller that its children stopped.

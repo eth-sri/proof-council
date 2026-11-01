@@ -689,6 +689,10 @@ class Compute(CLIAgent):
             self.CLI_CMD[2:2] = ["--ignore-user-config", "-c", 'model_provider="openai"',
                                 "-c", 'forced_login_method="chatgpt"']
         try:
+            if self.ctx.execution_backend == "subscription":
+                from proofstack.subscription import tracked_compute
+                async with tracked_compute(self):
+                    return await super().run(inp)
             return await super().run(inp)
         finally:
             self._paid_codex_api_key = None

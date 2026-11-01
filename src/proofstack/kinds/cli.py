@@ -1618,6 +1618,7 @@ class CLIAgent(Agent):
         # finally knows whether it still owes a partial-usage metering (see the
         # cancellation note in the finally block).
         usage_recorded = False
+        initial_planning_spend = self.tracker.planning_usd
         done = None
         # The retained metering task once the run produced a done record. The
         # finally awaits THIS task rather than re-running metering, so a cancel
@@ -2626,18 +2627,19 @@ class CLIAgent(Agent):
                             pass
             settlement_path = self.component_config.get("subscription_settlement_path")
             if settlement_path and self.ctx.execution_backend == "subscription":
-                from proofstack.atomic import write_text_atomic
-                # Partial metering cannot price an interrupted last model turn.
-                # Only a terminal invocation (or a proven no-spawn) is settled.
-                settled = (process_stopped and required_usage_error is None
-                           and storage_lease_error is None and workspace_guard_error is None
-                           and (not stream_spawn_attempted or
-                                (usage_recorded and done is not None and done.status == "done")))
-                write_text_atomic(Path(settlement_path), json.dumps({
-                    "settled": settled, "process_stopped": process_stopped,
-                    "spawn_attempted": stream_spawn_attempted,
-                    "workdir": str(self.workdir.relative_to(self.ctx.root_workdir)),
-                }))
+                from proofstack.subscription import settle_cli_worker, SubscriptionBlocked
+                interrupted = (done is None or done.status == "partial"
+                               or (stream is not None and (stream.proc.returncode or 0) < 0))
+                self.component_config["subscription_interrupted"] = interrupted
+                settled = settle_cli_worker(self, process_stopped=process_stopped,
+                    spawn_attempted=stream_spawn_attempted,
+                    terminal_metered=usage_recorded and required_usage_error is None and not interrupted,
+                    safety_ok=storage_lease_error is None and workspace_guard_error is None,
+                    initial_spend=initial_planning_spend)
+                if not settled:
+                    raise SubscriptionBlocked("Subscription worker stop or usage is unresolved") from required_usage_error
+                # A stopped interrupted call is covered by its full saved allowance.
+                required_usage_error = None
             if required_usage_error is not None:
                 raise RuntimeError(
                     "required CLI usage accounting failed; downstream "

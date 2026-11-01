@@ -325,11 +325,17 @@ class APIClient:
     def _report_attempt_failure(self, ts, idx, exc, *, retry_decision):
         trace = active_trace.get()
         if trace is not None:
+            # A transport failure can leave paid work running even without a
+            # response ID. Do not treat it like an explicit rejected create.
+            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            rejected = (type(status) is int and 400 <= status < 600) or _is_context_length_error(exc)
+            uncertain = not trace.attempts.get((ts, idx), {}).get("response_id") and not rejected
             trace.failure(
                 (ts, idx), error_type=type(exc).__name__,
                 error_code="context_length_exceeded" if _is_context_length_error(exc) else getattr(exc, "code", None),
                 error_message=str(exc)[:500],
                 retry_decision=retry_decision,
+                **({"reconciliation_pending": True} if uncertain else {}),
             )
 
     def _provider_response_dict(self, response):
@@ -2338,6 +2344,7 @@ class APIClient:
                     total_retries += 1
                 if request_logged:
                     self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                    self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e) else "retry")
                 logger.error(f"Got Anthropic error in final-answer salvage. Exception: {e}")
                 if (
                     isinstance(e, _ProviderWallclockTimeout)
@@ -2618,6 +2625,7 @@ class APIClient:
                         total_retries += 1
                     if request_logged:
                         self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                        self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e) else "retry")
                     logger.error(f"Got Anthropic error in tools inner loop. Exception: {e}")
                     if (
                         isinstance(e, _ProviderWallclockTimeout)
@@ -3521,6 +3529,7 @@ class APIClient:
                     if "rate limit" not in str(e).lower() and "429" not in str(e):
                         total_retries += 1
                     self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                    self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e, context_length_recovery=True) else "retry")
                     if isinstance(e, RateLimitError):
                         logger.info(f"Got OpenAI CC rate limit error. Sleeping for 60 seconds. Exception: {e}")
                         self._sleep(60)
@@ -3722,6 +3731,7 @@ class APIClient:
                 if "rate limit" not in str(e).lower() and "429" not in str(e):
                     total_retries += 1
                 self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e, context_length_recovery=True) else "retry")
                 if isinstance(e, RateLimitError):
                     logger.info(f"Got OpenAI CC rate limit error. Sleeping for 60 seconds. Exception: {e}")
                     self._sleep(60)
@@ -3913,10 +3923,13 @@ class APIClient:
             self._log_provider_response(ts=ts, batch_idx=idx, response=response.json())
             return response
 
-        response = self._bounded_provider_operation(generate, timeout=timeout)
-
-        if response.status_code != 200:
-            raise Exception(f"Error: {response.status_code} - {response.text}")
+        try:
+            response = self._bounded_provider_operation(generate, timeout=timeout)
+            if response.status_code != 200:
+                raise requests.HTTPError(f"Error: {response.status_code} - {response.text}", response=response)
+        except Exception as exc:
+            self._report_attempt_failure(ts, idx, exc, retry_decision="stop" if _is_terminal_api_error(exc) else "retry")
+            raise
         json_response = response.json()
 
         if "candidates" not in json_response:

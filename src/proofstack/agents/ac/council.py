@@ -184,6 +184,9 @@ class Council(Agent):
     async def run(self, inp: Inputs) -> Outputs:  # type: ignore[override]
         if not inp.member_models:
             return self.Outputs(replies=[])
+        from proofstack.subscription import call_allowance, run_with_nominal_allowance
+        share = (call_allowance(self.tracker) / len(inp.member_models)
+                 if self.ctx.execution_backend == "subscription" else None)
 
         async def _one(model_ref: str) -> CouncilReply:
             seat = CouncilMember(
@@ -193,12 +196,12 @@ class Council(Agent):
                 parent_budget_scope=self.tracker.scope,
             )
             try:
-                out = await seat(
+                out = await run_with_nominal_allowance(seat, share, lambda: seat(
                     author_question=inp.author_question,
                     answer_tex=inp.answer_tex,
                     research_notes_tex=inp.research_notes_tex,
                     references_bib=inp.references_bib,
-                )
+                ))
                 # An empty reply means the provider returned an empty
                 # assistant message (sometimes the result of a
                 # silently-swallowed inner-loop error). Render as an
@@ -248,7 +251,15 @@ class Council(Agent):
             )
             for ref in inp.member_models
         ]
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            from .async_helpers import _join_tasks
+            await _join_tasks(tasks)
+            raise
         for t in tasks:
             if not t.done():
                 t.cancel()

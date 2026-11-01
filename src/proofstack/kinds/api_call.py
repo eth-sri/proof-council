@@ -239,17 +239,16 @@ class APICallAgent(Agent):
             raise
         except Exception as exc:
             if isinstance(getattr(exc, "cost", None), dict):
-                # Author owns attachment-rejection charging; enrich its receipt
-                # rather than charge the same response twice.
+                # Preserve attachment-rejection usage for Author's receipt too;
+                # the call-ID ledger deduplicates its later accounting.
                 totals = trace.totals()
                 for name, value in totals.items():
                     if name in exc.cost and isinstance(value, (int, float)):
                         exc.cost[name] = max(exc.cost[name] or 0, value)
-            else:
-                await self._charge_failed_provider_trace(trace, client, call_id, "failed")
-                from proofstack.provider_accounting import provider_attempts_settled
-                exc.provider_usage_resolved = task.done() and provider_attempts_settled(trace.attempts.values())
-                self._save_provider_settlement(exc.provider_usage_resolved)
+            await self._charge_failed_provider_trace(trace, client, call_id, "failed")
+            from proofstack.provider_accounting import provider_attempts_settled
+            exc.provider_usage_resolved = task.done() and provider_attempts_settled(trace.attempts.values())
+            self._save_provider_settlement(exc.provider_usage_resolved)
             raise
         finally:
             from proofstack.provider_accounting import provider_attempts_settled
@@ -261,7 +260,10 @@ class APICallAgent(Agent):
 
     def _save_provider_settlement(self, settled):
         from proofstack.atomic import write_text_atomic
-        write_text_atomic(self.workdir / "provider-settlement.json", json.dumps({"settled": bool(settled)}))
+        # Supplementary evidence must not replace cancellation or a paid reply.
+        # Resume re-reads the strict provider attempts ledger independently.
+        with contextlib.suppress(OSError):
+            write_text_atomic(self.workdir / "provider-settlement.json", json.dumps({"settled": bool(settled)}))
 
     async def _charge_failed_provider_trace(self, trace, client, call_id, status):
         totals = trace.totals()
@@ -280,7 +282,7 @@ class APICallAgent(Agent):
         await record_provider_usage(self.ctx, self.tracker, payload, call_id=call_id, emitter=self.events)
         if payload.get("status") not in {"failed", "cancelled"}:
             self._save_provider_settlement(
-                getattr(self, "_provider_query_settled", False) and not payload.get("usage_unavailable", False))
+                getattr(self, "_provider_query_settled", False))
 
     def _limit_client_deadline(self, cfg):
         remaining = self.tracker.remaining_wallclock_s()

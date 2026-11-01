@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 from dataclasses import replace
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from proofstack.atomic import write_text_atomic
@@ -58,7 +59,11 @@ def _settlement_path(receipt):
 
 def _settled(receipt):
     path = _settlement_path(receipt)
-    return path.exists() and _read_receipt(path).get("settled") is True
+    if not path.exists():
+        return False
+    evidence = _read_receipt(path)
+    return (evidence.get("settled") is True
+            and evidence.get("attempt", 1) == _read_receipt(receipt).get("attempts", 1))
 
 
 def recover_packet(root, receipt_id):
@@ -83,12 +88,15 @@ def reconcile_receipt(receipt):
             raise SubscriptionBlocked("Invalid subscription worker artifact path")
         output_path = folder / "output.json"
         recovered = {**saved, "status": "completed", "output": _read_receipt(output_path)} if output_path.exists() else {}
-        saved = recovered if _completed(recovered) else {**saved, "status": "failed"}
-        write_text_atomic(receipt, json.dumps(saved))
+        updated = recovered if _completed(recovered) else {**saved, "status": "failed"}
+        if updated != saved:
+            write_text_atomic(receipt, json.dumps(updated))
+        saved = updated
     return saved
 
 
-def reconcile_stopped_call(root, receipt_id, *, unreported_allowance_usd, workers_stopped=False):
+def reconcile_stopped_call(root, receipt_id, *, unreported_allowance_usd, workers_stopped=False,
+                           override_stop_evidence=False):
     """Explicit operator recovery; never starts workers or changes a run limit."""
     if not workers_stopped:
         raise SubscriptionBlocked("Confirm all workers and descendants are stopped before reconciliation")
@@ -106,11 +114,15 @@ def reconcile_stopped_call(root, receipt_id, *, unreported_allowance_usd, worker
             raise SubscriptionBlocked("Subscription controller is still running") from exc
         if receipt.resolve() in _active_receipts:
             raise SubscriptionBlocked("Subscription controller is still running")
-        saved = _read_receipt(receipt)
+        saved = reconcile_receipt(receipt)
         if _completed(saved) or (saved.get("status") == "failed" and _settled(receipt)):
             return saved
-        if saved.get("status") != "started":
+        if saved.get("status") not in {"started", "failed"}:
             raise SubscriptionBlocked("Only an interrupted invocation can be reconciled manually")
+        evidence_path = _settlement_path(receipt)
+        if (evidence_path.exists() and _read_receipt(evidence_path).get("process_stopped") is False
+                and not override_stop_evidence):
+            raise SubscriptionBlocked("Saved evidence says the worker did not stop; explicit stop-evidence override required")
         attempt = saved.get("attempts", 1)
         if type(attempt) is not int or attempt < 1:
             raise SubscriptionBlocked("Invalid subscription attempt number")
@@ -136,11 +148,112 @@ def reconcile_stopped_call(root, receipt_id, *, unreported_allowance_usd, worker
         # No fabricated output is recovered from this synthetic directory.
         write_text_atomic(settlement, json.dumps({
             "settled": True, "process_stopped": True, "operator_confirmed": True,
+            "attempt": attempt, "stop_evidence_overridden": override_stop_evidence,
             "workdir": f"agents/reconciled-{receipt_id}",
         }))
         saved = {**saved, "status": "failed", "operator_reconciled": True}
         write_text_atomic(receipt, json.dumps(saved))
         return saved
+
+
+def call_allowance(tracker):
+    limits = [max(0.0, node.spec.max_usd - node.planning_usd) for node in tracker.chain()
+              if node.spec and node.spec.max_usd is not None]
+    if not limits or not math.isfinite(min(limits)):
+        raise SubscriptionBlocked("Subscription calls require a finite planning allowance")
+    return min(limits)
+
+
+async def run_with_nominal_allowance(agent, allowance, call):
+    """Partition a subscription fanout's worst-case shutdown charge."""
+    if allowance is None:
+        return await call()
+    original = agent.tracker.spec
+    agent.tracker.spec = (original or BudgetSpec()).model_copy(update={
+        "max_usd": agent.tracker.planning_usd + min(allowance, call_allowance(agent.tracker))})
+    try:
+        return await call()
+    finally:
+        agent.tracker.spec = original
+
+
+def settle_cli_worker(agent, *, process_stopped, spawn_attempted, terminal_metered, safety_ok,
+                      initial_spend):
+    """Persist shutdown evidence; conservatively price an interrupted last turn."""
+    path = Path(agent.component_config["subscription_settlement_path"])
+    attempt = agent.component_config.get("subscription_attempt", 1)
+    allowance = agent.component_config.get("subscription_call_allowance_usd")
+    estimated = 0.0
+    settled = process_stopped and safety_ok and (not spawn_attempted or terminal_metered)
+    if (process_stopped and safety_ok and spawn_attempted and not terminal_metered
+            and agent.component_config.get("subscription_interrupted")
+            and type(allowance) in (int, float) and math.isfinite(allowance) and allowance >= 0):
+        estimated = max(0.0, allowance - (agent.tracker.planning_usd - initial_spend))
+        key = hashlib.sha256(f"{path}:{attempt}:{agent.workdir}".encode()).hexdigest()
+        debit = agent.ctx.root_workdir / "subscription_usage" / f"interrupted-{key}.json"
+        if not debit.exists():
+            write_text_atomic(debit, json.dumps({
+                "kind": "model.call", "subscription_usage_id": f"interrupted-{key}",
+                "payload": {"subscription": True, "cost_usd": 0, "api_equivalent_usd": estimated,
+                            "metered_tokens": 0, "cost_estimated": True, "usage_unavailable": True,
+                            "via": "interrupted_call_allowance", "attempt": attempt,
+                            "saved_allowance_usd": allowance},
+            }))
+            agent.tracker.add_api_equivalent_usd(estimated)
+        settled = True
+    write_text_atomic(path, json.dumps({
+        "settled": settled, "process_stopped": process_stopped, "spawn_attempted": spawn_attempted,
+        "attempt": attempt, "estimated_unreported_usd": estimated,
+        "workdir": str(agent.workdir.relative_to(agent.ctx.root_workdir)),
+    }))
+    return settled
+
+
+def packet_identity(agent, packet, *, key=None, files=None, outputs=None, provider="codex",
+                    attachment_hash=None, tools=True):
+    identity = json.dumps((["separate-report-v2"] if provider == "codex" else []) + [key or agent.name, packet,
+        files or {}, outputs, provider, attachment_hash, tools, agent.ctx.subscription_config], sort_keys=True)
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def recover_model_role(agent, inp):
+    messages = agent.render_messages(inp)
+    packet = "\n\n".join(f"# {m['role']}\n{m['content']}" for m in messages)
+    digest = packet_identity(agent, packet, key=agent._cache_key(inp), files={}, outputs={})
+    receipt = agent.ctx.root_workdir / "subscription_calls" / f"{digest}.json"
+    if not receipt.exists():
+        return None
+    settled, output = recover_packet(agent.ctx.root_workdir, digest)
+    if not settled:
+        raise SubscriptionBlocked("Saved final review has unresolved subscription work")
+    return output
+
+
+@asynccontextmanager
+async def tracked_compute(agent):
+    check_pending_calls(agent.ctx.root_workdir)
+    digest = hashlib.sha256(str(agent.workdir.relative_to(agent.ctx.root_workdir)).encode()).hexdigest()
+    receipt = agent.ctx.root_workdir / "subscription_calls" / f"{digest}.json"
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    with receipt.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if receipt.exists():
+            raise SubscriptionBlocked("Compute invocation cannot reuse a prior work directory")
+        allowance = call_allowance(agent.tracker)
+        write_text_atomic(receipt, json.dumps({"status": "started", "worker": agent.name,
+                                              "attempts": 1, "allowance_usd": allowance}))
+        original = agent.component_config
+        agent.component_config = {**original, "subscription_settlement_path": str(_settlement_path(receipt)),
+                                  "subscription_attempt": 1, "subscription_call_allowance_usd": allowance}
+        _active_receipts.add(receipt.resolve())
+        try:
+            yield
+        finally:
+            _active_receipts.discard(receipt.resolve())
+            agent.component_config = original
+            reconcile_receipt(receipt)
+            if not _settled(receipt):
+                raise SubscriptionBlocked("Compute worker stop or usage is unresolved; reconcile before continuing")
 
 
 def deny_api(*args, **kwargs):
@@ -360,9 +473,8 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
             attachment_hash = hashlib.file_digest(stream, "sha256").hexdigest()
         config["input_files"]["compute-workspace.zip"] = {"from_binary_path_input": "attachment"}
     # Older Codex receipts may contain a final chat summary that overwrote report.md.
-    identity = json.dumps((["separate-report-v2"] if provider == "codex" else []) + [key or agent.name, packet, files or {}, outputs, provider,
-                           attachment_hash, tools, agent.ctx.subscription_config], sort_keys=True)
-    digest = hashlib.sha256(identity.encode()).hexdigest()
+    digest = packet_identity(agent, packet, key=key, files=files, outputs=outputs, provider=provider,
+                             attachment_hash=attachment_hash, tools=tools)
     receipt = agent.ctx.root_workdir / "subscription_calls" / f"{digest}.json"
     receipt.parent.mkdir(parents=True, exist_ok=True)
     check_pending_calls(agent.ctx.root_workdir)
@@ -394,6 +506,7 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
     # Deadline includes time waiting for the shared subscription concurrency slot.
     async with asyncio.timeout(seconds):
         async with agent.ctx.subscription_limiter:
+            check_pending_calls(agent.ctx.root_workdir)
             agent.tracker.check()
             lock = receipt.with_suffix(".lock").open("a")
             try:
@@ -410,10 +523,13 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
                         return saved["output"]
                     if saved != previous:
                         raise SubscriptionBlocked("Subscription invocation changed while queued")
-                settlement.unlink(missing_ok=True)
                 started = {"status": "started", "worker": name,
-                           "attempts": (previous or {}).get("attempts", 0) + 1}
+                           "attempts": (previous or {}).get("attempts", 0) + 1,
+                           "allowance_usd": call_allowance(agent.tracker)}
                 write_text_atomic(receipt, json.dumps(started))
+                settlement.unlink(missing_ok=True)
+                worker.component_config.update(subscription_attempt=started["attempts"],
+                                               subscription_call_allowance_usd=started["allowance_usd"])
                 write_text_atomic(agent.workdir / "subscription-settlement.json",
                                   json.dumps({"settled": False, "receipt_id": digest}))
                 _active_receipts.add(receipt.resolve())

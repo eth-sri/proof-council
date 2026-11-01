@@ -26,6 +26,7 @@ def simplification(pipeline, monkeypatch):
         seen.setdefault("simplify_caps", []).append(self.ctx.budgets.root().spec.max_usd)
         self.tracker.add_usd(options.get("simplify_author_cost", 1))
         if options.get("author_error"):
+            (self.workdir / "provider-settlement.json").write_text('{"settled":false}')
             raise options["author_error"]
         number = calls["simplify_author"]
         document = inp.answer_tex if options.get("unchanged") else TEX.replace("Proof.", f"Simpler proof {number}.")
@@ -209,9 +210,9 @@ def test_interrupting_call_keeps_baseline_and_blocks_further_paid_work(simplific
     execute, calls, _, options, ctx, agent = simplification
     options["author_error"] = RuntimeError("provider poll failed")
     out = asyncio.run(execute(simplification_rounds=3))
-    assert not out.submission_approved and not out.partial_ready
-    assert out.accepted_baseline_pending and out.answer_tex.read_text() == TEX
-    assert out.output_kind == "accepted_baseline_needs_final_review"
+    assert not out.submission_approved and out.partial_ready
+    assert out.accepted_baseline_pending and out.accepted_baseline_path.read_text() == TEX
+    assert out.output_kind == "partial_unreviewed"
     assert not out.error_retryable and "reconcile provider work" in out.error
     assert calls["rewrite"] == calls["final_critic"] == 0 and calls["simplify_author"] == 1
     inp = FirstProofBatch3Workflow.Inputs(problem=ORIGINAL, problem_id="p", simplification_rounds=3)
@@ -284,6 +285,7 @@ def test_cancellation_inside_review_does_not_replay_model_call(simplification, m
 
     async def cancel_review(self, inp):
         calls["cancelled_critic"] += 1
+        (self.workdir / "provider-settlement.json").write_text('{"settled":false}')
         raise asyncio.CancelledError
 
     monkeypatch.setattr(SimplificationCritic, "run", cancel_review)
@@ -373,8 +375,8 @@ def test_real_simplification_timeout_preserves_baseline(simplification, monkeypa
         assert calls["rewrite"] == calls["final_critic"] == 1
         assert json.loads(states(ctx)[0].read_text())["document"] == TEX
     else:
-        assert out.accepted_baseline_pending and out.answer_tex.read_text() == TEX
-        assert not out.partial_ready and not out.submission_approved
+        assert out.accepted_baseline_pending and out.accepted_baseline_path.read_text() == TEX
+        assert out.partial_ready and not out.submission_approved
         assert calls["rewrite"] == calls["final_critic"] == calls["partial"] == 0
 
 

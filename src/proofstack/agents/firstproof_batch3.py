@@ -388,6 +388,13 @@ class FirstProofBatch3Workflow(Agent):
             )
             _save_json(path, state.model_dump(mode="json"))
         _save_json(self._final_review_pointer(), {"key": key})
+        if state.status == "pending":
+            critic = FinalStatelessCritic(self.ctx, name="final_stateless_critic")
+            critic.verdict_attempt = state.attempt
+            recovered = await critic.recover_completed(state.review_input)
+            if recovered is not None:
+                state.status, state.review = "completed", recovered
+                _save_json(path, state.model_dump(mode="json"))
         if state.status == "completed":
             if state.review is None:
                 raise FinalReviewBlocked("Completed final review is missing its verdict")
@@ -653,7 +660,7 @@ class FirstProofBatch3Workflow(Agent):
         _save_json(self._accepted_checkpoint(), baseline.model_dump())
         self._accepted_baseline = baseline
 
-    def _recover_simplification_call(self, inp, state, path):
+    async def _recover_simplification_call(self, inp, state, path):
         """Reconcile saved local evidence without issuing another model call."""
         if state.stage in {"author", "critic"} or state.call_pending:
             role = state.call_role or state.stage
@@ -662,10 +669,12 @@ class FirstProofBatch3Workflow(Agent):
             subscription_output = None
             if len(folders) == 1:
                 folder = folders[0]
+                if self.ctx.execution_backend != "subscription":
+                    from proofstack.provider_accounting import reconcile_provider_call
+                    settled = await reconcile_provider_call(self.ctx, self.tracker, folder)
                 for name in ("provider-settlement.json", "subscription-settlement.json"):
                     if (folder / name).exists():
                         evidence = json.loads(_read(folder / name))
-                        settled = evidence.get("settled") is True
                         if name == "subscription-settlement.json" and evidence.get("receipt_id"):
                             from proofstack.subscription import recover_packet
                             settled, subscription_output = recover_packet(self.ctx.root_workdir, evidence["receipt_id"])
@@ -729,7 +738,7 @@ class FirstProofBatch3Workflow(Agent):
         if self._accepted_baseline is not None:
             self._retain_simplified(state)
 
-    def _reconcile_simplifications(self, inp):
+    async def _reconcile_simplifications(self, inp):
         for path in sorted((self.ctx.root_workdir / "proof_simplification").glob("*/state.json")):
             state = SimplificationState.model_validate_json(path.read_text(encoding="utf-8"))
             baseline = self._accepted_baseline
@@ -740,7 +749,7 @@ class FirstProofBatch3Workflow(Agent):
             if (state.stage in {"author", "critic"} or state.call_pending) and baseline is not None and not same_baseline:
                 raise SimplificationInterrupted("Unresolved simplification belongs to another accepted baseline")
             if state.stage in {"author", "critic", "reviewed", "rejected"} or state.call_pending:
-                self._recover_simplification_call(inp, state, path)
+                await self._recover_simplification_call(inp, state, path)
 
     def _preserve_pending_baseline(self, inp, out, error):
         baseline = self._accepted_baseline
@@ -751,9 +760,10 @@ class FirstProofBatch3Workflow(Agent):
             # This is a previously accepted proof, not a final-approved submission
             # or an unreviewed partial. Keep it outside both export directories.
             out = out.model_copy(update={
-                "answer_tex": path, "submission_approved": False, "submission_sha256": None,
-                "partial_ready": False, "partial_sha256": None, "abstained": True,
-                "final_critic_answer_ready": False, "output_kind": "accepted_baseline_needs_final_review",
+                "answer_tex": out.answer_tex if out.partial_ready else path,
+                "submission_approved": False, "submission_sha256": None,
+                "abstained": not out.partial_ready, "final_critic_answer_ready": False,
+                "output_kind": "partial_unreviewed" if out.partial_ready else "accepted_baseline_needs_final_review",
                 "accepted_baseline_pending": True, "accepted_baseline_path": path,
                 "accepted_baseline_sha256": baseline.sha256,
             })
@@ -773,7 +783,7 @@ class FirstProofBatch3Workflow(Agent):
             if state.source_sha256 != source:
                 raise ValueError("Simplification checkpoint belongs to another manuscript")
             if state.stage in {"author", "critic", "reviewed", "rejected"} or state.call_pending:
-                self._recover_simplification_call(inp, state, path)
+                await self._recover_simplification_call(inp, state, path)
         else:
             seconds = deadline - time.monotonic()
             available = self._remaining_usd() - reserve
@@ -819,7 +829,7 @@ class FirstProofBatch3Workflow(Agent):
         except Exception as exc:
             interrupted_call = state.stage in {"author", "critic"} or state.call_pending
             if interrupted_call:
-                self._recover_simplification_call(inp, state, path)
+                await self._recover_simplification_call(inp, state, path)
             if not interrupted_call and not isinstance(exc, (BudgetExhausted, TimeoutError)):
                 raise
             state.stop_reason = f"{type(exc).__name__}: {exc}"
@@ -1279,8 +1289,9 @@ class FirstProofBatch3Workflow(Agent):
         self._accepted_baseline = self._restore_accepted(inp) if inp.resume_run else None
         self._reconcile_accepted(inp)
         if inp.resume_run:
+            out = self._restore_output(inp)
             try:
-                self._reconcile_simplifications(inp)
+                await self._reconcile_simplifications(inp)
             except SimplificationInterrupted as exc:
                 return self._preserve_pending_baseline(inp, out, exc)
         accounting_blocked = (self.ctx.root_workdir / "cleanup-accounting-uncertain.json").exists()
@@ -1292,6 +1303,8 @@ class FirstProofBatch3Workflow(Agent):
             out.error = "Cleanup usage is unresolved; reconcile before resuming paid work"
             out.error_retryable = False
             out.cleanup_errors.append(out.error)
+            if self._accepted_baseline is not None and final_required:
+                return self._preserve_pending_baseline(inp, out, RuntimeError(out.error))
             return out
         remaining = self.tracker.remaining_wallclock_s()
         if remaining is None or not math.isfinite(remaining) or remaining <= 0:
@@ -1459,7 +1472,9 @@ class FirstProofBatch3Workflow(Agent):
                     error = out.partial_reason
                     out.error = error
                     out.error_retryable = False
-                    if isinstance(exc, SimplificationInterrupted):
+                    if (isinstance(exc, SimplificationInterrupted) or (
+                            self._accepted_baseline is not None and self._requires_final_review(inp)
+                            and getattr(exc, "requires_reconciliation", False))):
                         return self._preserve_pending_baseline(inp, out, exc)
                     state = self._research_state(inp)
                     out.rounds_completed = max(out.rounds_completed, int(state.get("last_round_run") or 0))
