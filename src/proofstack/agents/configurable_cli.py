@@ -289,6 +289,8 @@ class ConfigurableCLIAgent(CLIAgent):
         result["text"] = value
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
+        self._subscription_spawn_attempted = False
+        self._subscription_worker_workdir = self.workdir
         if self.ctx.execution_backend != "subscription":
             from mathagents.execution_policy import require_api_allowed
             require_api_allowed()

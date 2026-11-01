@@ -11,6 +11,7 @@ import re
 import shutil
 from dataclasses import replace
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from proofstack.atomic import write_text_atomic
@@ -34,6 +35,7 @@ class SubscriptionCallFailed(RuntimeError):
 
 
 _active_receipts: set[Path] = set()
+_shutdown_allowance = ContextVar("subscription_shutdown_allowance", default=None)
 
 
 def _read_receipt(path):
@@ -161,20 +163,19 @@ def call_allowance(tracker):
               if node.spec and node.spec.max_usd is not None]
     if not limits or not math.isfinite(min(limits)):
         raise SubscriptionBlocked("Subscription calls require a finite planning allowance")
-    return min(limits)
+    share = _shutdown_allowance.get()
+    return min(limits) if share is None else min(min(limits), share)
 
 
 async def run_with_nominal_allowance(agent, allowance, call):
     """Partition a subscription fanout's worst-case shutdown charge."""
     if allowance is None:
         return await call()
-    original = agent.tracker.spec
-    agent.tracker.spec = (original or BudgetSpec()).model_copy(update={
-        "max_usd": agent.tracker.planning_usd + min(allowance, call_allowance(agent.tracker))})
+    token = _shutdown_allowance.set(min(allowance, call_allowance(agent.tracker)))
     try:
         return await call()
     finally:
-        agent.tracker.spec = original
+        _shutdown_allowance.reset(token)
 
 
 def settle_cli_worker(agent, *, process_stopped, spawn_attempted, terminal_metered, safety_ok,
@@ -183,13 +184,15 @@ def settle_cli_worker(agent, *, process_stopped, spawn_attempted, terminal_meter
     path = Path(agent.component_config["subscription_settlement_path"])
     attempt = agent.component_config.get("subscription_attempt", 1)
     allowance = agent.component_config.get("subscription_call_allowance_usd")
+    workdir = getattr(agent, "_subscription_worker_workdir", None) or agent.workdir
     estimated = 0.0
     settled = process_stopped and safety_ok and (not spawn_attempted or terminal_metered)
     if (process_stopped and safety_ok and spawn_attempted and not terminal_metered
             and agent.component_config.get("subscription_interrupted")
             and type(allowance) in (int, float) and math.isfinite(allowance) and allowance >= 0):
-        estimated = max(0.0, allowance - (agent.tracker.planning_usd - initial_spend))
-        key = hashlib.sha256(f"{path}:{attempt}:{agent.workdir}".encode()).hexdigest()
+        estimated = min(call_allowance(agent.tracker),
+                        max(0.0, allowance - (agent.tracker.planning_usd - initial_spend)))
+        key = hashlib.sha256(f"{path}:{attempt}:{workdir}".encode()).hexdigest()
         debit = agent.ctx.root_workdir / "subscription_usage" / f"interrupted-{key}.json"
         if not debit.exists():
             write_text_atomic(debit, json.dumps({
@@ -204,9 +207,35 @@ def settle_cli_worker(agent, *, process_stopped, spawn_attempted, terminal_meter
     write_text_atomic(path, json.dumps({
         "settled": settled, "process_stopped": process_stopped, "spawn_attempted": spawn_attempted,
         "attempt": attempt, "estimated_unreported_usd": estimated,
-        "workdir": str(agent.workdir.relative_to(agent.ctx.root_workdir)),
+        "workdir": str(workdir.relative_to(agent.ctx.root_workdir)),
     }))
     return settled
+
+
+def settle_unstarted_worker(agent):
+    # In-process evidence only: a crash after the started receipt still requires
+    # reconciliation. Never overwrite a failed safety/stop settlement.
+    if getattr(agent, "_subscription_spawn_attempted", None) is not False:
+        return
+    path = Path(agent.component_config["subscription_settlement_path"])
+    attempt = agent.component_config.get("subscription_attempt", 1)
+    if path.exists() and _read_receipt(path).get("attempt", 1) == attempt:
+        return
+    settle_cli_worker(agent, process_stopped=True, spawn_attempted=False,
+                      terminal_metered=False, safety_ok=True, initial_spend=agent.tracker.planning_usd)
+
+
+def local_call_settlement(root, folder):
+    marker = folder / "subscription-settlement.json"
+    if marker.exists():
+        evidence = _read_receipt(marker)
+        if evidence.get("receipt_id"):
+            return recover_packet(root, evidence["receipt_id"])
+        return evidence.get("settled") is True, None
+    # Preflight may fail before a local marker. A global started receipt still
+    # blocks, including a crash in the gap between those two writes.
+    check_pending_calls(root)
+    return True, None
 
 
 def packet_identity(agent, packet, *, key=None, files=None, outputs=None, provider="codex",
@@ -245,12 +274,16 @@ async def tracked_compute(agent):
         original = agent.component_config
         agent.component_config = {**original, "subscription_settlement_path": str(_settlement_path(receipt)),
                                   "subscription_attempt": 1, "subscription_call_allowance_usd": allowance}
+        agent._subscription_spawn_attempted = None
         _active_receipts.add(receipt.resolve())
         try:
             yield
         finally:
             _active_receipts.discard(receipt.resolve())
-            agent.component_config = original
+            try:
+                settle_unstarted_worker(agent)
+            finally:
+                agent.component_config = original
             reconcile_receipt(receipt)
             if not _settled(receipt):
                 raise SubscriptionBlocked("Compute worker stop or usage is unresolved; reconcile before continuing")
@@ -496,6 +529,7 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
     ctx = replace(agent.ctx, component_configs={name: config}, model_overrides={})
     worker = ConfigurableCLIAgent(ctx, name=name, parent_budget_scope=agent.tracker.scope)
     worker.tracker.parent = agent.tracker
+    worker._subscription_spawn_attempted = None
     prompt = ("Read request.md completely and carry out its role and instructions. The labelled messages "
               "are the exact supplied conversation, not another session. Do not read any other agent's files. "
               "Provider-hosted code tools mean local tools here; there are no API credentials. "
@@ -541,6 +575,8 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
                     write_text_atomic(receipt, json.dumps({**started, "status": "completed", "output": out.model_dump(mode="json")}))
                 raise
             except Exception as exc:
+                if worker.component_config.get("subscription_attempt") is not None:
+                    settle_unstarted_worker(worker)
                 if receipt.exists() and _settled(receipt):
                     reconcile_receipt(receipt)
                     raise SubscriptionCallFailed(
@@ -551,11 +587,15 @@ async def run_packet(agent, packet, *, provider="codex", files=None, outputs=Non
                 ) from exc
             finally:
                 _active_receipts.discard(receipt.resolve())
-                lock.close()
-                if receipt.exists():
-                    saved = reconcile_receipt(receipt)
-                    write_text_atomic(agent.workdir / "subscription-settlement.json",
-                                      json.dumps({"settled": _completed(saved) or _settled(receipt), "receipt_id": digest}))
+                try:
+                    if receipt.exists():
+                        if worker.component_config.get("subscription_attempt") == _read_receipt(receipt).get("attempts"):
+                            settle_unstarted_worker(worker)
+                        saved = reconcile_receipt(receipt)
+                        write_text_atomic(agent.workdir / "subscription-settlement.json",
+                                          json.dumps({"settled": _completed(saved) or _settled(receipt), "receipt_id": digest}))
+                finally:
+                    lock.close()
             if out.status != "done" or not (out.text or "").strip():
                 error = SubscriptionCallFailed if _settled(receipt) else SubscriptionBlocked
                 raise error("Subscription CLI did not deliver a completed report; no API fallback")

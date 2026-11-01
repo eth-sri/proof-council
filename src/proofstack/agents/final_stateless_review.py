@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import json
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -39,21 +38,10 @@ class FinalStatelessCritic(ACCritic):
             from proofstack.subscription import recover_model_role
             raw = recover_model_role(self, inp)
             return self.parse_output(raw["text"], inp) if raw is not None else None
-        checkpoint = self._recovery_checkpoint(inp)
-        if not checkpoint.exists():
-            return None
-        saved = json.loads(checkpoint.read_text())
-        if saved.get("status") != "completed" or not saved.get("output"):
-            return None
-        previous_dir = saved.get("attempt_workdir")
-        if previous_dir:
-            from proofstack.provider_accounting import reconcile_provider_call
-            folder = (self.ctx.root_workdir / previous_dir).resolve()
-            if not folder.is_relative_to((self.ctx.root_workdir / "agents").resolve()):
-                raise FinalReviewBlocked("Invalid final critic artifact path")
-            if not await reconcile_provider_call(self.ctx, self.tracker, folder):
-                raise FinalReviewBlocked("Completed final critic has unresolved provider work")
-        return self.Outputs.model_validate(saved["output"])
+        try:
+            return await super().run(inp, recover_only=True)
+        except RuntimeError as exc:
+            raise FinalReviewBlocked(str(exc)) from exc
 
 
 class FinalReviewBlocked(RuntimeError):

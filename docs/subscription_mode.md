@@ -117,6 +117,11 @@ mode overrides API presets' Compute bypass setting.
   reserved cleanup/final-review funds. Concurrent critic/Council/Compute roles
   divide the remaining phase allowance, and Council seats divide their role's
   share, so overlapping cancellations cannot each reserve the entire phase.
+  These are shutdown estimates, not individual live spending caps: a successful
+  role may use more than its share within the enclosing phase budget. Estimates
+  are limited to remaining phase headroom after other recorded charges. A valid
+  Compute finish record followed by harness termination, or a clean exit with
+  salvaged artifacts, uses recorded usage rather than the interruption estimate.
   An unknown stop or terminal call with
   missing usage still blocks. Council and Compute failures that need reconciliation
   propagate instead of being hidden in a textual reply. Compute also leaves a

@@ -143,6 +143,27 @@ class ProviderTrace:
             self.completed_report = None
             self.update(key, provider=client.api, model=payload.get("model", client.model),
                         reasoning=payload.get("reasoning"), outcome="started")
+            # Save pricing while the exact client/model is available. Resume can
+            # settle a terminal response without credentials or another request.
+            if callable(getattr(client, "_get_cost", None)):
+                inputs = int(getattr(client, "context_window_tokens", 1_050_000) or 1_050_000)
+                outputs = int(payload.get("max_output_tokens") or getattr(client, "max_tokens", None) or 128_000)
+                estimate = float(client._get_cost(inputs, outputs, 0, 0))
+                if inputs > 0 and outputs > 0 and math.isfinite(estimate) and estimate > 0:
+                    self.update(key, terminal_usage_estimate_usd=estimate,
+                                estimate_input_tokens=inputs, estimate_output_tokens=outputs)
+
+    def estimate_terminal_usage(self):
+        with self.lock:
+            for key, row in list(self.attempts.items()):
+                estimate = row.get("terminal_usage_estimate_usd")
+                if (row.get("provider") == "openai" and row.get("response_id")
+                        and row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
+                        and row.get("usage_unavailable", True) and not row.get("cost_estimated")
+                        and type(estimate) in (int, float) and math.isfinite(estimate) and estimate > 0):
+                    self.update(key, cost=max(estimate, row.get("cost", 0)), cost_estimated=True,
+                                estimated_cost_usd=estimate, reconciliation_pending=False,
+                                estimate_reason="terminal_response_without_usage")
 
     def response(self, client, ts, idx, response):
         if not isinstance(response, dict):

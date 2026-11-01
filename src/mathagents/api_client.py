@@ -328,14 +328,15 @@ class APIClient:
             # A transport failure can leave paid work running even without a
             # response ID. Do not treat it like an explicit rejected create.
             status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-            rejected = (type(status) is int and 400 <= status < 600) or _is_context_length_error(exc)
-            uncertain = not trace.attempts.get((ts, idx), {}).get("response_id") and not rejected
+            rejected = (type(status) is int and 400 <= status < 600 and status not in {408, 504, 524}) or _is_context_length_error(exc)
+            row = trace.attempts.get((ts, idx), {})
+            uncertain = not row.get("response_id") and not rejected
             trace.failure(
-                (ts, idx), error_type=type(exc).__name__,
+                (ts, idx), outcome="error", error_type=type(exc).__name__,
                 error_code="context_length_exceeded" if _is_context_length_error(exc) else getattr(exc, "code", None),
                 error_message=str(exc)[:500],
                 retry_decision=retry_decision,
-                **({"reconciliation_pending": True} if uncertain else {}),
+                transport_uncertain=uncertain,
             )
 
     def _provider_response_dict(self, response):
@@ -3920,13 +3921,13 @@ class APIClient:
         timeout = self._anthropic_request_timeout(time.time())
         def generate():
             response = requests.post(self.base_url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code != 200:
+                raise requests.HTTPError(f"Google HTTP {response.status_code}", response=response)
             self._log_provider_response(ts=ts, batch_idx=idx, response=response.json())
             return response
 
         try:
             response = self._bounded_provider_operation(generate, timeout=timeout)
-            if response.status_code != 200:
-                raise requests.HTTPError(f"Error: {response.status_code} - {response.text}", response=response)
         except Exception as exc:
             self._report_attempt_failure(ts, idx, exc, retry_decision="stop" if _is_terminal_api_error(exc) else "retry")
             raise

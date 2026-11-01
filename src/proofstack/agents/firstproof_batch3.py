@@ -423,6 +423,9 @@ class FirstProofBatch3Workflow(Agent):
                         or not isinstance(completed, ACCritic.Outputs)):
                     raise
                 review = completed
+            recovered = await critic.recover_completed(state.review_input)
+            if recovered is not None:
+                review = recovered
             # Save before event logging/publication. The regular critic owns
             # provider reconciliation if interruption happened before this point.
             state.status, state.review = "completed", review
@@ -672,12 +675,14 @@ class FirstProofBatch3Workflow(Agent):
                 if self.ctx.execution_backend != "subscription":
                     from proofstack.provider_accounting import reconcile_provider_call
                     settled = await reconcile_provider_call(self.ctx, self.tracker, folder)
-                for name in ("provider-settlement.json", "subscription-settlement.json"):
-                    if (folder / name).exists():
-                        evidence = json.loads(_read(folder / name))
-                        if name == "subscription-settlement.json" and evidence.get("receipt_id"):
-                            from proofstack.subscription import recover_packet
-                            settled, subscription_output = recover_packet(self.ctx.root_workdir, evidence["receipt_id"])
+                if (self.ctx.execution_backend == "subscription"
+                        or (folder / "subscription-settlement.json").exists()):
+                    from proofstack.subscription import local_call_settlement, SubscriptionBlocked
+                    try:
+                        subscription_settled, subscription_output = local_call_settlement(self.ctx.root_workdir, folder)
+                        settled = subscription_settled and (settled or not (folder / "provider-attempts.jsonl").exists())
+                    except SubscriptionBlocked:
+                        settled = False
                 if role == "critic":
                     raw = _read(folder / "completed_review.json") or _read(folder / "output.json")
                     if raw:
@@ -737,6 +742,26 @@ class FirstProofBatch3Workflow(Agent):
         _save_json(path, state.model_dump(mode="json"))
         if self._accepted_baseline is not None:
             self._retain_simplified(state)
+
+    async def _call_settled(self, folder):
+        from proofstack.provider_accounting import reconcile_provider_call
+        settled = (await reconcile_provider_call(self.ctx, self.tracker, folder)
+                   if self.ctx.execution_backend != "subscription" or (folder / "provider-attempts.jsonl").exists()
+                   else True)
+        if self.ctx.execution_backend == "subscription" or (folder / "subscription-settlement.json").exists():
+            from proofstack.subscription import local_call_settlement
+            return local_call_settlement(self.ctx.root_workdir, folder)[0] and settled
+        return settled
+
+    async def _settle_simplification(self, state, path):
+        # Persist the paid result before the gate, but keep the pending flag
+        # until every attempt (not just the successful retry) is settled.
+        _save_json(path, state.model_dump(mode="json"))
+        folders = list((self.ctx.root_workdir / "agents").glob(f"{state.call_agent}-c*"))
+        if len(folders) != 1 or not await self._call_settled(folders[0]):
+            raise SimplificationInterrupted("Simplification has unresolved provider work")
+        state.call_pending = False
+        _save_json(path, state.model_dump(mode="json"))
 
     async def _reconcile_simplifications(self, inp):
         for path in sorted((self.ctx.root_workdir / "proof_simplification").glob("*/state.json")):
@@ -870,12 +895,10 @@ class FirstProofBatch3Workflow(Agent):
                     if isinstance(completed, Author.Outputs):
                         state.candidate = completed
                         state.stage = "candidate"
-                        state.call_pending = False
-                        _save_json(path, state.model_dump(mode="json"))
+                        await self._settle_simplification(state, path)
                     raise
                 state.stage = "candidate"
-                state.call_pending = False
-                _save_json(path, state.model_dump(mode="json"))
+                await self._settle_simplification(state, path)
             candidate = state.candidate
             if candidate is None:
                 raise ValueError("Simplification checkpoint is missing its candidate")
@@ -916,8 +939,11 @@ class FirstProofBatch3Workflow(Agent):
                     else:
                         raise
                 state.stage = "reviewed"
-                state.call_pending = False
-                _save_json(path, state.model_dump(mode="json"))
+                if not state.review.parse_failed and state.review.disposition == "research":
+                    state.stage = "rejected"
+                    _save_json(path, state.model_dump(mode="json"))
+                    self._handoff(inp, state.document, document, state.review)
+                await self._settle_simplification(state, path)
             review = state.review if not reason else None
             if review is not None and not review.parse_failed and review.disposition == "research":
                 state.stage = "rejected"
@@ -1473,8 +1499,7 @@ class FirstProofBatch3Workflow(Agent):
                     out.error = error
                     out.error_retryable = False
                     if (isinstance(exc, SimplificationInterrupted) or (
-                            self._accepted_baseline is not None and self._requires_final_review(inp)
-                            and getattr(exc, "requires_reconciliation", False))):
+                            self._accepted_baseline is not None and self._requires_final_review(inp))):
                         return self._preserve_pending_baseline(inp, out, exc)
                     state = self._research_state(inp)
                     out.rounds_completed = max(out.rounds_completed, int(state.get("last_round_run") or 0))

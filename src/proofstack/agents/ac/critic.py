@@ -893,7 +893,7 @@ class ACCritic(APICallAgent):
         canonical = path(identity_input)
         return legacy if legacy.exists() and not canonical.exists() else canonical
 
-    async def run(self, inp):
+    async def run(self, inp, *, recover_only=False):
         self._notes_verification_policy()
         checkpoint = self._recovery_checkpoint(inp)
 
@@ -930,20 +930,32 @@ class ACCritic(APICallAgent):
             if saved.get("status") == "recovery_started" and not previous_dir:
                 raise RuntimeError("Legacy fresh recovery has no provider receipt location; reconcile before retrying")
             if previous_dir:
-                trace_path = self.ctx.root_workdir / previous_dir / "provider-attempts.jsonl"
+                folder = (self.ctx.root_workdir / previous_dir).resolve()
+                if folder.parent != (self.ctx.root_workdir / "agents").resolve():
+                    raise RuntimeError("Invalid critic provider receipt location")
+                trace_path = folder / "provider-attempts.jsonl"
                 rows = latest_attempts(trace_path) if trace_path.exists() else []
                 rows = [r for r in rows if r["invocation_id"] not in saved.get("prior_invocations", [])]
+                from proofstack.provider_accounting import (
+                    _operator_reconciled, reconcile_provider_call, transport_uncertain,
+                )
+                operator_settled = _operator_reconciled(self.ctx.root_workdir, folder)
+                if recover_only or operator_settled:
+                    if not await reconcile_provider_call(self.ctx, self.tracker, folder):
+                        raise RuntimeError("Saved critic has unresolved provider work; reconcile before retrying")
                 if rows:
-                    await self._reconcile_recovery(trace_path, rows, require_tool_evidence=(
-                        self._notes_transport() == "file" and bool(review_input.research_notes_tex)))
+                    if not recover_only and not operator_settled:
+                        await self._reconcile_recovery(trace_path, rows, require_tool_evidence=(
+                            self._notes_transport() == "file" and bool(review_input.research_notes_tex)))
                     rows = [r for r in latest_attempts(trace_path)
                             if r["invocation_id"] not in saved.get("prior_invocations", [])]
-                    if any(r.get("reconciliation_pending") or (
+                    if not operator_settled and any((r.get("reconciliation_pending") and not transport_uncertain(r)) or (
                         (r.get("response_id") or self._provider_attempt_terminal(r)) and (
                             not self._provider_attempt_terminal(r) or
                             (r.get("usage_unavailable", False) and not r.get("cost_estimated", False)))) for r in rows):
                         raise RuntimeError("Fresh critic recovery has unresolved provider work; reconcile before retrying")
-                    if any(not r.get("response_id") and r.get("outcome") not in {"error", "failed", "cancelled"}
+                    if not operator_settled and any(not r.get("response_id") and not transport_uncertain(r)
+                           and r.get("outcome") not in {"error", "failed", "cancelled"}
                            and not self._provider_attempt_terminal(r) for r in rows):
                         raise RuntimeError("Fresh critic recovery has unresolved provider work without a response ID")
                     invocation = rows[-1]["invocation_id"]
@@ -977,6 +989,8 @@ class ACCritic(APICallAgent):
                                                            self._notes_evidence_status(review_input) == "mismatch"),
                                                        "research_notes_advisory_accepted": False})
                 return output
+            if recover_only:
+                return None
             attempts = int(saved.get("attempts", 1 if saved.get("status") == "recovery_started" else 0))
             if not ordinary and attempts >= 2:
                 await stop("Fresh critic recovery exhausted its two attempts after interruption/provider failure")
@@ -1019,7 +1033,7 @@ class ACCritic(APICallAgent):
             try:
                 return await recover(saved)
             except Exception as exc:
-                if saved.get("kind") != "ordinary" or not _is_context_length_error(exc):
+                if recover_only or saved.get("kind") != "ordinary" or not _is_context_length_error(exc):
                     raise
                 review_input = self.Inputs.model_validate(saved["review_input"])
                 if review_input.mode == "fresh":
@@ -1035,6 +1049,8 @@ class ACCritic(APICallAgent):
                 return await review(saved)
             await stop(saved.get("reason") or "Invalid critic recovery receipt")
 
+        if recover_only:
+            return None
         self.tracker.check()
         candidate = inp
         if not await fits(candidate, "original"):

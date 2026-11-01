@@ -35,9 +35,17 @@ def provider_attempt_terminal(row):
     return False
 
 
+def transport_uncertain(row):
+    # Older receipts used the remote-reconciliation flag for no-ID outages.
+    return bool((row.get("transport_uncertain") and not row.get("response_id")
+                 and not provider_attempt_terminal(row)) or (
+        row.get("reconciliation_pending") and not row.get("response_id")
+        and row.get("error_type") and row.get("retry_decision") in {"retry", "stop"}))
+
+
 def provider_attempts_settled(rows):
     def settled(row):
-        if row.get("reconciliation_pending"):
+        if row.get("reconciliation_pending") or transport_uncertain(row):
             return False
         if provider_attempt_terminal(row):
             return not row.get("usage_unavailable", True) or row.get("cost_estimated", False)
@@ -59,6 +67,10 @@ async def reconcile_provider_call(ctx, tracker, folder):
         return True
     if not path.exists():
         return not marker.exists() or json.loads(marker.read_text()).get("settled") is True
+    rows = latest_attempts(path)
+    from mathagents.provider_trace import ProviderTrace
+    for invocation in dict.fromkeys(r["invocation_id"] for r in rows):
+        ProviderTrace.restore(path, invocation).estimate_terminal_usage()
     rows = latest_attempts(path)
     await settle_provider_usage(ctx, tracker, call_ids={r.get("call_id") or r["invocation_id"] for r in rows})
     if rows and provider_attempts_settled(rows):
@@ -293,9 +305,11 @@ async def settle_provider_usage(ctx, tracker, *, call_ids=None, emitter=None):
                 call_id, payload = adjustment["call_id"], adjustment["payload"]
                 if call_id.startswith("recovery:"):
                     continue  # Legacy debits stay in their own durable ledger.
-                if call_ids is not None and (call_id not in call_ids or (
-                        payload["usage_unavailable"] and not payload.get("cost_estimated"))):
+                if call_ids is not None and call_id not in call_ids:
                     continue
+                # Charge known usage even if another attempt has unknown usage.
+                # Settlement eligibility is a separate check; this is a floor,
+                # never a claim that the unresolved work was free.
                 if not any(payload.get(k, 0) for k in ("cost_usd", "in_tokens", "out_tokens", "reasoning_tokens")):
                     continue
                 await emitter.emit("model.call", {

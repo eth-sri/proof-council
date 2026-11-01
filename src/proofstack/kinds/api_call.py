@@ -210,7 +210,14 @@ class APICallAgent(Agent):
         token = active_trace.set(trace)
         task = asyncio.create_task(asyncio.to_thread(query, client, messages))
         try:
-            return await asyncio.shield(task)
+            result = await asyncio.shield(task)
+            trace.estimate_terminal_usage()
+            if isinstance(result, tuple) and len(result) == 3 and isinstance(result[2], dict):
+                cost = dict(result[2])
+                for key in ("cost", "input_tokens", "output_tokens", "reasoning_tokens"):
+                    cost[key] = max(cost.get(key, 0) or 0, trace.totals()[key])
+                result = (*result[:2], cost)
+            return result
         except asyncio.CancelledError as exc:
             # Cancelling to_thread does not stop its provider polling loop.
             with contextlib.suppress(Exception):
@@ -266,6 +273,7 @@ class APICallAgent(Agent):
             write_text_atomic(self.workdir / "provider-settlement.json", json.dumps({"settled": bool(settled)}))
 
     async def _charge_failed_provider_trace(self, trace, client, call_id, status):
+        trace.estimate_terminal_usage()
         totals = trace.totals()
         if not totals["provider_attempts"]:
             return

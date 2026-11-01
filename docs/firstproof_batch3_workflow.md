@@ -873,6 +873,17 @@ do not erase an earlier open response. A preflight
 failure with no request evidence is safe to leave. Completed final verdicts are
 recovered before applying the allowance for a new call.
 
+No-ID transport uncertainty is recorded separately from retrievable remote work.
+Ordinary research critics retain their bounded retry/replay behavior after a
+transport outage, including for older receipts; this does not resolve the unknown
+charge. Simplification and final approval still require every attempt to settle,
+or an operator reconciliation receipt. HTTP 408, 504 and 524 are uncertain, not
+zero-cost rejections. Terminal OpenAI responses with missing usage use a saved
+full-context/output cost estimate, charged once without inventing token counts.
+Raw saved final reports are recoverable even if a crash preceded the completed
+critic checkpoint. Non-mathematical terminal cleanup errors retain an accepted
+baseline pending final review and preserve any separately published partial.
+
 For genuinely unresolved API work, stop all local controllers and descendants
 and independently retrieve or cancel any remote response IDs and reconcile their
 charges. Then record the result without editing workflow checkpoints:
