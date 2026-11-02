@@ -496,8 +496,8 @@ class APIClient:
                 return value
             raise value
 
-    def reconcile_background_response(self, response_id, *, timeout=15.0, on_response=None):
-        """Retrieve, then boundedly cancel an existing response; never create one."""
+    def reconcile_background_response(self, response_id, *, timeout=15.0, on_response=None, cancel_pending=True):
+        """Retrieve an existing response, optionally cancelling; never create one."""
         if self.api != "openai" or not self.use_openai_responses_api:
             raise ValueError("Background reconciliation requires OpenAI Responses")
 
@@ -507,7 +507,8 @@ class APIClient:
             with OpenAI(api_key=self.api_key, base_url=self.base_url,
                         timeout=min(3.0, timeout), max_retries=0) as client:
                 data = {}
-                for operation in ("retrieve", "retrieve", "cancel", "retrieve"):
+                operations = ("retrieve", "retrieve", "cancel", "retrieve") if cancel_pending else ("retrieve",)
+                for operation in operations:
                     left = deadline - time.monotonic()
                     if left <= 0:
                         break

@@ -519,15 +519,12 @@ class ACCritic(APICallAgent):
         finally:
             capture["lock"].release()
 
-    async def _retrieve_notes_verification(self, inp, *, client=None, receipt_root=None):
+    def _restore_notes_receipts(self, inp, receipt_root):
         if self._notes_transport() != "file" or not inp.research_notes_tex:
-            return
-        from proofstack.atomic import write_text_atomic
-
-        receipt_root = receipt_root or self.workdir
+            return []
         expected_code = self._verification_syntax(self._notes_verification_code(inp))
         if expected_code is None:
-            return
+            return []
         items = []
         # Restore every durable receipt before network I/O or a verdict shortcut.
         # A provider report may predate a mismatch captured just before a crash.
@@ -545,6 +542,15 @@ class ACCritic(APICallAgent):
                             item["notes_verification_receipt"] = receipt
             except (OSError, ValueError, RecursionError):
                 continue
+        return items
+
+    async def _retrieve_notes_verification(self, inp, *, client=None, receipt_root=None):
+        if self._notes_transport() != "file" or not inp.research_notes_tex:
+            return
+        from proofstack.atomic import write_text_atomic
+
+        receipt_root = receipt_root or self.workdir
+        items = self._restore_notes_receipts(inp, receipt_root)
         if self._notes_evidence_status(inp) == "mismatch":
             return
         remaining = self.tracker.remaining_wallclock_s()
@@ -893,7 +899,7 @@ class ACCritic(APICallAgent):
         canonical = path(identity_input)
         return legacy if legacy.exists() and not canonical.exists() else canonical
 
-    async def run(self, inp, *, recover_only=False):
+    async def run(self, inp, *, recover_only=False, recovery_deadline=None):
         self._notes_verification_policy()
         checkpoint = self._recovery_checkpoint(inp)
 
@@ -941,10 +947,10 @@ class ACCritic(APICallAgent):
                 )
                 operator_settled = _operator_reconciled(self.ctx.root_workdir, folder)
                 if rows and not operator_settled:
-                    # Recovery-only forbids new inference, not bounded
-                    # retrieval/cancellation of an already-paid response ID.
+                    # Final-review recovery must not discard a live paid review.
                     await self._reconcile_recovery(trace_path, rows, require_tool_evidence=(
-                        self._notes_transport() == "file" and bool(review_input.research_notes_tex)))
+                        self._notes_transport() == "file" and bool(review_input.research_notes_tex)),
+                        recover_only=recover_only, recovery_deadline=recovery_deadline)
                 if recover_only or operator_settled:
                     if not await reconcile_provider_call(self.ctx, self.tracker, folder):
                         raise RuntimeError("Saved critic has unresolved provider work; reconcile before retrying")
@@ -960,10 +966,29 @@ class ACCritic(APICallAgent):
                            and r.get("outcome") not in {"error", "failed", "cancelled"}
                            and not self._provider_attempt_terminal(r) for r in rows):
                         raise RuntimeError("Fresh critic recovery has unresolved provider work without a response ID")
-                    invocation = rows[-1]["invocation_id"]
-                    report_path = trace_path.parent / f"provider-completed-{invocation}.json"
-                    if report_path.exists():
-                        report = json.loads(report_path.read_text(encoding="utf-8"))
+                    reports = []
+                    for invocation in dict.fromkeys(r["invocation_id"] for r in rows):
+                        paths = [trace_path.parent / f"provider-completed-{invocation}.json"]
+                        paths.extend(sorted(trace_path.parent.glob(f"provider-completed-{invocation}-*.json")))
+                        attempts = [r for r in rows if r["invocation_id"] == invocation]
+                        for report_path in paths:
+                            if not report_path.exists():
+                                continue
+                            report = json.loads(report_path.read_text(encoding="utf-8"))
+                            if (report.get("attempt_id") and report["attempt_id"] not in {r["attempt_id"] for r in attempts}
+                                    or report.get("response_id") and report["response_id"] not in {r.get("response_id") for r in attempts}):
+                                raise RuntimeError("Completed critic report does not match its provider attempt")
+                            self._provider_tool_evidence = report.get("tool_evidence", [])
+                            self._restore_notes_receipts(review_input, trace_path.parent)
+                            parsed = self.parse_output(report["report"], review_input)
+                            prior_integrity_failed |= parsed.research_notes_integrity_failed
+                            answer_ready, parse_failed = _parse_answer_ready(report["report"])
+                            order = next((i for i, r in enumerate(rows) if r["attempt_id"] == report.get("attempt_id")), len(rows))
+                            reports.append((parse_failed, answer_ready, order, report))
+                    if reports:
+                        # Never pay for another opinion instead of using a
+                        # completed rejection of this exact review packet.
+                        _, _, _, report = min(reports, key=lambda item: item[:3])
                         self._provider_tool_evidence = report.get("tool_evidence", [])
                         await self._retrieve_notes_verification(review_input, receipt_root=trace_path.parent)
                         result = await self._finalize_notes_review(report["report"], review_input,
@@ -1082,10 +1107,16 @@ class ACCritic(APICallAgent):
         from proofstack.provider_accounting import provider_attempt_terminal
         return provider_attempt_terminal(row)
 
-    async def _reconcile_recovery(self, trace_path, rows, *, require_tool_evidence=False):
+    async def _reconcile_recovery(self, trace_path, rows, *, require_tool_evidence=False,
+                                  recover_only=False, recovery_deadline=None):
         terminal = {"failed", "cancelled", "incomplete", "completed"}
         remaining = self.tracker.remaining_wallclock_s()
-        deadline = time.monotonic() + min(30.0, max(0.0, remaining if remaining is not None else 30.0))
+        now = time.monotonic()
+        deadline = now + max(0.0, remaining if remaining is not None else 30.0)
+        if recover_only and recovery_deadline is not None:
+            deadline = min(deadline, recovery_deadline)
+        else:
+            deadline = min(deadline, now + 30.0)
         touched = False
         try:
             for invocation in dict.fromkeys(r["invocation_id"] for r in rows):
@@ -1129,27 +1160,23 @@ class ACCritic(APICallAgent):
                         def record(data, trace=trace, key=key, client=client):
                             trace.response(client, *key, data)
                             trace.update(key, reconciliation_pending=data.get("status") not in terminal)
-                        await asyncio.to_thread(client.reconcile_background_response, row["response_id"],
-                                                timeout=min(15.0, left), on_response=record)
-                        trace.estimate_terminal_usage()
-                        settled = trace.attempts[key]
-                        if (settled.get("status") in terminal and settled.get("usage_unavailable", True)
-                                and not settled.get("cost_estimated", False)):
-                            config = self.ctx.component_config_for(self)
-                            model = load_solver_config(self.ctx.model_for(self, self.MODEL))
-                            inputs = int(config.get("context_window_tokens", 1_050_000))
-                            outputs = int(model.get("max_tokens") or 128_000)
-                            estimate = float(client._get_cost(inputs, outputs, 0, 0))
-                            if inputs <= 0 or outputs <= 0 or not math.isfinite(estimate) or estimate <= 0:
-                                raise ValueError("Cannot price an unreported terminal critic attempt")
-                            trace.update(key, cost=max(estimate, settled.get("cost", 0)), cost_estimated=True,
-                                         estimated_cost_usd=estimate, reconciliation_pending=False,
-                                         estimate_reason="terminal_response_without_usage",
-                                         estimate_input_tokens=inputs, estimate_output_tokens=outputs)
-                            await self.events.emit("ac.critic.usage_estimated", {
-                                "response_id": settled["response_id"], "estimated_cost_usd": estimate,
-                                "reason": "Terminal response has no complete usage; full context/output allowance charged",
-                            })
+                        while left > 0:
+                            kwargs = {"cancel_pending": False} if recover_only else {}
+                            def reconcile(client=client, response_id=row["response_id"], record=record, kwargs=kwargs):
+                                # Executor queue time consumes the saved deadline too.
+                                remaining = deadline - time.monotonic()
+                                if remaining > 0:
+                                    client.reconcile_background_response(response_id,
+                                        timeout=min(15.0, remaining), on_response=record, **kwargs)
+                            await asyncio.wait_for(asyncio.to_thread(reconcile), timeout=left)
+                            trace.estimate_terminal_usage()
+                            if (not recover_only or recovery_deadline is None
+                                    or trace.attempts[key].get("status") in terminal):
+                                break
+                            left = deadline - time.monotonic()
+                            if left > 0:
+                                await asyncio.sleep(min(5.0, left))
+                            left = deadline - time.monotonic()
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:

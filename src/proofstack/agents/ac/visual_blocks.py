@@ -928,6 +928,8 @@ class ACReturnBlock(ACWorkflow):
                 await self.events.emit("ac.final_critic_skipped", {"reason": "budget_exhausted", "scope": e.scope})
                 final_critic_mode_run = "skipped_budget_exhausted"
             except Exception as e:
+                if getattr(e, "requires_reconciliation", False):
+                    raise
                 await self.events.emit("ac.final_critic_failed", {"type": type(e).__name__, "msg": str(e)})
                 final_critic_mode_run = "failed"
 

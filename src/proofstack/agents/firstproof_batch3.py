@@ -388,10 +388,12 @@ class FirstProofBatch3Workflow(Agent):
             )
             _save_json(path, state.model_dump(mode="json"))
         _save_json(self._final_review_pointer(), {"key": key})
+        phase_end = min(deadline - inp.final_review_export_seconds,
+                        time.monotonic() + state.deadline_unix_s - time.time())
         if state.status == "pending":
             critic = FinalStatelessCritic(self.ctx, name="final_stateless_critic")
             critic.verdict_attempt = state.attempt
-            recovered = await critic.recover_completed(state.review_input)
+            recovered = await critic.recover_completed(state.review_input, deadline=phase_end)
             if recovered is not None:
                 state.status, state.review = "completed", recovered
                 _save_json(path, state.model_dump(mode="json"))
@@ -400,8 +402,6 @@ class FirstProofBatch3Workflow(Agent):
                 raise FinalReviewBlocked("Completed final review is missing its verdict")
             if not state.review.parse_failed or state.attempt >= 1:
                 return state.review
-        phase_end = min(deadline - inp.final_review_export_seconds,
-                        time.monotonic() + state.deadline_unix_s - time.time())
         allowance = min(self._remaining_usd(),
                         state.max_usd - max(0.0, self.tracker.planning_usd - state.initial_spend))
         if state.status == "completed":
@@ -423,7 +423,7 @@ class FirstProofBatch3Workflow(Agent):
                         or not isinstance(completed, ACCritic.Outputs)):
                     raise
                 review = completed
-            recovered = await critic.recover_completed(state.review_input)
+            recovered = await critic.recover_completed(state.review_input, deadline=phase_end)
             if recovered is not None:
                 review = recovered
             # Save before event logging/publication. The regular critic owns
@@ -1572,7 +1572,24 @@ class FirstProofBatch3Workflow(Agent):
                                                             "cleanup_handoff": in_cleanup, "reason": out.partial_reason})
                     continue
                 break
-        if await self._publish_retained(inp, out, deadline=deadline, allow_final_review=True):
+        try:
+            if await self._publish_retained(inp, out, deadline=deadline, allow_final_review=True):
+                return out
+        except SubscriptionParked:
+            raise
+        except Exception as exc:
+            error = f"Retained manuscript recovery: {type(exc).__name__}: {exc}"
+            out.cleanup_errors.append(error)
+            if self._accepted_baseline is not None and self._requires_final_review(inp):
+                out = self._preserve_pending_baseline(inp, out, error)
+            else:
+                await self._fallback(inp, out, _read(self._workspace(inp) / "answer.tex") or document,
+                                     deadline=deadline)
+            out.error, out.partial_reason, out.error_retryable = error, error, False
+            _save_json(self.ctx.root_workdir / "batch3-output.json", out.model_dump(mode="json"))
+            await self.events.emit("batch3.recovery_blocked", {
+                "reason": error, "retryable": False, "operator_action_required": True,
+            })
             return out
         workspace = self._workspace(inp)
         document = _read(workspace / "answer.tex") or document

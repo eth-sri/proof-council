@@ -218,10 +218,15 @@ An error while polling a known response ID is not a terminal provider status.
 Resume retrieves saved response IDs and, if necessary, cancels them within a
 30-second reconciliation window. Every outstanding attempt is checked before
 a completed report is reused. Missing terminal status still blocks another paid
-call; reconciliation never creates a new response. If a retrieved terminal
-response omits usage, recovery uses its saved actual-request/visible-output text
-estimate. Only legacy receipts lacking that estimate fall back to the configured
-full context window and maximum output allowance. The receipt
+call; reconciliation never creates a new response. Final stateless review recovery
+instead polls without cancelling, within the original saved review and run
+deadlines. If still pending at that deadline it remains blocked for operator
+reconciliation, not replaced by a new call. Every completed attempt's report is
+retained; a valid rejection takes precedence over other reports for the same
+review packet. If a retrieved terminal response omits usage, recovery uses the
+saved request pricing and elapsed-time heuristic described below. Legacy receipts
+without the necessary pricing/timing data remain unresolved instead of charging
+a model's entire context/output capacity. The receipt
 keeps `usage_unavailable` and adds `cost_estimated`, the estimated amount and its
 basis; this is not measured usage or a bound on separate tool charges. The debit
 is not automatically refunded and can exhaust the budget before a retry. Durable
@@ -879,22 +884,29 @@ Ordinary research critics retain their bounded retry/replay behavior after a
 transport outage, including for older receipts; this does not resolve the unknown
 charge. Simplification and final approval still require every attempt to settle,
 or an operator reconciliation receipt. HTTP 408, 504 and 524 are uncertain, not
-zero-cost rejections. Empty background rate-limit admission rejections settle at
-zero only when the receipt records that the response was never observed running;
-older ambiguous receipts are not assumed free. Other terminal OpenAI responses
-with missing usage charge estimated actual request text (including replayed tool
-data), plus at least the request's saved output-token allowance. This covers
-unseen reasoning/output without charging for the model's entire input context.
-These are conservative budget estimates, not provider-reported bills. Visible
-salvaged token counts remain separate from the output allowance; reasoning is
-not counted twice. Older text-estimate receipts without a saved output allowance
-retain their original estimate.
-Legacy critic recovery receipts without request estimates retain their previous
-conservative context/output allowance fallback.
+zero-cost rejections. A queued response may execute between polls or across a
+controller crash, so an empty background rate limit is not assumed free merely
+because no `in_progress` status was observed. Usage-less terminal OpenAI responses
+with saved pricing/timing data charge estimated request text (including replayed
+tool data), plus the larger of visible output and
+`min(max_output_tokens, ceil(elapsed_seconds * 50))` output tokens. Elapsed time
+runs from the saved request start to the first terminal observation, including
+queue time and polling gaps; it is frozen across subsequent recovery. Explicit
+context-length or file rejections without execution/output evidence add no unseen
+output allowance. Salvaged replies use the same estimate, never less than their
+visible usage or any previously recorded charge. Reasoning is included in output,
+not added again. The 50 tokens/second rate is a documented planning heuristic,
+not measured throughput, an actual provider bill, or a guaranteed upper bound.
+The receipt exposes its rate, elapsed time, estimated tokens and dollars, and
+keeps `usage_unavailable=true`. Estimates do not become reported token usage.
+Old receipts lacking timing/pricing cannot be newly settled automatically; an
+already charged estimate is retained without an automatic refund.
 Raw saved final reports are recoverable even if a crash preceded the completed
-critic checkpoint. Recovery can retrieve or cancel an existing OpenAI response ID
-within the remaining run deadline (at most 30 seconds), even with no new-call
-allowance. It never creates a new response, and no-ID uncertainty remains blocking.
+critic checkpoint. Final-review recovery polls an existing OpenAI response ID
+until the earlier of the saved final-review deadline and the run's export cutoff,
+even with no new-call allowance. It does not cancel a live review to buy a new one.
+If that deadline has already passed, no remote retrieval starts and unresolved
+work stays blocked. It never creates a new response, and no-ID uncertainty remains blocking.
 Settled non-mathematical terminal cleanup errors send the
 accepted baseline directly to the final gate, without retrying cleanup. If work
 is unresolved or the gate cannot approve it, the baseline remains pending and any

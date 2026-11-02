@@ -243,7 +243,7 @@ def test_preflight_without_marker_is_settled_but_global_crash_is_not(tmp_path):
 
 
 @pytest.mark.parametrize("error", ["context", "programming"])
-def test_cleanup_infrastructure_error_preserves_accepted_baseline(simplification, monkeypatch, error):
+def test_settled_cleanup_error_routes_baseline_through_final_gate(simplification, monkeypatch, error):
     from proofstack.agents.batch3_critic import CleanupContextTooLarge
     execute, calls, _, options, ctx, _ = simplification
     options["rewrite_error"] = CleanupContextTooLarge("Synthetic overflow") if error == "context" else TypeError("Synthetic bug")
@@ -280,9 +280,11 @@ def test_google_html_error_preserves_http_status(tmp_path, monkeypatch, status):
 @pytest.mark.parametrize("error_code,retry,failures,salvage", [
     ("rate_limit_exceeded", True, 3, False), ("server_error", True, 1, False),
     ("server_error", False, 1, False), ("rate_limit_exceeded", False, 1, True),
+    ("server_error", True, 78, False),
 ])
 def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error_code, retry, failures, salvage):
     from mathagents import api_client as api
+    monkeypatch.setattr("mathagents.provider_trace.time.time", lambda: 100.0)
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     monkeypatch.setattr(APIClient, "_sleep", lambda *args: None)
     monkeypatch.setattr(api.time, "sleep", lambda *args: None)
@@ -322,8 +324,9 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
                    "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 5}})
     transport = SimpleNamespace(responses=SimpleNamespace(create=create, retrieve=retrieve))
     agent = ACCritic(RunContext.create(root_workdir=tmp_path, flat=True))
+    question = "x" * 300000 if failures == 78 else "Synthetic"
     def query(client, messages):
-        result = client._openai_query_responses_api(transport, 0, [{"role": "user", "content": "Synthetic"}])
+        result = client._openai_query_responses_api(transport, 0, [{"role": "user", "content": question}])
         return 0, result.conversation, {"cost": result.cost_usd, "input_tokens": result.input_tokens,
                                         "output_tokens": result.output_tokens}
     async def run():
@@ -339,14 +342,11 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
     asyncio.run(run())
     rows = latest_attempts(agent.workdir / "provider-attempts.jsonl")
     assert len(rows) == (failures + 1 if retry else 1)
-    if error_code == "rate_limit_exceeded" and not salvage:
-        assert all(row["admission_rejected"] and not row["usage_unavailable"] for row in rows[:-1])
-        failed_cost = 0
-    else:
-        assert rows[0]["cost_estimated"] and rows[0]["usage_unavailable"]
-        assert rows[0]["estimate_reason"] == ("salvaged_response_text" if salvage else "terminal_response_without_usage")
-        failed_cost = (len("Synthetic") // 3) * 10 / 1_000_000 + 128_000 * 50 / 1_000_000
-        assert rows[0]["estimate_output_allowance_tokens"] == 128_000
+    assert rows[0]["cost_estimated"] and rows[0]["usage_unavailable"]
+    assert not any(row.get("admission_rejected") for row in rows)
+    assert rows[0]["estimate_reason"] == ("salvaged_response_text" if salvage else "terminal_response_without_usage")
+    failed_cost = failures * ((len(question) // 3) * 10 + (20 if salvage else 0) * 50) / 1_000_000
+    assert rows[0]["estimate_output_tokens"] == (20 if salvage else 0)
     assert agent.tracker.counters.usd == pytest.approx(failed_cost + (.0011 if retry else 0))
     assert agent.tracker.counters.tokens == (30 if retry else 23 if salvage else 0)
     assert provider_attempts_settled(rows)
@@ -357,7 +357,7 @@ def test_terminal_estimate_is_recovered_locally_after_crash(tmp_path):
     trace = ProviderTrace(agent.workdir / "provider-attempts.jsonl", call_id="crash")
     client = SimpleNamespace(api="openai", model="synthetic", _get_cost=lambda *args: 3)
     trace.request(client, "request", 0, {})
-    trace.update(("request", 0), response_id="saved", status="failed")
+    trace.response(client, "request", 0, {"id": "saved", "status": "failed"})
     assert not provider_attempts_settled(latest_attempts(trace.path))
     for _ in range(2):
         assert asyncio.run(reconcile_provider_call(agent.ctx, agent.tracker, agent.workdir))

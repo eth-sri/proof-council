@@ -1341,6 +1341,8 @@ class ACWorkflow(Agent):
                     )
                     final_critic_mode_run = "skipped_budget_exhausted"
                 except Exception as e:
+                    if getattr(e, "requires_reconciliation", False):
+                        raise
                     await self.events.emit(
                         "ac.final_critic_failed",
                         {"type": type(e).__name__, "msg": str(e)},

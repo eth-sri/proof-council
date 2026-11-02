@@ -39,8 +39,10 @@ class SimplificationCritic(Batch3CleanupCritic):
         defaults = component_config_for_class(ctx.component_configs, Batch3CleanupCritic, "Batch3CleanupCritic")
         configured = _deep_merge({"SimplificationCritic": defaults}, ctx.component_configs)
         overrides = dict(ctx.model_overrides)
-        if "Batch3CleanupCritic" in overrides:
-            overrides.setdefault("SimplificationCritic", overrides["Batch3CleanupCritic"])
+        inherited = ctx.model_for_class(Batch3CleanupCritic, "Batch3CleanupCritic")
+        if inherited is not None:
+            overrides.setdefault("SimplificationCritic", ctx.model_for_class(
+                type(self), kwargs.get("name", type(self).__name__), inherited, include_wildcard=False))
         super().__init__(replace(ctx, component_configs=configured, model_overrides=overrides), **kwargs)
 
     def render_messages(self, inp):

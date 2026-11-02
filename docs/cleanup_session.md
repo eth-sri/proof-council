@@ -216,6 +216,11 @@ The compiler retains its existing per-pass timeout and cancellation mechanism.
 
 ## Accounting and recovery
 
+API sessions saved before the subscription backend was introduced can resume
+with an otherwise identical settings hash that omits `execution_backend`.
+Current API hashes remain valid too. This compatibility does not permit switching
+to subscription mode, changing other settings, or bypassing unresolved usage.
+
 Both provider keys are required unless the Codex fraction is zero. Host
 subscription credentials/settings are not inherited. Claude Code >=2.1.251
 is required by Fable 5.1 and includes native-subagent budget enforcement; the submission image

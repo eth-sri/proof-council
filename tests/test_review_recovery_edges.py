@@ -56,7 +56,7 @@ def test_failed_response_salvage_with_real_sdk_objects():
             return queued
         transport = SimpleNamespace(responses=SimpleNamespace(create=create, retrieve=lambda *a, **k: failed))
         client = APIClient(api="custom", model="synthetic-pro", use_openai_responses_api=True,
-                    background=True, max_tokens=100, read_cost=10, write_cost=50)
+                    background=True, max_tokens=128000, read_cost=10, write_cost=50)
         trace = ProviderTrace()
         token = active_trace.set(trace)
         try:
@@ -68,6 +68,7 @@ def test_failed_response_salvage_with_real_sdk_objects():
             assert result.conversation[-1]["content"].strip() == "A paid proof."
             row, = trace.attempts.values()
             assert row["cost_estimated"] and row["cost"] > 0
+            assert row["cost"] < .01, "A short salvaged reply must not cost the full output allowance"
             assert row["input_tokens"] > 0 and row["output_tokens"] > 0
         finally:
             active_trace.reset(token)
@@ -78,7 +79,9 @@ def test_failed_response_salvage_with_real_sdk_objects():
 
 
 @pytest.mark.parametrize("history", ["queued", "in_progress", "legacy"])
-def test_zero_cost_rejection_requires_never_running_evidence(tmp_path, history):
+def test_unobserved_execution_is_not_a_zero_cost_rejection(tmp_path, monkeypatch, history):
+    clock = [100.0]
+    monkeypatch.setattr("mathagents.provider_trace.time.time", lambda: clock[0])
     client = SimpleNamespace(api="openai", model="synthetic", _get_cost=lambda i, o, *_: (i + o) / 100)
     trace = ProviderTrace(tmp_path / "provider-attempts.jsonl")
     trace.request(client, "call", 0, {"input": "x" * 300, "max_output_tokens": 200})
@@ -90,25 +93,26 @@ def test_zero_cost_rejection_requires_never_running_evidence(tmp_path, history):
         trace.attempts[("call", 0)].pop("ever_in_progress")
         trace.update(("call", 0))
     trace = ProviderTrace.restore(trace.path, trace.id)
+    clock[0] += 4
     key, = trace.attempts
     trace.response(client, *key, {"id": "saved", "status": "failed", "output": [],
                                 "error": {"code": "rate_limit_exceeded"}})
     trace.estimate_terminal_usage()
     row, = latest_attempts(trace.path)
-    if history == "queued":
-        assert row["cost"] == 0 and row["admission_rejected"]
-    else:
-        assert not row.get("admission_rejected")
-        assert row["cost"] == 3 and row["cost_estimated"] and row["usage_unavailable"]
+    assert not row.get("admission_rejected")
+    assert row["cost"] == pytest.approx(3) and row["cost_estimated"] and row["usage_unavailable"]
     assert provider_attempts_settled([row])
 
 
 @pytest.mark.parametrize("terminal", ["failed", "cancelled"])
-def test_missing_terminal_usage_reserves_unseen_output_after_crash(tmp_path, terminal):
+def test_missing_terminal_usage_reserves_unseen_output_after_crash(tmp_path, monkeypatch, terminal):
+    clock = [100.0]
+    monkeypatch.setattr("mathagents.provider_trace.time.time", lambda: clock[0])
     client = SimpleNamespace(api="openai", model="synthetic", _get_cost=lambda i, o, *_: i + o)
     trace = ProviderTrace(tmp_path / "provider-attempts.jsonl")
     trace.request(client, "call", 0, {"input": "x" * 300, "max_output_tokens": 200})
     trace.response(client, "call", 0, {"id": "saved", "status": "in_progress"})
+    clock[0] += 4
     trace.response(client, "call", 0, {"id": "saved", "status": terminal, "output": []})
     for _ in range(2):
         ProviderTrace.restore(trace.path, trace.id).estimate_terminal_usage()
@@ -136,7 +140,8 @@ def test_final_recovery_polls_known_id_without_new_inference(tmp_path, monkeypat
     operations = []
     class Client:
         model = "synthetic"
-        def reconcile_background_response(self, response_id, *, timeout, on_response):
+        def reconcile_background_response(self, response_id, *, timeout, on_response, cancel_pending):
+            assert cancel_pending is False
             operations.append(response_id)
             assert 0 < timeout <= 15
             response = {"id": response_id, "status": terminal, "output": []}

@@ -480,16 +480,23 @@ class CleanupSession(Agent):
 
     async def _locked_run(self, inp, settings, root, deadline):
         baseline = inp.baseline or inp.document
-        identity = hashlib.sha256(json.dumps({
+        identity_fields = {
             "problem": inp.problem, "baseline": baseline, "partial": inp.partial,
             "page_limit": inp.page_limit, "settings": settings.model_dump(),
-        }, sort_keys=True).encode()).hexdigest()
+        }
+        identity = hashlib.sha256(json.dumps(identity_fields, sort_keys=True).encode()).hexdigest()
+        compatible_identities = {identity}
+        if settings.execution_backend == "api":
+            # Pre-subscription API sessions omitted this default. Accept only
+            # that exact historical shape, not changes to any other setting.
+            identity_fields["settings"].pop("execution_backend")
+            compatible_identities.add(hashlib.sha256(json.dumps(identity_fields, sort_keys=True).encode()).hexdigest())
         state_path = root / "session.json"
         state = json.loads(_read_file(root, "session.json")) if state_path.exists() else {
             "identity": identity, "session_id": str(uuid.uuid4()), "resumable": False, "in_flight": False,
             "recorded_usd": 0.0, "claude_session_usd": 0.0, "claude_session_tokens": 0,
         }
-        if state["identity"] != identity:
+        if state["identity"] not in compatible_identities:
             raise ValueError("cleanup session belongs to different inputs/settings; use a new session_key")
         if state["in_flight"]:
             raise RuntimeError("cleanup session has an interrupted/unmetered invocation; reconcile it before reuse")

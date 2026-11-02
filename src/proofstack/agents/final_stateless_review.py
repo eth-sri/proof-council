@@ -21,8 +21,10 @@ class FinalStatelessCritic(ACCritic):
         defaults = component_config_for_class(ctx.component_configs, ACCritic, "ACCritic")
         configured = _deep_merge({"FinalStatelessCritic": defaults}, ctx.component_configs)
         overrides = dict(ctx.model_overrides)
-        if "ACCritic" in overrides:
-            overrides.setdefault("FinalStatelessCritic", overrides["ACCritic"])
+        inherited = ctx.model_for_class(ACCritic, "ACCritic")
+        if inherited is not None:
+            overrides.setdefault("FinalStatelessCritic", ctx.model_for_class(
+                type(self), kwargs.get("name", type(self).__name__), inherited, include_wildcard=False))
         super().__init__(replace(ctx, component_configs=configured, model_overrides=overrides), **kwargs)
 
     def _recovery_checkpoint(self, inp):
@@ -32,14 +34,14 @@ class FinalStatelessCritic(ACCritic):
             root = root / f"verdict-retry-{attempt}"
         return root / path.name
 
-    async def recover_completed(self, inp):
+    async def recover_completed(self, inp, *, deadline=None):
         """Recover an already-paid verdict before checking new-call allowances."""
         if self.ctx.execution_backend == "subscription":
             from proofstack.subscription import recover_model_role
             raw = recover_model_role(self, inp)
             return self.parse_output(raw["text"], inp) if raw is not None else None
         try:
-            return await super().run(inp, recover_only=True)
+            return await super().run(inp, recover_only=True, recovery_deadline=deadline)
         except RuntimeError as exc:
             raise FinalReviewBlocked(str(exc)) from exc
 
