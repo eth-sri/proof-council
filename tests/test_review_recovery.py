@@ -456,7 +456,7 @@ def test_settled_failed_receipt_is_not_rewritten(configured, monkeypatch):
 
 
 @pytest.mark.parametrize("usage", [False, True])
-def test_native_compute_usage_is_durable_and_blocks_followup_when_missing(configured, fake_cli, monkeypatch, usage):
+def test_finished_native_compute_usage_is_durable_or_estimated(configured, fake_cli, monkeypatch, usage):
     from proofstack.agents.ac.compute import Compute
     workflow, inp = configured
     inp = inp.model_copy(update={"compute_sandbox_backend": "subprocess", "compute_max_parallel_workers": 0,
@@ -486,20 +486,16 @@ Path('responses/response_round_1.md').write_text('Synthetic computation: 1+1=2')
     monkeypatch.setattr(Compute, "POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr("proofstack.agents.ac.compute._require_codex_cli_version", AsyncMock())
     async def run():
-        result = await workflow._safe_compute(inp=inp, round=1, instructions="Count", answer_tex="",
-            research_notes_tex="", references_bib="", compute_workspace=workflow.ctx.root_workdir / "compute")
+        result = await sub.run_with_nominal_allowance(workflow.compute, 4, lambda:
+            workflow._safe_compute(inp=inp, round=1, instructions="Count", answer_tex="",
+            research_notes_tex="", references_bib="", compute_workspace=workflow.ctx.root_workdir / "compute"))
         assert result.status == "done" and "1+1=2" in result.response_md, result.model_dump()
+    asyncio.run(run())
+    sub.check_pending_calls(workflow.ctx.root_workdir)
     if usage:
-        asyncio.run(run())
-        sub.check_pending_calls(workflow.ctx.root_workdir)
-        assert workflow.ctx.budgets.root().planning_usd > 0
+        assert 0 < workflow.ctx.budgets.root().planning_usd < .01
     else:
-        with pytest.raises(sub.SubscriptionBlocked, match="Compute"):
-            asyncio.run(run())
-        with pytest.raises(sub.SubscriptionBlocked, match="Unresolved"):
-            asyncio.run(sub.run_packet(workflow, "later review"))
-        with pytest.raises(sub.SubscriptionBlocked):
-            sub.configure_workflow(workflow, inp)
+        assert workflow.ctx.budgets.root().planning_usd == 4
     assert list((workflow.ctx.root_workdir / "subscription_calls").glob("*.json"))
     assert not fake_cli
 

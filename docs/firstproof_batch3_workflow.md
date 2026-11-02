@@ -219,8 +219,9 @@ Resume retrieves saved response IDs and, if necessary, cancels them within a
 30-second reconciliation window. Every outstanding attempt is checked before
 a completed report is reused. Missing terminal status still blocks another paid
 call; reconciliation never creates a new response. If a retrieved terminal
-response omits usage, recovery records a conservative model-token charge priced
-at the configured full context window and maximum output allowance. The receipt
+response omits usage, recovery uses its saved actual-request/visible-output text
+estimate. Only legacy receipts lacking that estimate fall back to the configured
+full context window and maximum output allowance. The receipt
 keeps `usage_unavailable` and adds `cost_estimated`, the estimated amount and its
 basis; this is not measured usage or a bound on separate tool charges. The debit
 is not automatically refunded and can exhaust the budget before a retry. Durable
@@ -878,11 +879,20 @@ Ordinary research critics retain their bounded retry/replay behavior after a
 transport outage, including for older receipts; this does not resolve the unknown
 charge. Simplification and final approval still require every attempt to settle,
 or an operator reconciliation receipt. HTTP 408, 504 and 524 are uncertain, not
-zero-cost rejections. Terminal OpenAI responses with missing usage use a saved
-full-context/output cost estimate, charged once without inventing token counts.
+zero-cost rejections. Empty background rate-limit admission rejections settle at
+zero. Other terminal OpenAI responses with missing usage use a saved text-based
+estimate of the actual request and visible output, not the model's full context
+and output capacity. These are estimates, not provider-reported bills; hidden
+reasoning is not observable. Salvaged output records its estimated token counts.
+Legacy critic recovery receipts without request estimates retain their previous
+conservative context/output allowance fallback.
 Raw saved final reports are recoverable even if a crash preceded the completed
-critic checkpoint. Non-mathematical terminal cleanup errors retain an accepted
-baseline pending final review and preserve any separately published partial.
+critic checkpoint. Settled non-mathematical terminal cleanup errors send the
+accepted baseline directly to the final gate, without retrying cleanup. If work
+is unresolved or the gate cannot approve it, the baseline remains pending and any
+separately published partial is preserved. The operator event records the failure
+in either case. Disabling new simplification rounds on resume does not discard
+previously accepted simplifications.
 
 For genuinely unresolved API work, stop all local controllers and descendants
 and independently retrieve or cancel any remote response IDs and reconcile their

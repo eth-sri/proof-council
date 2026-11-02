@@ -222,12 +222,13 @@ def test_interrupting_call_keeps_baseline_and_blocks_further_paid_work(simplific
     assert json.loads(states(ctx)[0].read_text())["stage"] == "author"
 
 
-def test_completed_phase_is_not_repeated_on_resume(simplification):
+@pytest.mark.parametrize("rounds", [0, 3])
+def test_completed_phase_is_not_repeated_on_resume(simplification, rounds):
     execute, calls, _, _, ctx, agent = simplification
     out = asyncio.run(execute(simplification_rounds=3))
     state = json.loads(states(ctx)[0].read_text())
     before = dict(calls)
-    inp = FirstProofBatch3Workflow.Inputs(problem=ORIGINAL, problem_id="p", simplification_rounds=3)
+    inp = FirstProofBatch3Workflow.Inputs(problem=ORIGINAL, problem_id="p", simplification_rounds=rounds)
     document, _, review = asyncio.run(agent._simplify_accepted(
         inp, TEX, "", "", out, deadline=time.monotonic() + 999, reserve=0,
     ))

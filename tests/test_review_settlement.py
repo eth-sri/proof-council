@@ -138,7 +138,8 @@ def test_raw_final_report_recovers_before_budget_gate(tmp_path, operator):
     assert asyncio.run(critic.recover_completed(inp)) is None
 
 
-@pytest.mark.parametrize("tail", ["finish_then_drain", "clean_exit_without_finish"])
+@pytest.mark.parametrize("tail", ["finish_then_drain", "clean_exit_without_finish", "finish_no_usage",
+                                   "error", "blocked", "timeout"])
 def test_finished_compute_uses_metered_cost(configured, fake_cli, monkeypatch, tail):
     workflow, inp = configured
     inp = inp.model_copy(update={"compute_sandbox_backend": "subprocess", "compute_max_parallel_workers": 0,
@@ -153,8 +154,11 @@ Path('responses').mkdir(exist_ok=True)
 Path('responses/response_round_1.md').write_text('Synthetic computation: 1+1=2')
 print(json.dumps({'type':'turn.completed','usage':{'input_tokens':100,'output_tokens':20}}), flush=True)
 """
-    if tail == "finish_then_drain":
-        script += "subprocess.run([os.environ['FINISH_BIN'], json.dumps({'status':'done','summary':'Done'})], check=True)\ntime.sleep(60)\n"
+    if tail == "finish_no_usage":
+        script = script[:script.index("print(json.dumps")]
+    if tail != "clean_exit_without_finish":
+        status = tail if tail in {"error", "blocked", "timeout"} else "done"
+        script += f"subprocess.run([os.environ['FINISH_BIN'], json.dumps({{'status':{status!r},'summary':'Done'}})], check=True)\ntime.sleep(60)\n"
     setup = Compute.setup
     async def synthetic_setup(self, sandbox, inp):
         async def auth_status(cmd, **kwargs):
@@ -168,11 +172,16 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':100,'output_to
     monkeypatch.setattr(Compute, "POLL_INTERVAL_S", .01)
     monkeypatch.setattr(Compute, "DONE_DRAIN_GRACE_S", .05)
     monkeypatch.setattr("proofstack.agents.ac.compute._require_codex_cli_version", AsyncMock())
-    result = asyncio.run(workflow._safe_compute(inp=inp, round=1, instructions="Count", answer_tex="",
-        research_notes_tex="", references_bib="", compute_workspace=workflow.ctx.root_workdir / "compute"))
+    result = asyncio.run(sub.run_with_nominal_allowance(workflow.compute, 4, lambda:
+        workflow._safe_compute(inp=inp, round=1, instructions="Count", answer_tex="",
+        research_notes_tex="", references_bib="", compute_workspace=workflow.ctx.root_workdir / "compute")))
     assert "1+1=2" in result.response_md
-    assert 0 < workflow.ctx.budgets.root().planning_usd < .01
-    assert not list((workflow.ctx.root_workdir / "subscription_usage").glob("interrupted-*.json"))
+    if tail == "finish_no_usage":
+        assert workflow.ctx.budgets.root().planning_usd == 4
+        assert len(list((workflow.ctx.root_workdir / "subscription_usage").glob("interrupted-*.json"))) == 1
+    else:
+        assert 0 < workflow.ctx.budgets.root().planning_usd < .01
+        assert not list((workflow.ctx.root_workdir / "subscription_usage").glob("interrupted-*.json"))
     sub.check_pending_calls(workflow.ctx.root_workdir)
     assert not fake_cli
 
@@ -236,12 +245,14 @@ def test_preflight_without_marker_is_settled_but_global_crash_is_not(tmp_path):
 @pytest.mark.parametrize("error", ["context", "programming"])
 def test_cleanup_infrastructure_error_preserves_accepted_baseline(simplification, monkeypatch, error):
     from proofstack.agents.batch3_critic import CleanupContextTooLarge
-    execute, calls, _, options, _, _ = simplification
+    execute, calls, _, options, ctx, _ = simplification
     options["rewrite_error"] = CleanupContextTooLarge("Synthetic overflow") if error == "context" else TypeError("Synthetic bug")
     out = asyncio.run(execute(simplification_rounds=0, final_stateless_review=True))
-    assert out.output_kind == "partial_unreviewed"
-    assert out.accepted_baseline_pending and not out.submission_approved
-    assert calls["final_critic"] == 0
+    assert out.output_kind == "accepted_solution" and out.submission_approved
+    assert not out.accepted_baseline_pending
+    assert calls["final_critic"] == 1 and calls["rewrite"] == 1
+    events = [json.loads(line) for line in (ctx.root_workdir / "events.jsonl").read_text().splitlines()]
+    assert any(e["kind"] == "batch3.recovery_blocked" and e["payload"]["operator_action_required"] for e in events)
 
 
 @pytest.mark.parametrize("status", [200, 502, 504])
@@ -266,8 +277,11 @@ def test_google_html_error_preserves_http_status(tmp_path, monkeypatch, status):
     assert rows[-1]["outcome"] == "error"
 
 
-@pytest.mark.parametrize("error_code,retry", [("rate_limit_exceeded", True), ("server_error", True), ("server_error", False)])
-def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error_code, retry):
+@pytest.mark.parametrize("error_code,retry,failures,salvage", [
+    ("rate_limit_exceeded", True, 3, False), ("server_error", True, 1, False),
+    ("server_error", False, 1, False), ("rate_limit_exceeded", False, 1, True),
+])
+def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error_code, retry, failures, salvage):
     from mathagents import api_client as api
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     monkeypatch.setattr(APIClient, "_sleep", lambda *args: None)
@@ -275,8 +289,9 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
     monkeypatch.setattr(api.request_logger, "log_request", lambda **kw: None)
     monkeypatch.setattr(api.request_logger, "log_response", lambda **kw: None)
     client = APIClient(api="openai", model="gpt-6-astra", use_openai_responses_api=True,
-                       background=True, max_retries_inner=1 if retry else 0, max_tokens=100,
-                       read_cost=1, write_cost=2)
+                       background=True, max_retries_inner=failures if retry else 0, max_tokens=128000,
+                       read_cost=10, write_cost=50, long_context_threshold_tokens=272000,
+                       long_context_input_multiplier=2, long_context_output_multiplier=1.5)
     monkeypatch.setattr(client, "_is_background_server_kill", lambda code, elapsed: code == "server_error")
     calls = []
     def sdk_object(value):
@@ -296,8 +311,11 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
         calls.append(kw)
         return response("queued", f"response-{len(calls)}")
     def retrieve(identity, **kw):
-        if identity == "response-1":
-            return response("failed", identity, error={"code": error_code, "message": "Synthetic provider failure"})
+        if int(identity.split("-")[-1]) <= failures:
+            output = [{"type": "message", "id": "salvaged", "role": "assistant", "status": "completed",
+                       "content": [{"type": "output_text", "text": "y" * 60, "annotations": []}]}] if salvage else []
+            return response("failed", identity, output=output,
+                            error={"code": error_code, "message": "Synthetic provider failure"})
         return response("completed", identity, output=[{"type": "message", "id": "message", "role": "assistant",
             "status": "completed", "content": [{"type": "output_text", "text": "Paid review", "annotations": []}]}],
             usage={"input_tokens": 10, "output_tokens": 20, "total_tokens": 30,
@@ -309,7 +327,7 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
         return 0, result.conversation, {"cost": result.cost_usd, "input_tokens": result.input_tokens,
                                         "output_tokens": result.output_tokens}
     async def run():
-        if retry:
+        if retry or salvage:
             _, _, cost = await agent._query(client, [], query, call_id="paid")
             await agent._record_model_usage({"cost_usd": cost["cost"], "in_tokens": cost["input_tokens"],
                                              "out_tokens": cost["output_tokens"]}, call_id="paid")
@@ -320,11 +338,16 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
             assert await reconcile_provider_call(agent.ctx, agent.tracker, agent.workdir)
     asyncio.run(run())
     rows = latest_attempts(agent.workdir / "provider-attempts.jsonl")
-    assert len(rows) == (2 if retry else 1)
-    assert rows[0]["cost_estimated"] and rows[0]["usage_unavailable"]
-    assert rows[0]["estimate_reason"] == "terminal_response_without_usage"
-    assert agent.tracker.counters.usd == pytest.approx(1.0502 + (.00005 if retry else 0))
-    assert agent.tracker.counters.tokens == (30 if retry else 0)
+    assert len(rows) == (failures + 1 if retry else 1)
+    if error_code == "rate_limit_exceeded" and not salvage:
+        assert all(row["admission_rejected"] and not row["usage_unavailable"] for row in rows[:-1])
+        failed_cost = 0
+    else:
+        assert rows[0]["cost_estimated"] and rows[0]["usage_unavailable"]
+        assert rows[0]["estimate_reason"] == ("salvaged_response_text" if salvage else "terminal_response_without_usage")
+        failed_cost = (len("Synthetic") // 3) * 10 / 1_000_000 + (.001 if salvage else 0)
+    assert agent.tracker.counters.usd == pytest.approx(failed_cost + (.0011 if retry else 0))
+    assert agent.tracker.counters.tokens == (30 if retry else 23 if salvage else 0)
     assert provider_attempts_settled(rows)
 
 

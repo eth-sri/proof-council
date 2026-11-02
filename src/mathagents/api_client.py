@@ -3145,6 +3145,10 @@ class APIClient:
                                         output_items,
                                     )
                                     failed_usage = _SalvageUsage(est_in, est_out)
+                                    self._log_provider_response(ts=ts, batch_idx=idx, response={
+                                        **self._provider_response_dict(response),
+                                        "usage": failed_usage.model_dump(), "usage_estimated": True,
+                                    })
                                 (
                                     step_input,
                                     step_output,
@@ -3203,6 +3207,10 @@ class APIClient:
                                 )
                                 if response.usage is None:
                                     response.usage = _SalvageUsage(est_in, est_out)
+                                    self._log_provider_response(ts=ts, batch_idx=idx, response={
+                                        **self._provider_response_dict(response),
+                                        "usage": response.usage.model_dump(), "usage_estimated": True,
+                                    })
                             elif self._is_background_server_kill(err_code, time.time() - time_start):
                                 raise _BackgroundResponseTimeout(
                                     f"OpenAI background response {getattr(response, 'id', '?')} failed "
@@ -3755,11 +3763,19 @@ class APIClient:
         text_parts = []
         reasoning_parts = []
         final_usage = None
+        finished_choices = {}
+        response_id = None
         for event in response:
+            response_id = getattr(event, "id", None) or response_id
             if getattr(event, "usage", None) is not None:
                 final_usage = event.usage
             if not getattr(event, "choices", None):
                 continue
+            for choice in event.choices:
+                index = getattr(choice, "index", 0)
+                finished_choices.setdefault(index, {"finish_reason": None})
+                if getattr(choice, "finish_reason", None) is not None:
+                    finished_choices[index] = {"finish_reason": choice.finish_reason}
             delta = event.choices[0].delta
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)
@@ -3783,6 +3799,8 @@ class APIClient:
             batch_idx=idx,
             response={
                 "streamed": True,
+                "id": response_id,
+                "choices": list(finished_choices.values()),
                 "content": content,
                 "reasoning": reasoning,
                 "usage": final_usage.model_dump() if final_usage is not None else None,
@@ -3922,7 +3940,9 @@ class APIClient:
         def generate():
             response = requests.post(self.base_url, headers=headers, json=payload, timeout=timeout)
             if response.status_code != 200:
-                raise requests.HTTPError(f"Google HTTP {response.status_code}", response=response)
+                error = requests.HTTPError(f"Error: {response.status_code} - {response.text[:2000]}", response=response)
+                error.status_code = response.status_code
+                raise error
             self._log_provider_response(ts=ts, batch_idx=idx, response=response.json())
             return response
 

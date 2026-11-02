@@ -797,7 +797,7 @@ class FirstProofBatch3Workflow(Agent):
         return out
 
     async def _simplify_accepted(self, inp, document, notes, report, out, *, deadline, reserve):
-        if not inp.simplification_rounds or self._accepted_baseline is None:
+        if self._accepted_baseline is None:
             return document, notes, None
         source = hashlib.sha256(document.encode()).hexdigest()
         key = f"{self._accepted_baseline.round}-{source}"
@@ -810,6 +810,9 @@ class FirstProofBatch3Workflow(Agent):
             if state.stage in {"author", "critic", "reviewed", "rejected"} or state.call_pending:
                 await self._recover_simplification_call(inp, state, path)
         else:
+            if not inp.simplification_rounds:
+                baseline = self._accepted_baseline
+                return baseline.document, notes, None
             seconds = deadline - time.monotonic()
             available = self._remaining_usd() - reserve
             if seconds <= 0 or available <= 0:
@@ -828,9 +831,10 @@ class FirstProofBatch3Workflow(Agent):
                 and not state.review.parse_failed and state.review.disposition == "research"):
             state.stage = "rejected"
             _save_json(path, state.model_dump(mode="json"))
-            self._handoff(inp, state.document,
-                          normalize_submission_latex(state.candidate.answer_tex) if state.candidate else state.document,
-                          state.review)
+            if self._accepted_baseline is not None:
+                self._handoff(inp, state.document,
+                              normalize_submission_latex(state.candidate.answer_tex) if state.candidate else state.document,
+                              state.review)
             return state.document, state.notes, state.review
         self._retain_simplified(state)
         if state.stage in {"author", "critic"}:
@@ -839,7 +843,7 @@ class FirstProofBatch3Workflow(Agent):
             )
         if state.stage == "rejected":
             raise ValueError("Rejected simplification checkpoint has no valid baseline rejection")
-        if state.stage == "done":
+        if state.stage == "done" or not inp.simplification_rounds:
             return state.document, state.notes, None
         phase_end = min(deadline, time.monotonic() + state.deadline_unix_s - time.time())
         allowance = min(self._remaining_usd() - reserve,
@@ -929,7 +933,8 @@ class FirstProofBatch3Workflow(Agent):
                     )
                 except BaseException as exc:
                     completed = critic.completed_review or getattr(exc, "completed_output", None)
-                    if isinstance(completed, Batch3CleanupCritic.Outputs) and completed.disposition == "research":
+                    if (isinstance(completed, Batch3CleanupCritic.Outputs) and not completed.parse_failed
+                            and completed.disposition == "research"):
                         state.review, state.stage = completed, "rejected"
                         _save_json(path, state.model_dump(mode="json"))
                         self._handoff(inp, state.document, document, completed)
@@ -942,13 +947,15 @@ class FirstProofBatch3Workflow(Agent):
                 if not state.review.parse_failed and state.review.disposition == "research":
                     state.stage = "rejected"
                     _save_json(path, state.model_dump(mode="json"))
-                    self._handoff(inp, state.document, document, state.review)
+                    if self._accepted_baseline is not None:
+                        self._handoff(inp, state.document, document, state.review)
                 await self._settle_simplification(state, path)
             review = state.review if not reason else None
             if review is not None and not review.parse_failed and review.disposition == "research":
                 state.stage = "rejected"
                 _save_json(path, state.model_dump(mode="json"))
-                self._handoff(inp, state.document, document, review)
+                if self._accepted_baseline is not None:
+                    self._handoff(inp, state.document, document, review)
                 return
             accepted = bool(review is not None and review.answer_ready and not review.parse_failed
                             and review.disposition == "accept" and ok)
@@ -1319,6 +1326,10 @@ class FirstProofBatch3Workflow(Agent):
             try:
                 await self._reconcile_simplifications(inp)
             except SimplificationInterrupted as exc:
+                out.rounds_completed = max(out.rounds_completed, int(self._research_state(inp).get("last_round_run") or 0))
+                await self.events.emit("batch3.recovery_blocked", {
+                    "reason": str(exc), "retryable": False, "operator_action_required": True,
+                })
                 return self._preserve_pending_baseline(inp, out, exc)
         accounting_blocked = (self.ctx.root_workdir / "cleanup-accounting-uncertain.json").exists()
         if not accounting_blocked and (self.ctx.root_workdir / "cleanup_sessions").exists():
@@ -1329,6 +1340,10 @@ class FirstProofBatch3Workflow(Agent):
             out.error = "Cleanup usage is unresolved; reconcile before resuming paid work"
             out.error_retryable = False
             out.cleanup_errors.append(out.error)
+            out.rounds_completed = max(out.rounds_completed, int(self._research_state(inp).get("last_round_run") or 0))
+            await self.events.emit("batch3.recovery_blocked", {
+                "reason": out.error, "retryable": False, "operator_action_required": True,
+            })
             if self._accepted_baseline is not None and final_required:
                 return self._preserve_pending_baseline(inp, out, RuntimeError(out.error))
             return out
@@ -1493,18 +1508,22 @@ class FirstProofBatch3Workflow(Agent):
                 out.cleanup_errors.append(out.partial_reason)
                 if (not retryable or _is_programming_error(exc) or isinstance(exc, (CleanupContextTooLarge, CriticContextTooLarge))
                         or getattr(exc, "requires_reconciliation", False)):
-                    # Repeating a paid phase cannot repair a broken code path.
-                    # Preserve the last draft without another model invocation.
+                    # Do not retry the broken phase. A settled editorial failure
+                    # can still send the retained proof to its independent gate.
                     error = out.partial_reason
                     out.error = error
                     out.error_retryable = False
-                    if (isinstance(exc, SimplificationInterrupted) or (
-                            self._accepted_baseline is not None and self._requires_final_review(inp))):
-                        return self._preserve_pending_baseline(inp, out, exc)
                     state = self._research_state(inp)
                     out.rounds_completed = max(out.rounds_completed, int(state.get("last_round_run") or 0))
                     _save_json(self.ctx.root_workdir / "batch3-output.json", out.model_dump(mode="json"))
-                    if not await self._publish_retained(inp, out, deadline=deadline):
+                    unresolved = isinstance(exc, SimplificationInterrupted) or getattr(exc, "requires_reconciliation", False)
+                    retained = await self._publish_retained(
+                        inp, out, deadline=deadline, allow_final_review=not unresolved)
+                    if retained is not None:
+                        out = retained
+                    if not out.submission_approved and self._accepted_baseline is not None and self._requires_final_review(inp):
+                        out = self._preserve_pending_baseline(inp, out, exc)
+                    elif retained is None:
                         await self._fallback(inp, out, _read(self._workspace(inp) / "answer.tex") or document,
                                              deadline=deadline)
                     # Publishing clears the error; the operator must still see it.

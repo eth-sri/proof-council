@@ -2236,7 +2236,7 @@ class ACWorkflow(Agent):
     ):
         """Run Council with non-fatal exceptions swallowed.
 
-        Only ``CancelledError`` and run-scope ``BudgetExhausted``
+        Reconciliation errors, ``CancelledError`` and run-scope ``BudgetExhausted``
         propagate; everything else is logged as ``ac.council_failed``
         and returns ``None`` so the Critic can complete unmolested.
         """
@@ -2259,6 +2259,8 @@ class ACWorkflow(Agent):
             )
             return None
         except Exception as e:
+            if getattr(e, "requires_reconciliation", False):
+                raise
             await self.events.emit(
                 "ac.council_failed",
                 {"round": round, "type": type(e).__name__, "msg": str(e)},

@@ -2251,7 +2251,10 @@ class CLIAgent(Agent):
                     {"type": type(e).__name__},
                     call_id=spawn_call_id,
                 )
-                if self.cli_usage_must_succeed():
+                if self.cli_usage_must_succeed() and not (
+                        self.ctx.execution_backend == "subscription"
+                        and self.component_config.get("subscription_settlement_path")
+                        and getattr(stream, "completion_record_delivered", False)):
                     raise RuntimeError(
                         "required CLI usage accounting failed; downstream "
                         "execution was stopped"
@@ -2634,6 +2637,11 @@ class CLIAgent(Agent):
                 interrupted = not (done is not None and stream is not None and (
                     getattr(stream, "completion_record_delivered", False)
                     or getattr(stream, "natural_process_exit", False)))
+                if (process_stopped and required_usage_error is not None and stream is not None
+                        and getattr(stream, "completion_record_delivered", False)):
+                    # Finish can precede the CLI's end-of-turn usage. A drain
+                    # timeout is still a harness interruption for accounting.
+                    interrupted = True
                 self.component_config["subscription_interrupted"] = interrupted
                 settled = settle_cli_worker(self, process_stopped=process_stopped,
                     spawn_attempted=stream_spawn_attempted,
@@ -2828,7 +2836,12 @@ class CLIAgent(Agent):
                         else None
                     ),
                 )
-                stream.completion_record_delivered = done.status in {"done", "partial"}
+                try:
+                    CLIDoneRecord.model_validate_json(done_path.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    stream.completion_record_delivered = False
+                else:
+                    stream.completion_record_delivered = True
                 return await self._finalize_workspace_recovery(
                     done,
                     workspace_root,

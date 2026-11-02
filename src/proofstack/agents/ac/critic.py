@@ -1088,6 +1088,7 @@ class ACCritic(APICallAgent):
         try:
             for invocation in dict.fromkeys(r["invocation_id"] for r in rows):
                 trace = ProviderTrace.restore(trace_path, invocation)
+                trace.estimate_terminal_usage()
                 for key, row in list(trace.attempts.items()):
                     # Only OpenAI response IDs can be retrieved/cancelled through
                     # this endpoint. Other providers must already be terminal.
@@ -1096,7 +1097,7 @@ class ACCritic(APICallAgent):
                     evidence = row.get("code_interpreter_calls") or []
                     missing_evidence = (require_tool_evidence and row.get("status") == "completed"
                                         and (not evidence or any(item.get("outputs") is None for item in evidence)))
-                    if not row.get("response_id") or (row.get("status") in terminal
+                    if not row.get("response_id") or (self._provider_attempt_terminal(row)
                             and not row.get("reconciliation_pending") and not missing_evidence
                             and (not row.get("usage_unavailable", False) or row.get("cost_estimated", False))):
                         continue
@@ -1128,6 +1129,7 @@ class ACCritic(APICallAgent):
                             trace.update(key, reconciliation_pending=data.get("status") not in terminal)
                         await asyncio.to_thread(client.reconcile_background_response, row["response_id"],
                                                 timeout=min(15.0, left), on_response=record)
+                        trace.estimate_terminal_usage()
                         settled = trace.attempts[key]
                         if (settled.get("status") in terminal and settled.get("usage_unavailable", True)
                                 and not settled.get("cost_estimated", False)):

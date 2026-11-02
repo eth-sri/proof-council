@@ -439,6 +439,8 @@ class CleanupSession(Agent):
                 "provider_keys": [provider], "env_allowlist": ["PATH", "LANG", "LC_ALL"]}
 
     async def run(self, inp):
+        from proofstack.subscription import check_pending_calls
+        check_pending_calls(self.ctx.root_workdir)
         accounting_guard = self.ctx.root_workdir / "cleanup-accounting-uncertain.json"
         if cleanup_accounting_unresolved(self.ctx.root_workdir):
             raise CleanupAccountingUncertain("cleanup usage is unresolved; reconcile it before continuing this run")
