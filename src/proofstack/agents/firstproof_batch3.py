@@ -775,6 +775,10 @@ class FirstProofBatch3Workflow(Agent):
                 raise SimplificationInterrupted("Unresolved simplification belongs to another accepted baseline")
             if state.stage in {"author", "critic", "reviewed", "rejected"} or state.call_pending:
                 await self._recover_simplification_call(inp, state, path)
+            elif state.stage in {"ready", "done"} and same_baseline:
+                # The state is saved before the accepted-baseline checkpoint.
+                # Restore it even if the research cutoff prevents another round.
+                self._retain_simplified(state)
 
     def _preserve_pending_baseline(self, inp, out, error):
         baseline = self._accepted_baseline
@@ -811,8 +815,7 @@ class FirstProofBatch3Workflow(Agent):
                 await self._recover_simplification_call(inp, state, path)
         else:
             if not inp.simplification_rounds:
-                baseline = self._accepted_baseline
-                return baseline.document, notes, None
+                return document, notes, None
             seconds = deadline - time.monotonic()
             available = self._remaining_usd() - reserve
             if seconds <= 0 or available <= 0:
@@ -1517,12 +1520,20 @@ class FirstProofBatch3Workflow(Agent):
                     out.rounds_completed = max(out.rounds_completed, int(state.get("last_round_run") or 0))
                     _save_json(self.ctx.root_workdir / "batch3-output.json", out.model_dump(mode="json"))
                     unresolved = isinstance(exc, SimplificationInterrupted) or getattr(exc, "requires_reconciliation", False)
-                    retained = await self._publish_retained(
-                        inp, out, deadline=deadline, allow_final_review=not unresolved)
+                    retained = None
+                    try:
+                        retained = await self._publish_retained(
+                            inp, out, deadline=deadline, allow_final_review=not unresolved)
+                    except SubscriptionParked:
+                        raise
+                    except Exception as recovery_error:
+                        detail = f"Retained manuscript recovery: {type(recovery_error).__name__}: {recovery_error}"
+                        out.cleanup_errors.append(detail)
+                        error += "; " + detail
                     if retained is not None:
                         out = retained
                     if not out.submission_approved and self._accepted_baseline is not None and self._requires_final_review(inp):
-                        out = self._preserve_pending_baseline(inp, out, exc)
+                        out = self._preserve_pending_baseline(inp, out, error)
                     elif retained is None:
                         await self._fallback(inp, out, _read(self._workspace(inp) / "answer.tex") or document,
                                              deadline=deadline)

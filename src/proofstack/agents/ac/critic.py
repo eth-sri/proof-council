@@ -940,13 +940,15 @@ class ACCritic(APICallAgent):
                     _operator_reconciled, reconcile_provider_call, transport_uncertain,
                 )
                 operator_settled = _operator_reconciled(self.ctx.root_workdir, folder)
+                if rows and not operator_settled:
+                    # Recovery-only forbids new inference, not bounded
+                    # retrieval/cancellation of an already-paid response ID.
+                    await self._reconcile_recovery(trace_path, rows, require_tool_evidence=(
+                        self._notes_transport() == "file" and bool(review_input.research_notes_tex)))
                 if recover_only or operator_settled:
                     if not await reconcile_provider_call(self.ctx, self.tracker, folder):
                         raise RuntimeError("Saved critic has unresolved provider work; reconcile before retrying")
                 if rows:
-                    if not recover_only and not operator_settled:
-                        await self._reconcile_recovery(trace_path, rows, require_tool_evidence=(
-                            self._notes_transport() == "file" and bool(review_input.research_notes_tex)))
                     rows = [r for r in latest_attempts(trace_path)
                             if r["invocation_id"] not in saved.get("prior_invocations", [])]
                     if not operator_settled and any((r.get("reconciliation_pending") and not transport_uncertain(r)) or (

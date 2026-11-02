@@ -168,8 +168,8 @@ def _estimate_salvaged_usage(
     to the 4 chars/token rule of thumb; we want to err toward
     *over*-billing the budget tracker for a salvaged turn.
 
-    Walks ``payload["input"]`` for message content and ``output_items``
-    for reasoning / code_interpreter_call / message blocks. Tool-call
+    Walks ``payload["input"]`` for message content and replayed tool data, and
+    ``output_items`` for reasoning / code_interpreter_call / message blocks. Tool-call
     metadata (web_search_call action fields etc.) is not counted.
     """
 
@@ -193,12 +193,27 @@ def _estimate_salvaged_usage(
                     _add_text(acc, t)
 
     in_chars = [0]
-    inp = payload.get("input", []) if isinstance(payload, dict) else []
+    payload = payload if isinstance(payload, dict) else {}
+    inp = payload.get("input", [])
+    _add_text(in_chars, payload.get("instructions", ""))
+    if isinstance(inp, str):
+        _add_text(in_chars, inp)
     if isinstance(inp, list):
         for msg in inp:
             if not isinstance(msg, dict):
                 continue
             _walk_content(msg.get("content", ""), in_chars)
+            if msg.get("type") == "function_call_output":
+                _walk_content(msg.get("output", ""), in_chars)
+            elif msg.get("type") == "function_call":
+                _add_text(in_chars, msg.get("arguments", ""))
+            elif msg.get("type") == "code_interpreter_call":
+                _add_text(in_chars, msg.get("code", ""))
+                for output in msg.get("outputs") or []:
+                    if isinstance(output, dict):
+                        _add_text(in_chars, output.get("logs", ""))
+            elif msg.get("type") == "reasoning":
+                _walk_content(msg.get("summary", []), in_chars)
 
     out_chars = [0]
     for item in output_items or []:
@@ -3206,9 +3221,12 @@ class APIClient:
                                     f"Error: {err_code} {err_msg[:200]}"
                                 )
                                 if response.usage is None:
+                                    # Serialize the SDK object before assigning our
+                                    # non-Pydantic usage stand-in.
+                                    response_data = self._provider_response_dict(response)
                                     response.usage = _SalvageUsage(est_in, est_out)
                                     self._log_provider_response(ts=ts, batch_idx=idx, response={
-                                        **self._provider_response_dict(response),
+                                        **response_data,
                                         "usage": response.usage.model_dump(), "usage_estimated": True,
                                     })
                             elif self._is_background_server_kill(err_code, time.time() - time_start):

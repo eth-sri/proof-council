@@ -88,6 +88,8 @@ class DAGWorkflow(Agent):
                 return self.Outputs(**fallback_outputs)
             return await self._last_gasp(inp, state, e)
         except Exception as e:
+            if getattr(e, "requires_reconciliation", False):
+                raise
             return await self._last_gasp(inp, state, e)
 
     async def _last_gasp(self, inp, state: dict[str, Any], error: Exception):
@@ -145,6 +147,8 @@ class DAGWorkflow(Agent):
                     )
             return self._build_outputs(self.dag.get("outputs") or {}, state)
         except Exception as fallback_error:
+            if getattr(fallback_error, "requires_reconciliation", False):
+                raise
             await self.events.emit(
                 "workflow.budget_fallback_failed",
                 {"type": type(fallback_error).__name__, "msg": str(fallback_error)},
@@ -333,7 +337,7 @@ class DAGWorkflow(Agent):
             )
             return _eval_value(node.get("default", {}), state)
         except Exception as e:
-            if not node.get("soft_fail"):
+            if getattr(e, "requires_reconciliation", False) or not node.get("soft_fail"):
                 raise
             await self.events.emit(
                 "dag.node_error",
@@ -605,6 +609,8 @@ class DAGWorkflow(Agent):
                         return None
                     scope["step"][step_id] = _eval_value(step.get("default", {}), scope)
                 except Exception as e:
+                    if getattr(e, "requires_reconciliation", False):
+                        raise
                     await self.events.emit(
                         "dag.chain_step_error",
                         {
@@ -1287,6 +1293,8 @@ async def _call_with_retries(factory, *, retries: int, retry_delay_s: float) -> 
         except BudgetExhausted:
             raise
         except Exception as e:
+            if getattr(e, "requires_reconciliation", False):
+                raise
             last_error = e
             if attempt + 1 >= attempts:
                 break

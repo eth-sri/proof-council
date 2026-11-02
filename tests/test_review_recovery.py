@@ -456,7 +456,8 @@ def test_settled_failed_receipt_is_not_rewritten(configured, monkeypatch):
 
 
 @pytest.mark.parametrize("usage", [False, True])
-def test_finished_native_compute_usage_is_durable_or_estimated(configured, fake_cli, monkeypatch, usage):
+@pytest.mark.parametrize("drain_interrupted", [False, True])
+def test_finished_native_compute_usage_is_durable_or_estimated(configured, fake_cli, monkeypatch, usage, drain_interrupted):
     from proofstack.agents.ac.compute import Compute
     workflow, inp = configured
     inp = inp.model_copy(update={"compute_sandbox_backend": "subprocess", "compute_max_parallel_workers": 0,
@@ -473,6 +474,8 @@ Path('responses/response_round_1.md').write_text('Synthetic computation: 1+1=2')
     if usage:
         script += "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':100,'output_tokens':20}}), flush=True)\n"
     script += "subprocess.run([os.environ['FINISH_BIN'], json.dumps({'status':'done','summary':'Synthetic computation'})], check=True)\n"
+    if drain_interrupted:
+        script += "import time\ntime.sleep(60)\n"
     setup = Compute.setup
     async def synthetic_setup(self, sandbox, inp):
         async def auth_status(cmd, **kwargs):
@@ -484,12 +487,20 @@ Path('responses/response_round_1.md').write_text('Synthetic computation: 1+1=2')
         self.CLI_CMD = [sys.executable, "-c", script]
     monkeypatch.setattr(Compute, "setup", synthetic_setup)
     monkeypatch.setattr(Compute, "POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(Compute, "DONE_DRAIN_GRACE_S", .05 if drain_interrupted else 2)
     monkeypatch.setattr("proofstack.agents.ac.compute._require_codex_cli_version", AsyncMock())
     async def run():
         result = await sub.run_with_nominal_allowance(workflow.compute, 4, lambda:
             workflow._safe_compute(inp=inp, round=1, instructions="Count", answer_tex="",
             research_notes_tex="", references_bib="", compute_workspace=workflow.ctx.root_workdir / "compute"))
         assert result.status == "done" and "1+1=2" in result.response_md, result.model_dump()
+    if not usage and not drain_interrupted:
+        with pytest.raises(sub.SubscriptionBlocked, match="usage is unresolved"):
+            asyncio.run(run())
+        with pytest.raises(sub.SubscriptionBlocked):
+            sub.check_pending_calls(workflow.ctx.root_workdir)
+        assert not list((workflow.ctx.root_workdir / "subscription_usage").glob("interrupted-*.json"))
+        return
     asyncio.run(run())
     sub.check_pending_calls(workflow.ctx.root_workdir)
     if usage:

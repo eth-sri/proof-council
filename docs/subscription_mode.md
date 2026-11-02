@@ -125,8 +125,11 @@ mode overrides API presets' Compute bypass setting.
   salvaged artifacts, uses recorded usage rather than the interruption estimate.
   Any valid finish status counts as delivered. If the harness drains/stops a
   finished worker before its end-of-turn usage arrives, the saved capped estimate
-  applies instead. Council reconciliation errors propagate, and cleanup checks
-  outstanding subscription receipts before admitting another editor.
+  applies instead. A worker that exits naturally before the drain finishes is
+  not classified as interrupted merely because its usage record is missing;
+  that metering failure remains blocked. Council reconciliation errors propagate
+  through the workflow without automatic retry or soft-failure substitution,
+  and cleanup checks outstanding subscription receipts before admitting another editor.
   An unknown stop or terminal call with
   missing usage still blocks. Council and Compute failures that need reconciliation
   propagate instead of being hidden in a textual reply. Compute also leaves a

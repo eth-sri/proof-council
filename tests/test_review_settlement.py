@@ -345,7 +345,8 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
     else:
         assert rows[0]["cost_estimated"] and rows[0]["usage_unavailable"]
         assert rows[0]["estimate_reason"] == ("salvaged_response_text" if salvage else "terminal_response_without_usage")
-        failed_cost = (len("Synthetic") // 3) * 10 / 1_000_000 + (.001 if salvage else 0)
+        failed_cost = (len("Synthetic") // 3) * 10 / 1_000_000 + 128_000 * 50 / 1_000_000
+        assert rows[0]["estimate_output_allowance_tokens"] == 128_000
     assert agent.tracker.counters.usd == pytest.approx(failed_cost + (.0011 if retry else 0))
     assert agent.tracker.counters.tokens == (30 if retry else 23 if salvage else 0)
     assert provider_attempts_settled(rows)

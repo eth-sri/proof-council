@@ -1412,6 +1412,8 @@ class ACWorkflow(Agent):
             )
 
         except (BudgetExhausted, asyncio.TimeoutError, Exception) as e:
+            if getattr(e, "requires_reconciliation", False):
+                raise
             # ``asyncio.CancelledError`` is INTENTIONALLY not caught
             # here: external cancellation (runner shutdown, server stop,
             # parent task cancel) must reach the caller as a real

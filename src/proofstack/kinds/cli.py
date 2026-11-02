@@ -2638,7 +2638,8 @@ class CLIAgent(Agent):
                     getattr(stream, "completion_record_delivered", False)
                     or getattr(stream, "natural_process_exit", False)))
                 if (process_stopped and required_usage_error is not None and stream is not None
-                        and getattr(stream, "completion_record_delivered", False)):
+                        and getattr(stream, "completion_record_delivered", False)
+                        and getattr(stream, "completion_drain_interrupted", False)):
                     # Finish can precede the CLI's end-of-turn usage. A drain
                     # timeout is still a harness interruption for accounting.
                     interrupted = True
@@ -2823,6 +2824,8 @@ class CLIAgent(Agent):
                     and stream.remaining_s > 0
                 ):
                     await asyncio.sleep(self.POLL_INTERVAL_S)
+                stream.natural_process_exit = stream.proc.returncode is not None and stream.proc.returncode >= 0
+                stream.completion_drain_interrupted = stream.proc.returncode is None
                 await stream.terminate()
                 _require_worker_stopped(stream, phase="completion_signal")
                 done = self._read_done(

@@ -880,19 +880,27 @@ transport outage, including for older receipts; this does not resolve the unknow
 charge. Simplification and final approval still require every attempt to settle,
 or an operator reconciliation receipt. HTTP 408, 504 and 524 are uncertain, not
 zero-cost rejections. Empty background rate-limit admission rejections settle at
-zero. Other terminal OpenAI responses with missing usage use a saved text-based
-estimate of the actual request and visible output, not the model's full context
-and output capacity. These are estimates, not provider-reported bills; hidden
-reasoning is not observable. Salvaged output records its estimated token counts.
+zero only when the receipt records that the response was never observed running;
+older ambiguous receipts are not assumed free. Other terminal OpenAI responses
+with missing usage charge estimated actual request text (including replayed tool
+data), plus at least the request's saved output-token allowance. This covers
+unseen reasoning/output without charging for the model's entire input context.
+These are conservative budget estimates, not provider-reported bills. Visible
+salvaged token counts remain separate from the output allowance; reasoning is
+not counted twice. Older text-estimate receipts without a saved output allowance
+retain their original estimate.
 Legacy critic recovery receipts without request estimates retain their previous
 conservative context/output allowance fallback.
 Raw saved final reports are recoverable even if a crash preceded the completed
-critic checkpoint. Settled non-mathematical terminal cleanup errors send the
+critic checkpoint. Recovery can retrieve or cancel an existing OpenAI response ID
+within the remaining run deadline (at most 30 seconds), even with no new-call
+allowance. It never creates a new response, and no-ID uncertainty remains blocking.
+Settled non-mathematical terminal cleanup errors send the
 accepted baseline directly to the final gate, without retrying cleanup. If work
 is unresolved or the gate cannot approve it, the baseline remains pending and any
 separately published partial is preserved. The operator event records the failure
 in either case. Disabling new simplification rounds on resume does not discard
-previously accepted simplifications.
+previously accepted simplifications, including after the research cutoff.
 
 For genuinely unresolved API work, stop all local controllers and descendants
 and independently retrieve or cancel any remote response IDs and reconcile their

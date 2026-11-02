@@ -142,16 +142,20 @@ class ProviderTrace:
             self._latest_request = key
             self.completed_report = None
             self.update(key, provider=client.api, model=payload.get("model", client.model),
-                        reasoning=payload.get("reasoning"), outcome="started")
+                        reasoning=payload.get("reasoning"), outcome="started", ever_in_progress=False)
             # Save pricing while the exact client/model is available. Resume can
             # settle a terminal response without credentials or another request.
             if callable(getattr(client, "_get_cost", None)):
                 from .api_client import _estimate_salvaged_usage
                 inputs, _ = _estimate_salvaged_usage(payload, [])
-                estimate = float(client._get_cost(inputs, 0, 0, 0))
+                output_allowance = payload.get("max_output_tokens", 0)
+                if type(output_allowance) is not int or output_allowance < 0:
+                    output_allowance = 0
+                estimate = float(client._get_cost(inputs, output_allowance, 0, 0))
                 if math.isfinite(estimate) and estimate >= 0:
                     self.update(key, terminal_usage_estimate_usd=estimate,
-                                estimate_input_tokens=inputs, estimate_output_tokens=0,
+                                estimate_input_tokens=inputs, estimate_output_tokens=output_allowance,
+                                estimate_output_allowance_tokens=output_allowance,
                                 terminal_estimate_source="request_text")
 
     def estimate_terminal_usage(self):
@@ -247,9 +251,12 @@ class ProviderTrace:
                 if row.get("terminal_estimate_source") == "request_text":
                     inputs = row["estimate_input_tokens"]
                     _, outputs = _estimate_salvaged_usage({}, response.get("output") or [])
+                    outputs = max(outputs, row.get("estimate_output_allowance_tokens", 0))
                     error = response.get("error") or {}
                     if (response.get("status") == "failed" and not response.get("output")
                             and error.get("code") == "rate_limit_exceeded"
+                            and row.get("ever_in_progress") is False
+                            and row.get("status") != "in_progress"
                             and not any(row.get(name) for name in ("cost", *COUNTS))
                             and not row.get("code_interpreter_calls")):
                         # Admission rejection, not an interrupted inference.
@@ -272,6 +279,9 @@ class ProviderTrace:
                           cost=client._get_cost(inputs, outputs, cached, written),
                           usage_unavailable=bool(response.get("usage_partial", False) or response.get("usage_estimated", False)))
             if response.get("usage_estimated"):
+                with self.lock:
+                    allowance = self.attempts.get(key, {}).get("terminal_usage_estimate_usd", 0)
+                fields["cost"] = max(fields["cost"], allowance)
                 fields.update(cost_estimated=True, estimated_cost_usd=fields["cost"],
                               estimate_reason="salvaged_response_text", reconciliation_pending=False)
             with self.lock:
@@ -281,6 +291,8 @@ class ProviderTrace:
         for name in ("id", "status", "stop_reason"):
             if response.get(name) is not None:
                 fields["response_id" if name == "id" else name] = response[name]
+        if response.get("status") == "in_progress":
+            fields["ever_in_progress"] = True
         candidates = response.get("candidates") or []
         if candidates:
             fields["finish_reason"] = candidates[0].get("finishReason")
