@@ -139,7 +139,7 @@ def test_recovery_keeps_earlier_completed_rejection(tmp_path, pricing_client, mo
 
 
 @pytest.mark.parametrize("outcome", ["completed", "expired", "pending"])
-def test_final_recovery_preserves_live_response_until_saved_deadline(tmp_path, pricing_client, monkeypatch, outcome):
+def test_final_recovery_preserves_live_response_within_read_window(tmp_path, pricing_client, monkeypatch, outcome):
     operations = []
     class SDK:
         def __init__(self, **kwargs):
@@ -161,11 +161,11 @@ def test_final_recovery_preserves_live_response_until_saved_deadline(tmp_path, p
         def create(self, *args, **kwargs):
             pytest.fail("Recovery must not start another model call")
     monkeypatch.setattr("mathagents.api_client.OpenAI", SDK)
-    sleep = asyncio.sleep
+    clock = [100.0]
+    monkeypatch.setattr("proofstack.agents.ac.critic.time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
     async def fast_sleep(seconds):
-        await sleep(0)
-    if outcome == "completed":
-        monkeypatch.setattr("proofstack.agents.ac.critic.asyncio.sleep", fast_sleep)
+        clock[0] += seconds
+    monkeypatch.setattr("proofstack.agents.ac.critic.asyncio.sleep", fast_sleep)
     ctx = RunContext.create(root_workdir=tmp_path, flat=True,
         run_budget=BudgetSpec(max_usd=100, max_wallclock_s=10),
         component_configs={"ACCritic": {"research_notes_transport": "inline"}},
@@ -179,14 +179,15 @@ def test_final_recovery_preserves_live_response_until_saved_deadline(tmp_path, p
     checkpoint.write_text(json.dumps({"status": "recovery_started", "kind": "ordinary",
         "attempt_workdir": "agents/saved", "review_input": inp.model_dump(mode="json")}))
     if outcome != "completed":
-        deadline = time.monotonic() + (-1 if outcome == "expired" else .1)
+        deadline = clock[0] + (-1 if outcome == "expired" else .1)
         with pytest.raises(FinalReviewBlocked, match="unresolved"):
-            asyncio.run(critic.recover_completed(inp, deadline=deadline))
-        assert operations == [("retrieve", "saved")]
+            asyncio.run(critic.recover_completed(inp, deadline=deadline, cutoff=clock[0] + 6))
+        assert operations == [("retrieve", "saved")] * 2
+        assert clock[0] == 106.0
         assert latest_attempts(trace.path)[0]["status"] == "in_progress"
         assert ctx.budgets.root().counters.usd == 0
     else:
-        result = asyncio.run(critic.recover_completed(inp, deadline=time.monotonic() + 2))
+        result = asyncio.run(critic.recover_completed(inp, deadline=clock[0] + 2))
         assert result.answer_ready
         assert operations == [("retrieve", "saved"), ("retrieve", "saved")]
         assert ctx.budgets.root().counters.usd == pytest.approx(.0011)
@@ -328,7 +329,8 @@ def test_dag_budget_fallback_propagates_reconciliation(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("expired_window", [False, True])
-def test_final_recovery_uses_real_sdk_without_cancelling_or_recreating(tmp_path, expired_window):
+@pytest.mark.parametrize("transient_error", [False, True])
+def test_final_recovery_uses_real_sdk_without_cancelling_or_recreating(tmp_path, expired_window, transient_error):
     # Isolate the real SDK from older tests that install module-level stubs.
     script = textwrap.dedent('''
         import asyncio, json, socket, sys, time
@@ -347,9 +349,12 @@ def test_final_recovery_uses_real_sdk_without_cancelling_or_recreating(tmp_path,
         socket.socket.connect = no_network
         operations = []
         expired_window = sys.argv[2] == "True"
+        transient_error = sys.argv[3] == "True"
         def handle(request):
             operations.append((request.method, request.url.path))
             assert request.method == "GET" and request.url.path == "/v1/responses/saved", operations
+            if transient_error and len(operations) == 1:
+                return httpx.Response(503, json={"error":{"message":"Synthetic outage", "type":"server_error"}})
             done = expired_window or len(operations) >= 2
             return httpx.Response(200, json={"id":"saved", "object":"response", "created_at":100,
                 "status":"completed" if done else "in_progress", "model":"synthetic",
@@ -383,9 +388,9 @@ def test_final_recovery_uses_real_sdk_without_cancelling_or_recreating(tmp_path,
                 result = asyncio.run(critic.recover_completed(inp,
                     deadline=time.monotonic()+(-3600 if expired_window else 5), cutoff=time.monotonic()+5))
                 assert result.answer_ready
-        assert operations == [("GET", "/v1/responses/saved")] * (1 if expired_window else 2), operations
+        assert operations == [("GET", "/v1/responses/saved")] * (1 if expired_window and not transient_error else 2), operations
         assert abs(ctx.budgets.root().counters.usd - .0011) < 1e-10
     ''')
-    result = subprocess.run([sys.executable, "-c", script, str(tmp_path), str(expired_window)], text=True, capture_output=True,
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path), str(expired_window), str(transient_error)], text=True, capture_output=True,
                             cwd=Path(__file__).resolve().parents[1], timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr

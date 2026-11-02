@@ -35,7 +35,7 @@ class FinalStatelessCritic(ACCritic):
         return root / path.name
 
     async def recover_completed(self, inp, *, deadline=None, cutoff=None):
-        """Recover paid work; deadline limits waiting, cutoff also limits retrieval."""
+        """Recover within the saved review/retrieval windows, never past cutoff."""
         if self.ctx.execution_backend == "subscription":
             from proofstack.subscription import recover_model_role
             raw = recover_model_role(self, inp)

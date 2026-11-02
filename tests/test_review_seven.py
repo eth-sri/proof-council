@@ -158,7 +158,7 @@ def test_recovery_polls_later_rejection_before_waiting_on_abandoned_attempt(
     with pytest.raises(FinalReviewBlocked, match="unresolved"):
         asyncio.run(critic.recover_completed(inp, deadline=clock[0] + 12, cutoff=clock[0] + 30))
     assert calls[:2] == ["saved-0", "saved-1"]
-    assert calls.count("saved-1") == 1 and calls.count("saved-0") == 3
+    assert calls.count("saved-1") == 1 and calls.count("saved-0") == 6
     assert [r["status"] for r in latest_attempts(path)] == ["in_progress", "completed"]
     assert ctx.budgets.root().counters.usd == pytest.approx(.0011)
     assert any("false" in json.loads(p.read_text())["report"] for p in path.parent.glob("provider-completed-*.json"))
@@ -185,19 +185,26 @@ def test_slow_first_retrieval_leaves_time_for_later_attempt(tmp_path, monkeypatc
         component_configs={"ACCritic": {"research_notes_transport": "inline"}})
     inp = FinalStatelessCritic.Inputs(problem="Synthetic", answer_tex="Synthetic proof", mode="fresh")
     critic, path = saved_review(ctx, pricing_client, inp, attempts=2)
+    clock = [100.0]
+    monkeypatch.setattr("proofstack.agents.ac.critic.time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    async def advance(seconds):
+        clock[0] += seconds
+    async def inline(func, *args, **kwargs):
+        return func(*args, **kwargs)
+    monkeypatch.setattr("proofstack.agents.ac.critic.asyncio.sleep", advance)
+    monkeypatch.setattr("proofstack.agents.ac.critic.asyncio.to_thread", inline)
     calls = []
     def retrieve(response_id, *, timeout, on_response, cancel_pending):
-        assert not cancel_pending
-        calls.append(response_id)
+        calls.append((response_id, timeout, cancel_pending))
         if response_id == "saved-0":
-            assert timeout <= .5
-            time.sleep(timeout + .02)
+            clock[0] += timeout
         else:
             on_response(completed(response_id, accepted=False))
     monkeypatch.setattr(pricing_client, "reconcile_background_response", retrieve)
     with pytest.raises(FinalReviewBlocked, match="unresolved"):
-        asyncio.run(critic.recover_completed(inp, deadline=time.monotonic() - 1, cutoff=time.monotonic() + 1))
-    assert calls == ["saved-0", "saved-1"]
+        asyncio.run(critic.recover_completed(inp, deadline=clock[0] - 1, cutoff=clock[0] + 1))
+    assert calls == [("saved-0", .5, False), ("saved-1", .5, False)]
+    assert clock[0] == 101.0
     assert latest_attempts(path)[1]["status"] == "completed"
     assert ctx.budgets.root().counters.usd == pytest.approx(.0011)
 

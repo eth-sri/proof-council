@@ -99,6 +99,18 @@ uv run python scripts/run_workflow.py \
 
 Workflow presets are in `configs/workflows/`. Pass either a preset name such as `author_critic` or a YAML path such as `configs/workflows/author_critic.yaml`.
 
+### Upgrading Existing Runs
+
+After the Third Batch workflow update (PR #14), an older in-flight API run can
+stop on resume with `Fresh critic recovery has unresolved provider work` (or
+`Saved critic has unresolved provider work`). Older provider receipts may lack
+the pricing/timing evidence now required to settle missing usage. This can affect
+ordinary critic runs even with all new optional modes disabled; it does not by
+itself mean the proof was rejected. Prefer finishing active runs on their original
+revision. If migration is necessary, preserve the run artifacts and follow the
+[API reconciliation procedure](docs/firstproof_batch3_workflow.md#migrating-in-flight-api-runs)
+before resuming. Do not delete receipts or reset the spending ledger.
+
 ### Research Model Defaults
 
 The Author/Critic research presets and prescreen use

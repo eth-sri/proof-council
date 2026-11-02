@@ -905,11 +905,13 @@ Old receipts lacking timing/pricing cannot be newly settled automatically; an
 already charged estimate is retained without an automatic refund.
 Raw saved final reports are recoverable even if a crash preceded the completed
 critic checkpoint. While the run's export cutoff and tracker permit, final-review
-recovery makes one retrieval pass over saved OpenAI response IDs, bounded to 30
-seconds in total, even after the saved review window expires or with no new-call
-allowance. Further polling is allowed only until the earlier of the saved review
-deadline and the export cutoff. Each pass polls every pending attempt once,
-sharing its remaining time so one abandoned attempt cannot starve later verdicts.
+recovery has a 30-second retrieval/retry window for saved OpenAI response IDs,
+even after the saved review window expires or with no new-call allowance. This
+window is shared across all attempts and retries, not restarted after a failed
+GET. A later saved review deadline permits further polling, but neither window
+can extend the tracker or the run's export cutoff. Each pass polls every pending
+attempt once, sharing its remaining time so one abandoned attempt cannot starve
+later verdicts.
 It neither cancels a live review nor creates a new response. Unresolved work still
 blocks acceptance, including when another attempt has returned a verdict, and
 no-ID uncertainty remains blocking. No retrieval starts after the export cutoff.
@@ -920,9 +922,23 @@ separately published partial is preserved. The operator event records the failur
 in either case. Disabling new simplification rounds on resume does not discard
 previously accepted simplifications, including after the research cutoff.
 
-For genuinely unresolved API work, stop all local controllers and descendants
-and independently retrieve or cancel any remote response IDs and reconcile their
-charges. Then record the result without editing workflow checkpoints:
+### Migrating In-Flight API Runs
+
+The Third Batch workflow update (PR #14) no longer applies a full-context charge
+for usage-less terminal rows that lack saved pricing/timing evidence. An older
+run resumed across the upgrade can therefore stop with
+`Fresh critic recovery has unresolved provider work` or
+`Saved critic has unresolved provider work`, including in ordinary API mode
+with simplification and the final gate disabled. This is an accounting hold, not
+a mathematical rejection. Fresh runs do not need this migration step, and known
+usage or previously recorded charges are not refunded.
+
+Prefer completing active runs on their original revision. Before migrating,
+preserve their artifacts, checkpoints and spending ledger; do not delete or
+hand-edit receipts to bypass the hold. For genuinely unresolved API work, stop
+all local controllers and descendants and independently retrieve or cancel any
+remote response IDs and reconcile their charges. Then record the result without
+editing workflow checkpoints:
 
 ```bash
 uv run python scripts/reconcile_api_call.py /path/to/run /path/to/run/agents/CALL \

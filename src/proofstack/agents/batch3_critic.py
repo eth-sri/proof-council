@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from typing import Literal
 
 from mathagents.api_client import _is_context_length_error
@@ -41,7 +42,9 @@ class Batch3CleanupCritic(ACCritic):
         # rejections even if subsequent accounting or logging is interrupted.
         self.completed_review = self.parse_output(raw_text, inp)
         from proofstack.atomic import write_text_atomic
-        write_text_atomic(self.workdir / "completed_review.json", self.completed_review.model_dump_json())
+        # This supplementary checkpoint must not prevent metering the paid call.
+        with suppress(OSError):
+            write_text_atomic(self.workdir / "completed_review.json", self.completed_review.model_dump_json())
 
     @staticmethod
     def _reviews(inp):

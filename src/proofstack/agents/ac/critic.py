@@ -1116,9 +1116,9 @@ class ACCritic(APICallAgent):
         cutoff = now + max(0.0, remaining if remaining is not None else 30.0)
         if recovery_cutoff is not None:
             cutoff = min(cutoff, recovery_cutoff)
-        # Retrieving a paid result is still allowed after its inference window,
-        # but never after the run's export cutoff. Only waiting uses that window.
-        deadline = min(cutoff, now + 30.0)
+        # Keep a bounded retrieval/retry window even after inference expires;
+        # a transient GET failure must not strand an already-paid verdict.
+        first_pass_deadline = deadline = min(cutoff, now + 30.0)
         touched = False
         try:
             pending = []
@@ -1188,7 +1188,7 @@ class ACCritic(APICallAgent):
                 if not recover_only or recovery_deadline is None:
                     break
                 pending = [(trace, key) for trace, key in pending if trace.attempts[key].get("status") not in terminal]
-                deadline = min(cutoff, recovery_deadline)
+                deadline = min(cutoff, max(first_pass_deadline, recovery_deadline))
                 left = deadline - time.monotonic()
                 if not pending or left <= 0:
                     break
