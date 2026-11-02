@@ -284,14 +284,18 @@ def test_google_html_error_preserves_http_status(tmp_path, monkeypatch, status):
 ])
 def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error_code, retry, failures, salvage):
     from mathagents import api_client as api
-    monkeypatch.setattr("mathagents.provider_trace.time.time", lambda: 100.0)
+    clock = [100.0]
+    monkeypatch.setattr("mathagents.provider_trace.time.time", lambda: clock[0])
     monkeypatch.setenv("OPENAI_API_KEY", "test")
-    monkeypatch.setattr(APIClient, "_sleep", lambda *args: None)
-    monkeypatch.setattr(api.time, "sleep", lambda *args: None)
+    def advance(seconds):
+        clock[0] += seconds
+    monkeypatch.setattr(APIClient, "_sleep", lambda self, seconds: advance(seconds))
+    monkeypatch.setattr(api.time, "sleep", advance)
     monkeypatch.setattr(api.request_logger, "log_request", lambda **kw: None)
     monkeypatch.setattr(api.request_logger, "log_response", lambda **kw: None)
     client = APIClient(api="openai", model="gpt-6-astra", use_openai_responses_api=True,
                        background=True, max_retries_inner=failures if retry else 0, max_tokens=128000,
+                       max_wallclock_per_call_s=24 * 3600,
                        read_cost=10, write_cost=50, long_context_threshold_tokens=272000,
                        long_context_input_multiplier=2, long_context_output_multiplier=1.5)
     monkeypatch.setattr(client, "_is_background_server_kill", lambda code, elapsed: code == "server_error")
@@ -345,8 +349,9 @@ def test_terminal_background_failure_is_priced_once(tmp_path, monkeypatch, error
     assert rows[0]["cost_estimated"] and rows[0]["usage_unavailable"]
     assert not any(row.get("admission_rejected") for row in rows)
     assert rows[0]["estimate_reason"] == ("salvaged_response_text" if salvage else "terminal_response_without_usage")
-    failed_cost = failures * ((len(question) // 3) * 10 + (20 if salvage else 0) * 50) / 1_000_000
-    assert rows[0]["estimate_output_tokens"] == (20 if salvage else 0)
+    failed_cost = failures * ((len(question) // 3) * 10 + 3000 * 50) / 1_000_000
+    assert all(row["estimate_elapsed_s"] == 60 for row in rows[:failures])
+    assert rows[0]["estimate_output_tokens"] == 3000
     assert agent.tracker.counters.usd == pytest.approx(failed_cost + (.0011 if retry else 0))
     assert agent.tracker.counters.tokens == (30 if retry else 23 if salvage else 0)
     assert provider_attempts_settled(rows)

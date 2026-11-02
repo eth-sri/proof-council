@@ -899,7 +899,7 @@ class ACCritic(APICallAgent):
         canonical = path(identity_input)
         return legacy if legacy.exists() and not canonical.exists() else canonical
 
-    async def run(self, inp, *, recover_only=False, recovery_deadline=None):
+    async def run(self, inp, *, recover_only=False, recovery_deadline=None, recovery_cutoff=None):
         self._notes_verification_policy()
         checkpoint = self._recovery_checkpoint(inp)
 
@@ -950,7 +950,8 @@ class ACCritic(APICallAgent):
                     # Final-review recovery must not discard a live paid review.
                     await self._reconcile_recovery(trace_path, rows, require_tool_evidence=(
                         self._notes_transport() == "file" and bool(review_input.research_notes_tex)),
-                        recover_only=recover_only, recovery_deadline=recovery_deadline)
+                        recover_only=recover_only, recovery_deadline=recovery_deadline,
+                        recovery_cutoff=recovery_cutoff)
                 if recover_only or operator_settled:
                     if not await reconcile_provider_call(self.ctx, self.tracker, folder):
                         raise RuntimeError("Saved critic has unresolved provider work; reconcile before retrying")
@@ -1108,17 +1109,19 @@ class ACCritic(APICallAgent):
         return provider_attempt_terminal(row)
 
     async def _reconcile_recovery(self, trace_path, rows, *, require_tool_evidence=False,
-                                  recover_only=False, recovery_deadline=None):
+                                  recover_only=False, recovery_deadline=None, recovery_cutoff=None):
         terminal = {"failed", "cancelled", "incomplete", "completed"}
         remaining = self.tracker.remaining_wallclock_s()
         now = time.monotonic()
-        deadline = now + max(0.0, remaining if remaining is not None else 30.0)
-        if recover_only and recovery_deadline is not None:
-            deadline = min(deadline, recovery_deadline)
-        else:
-            deadline = min(deadline, now + 30.0)
+        cutoff = now + max(0.0, remaining if remaining is not None else 30.0)
+        if recovery_cutoff is not None:
+            cutoff = min(cutoff, recovery_cutoff)
+        # Retrieving a paid result is still allowed after its inference window,
+        # but never after the run's export cutoff. Only waiting uses that window.
+        deadline = min(cutoff, now + 30.0)
         touched = False
         try:
+            pending = []
             for invocation in dict.fromkeys(r["invocation_id"] for r in rows):
                 trace = ProviderTrace.restore(trace_path, invocation)
                 trace.estimate_terminal_usage()
@@ -1134,53 +1137,62 @@ class ACCritic(APICallAgent):
                             and not row.get("reconciliation_pending") and not missing_evidence
                             and (not row.get("usage_unavailable", False) or row.get("cost_estimated", False))):
                         continue
+                    pending.append((trace, key))
+            while pending:
+                for index, (trace, key) in enumerate(pending):
+                    row = trace.attempts[key]
                     left = deadline - time.monotonic()
                     if left <= 0:
                         return
+                    # One slow/abandoned attempt must not consume the pass
+                    # before later attempts get a chance to return their verdicts.
+                    row_deadline = (min(deadline, time.monotonic() + min(15.0, left / (len(pending) - index)))
+                                    if recover_only else deadline)
                     try:
                         if getattr(self._client, "terminated", False):
                             self._client = None
-                        client = await asyncio.wait_for(self._get_client(), timeout=left)
+                        client = await asyncio.wait_for(self._get_client(), timeout=row_deadline - time.monotonic())
                         attachment_path = trace_path.parent / "research-notes-attachment.json"
                         if not touched and attachment_path.exists():
                             touched = True
                             attachment = json.loads(attachment_path.read_text(encoding="utf-8"))
-                            left = deadline - time.monotonic()
+                            left = row_deadline - time.monotonic()
                             if attachment.get("container_mode") == "explicit" and attachment.get("container_id") and left > 0:
                                 try:
                                     await self._touch_notes_container(client, attachment["container_id"],
-                                                                     deadline=deadline, timeout=5.0)
+                                                                     deadline=row_deadline, timeout=5.0)
                                 except Exception as exc:
                                     await self.events.emit("ac.critic.notes.keepalive", {
                                         "container_id": attachment["container_id"], "error_type": type(exc).__name__,
                                     })
-                        left = deadline - time.monotonic()
+                        left = row_deadline - time.monotonic()
                         if left <= 0:
-                            return
+                            continue
                         def record(data, trace=trace, key=key, client=client):
                             trace.response(client, *key, data)
                             trace.update(key, reconciliation_pending=data.get("status") not in terminal)
-                        while left > 0:
-                            kwargs = {"cancel_pending": False} if recover_only else {}
-                            def reconcile(client=client, response_id=row["response_id"], record=record, kwargs=kwargs):
-                                # Executor queue time consumes the saved deadline too.
-                                remaining = deadline - time.monotonic()
-                                if remaining > 0:
-                                    client.reconcile_background_response(response_id,
-                                        timeout=min(15.0, remaining), on_response=record, **kwargs)
-                            await asyncio.wait_for(asyncio.to_thread(reconcile), timeout=left)
-                            trace.estimate_terminal_usage()
-                            if (not recover_only or recovery_deadline is None
-                                    or trace.attempts[key].get("status") in terminal):
-                                break
-                            left = deadline - time.monotonic()
-                            if left > 0:
-                                await asyncio.sleep(min(5.0, left))
-                            left = deadline - time.monotonic()
+                        kwargs = {"cancel_pending": False} if recover_only else {}
+                        def reconcile(client=client, response_id=row["response_id"], record=record,
+                                      kwargs=kwargs, row_deadline=row_deadline):
+                            # Executor queue time consumes this row's share too.
+                            remaining = row_deadline - time.monotonic()
+                            if remaining > 0:
+                                client.reconcile_background_response(response_id,
+                                    timeout=min(15.0, remaining), on_response=record, **kwargs)
+                        await asyncio.wait_for(asyncio.to_thread(reconcile), timeout=left)
+                        trace.estimate_terminal_usage()
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         await self.events.emit("ac.critic.reconciliation_failed", {"error_type": type(exc).__name__})
+                if not recover_only or recovery_deadline is None:
+                    break
+                pending = [(trace, key) for trace, key in pending if trace.attempts[key].get("status") not in terminal]
+                deadline = min(cutoff, recovery_deadline)
+                left = deadline - time.monotonic()
+                if not pending or left <= 0:
+                    break
+                await asyncio.sleep(min(5.0, left))
         finally:
             # Only settle these critic calls. Run-wide rehydration belongs to
             # outer resume; siblings may still be accruing and charging usage.

@@ -891,10 +891,12 @@ with saved pricing/timing data charge estimated request text (including replayed
 tool data), plus the larger of visible output and
 `min(max_output_tokens, ceil(elapsed_seconds * 50))` output tokens. Elapsed time
 runs from the saved request start to the first terminal observation, including
-queue time and polling gaps; it is frozen across subsequent recovery. Explicit
-context-length or file rejections without execution/output evidence add no unseen
-output allowance. Salvaged replies use the same estimate, never less than their
-visible usage or any previously recorded charge. Reasoning is included in output,
+queue time and polling gaps; it is frozen across subsequent recovery, with negative
+elapsed time from a backward clock step clamped to zero. Explicit context-length,
+file or attachment-count rejections without execution/output evidence add neither
+an input charge nor an unseen output allowance. Salvaged replies use the same
+estimate, never less than their visible usage or any previously recorded charge.
+Reasoning is included in output,
 not added again. The 50 tokens/second rate is a documented planning heuristic,
 not measured throughput, an actual provider bill, or a guaranteed upper bound.
 The receipt exposes its rate, elapsed time, estimated tokens and dollars, and
@@ -902,11 +904,15 @@ keeps `usage_unavailable=true`. Estimates do not become reported token usage.
 Old receipts lacking timing/pricing cannot be newly settled automatically; an
 already charged estimate is retained without an automatic refund.
 Raw saved final reports are recoverable even if a crash preceded the completed
-critic checkpoint. Final-review recovery polls an existing OpenAI response ID
-until the earlier of the saved final-review deadline and the run's export cutoff,
-even with no new-call allowance. It does not cancel a live review to buy a new one.
-If that deadline has already passed, no remote retrieval starts and unresolved
-work stays blocked. It never creates a new response, and no-ID uncertainty remains blocking.
+critic checkpoint. While the run's export cutoff and tracker permit, final-review
+recovery makes one retrieval pass over saved OpenAI response IDs, bounded to 30
+seconds in total, even after the saved review window expires or with no new-call
+allowance. Further polling is allowed only until the earlier of the saved review
+deadline and the export cutoff. Each pass polls every pending attempt once,
+sharing its remaining time so one abandoned attempt cannot starve later verdicts.
+It neither cancels a live review nor creates a new response. Unresolved work still
+blocks acceptance, including when another attempt has returned a verdict, and
+no-ID uncertainty remains blocking. No retrieval starts after the export cutoff.
 Settled non-mathematical terminal cleanup errors send the
 accepted baseline directly to the final gate, without retrying cleanup. If work
 is unresolved or the gate cannot approve it, the baseline remains pending and any

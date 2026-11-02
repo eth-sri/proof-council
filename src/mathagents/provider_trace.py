@@ -18,16 +18,16 @@ active_attempt: ContextVar[tuple | None] = ContextVar("provider_attempt", defaul
 COUNTS = ("input_tokens", "output_tokens", "cached_input_tokens", "cached_write_tokens", "reasoning_tokens")
 # A planning heuristic, not measured throughput or a guaranteed billing bound.
 ESTIMATED_OUTPUT_TOKENS_PER_SECOND = 50
-PRE_INFERENCE_REJECTIONS = {"context_length_exceeded", "invalid_file", "file_not_found"}
+PRE_INFERENCE_REJECTIONS = {"context_length_exceeded", "invalid_file", "file_not_found", "array_above_max_length"}
 
 
 def _terminal_estimate(row):
     start, end = row.get("request_started_at"), row.get("terminal_observed_at")
     input_cost, output_rate = row.get("estimate_input_usd"), row.get("estimate_output_usd_per_token")
     if not all(type(x) in (int, float) and math.isfinite(x) and x >= 0
-               for x in (start, end, input_cost, output_rate)) or end < start:
+               for x in (start, end, input_cost, output_rate)):
         return {}
-    elapsed = end - start
+    elapsed = max(0.0, end - start)
     visible = row.get("estimate_visible_output_tokens", 0)
     allowance = row.get("estimate_output_allowance_tokens", 0)
     if any(type(x) is not int or x < 0 for x in (visible, allowance)):
@@ -37,7 +37,7 @@ def _terminal_estimate(row):
                              * ESTIMATED_OUTPUT_TOKENS_PER_SECOND))
     # Visible reasoning is already output: do not add it a second time.
     outputs = max(visible, unseen)
-    cost = input_cost + outputs * output_rate
+    cost = (0 if row.get("pre_inference_rejection") else input_cost) + outputs * output_rate
     if not math.isfinite(cost):
         return {}
     return {"terminal_usage_estimate_usd": cost,

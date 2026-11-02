@@ -34,14 +34,14 @@ class FinalStatelessCritic(ACCritic):
             root = root / f"verdict-retry-{attempt}"
         return root / path.name
 
-    async def recover_completed(self, inp, *, deadline=None):
-        """Recover an already-paid verdict before checking new-call allowances."""
+    async def recover_completed(self, inp, *, deadline=None, cutoff=None):
+        """Recover paid work; deadline limits waiting, cutoff also limits retrieval."""
         if self.ctx.execution_backend == "subscription":
             from proofstack.subscription import recover_model_role
             raw = recover_model_role(self, inp)
             return self.parse_output(raw["text"], inp) if raw is not None else None
         try:
-            return await super().run(inp, recover_only=True, recovery_deadline=deadline)
+            return await super().run(inp, recover_only=True, recovery_deadline=deadline, recovery_cutoff=cutoff)
         except RuntimeError as exc:
             raise FinalReviewBlocked(str(exc)) from exc
 

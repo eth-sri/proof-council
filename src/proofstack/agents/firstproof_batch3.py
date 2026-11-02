@@ -393,7 +393,8 @@ class FirstProofBatch3Workflow(Agent):
         if state.status == "pending":
             critic = FinalStatelessCritic(self.ctx, name="final_stateless_critic")
             critic.verdict_attempt = state.attempt
-            recovered = await critic.recover_completed(state.review_input, deadline=phase_end)
+            recovered = await critic.recover_completed(state.review_input, deadline=phase_end,
+                                                       cutoff=deadline - inp.final_review_export_seconds)
             if recovered is not None:
                 state.status, state.review = "completed", recovered
                 _save_json(path, state.model_dump(mode="json"))
@@ -423,7 +424,8 @@ class FirstProofBatch3Workflow(Agent):
                         or not isinstance(completed, ACCritic.Outputs)):
                     raise
                 review = completed
-            recovered = await critic.recover_completed(state.review_input, deadline=phase_end)
+            recovered = await critic.recover_completed(state.review_input, deadline=phase_end,
+                                                       cutoff=deadline - inp.final_review_export_seconds)
             if recovered is not None:
                 review = recovered
             # Save before event logging/publication. The regular critic owns
@@ -1578,6 +1580,8 @@ class FirstProofBatch3Workflow(Agent):
         except SubscriptionParked:
             raise
         except Exception as exc:
+            if not self._requires_final_review(inp):
+                raise
             error = f"Retained manuscript recovery: {type(exc).__name__}: {exc}"
             out.cleanup_errors.append(error)
             if self._accepted_baseline is not None and self._requires_final_review(inp):
