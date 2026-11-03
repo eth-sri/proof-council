@@ -147,6 +147,8 @@ def test_resume_reconciles_all_attempts_before_report_or_retry(tmp_path, monkeyp
             raise ValueError("context_length_exceeded")
         if len(calls) == 2:
             rows = [{"attempt_id": "fresh:old:0", "invocation_id": "fresh", "call_id": "paid-call",
+                     "provider": "openai", "request_started_at": 1, "estimate_input_usd": 1.5,
+                     "estimate_output_usd_per_token": 0, "estimate_output_allowance_tokens": 100,
                      "response_id": "saved-response", "status": "in_progress", "outcome": "error",
                      "reconciliation_pending": True, "usage_unavailable": True, "cost": .2}]
             if saved_report:
@@ -184,8 +186,8 @@ def test_resume_reconciles_all_attempts_before_report_or_retry(tmp_path, monkeyp
         assert rows[0]["usage_unavailable"] == missing_usage
         assert rows[0].get("cost_estimated", False) == missing_usage
         if missing_usage:
-            assert rows[0]["estimate_input_tokens"] == 1_050_000
-            assert rows[0]["estimate_output_tokens"] == 128_000
+            assert rows[0]["terminal_estimate_source"] == "request_elapsed_v1"
+            assert rows[0]["estimate_output_tokens"] == 100
     assert reconciled == ["saved-response"]
 
 
@@ -231,6 +233,7 @@ def test_terminal_missing_usage_estimate_can_exhaust_budget_before_retry(tmp_pat
                             component_configs={"ACCritic": {"research_notes_transport": "inline"}})
     critic, inp = ACCritic(ctx), packet()
     trace = ProviderTrace(tmp_path / "agents/critic/provider-attempts.jsonl", call_id="saved-call")
+    trace.request(SimpleNamespace(api="openai", model="synthetic", _get_cost=lambda *args: 3), "request", 0, {})
     trace.update(("request", 0), response_id="saved", status="cancelled", usage_unavailable=True)
     checkpoint = critic._recovery_checkpoint(inp)
     checkpoint.parent.mkdir()

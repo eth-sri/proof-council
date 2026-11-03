@@ -701,6 +701,8 @@ class Author(APICallAgent):
     # ---- container-files run path ---------------------------------------
 
     async def run(self, inp: Inputs) -> Outputs:  # type: ignore[override]
+        if self.ctx.execution_backend == "subscription":
+            raise RuntimeError("Subscription Author must be invoked through the routed Agent call")
         if not self.USE_CONTAINER_FILES:
             return await super().run(inp)
         return await self._run_with_container_files(inp)

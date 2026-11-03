@@ -126,7 +126,7 @@ def harness(tmp_path, monkeypatch, request):
             trace.update(("synthetic", 0), response_id=f"response-{len(calls)}", status="completed", outcome="response",
                          cost=0.25, usage_unavailable=False, code_interpreter_calls=evidence)
             trace._retain_completed_report({"id": f"response-{len(calls)}", "status": "completed",
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": control.reply}]}]})
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": control.reply}]}]}, ("synthetic", 0))
         yield (0, messages[0] + [{"role": "assistant", "content": control.reply}],
                {"cost": 0.25, "input_tokens": 100, "output_tokens": 20})
 

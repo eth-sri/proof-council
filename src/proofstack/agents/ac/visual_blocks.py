@@ -243,6 +243,14 @@ class _ACVisualStep(ACWorkflow):
             return None
         return Compute.Outputs.model_validate(raw)
 
+    async def _review_branch(self, state, agent, call):
+        from proofstack.subscription import call_allowance, run_with_nominal_allowance
+        share = None
+        if self.ctx.execution_backend == "subscription":
+            roles = 1 + bool(state.get("run_council")) + bool(state.get("run_compute"))
+            share = state.get("review_nominal_allowance", call_allowance(self.tracker)) / roles
+        return await run_with_nominal_allowance(agent, share, call)
+
     def _save_visual_resume(
         self,
         state: dict[str, Any],
@@ -417,6 +425,9 @@ class ACAuthorBlock(_ACVisualStep):
                 "ready_for_gate": False,
             }
         )
+        if self.ctx.execution_backend == "subscription":
+            from proofstack.subscription import call_allowance
+            state["review_nominal_allowance"] = call_allowance(self.tracker)
         return self.Outputs(
             state=state,
             answer_tex=author.answer_tex,
@@ -449,7 +460,7 @@ class ACStatefulCriticBlock(_ACVisualStep):
             return self.Outputs(state=state)
         ac_inp = self._inp(state)
         k = int(state.get("current_round", 0) or 0)
-        review = await self.critic(
+        review = await self._review_branch(state, self.critic, lambda: self.critic(
             **self._critic_inputs(
                 inp=ac_inp,
                 workspace=self._workspace(state),
@@ -459,7 +470,7 @@ class ACStatefulCriticBlock(_ACVisualStep):
                 round=k,
                 omit_author_thinking=False,
             )
-        )
+        ))
         dumped = review.model_dump(mode="json")
         state["stateful_review"] = dumped
         state["round_review"] = dumped
@@ -489,7 +500,7 @@ class ACFreshCriticBlock(_ACVisualStep):
         k = int(state.get("current_round", 0) or 0)
         review: ACCritic.Outputs | None = None
         if state.get("critic_mode") == "fresh":
-            review = await self.critic(
+            review = await self._review_branch(state, self.critic, lambda: self.critic(
                 **self._critic_inputs(
                     inp=ac_inp,
                     workspace=self._workspace(state),
@@ -499,7 +510,7 @@ class ACFreshCriticBlock(_ACVisualStep):
                     round=k,
                     omit_author_thinking=bool(state.get("omit_author_thinking", False)),
                 )
-            )
+            ))
             dumped = review.model_dump(mode="json")
             state["fresh_review"] = dumped
             state["round_review"] = dumped
@@ -514,7 +525,7 @@ class ACFreshCriticBlock(_ACVisualStep):
                 and not bool(state.get("terminal_auxiliary_blocked"))
             )
             if should_force:
-                review = await self.critic(
+                review = await self._review_branch(state, self.critic, lambda: self.critic(
                     **self._critic_inputs(
                         inp=ac_inp,
                         workspace=self._workspace(state),
@@ -524,7 +535,7 @@ class ACFreshCriticBlock(_ACVisualStep):
                         omit_author_thinking=True,
                         round=k,
                     )
-                )
+                ))
                 await self.events.emit(
                     "ac.forced_fresh_review",
                     {
@@ -561,14 +572,14 @@ class ACCouncilBlock(_ACVisualStep):
         if not state.get("run_council") or author is None:
             return self.Outputs(state=state)
         ac_inp = self._inp(state)
-        replies = await self._safe_council(
+        replies = await self._review_branch(state, self.council, lambda: self._safe_council(
             round=int(state.get("current_round", 0) or 0),
             author_question=author.council_question or "",
             answer_tex=author.answer_tex,
             research_notes_tex=author.research_notes_tex,
             references_bib=author.references_bib,
             member_models=author.council_to or list(ac_inp.council_models),
-        )
+        ))
         state["council_replies"] = [reply.model_dump(mode="json") for reply in (replies.replies if replies else [])]
         text = render_council_replies_for_author(replies.replies) if replies and replies.replies else ""
         return self.Outputs(state=state, feedback=text)
@@ -598,7 +609,7 @@ class ACComputeBlock(_ACVisualStep):
         workspace = self._workspace(state)
         compute_workspace = workspace / "compute"
         compute_workspace.mkdir(parents=True, exist_ok=True)
-        out = await self._safe_compute(
+        out = await self._review_branch(state, self.compute, lambda: self._safe_compute(
             inp=ac_inp,
             round=int(state.get("current_round", 0) or 0),
             instructions=author.compute_instructions or "",
@@ -606,7 +617,7 @@ class ACComputeBlock(_ACVisualStep):
             research_notes_tex=author.research_notes_tex,
             references_bib=author.references_bib,
             compute_workspace=compute_workspace,
-        )
+        ))
         if out is not None:
             state["compute_out"] = out.model_dump(mode="json")
         return self.Outputs(
@@ -917,6 +928,8 @@ class ACReturnBlock(ACWorkflow):
                 await self.events.emit("ac.final_critic_skipped", {"reason": "budget_exhausted", "scope": e.scope})
                 final_critic_mode_run = "skipped_budget_exhausted"
             except Exception as e:
+                if getattr(e, "requires_reconciliation", False):
+                    raise
                 await self.events.emit("ac.final_critic_failed", {"type": type(e).__name__, "msg": str(e)})
                 final_critic_mode_run = "failed"
 

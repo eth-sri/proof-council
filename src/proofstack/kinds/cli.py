@@ -1547,6 +1547,8 @@ class CLIAgent(Agent):
     # --- framework-managed -----------------------------------------------------
 
     async def run(self, inp: BaseModel) -> BaseModel:  # type: ignore[override]
+        self._subscription_spawn_attempted = False
+        self._subscription_worker_workdir = self.workdir
         if not self.CLI_CMD:
             raise RuntimeError(f"{type(self).__name__}.CLI_CMD is empty")
 
@@ -1604,10 +1606,6 @@ class CLIAgent(Agent):
 
         self._cancel_workspace_recovery()
 
-        await self._emit_budget_warnings(self.tracker.check())
-        self.tracker.add_tool_call()
-        await self._emit_budget_warnings(self.tracker.check())
-
         # Track the streaming process so the finally block can terminate
         # it unconditionally on cancellation. Without this, if the
         # surrounding task is cancelled while ``_wait_for_done`` is
@@ -1618,6 +1616,8 @@ class CLIAgent(Agent):
         # finally knows whether it still owes a partial-usage metering (see the
         # cancellation note in the finally block).
         usage_recorded = False
+        initial_planning_spend = self.tracker.planning_usd
+        done = None
         # The retained metering task once the run produced a done record. The
         # finally awaits THIS task rather than re-running metering, so a cancel
         # landing mid-metering neither loses it nor double-counts it (A7).
@@ -1662,6 +1662,9 @@ class CLIAgent(Agent):
             )
 
         try:
+            await self._emit_budget_warnings(self.tracker.check())
+            self.tracker.add_tool_call()
+            await self._emit_budget_warnings(self.tracker.check())
             if root is not None:
                 root.mkdir(parents=True, exist_ok=True)
                 inherited_fds = (
@@ -2049,6 +2052,7 @@ class CLIAgent(Agent):
                 workspace_guard_phase = _WORKSPACE_GUARD_LAUNCH_PENDING
             worker_stop_phase = "spawn"
             stream_spawn_attempted = True
+            self._subscription_spawn_attempted = True
             try:
                 admission_kwargs = {}
                 if self.SANDBOX.memory_policy is not None:
@@ -2067,6 +2071,7 @@ class CLIAgent(Agent):
                 # workspace as idle so a missing executable cannot manufacture a
                 # stale guard and quarantine useful state on the next invocation.
                 stream_spawn_attempted = False
+                self._subscription_spawn_attempted = False
                 raise
             worker_stop_phase = "finalize"
             if workspace_active_guard is not None:
@@ -2246,7 +2251,10 @@ class CLIAgent(Agent):
                     {"type": type(e).__name__},
                     call_id=spawn_call_id,
                 )
-                if self.cli_usage_must_succeed():
+                if self.cli_usage_must_succeed() and not (
+                        self.ctx.execution_backend == "subscription"
+                        and self.component_config.get("subscription_settlement_path")
+                        and getattr(stream, "completion_record_delivered", False)):
                     raise RuntimeError(
                         "required CLI usage accounting failed; downstream "
                         "execution was stopped"
@@ -2623,6 +2631,28 @@ class CLIAgent(Agent):
                             )
                         except Exception:
                             pass
+            settlement_path = self.component_config.get("subscription_settlement_path")
+            if settlement_path and self.ctx.execution_backend == "subscription":
+                from proofstack.subscription import settle_cli_worker, SubscriptionBlocked
+                interrupted = not (done is not None and stream is not None and (
+                    getattr(stream, "completion_record_delivered", False)
+                    or getattr(stream, "natural_process_exit", False)))
+                if (process_stopped and required_usage_error is not None and stream is not None
+                        and getattr(stream, "completion_record_delivered", False)
+                        and getattr(stream, "completion_drain_interrupted", False)):
+                    # Finish can precede the CLI's end-of-turn usage. A drain
+                    # timeout is still a harness interruption for accounting.
+                    interrupted = True
+                self.component_config["subscription_interrupted"] = interrupted
+                settled = settle_cli_worker(self, process_stopped=process_stopped,
+                    spawn_attempted=stream_spawn_attempted,
+                    terminal_metered=usage_recorded and required_usage_error is None and not interrupted,
+                    safety_ok=storage_lease_error is None and workspace_guard_error is None,
+                    initial_spend=initial_planning_spend)
+                if not settled:
+                    raise SubscriptionBlocked("Subscription worker stop or usage is unresolved") from required_usage_error
+                # A stopped interrupted call is covered by its full saved allowance.
+                required_usage_error = None
             if required_usage_error is not None:
                 raise RuntimeError(
                     "required CLI usage accounting failed; downstream "
@@ -2794,6 +2824,8 @@ class CLIAgent(Agent):
                     and stream.remaining_s > 0
                 ):
                     await asyncio.sleep(self.POLL_INTERVAL_S)
+                stream.natural_process_exit = stream.proc.returncode is not None and stream.proc.returncode >= 0
+                stream.completion_drain_interrupted = stream.proc.returncode is None
                 await stream.terminate()
                 _require_worker_stopped(stream, phase="completion_signal")
                 done = self._read_done(
@@ -2807,6 +2839,12 @@ class CLIAgent(Agent):
                         else None
                     ),
                 )
+                try:
+                    CLIDoneRecord.model_validate_json(done_path.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    stream.completion_record_delivered = False
+                else:
+                    stream.completion_record_delivered = True
                 return await self._finalize_workspace_recovery(
                     done,
                     workspace_root,
@@ -2814,6 +2852,7 @@ class CLIAgent(Agent):
                 )
             if stream.done:
                 rc = stream.proc.returncode
+                stream.natural_process_exit = rc is not None and rc >= 0
                 completion_required = self.COMPLETION_SIGNAL != "exit"
                 fallback = (
                     (

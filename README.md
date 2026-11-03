@@ -38,6 +38,10 @@ GOOGLE_API_KEY=...
 
 Other supported key names include `XAI_API_KEY`, `GLM_API_KEY`, `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, `OPENROUTER_API_KEY`, `TOGETHER_API_KEY`, `STEPFUN_API_KEY`, and `TIIUAE_API_KEY`. You only need keys for the models used by your selected workflow.
 
+API execution remains the default. The single-author research/cleanup workflow
+also has an opt-in [subscription-only mode](docs/subscription_mode.md), using
+Codex and Claude Code logins with paid API fallback disabled.
+
 ## Use The App
 
 The app is the main way to use ProofCouncil.
@@ -94,6 +98,19 @@ uv run python scripts/run_workflow.py \
 ```
 
 Workflow presets are in `configs/workflows/`. Pass either a preset name such as `author_critic` or a YAML path such as `configs/workflows/author_critic.yaml`.
+
+### Upgrading Existing Runs
+
+After the Third Batch workflow update (PR #14), an older in-flight API run can
+stop on resume with `Fresh critic recovery has unresolved provider work`.
+Older provider receipts may lack the pricing/timing evidence now required to
+settle missing usage. This can affect ordinary critic runs even with all new
+optional modes disabled. With the final gate enabled, recovery can instead report
+`Saved critic has unresolved provider work`. Neither message by itself means
+the proof was rejected. Prefer finishing active runs on their original
+revision. If migration is necessary, preserve the run artifacts and follow the
+[API reconciliation procedure](docs/firstproof_batch3_workflow.md#migrating-in-flight-api-runs)
+before resuming. Do not delete receipts or reset the spending ledger.
 
 ### Research Model Defaults
 

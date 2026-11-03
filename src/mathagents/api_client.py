@@ -168,8 +168,8 @@ def _estimate_salvaged_usage(
     to the 4 chars/token rule of thumb; we want to err toward
     *over*-billing the budget tracker for a salvaged turn.
 
-    Walks ``payload["input"]`` for message content and ``output_items``
-    for reasoning / code_interpreter_call / message blocks. Tool-call
+    Walks ``payload["input"]`` for message content and replayed tool data, and
+    ``output_items`` for reasoning / code_interpreter_call / message blocks. Tool-call
     metadata (web_search_call action fields etc.) is not counted.
     """
 
@@ -193,12 +193,27 @@ def _estimate_salvaged_usage(
                     _add_text(acc, t)
 
     in_chars = [0]
-    inp = payload.get("input", []) if isinstance(payload, dict) else []
+    payload = payload if isinstance(payload, dict) else {}
+    inp = payload.get("input", [])
+    _add_text(in_chars, payload.get("instructions", ""))
+    if isinstance(inp, str):
+        _add_text(in_chars, inp)
     if isinstance(inp, list):
         for msg in inp:
             if not isinstance(msg, dict):
                 continue
             _walk_content(msg.get("content", ""), in_chars)
+            if msg.get("type") == "function_call_output":
+                _walk_content(msg.get("output", ""), in_chars)
+            elif msg.get("type") == "function_call":
+                _add_text(in_chars, msg.get("arguments", ""))
+            elif msg.get("type") == "code_interpreter_call":
+                _add_text(in_chars, msg.get("code", ""))
+                for output in msg.get("outputs") or []:
+                    if isinstance(output, dict):
+                        _add_text(in_chars, output.get("logs", ""))
+            elif msg.get("type") == "reasoning":
+                _walk_content(msg.get("summary", []), in_chars)
 
     out_chars = [0]
     for item in output_items or []:
@@ -325,11 +340,18 @@ class APIClient:
     def _report_attempt_failure(self, ts, idx, exc, *, retry_decision):
         trace = active_trace.get()
         if trace is not None:
+            # A transport failure can leave paid work running even without a
+            # response ID. Do not treat it like an explicit rejected create.
+            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            rejected = (type(status) is int and 400 <= status < 600 and status not in {408, 504, 524}) or _is_context_length_error(exc)
+            row = trace.attempts.get((ts, idx), {})
+            uncertain = not row.get("response_id") and not rejected
             trace.failure(
-                (ts, idx), error_type=type(exc).__name__,
+                (ts, idx), outcome="error", error_type=type(exc).__name__,
                 error_code="context_length_exceeded" if _is_context_length_error(exc) else getattr(exc, "code", None),
                 error_message=str(exc)[:500],
                 retry_decision=retry_decision,
+                transport_uncertain=uncertain,
             )
 
     def _provider_response_dict(self, response):
@@ -474,8 +496,8 @@ class APIClient:
                 return value
             raise value
 
-    def reconcile_background_response(self, response_id, *, timeout=15.0, on_response=None):
-        """Retrieve, then boundedly cancel an existing response; never create one."""
+    def reconcile_background_response(self, response_id, *, timeout=15.0, on_response=None, cancel_pending=True):
+        """Retrieve an existing response, optionally cancelling; never create one."""
         if self.api != "openai" or not self.use_openai_responses_api:
             raise ValueError("Background reconciliation requires OpenAI Responses")
 
@@ -485,7 +507,8 @@ class APIClient:
             with OpenAI(api_key=self.api_key, base_url=self.base_url,
                         timeout=min(3.0, timeout), max_retries=0) as client:
                 data = {}
-                for operation in ("retrieve", "retrieve", "cancel", "retrieve"):
+                operations = ("retrieve", "retrieve", "cancel", "retrieve") if cancel_pending else ("retrieve",)
+                for operation in operations:
                     left = deadline - time.monotonic()
                     if left <= 0:
                         break
@@ -793,6 +816,8 @@ class APIClient:
             tools (list, optional): A list of tools to use. Defaults to None.
             **kwargs: Additional keyword arguments for the API.
         """
+        from mathagents.execution_policy import require_api_allowed
+        require_api_allowed()
         if not isinstance(cache_write_tokens_in_input, bool):
             raise ValueError("cache_write_tokens_in_input must be a boolean")
         if cache_write_tokens_in_input:
@@ -1186,6 +1211,8 @@ class APIClient:
                 conversation: Full list of messages (including those from the query) in the API format (incl. CoT).
                 detailed_cost: A dict with total "cost" ($), "input_tokens", "output_tokens", and "time" (seconds).
         """
+        from mathagents.execution_policy import require_api_allowed
+        require_api_allowed()
         if not no_tqdm:
             logger.info(f"Running {len(queries)} queries.")
 
@@ -2334,6 +2361,7 @@ class APIClient:
                     total_retries += 1
                 if request_logged:
                     self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                    self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e) else "retry")
                 logger.error(f"Got Anthropic error in final-answer salvage. Exception: {e}")
                 if (
                     isinstance(e, _ProviderWallclockTimeout)
@@ -2614,6 +2642,7 @@ class APIClient:
                         total_retries += 1
                     if request_logged:
                         self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                        self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e) else "retry")
                     logger.error(f"Got Anthropic error in tools inner loop. Exception: {e}")
                     if (
                         isinstance(e, _ProviderWallclockTimeout)
@@ -3132,6 +3161,10 @@ class APIClient:
                                         output_items,
                                     )
                                     failed_usage = _SalvageUsage(est_in, est_out)
+                                    self._log_provider_response(ts=ts, batch_idx=idx, response={
+                                        **self._provider_response_dict(response),
+                                        "usage": failed_usage.model_dump(), "usage_estimated": True,
+                                    })
                                 (
                                     step_input,
                                     step_output,
@@ -3189,7 +3222,14 @@ class APIClient:
                                     f"Error: {err_code} {err_msg[:200]}"
                                 )
                                 if response.usage is None:
+                                    # Serialize the SDK object before assigning our
+                                    # non-Pydantic usage stand-in.
+                                    response_data = self._provider_response_dict(response)
                                     response.usage = _SalvageUsage(est_in, est_out)
+                                    self._log_provider_response(ts=ts, batch_idx=idx, response={
+                                        **response_data,
+                                        "usage": response.usage.model_dump(), "usage_estimated": True,
+                                    })
                             elif self._is_background_server_kill(err_code, time.time() - time_start):
                                 raise _BackgroundResponseTimeout(
                                     f"OpenAI background response {getattr(response, 'id', '?')} failed "
@@ -3517,6 +3557,7 @@ class APIClient:
                     if "rate limit" not in str(e).lower() and "429" not in str(e):
                         total_retries += 1
                     self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                    self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e, context_length_recovery=True) else "retry")
                     if isinstance(e, RateLimitError):
                         logger.info(f"Got OpenAI CC rate limit error. Sleeping for 60 seconds. Exception: {e}")
                         self._sleep(60)
@@ -3718,6 +3759,7 @@ class APIClient:
                 if "rate limit" not in str(e).lower() and "429" not in str(e):
                     total_retries += 1
                 self._log_provider_response(ts=ts, batch_idx=idx, response={"exception": str(e)})
+                self._report_attempt_failure(ts, idx, e, retry_decision="stop" if _is_terminal_api_error(e, context_length_recovery=True) else "retry")
                 if isinstance(e, RateLimitError):
                     logger.info(f"Got OpenAI CC rate limit error. Sleeping for 60 seconds. Exception: {e}")
                     self._sleep(60)
@@ -3740,11 +3782,19 @@ class APIClient:
         text_parts = []
         reasoning_parts = []
         final_usage = None
+        finished_choices = {}
+        response_id = None
         for event in response:
+            response_id = getattr(event, "id", None) or response_id
             if getattr(event, "usage", None) is not None:
                 final_usage = event.usage
             if not getattr(event, "choices", None):
                 continue
+            for choice in event.choices:
+                index = getattr(choice, "index", 0)
+                finished_choices.setdefault(index, {"finish_reason": None})
+                if getattr(choice, "finish_reason", None) is not None:
+                    finished_choices[index] = {"finish_reason": choice.finish_reason}
             delta = event.choices[0].delta
             if getattr(delta, "content", None):
                 text_parts.append(delta.content)
@@ -3768,6 +3818,8 @@ class APIClient:
             batch_idx=idx,
             response={
                 "streamed": True,
+                "id": response_id,
+                "choices": list(finished_choices.values()),
                 "content": content,
                 "reasoning": reasoning,
                 "usage": final_usage.model_dump() if final_usage is not None else None,
@@ -3906,13 +3958,18 @@ class APIClient:
         timeout = self._anthropic_request_timeout(time.time())
         def generate():
             response = requests.post(self.base_url, headers=headers, json=payload, timeout=timeout)
+            if response.status_code != 200:
+                error = requests.HTTPError(f"Error: {response.status_code} - {response.text[:2000]}", response=response)
+                error.status_code = response.status_code
+                raise error
             self._log_provider_response(ts=ts, batch_idx=idx, response=response.json())
             return response
 
-        response = self._bounded_provider_operation(generate, timeout=timeout)
-
-        if response.status_code != 200:
-            raise Exception(f"Error: {response.status_code} - {response.text}")
+        try:
+            response = self._bounded_provider_operation(generate, timeout=timeout)
+        except Exception as exc:
+            self._report_attempt_failure(ts, idx, exc, retry_decision="stop" if _is_terminal_api_error(exc) else "retry")
+            raise
         json_response = response.json()
 
         if "candidates" not in json_response:

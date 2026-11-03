@@ -73,6 +73,117 @@ Accepted documents go to `submissions/<problem_id>/<sha256>.tex`, with
 and refuses further normalization. A model's approval is an automated gate,
 not independent verification of a proof.
 
+## Optional proof simplification
+
+Set `inputs.simplification_rounds: 3` in a Batch 3 preset, or pass
+`--input simplification_rounds=3` to `scripts/run_workflow.py`. The default is
+`0` (disabled), including both competition presets. This also works in
+`FirstProofBatch3RehearsalWorkflow`; it is not an input to the standalone
+`author_critic` DAG.
+
+After a compiling manuscript earns Author/Critic agreement, this adds **up to
+three Author/fresh-Critic rounds before normal editorial cleanup**. The goal is
+simpler mathematics, not cosmetic compression: fewer lemmas or case splits,
+lighter machinery, or a more direct proof. All results, hypotheses, quantifiers
+and conclusion strength must be preserved. Essential arguments cannot be moved
+into research notes. Each candidate is normalized and compile/page-checked before
+review; only a correct, genuinely simpler candidate replaces the accepted one.
+An unchanged, incomplete or mechanically invalid candidate consumes an attempt
+but skips the redundant paid review.
+
+Each attempt starts from the latest accepted manuscript, with feedback from the
+previous attempt. Rejections and invalid critic verdicts retain that manuscript.
+A critic finding a mathematical flaw in the baseline itself revokes acceptance
+and hands the findings back to the ordinary research loop. A newly accepted
+research manuscript can then begin its own simplification phase. Subsequent
+editorial cleanup and its regression review remain enabled. An additional
+ordinary stateless critic must then approve the exact final manuscript before
+it can be published as an accepted solution (see below).
+
+The phase uses the configured `Author` and a fresh `SimplificationCritic` (which
+inherits `Batch3CleanupCritic` settings unless overridden), with the entire
+baseline and candidate supplied losslessly. It uses one Author, without
+delegated helpers, Council or Compute workers, even in the multiauthor preset.
+The critic sees no previous positive verdicts or private research notes as proof.
+
+No budget or deadline is extended. At phase entry, at most half the remaining
+money **above the cleanup and final-review reserves**, and half the time left before the
+research cutoff, are allocated to simplification. These limits are saved, not
+reset on resume. Thus three rounds are a maximum, not a guarantee. Provider
+charges are recorded through the normal accounting path; a completed call can
+overshoot its allowance, just as in research. No further attempt starts once
+the allowance is exhausted. The retained manuscript remains available if
+simplification or later editorial cleanup cannot finish, but it too must pass
+the final stateless gate before being exported as an accepted solution.
+
+`proof_simplification/<research-round>-<baseline-hash>/` contains `state.json`
+and per-round Author outputs, candidates, critic reports and acceptance flags.
+Events use `batch3.simplification_*`; costs use the `proof_simplification` phase.
+Completed rounds are not repeated. A saved candidate awaiting review can resume
+within the original limits. A crash or cancellation *inside* an Author/critic
+call is deliberately fail-closed: it blocks further paid work until an operator
+reconciles the saved provider artifacts, instead of risking duplicate calls or
+treating unresolved usage as free. Without a completed final approval, only a
+clearly labelled unapproved fallback can be exported in that case.
+
+## Final stateless approval
+
+When `simplification_rounds > 0`, final stateless approval is mandatory. Setting
+`inputs.final_stateless_review: true` enables the same gate without simplification.
+With neither option enabled, the existing workflow is unchanged.
+
+The sequence is research acceptance, optional simplification, editorial cleanup
+and its regression review, then **one ordinary fresh `ACCritic` review** of the
+exact final bytes. `FinalStatelessCritic` uses the regular critic's prompt,
+parser, configured model and tools. It receives the original problem, complete
+final manuscript and LaTeX contract, with no prior messages, baseline manuscript,
+research notes or Author thinking. Its provider receipts are separate from the
+research critic's, and the ordinary agent cache cannot substitute an earlier
+research review. Normal critic provider reconciliation still works on resume.
+
+The default reservations, configurable as workflow inputs, are:
+
+```yaml
+final_stateless_review: false  # automatically mandatory with simplification
+final_review_reserve_usd: 100
+final_review_seconds: 5400     # 90 minutes for the final critic
+final_review_export_seconds: 300
+```
+
+These are withheld from research, simplification and editorial cleanup, within
+the original total budget and deadline. They are additional to the existing
+partial-cleanup reserve. For a full 24-hour clock with the default two-hour
+cleanup window, research therefore stops no later than 20h25m after launch,
+instead of 22h; shorter external deadlines and research caps still apply.
+A $1,000 run with a 15% cleanup reserve leaves $750 for research/simplification/
+editorial work before the $150 cleanup and $100 final-review reserves. The
+workflow rejects a fresh launch whose budget or clock cannot cover its reserves.
+The allowances provide headroom, not a guarantee about provider latency or
+post-call billing: a completed call can still overshoot its dollar cap.
+
+Acceptance requires a valid positive fresh verdict and successful mechanical
+checks. Publication verifies a receipt keyed to the exact problem, manuscript,
+page limit and critic configuration. No edits occur after that review. Even an
+unpolished accepted-baseline fallback needs this gate; an older output manifest
+cannot bypass it when the gate is enabled on resume.
+
+A valid rejection revokes retained acceptance conservatively and sends the
+findings back to research if the original research cutoff and budget permit.
+Every changed final candidate needs another fresh review. Missing/invalid
+verdicts, timeouts and provider failures never approve the manuscript or trigger
+another paid phase automatically; a labelled unapproved artifact is retained
+where mechanical checks and the deadline permit. Partial/unsolved outputs remain
+explicitly unapproved and do not receive this full-solution gate.
+
+`final_stateless_review/` stores the exact review inputs, verdicts, original
+per-candidate allowance/deadline and provider-recovery receipts.
+`batch3-final-review-pending.json` points to a pending candidate. Resume handles
+that candidate before any further research or cleanup, reusing completed reports
+and reconciling interrupted provider work through the regular critic. Changed
+pending-review settings fail closed. The saved schedule prevents disabling the
+gate or resetting its reserves on resume. Events/costs use
+`batch3.final_stateless_review` and the `final_stateless_review` phase.
+
 ## Research critic context recovery
 
 Normal research reviews retain their full conversation and the configured
@@ -107,9 +218,15 @@ An error while polling a known response ID is not a terminal provider status.
 Resume retrieves saved response IDs and, if necessary, cancels them within a
 30-second reconciliation window. Every outstanding attempt is checked before
 a completed report is reused. Missing terminal status still blocks another paid
-call; reconciliation never creates a new response. If a retrieved terminal
-response omits usage, recovery records a conservative model-token charge priced
-at the configured full context window and maximum output allowance. The receipt
+call; reconciliation never creates a new response. Final stateless review recovery
+instead polls without cancelling, within the original saved review and run
+deadlines. If still pending at that deadline it remains blocked for operator
+reconciliation, not replaced by a new call. Every completed attempt's report is
+retained; a valid rejection takes precedence over other reports for the same
+review packet. If a retrieved terminal response omits usage, recovery uses the
+saved request pricing and elapsed-time heuristic described below. Legacy receipts
+without the necessary pricing/timing data remain unresolved instead of charging
+a model's entire context/output capacity. The receipt
 keeps `usage_unavailable` and adds `cost_estimated`, the estimated amount and its
 basis; this is not measured usage or a bound on separate tool charges. The debit
 is not automatically refunded and can exhaust the budget before a retry. Durable
@@ -497,6 +614,9 @@ editorial work; cleanup is not a separate additional budget.
 - Candidate cleanup first publishes a checked, labelled baseline and leaves
   the larger of `partial_cleanup_seconds` and an hour (10% of remaining time
   for shorter runs) for partial cleanup.
+  With the final gate enabled, it also stops no later than the run deadline minus
+  `partial_cleanup_seconds + final_review_seconds + final_review_export_seconds`,
+  so a final rejection cannot consume the partial-cleanup time reserve.
   Bibliographies are embedded before the fallback is checked. Timeout or
   interruption cannot erase an already published valid fallback.
 - `n_rounds=50` is a research continuation chunk, not a new run or budget.
@@ -732,3 +852,107 @@ Before competition deployment:
 
 No paid API call, Ada job, Docker launch or submission is performed by preparing
 this workflow.
+
+## Recovery of Optional Phases
+
+A settled simplification timeout or failed call stops optional simplification
+and retains the last accepted baseline for cleanup and the final stateless
+gate. An unresolved call blocks all further model work, including resume after
+the research cutoff or with simplification disabled. Its accepted manuscript
+is retained under `accepted_pending/`, not mislabelled as an unreviewed partial
+or published as a final-approved submission. A separately published partial, if
+one already exists, remains available to the adapter with its original bytes,
+hash and `partial_unreviewed` output kind. Otherwise the output kind is
+`accepted_baseline_needs_final_review`. This also applies to reconciliation stops
+during cleanup. Saved critic rejections are
+processed before deciding which phase the remaining clock/budget permits.
+
+Completed charged results are retained at both USD and subscription nominal
+monetary limits. A final critic's malformed verdict permits one fresh retry
+within the same saved allowance and deadline; a mathematical rejection is not
+a parse retry. Completed approvals are bound to the exact packet/configuration.
+Changing that configuration on resume fails closed without erasing the prior
+approved manuscript or manifest. Fresh launches must leave time for research
+after reserving both cleanup and final-review/export windows.
+
+API recovery re-reads the durable provider attempts, not just the supplementary
+settlement marker. Explicit failed creates without a response ID or usage settle
+at zero; timeouts and connection failures remain unresolved. Successful retries
+do not erase an earlier open response. A preflight
+failure with no request evidence is safe to leave. Completed final verdicts are
+recovered before applying the allowance for a new call.
+
+No-ID transport uncertainty is recorded separately from retrievable remote work.
+Ordinary research critics retain their bounded retry/replay behavior after a
+transport outage, including for older receipts; this does not resolve the unknown
+charge. Simplification and final approval still require every attempt to settle,
+or an operator reconciliation receipt. HTTP 408, 504 and 524 are uncertain, not
+zero-cost rejections. A queued response may execute between polls or across a
+controller crash, so an empty background rate limit is not assumed free merely
+because no `in_progress` status was observed. Usage-less terminal OpenAI responses
+with saved pricing/timing data charge estimated request text (including replayed
+tool data), plus the larger of visible output and
+`min(max_output_tokens, ceil(elapsed_seconds * 50))` output tokens. Elapsed time
+runs from the saved request start to the first terminal observation, including
+queue time and polling gaps; it is frozen across subsequent recovery, with negative
+elapsed time from a backward clock step clamped to zero. Explicit context-length,
+file or attachment-count rejections without execution/output evidence add neither
+an input charge nor an unseen output allowance. Salvaged replies use the same
+estimate, never less than their visible usage or any previously recorded charge.
+Reasoning is included in output,
+not added again. The 50 tokens/second rate is a documented planning heuristic,
+not measured throughput, an actual provider bill, or a guaranteed upper bound.
+The receipt exposes its rate, elapsed time, estimated tokens and dollars, and
+keeps `usage_unavailable=true`. Estimates do not become reported token usage.
+Old receipts lacking timing/pricing cannot be newly settled automatically; an
+already charged estimate is retained without an automatic refund.
+Raw saved final reports are recoverable even if a crash preceded the completed
+critic checkpoint. While the run's export cutoff and tracker permit, final-review
+recovery has a 30-second retrieval/retry window for saved OpenAI response IDs,
+even after the saved review window expires or with no new-call allowance. This
+window is shared across all attempts and retries, not restarted after a failed
+GET. A later saved review deadline permits further polling, but neither window
+can extend the tracker or the run's export cutoff. Each pass polls every pending
+attempt once, sharing its remaining time so one abandoned attempt cannot starve
+later verdicts.
+It neither cancels a live review nor creates a new response. Unresolved work still
+blocks acceptance, including when another attempt has returned a verdict, and
+no-ID uncertainty remains blocking. No retrieval starts after the export cutoff.
+Settled non-mathematical terminal cleanup errors send the
+accepted baseline directly to the final gate, without retrying cleanup. If work
+is unresolved or the gate cannot approve it, the baseline remains pending and any
+separately published partial is preserved. The operator event records the failure
+in either case. Disabling new simplification rounds on resume does not discard
+previously accepted simplifications, including after the research cutoff.
+
+### Migrating In-Flight API Runs
+
+The Third Batch workflow update (PR #14) no longer applies a full-context charge
+for usage-less terminal rows that lack saved pricing/timing evidence. An older
+run resumed across the upgrade can therefore stop with
+`Fresh critic recovery has unresolved provider work`, including in ordinary API
+mode with simplification and the final gate disabled. Final-gate recovery can
+instead report `Saved critic has unresolved provider work`. Both messages indicate
+an accounting hold, not a mathematical rejection. Fresh runs do not need this
+migration step, and known usage or previously recorded charges are not refunded.
+
+Prefer completing active runs on their original revision. Before migrating,
+preserve their artifacts, checkpoints and spending ledger; do not delete or
+hand-edit receipts to bypass the hold. For genuinely unresolved API work, stop
+all local controllers and descendants and independently retrieve or cancel any
+remote response IDs and reconcile their charges. Then record the result without
+editing workflow checkpoints:
+
+```bash
+uv run python scripts/reconcile_api_call.py /path/to/run /path/to/run/agents/CALL \
+  --confirm-workers-stopped --confirm-provider-work-terminal \
+  --unreported-allowance-usd 100
+```
+
+The amount is an additional conservative USD debit for unreported work, not a
+replacement for known usage or a budget increase. Zero requires evidence that
+no unreported charge remains. Confirmation is on operator trust: this command
+does not contact the provider or infer stopped remote work from a stopped local
+process. It binds reconciliation to the current input and attempt-log hashes,
+records each debit once, and starts no calls. Changed evidence requires renewed
+reconciliation; the original budget and deadline still govern a separate resume.

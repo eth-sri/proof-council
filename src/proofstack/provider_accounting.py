@@ -2,17 +2,138 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import json
 import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from mathagents.provider_trace import usage_adjustments
+from mathagents.provider_trace import COUNTS, usage_adjustments
 
 
 USAGE_FIELDS = ("cost_usd", "in_tokens", "out_tokens", "reasoning_tokens")
 logger = logging.getLogger(__name__)
+
+
+def provider_attempt_terminal(row):
+    if row.get("chat_completion_terminal") is True:
+        return True
+    provider = row.get("provider", "openai")
+    if provider == "openai":
+        return row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
+    if provider == "anthropic":
+        return row.get("stop_reason") in {
+            "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal",
+            "model_context_window_exceeded",
+        }
+    if provider == "google":
+        return row.get("finish_reason") in {
+            "STOP", "MAX_TOKENS", "SAFETY", "RECITATION", "OTHER", "BLOCKLIST",
+            "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",
+            "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION",
+        }
+    return False
+
+
+def transport_uncertain(row):
+    # Older receipts used the remote-reconciliation flag for no-ID outages.
+    return bool((row.get("transport_uncertain") and not row.get("response_id")
+                 and not provider_attempt_terminal(row)) or (
+        row.get("reconciliation_pending") and not row.get("response_id")
+        and row.get("error_type") and row.get("retry_decision") in {"retry", "stop"}))
+
+
+def provider_attempts_settled(rows):
+    def settled(row):
+        if row.get("reconciliation_pending") or transport_uncertain(row):
+            return False
+        if provider_attempt_terminal(row):
+            return not row.get("usage_unavailable", True) or row.get("cost_estimated", False)
+        # An explicit failed create/retry is not an open background response.
+        # Never discard a response ID, partial usage, or a merely started call.
+        return (not row.get("response_id") and row.get("error_type")
+                and row.get("retry_decision") in {"retry", "stop"}
+                and not any(row.get(key) for key in ("cost", *COUNTS)))
+    return all(settled(row) for row in rows)
+
+
+async def reconcile_provider_call(ctx, tracker, folder):
+    """Re-read and charge durable evidence, without making a provider request."""
+    from mathagents.provider_trace import latest_attempts
+    path = folder / "provider-attempts.jsonl"
+    marker = folder / "provider-settlement.json"
+    if _operator_reconciled(ctx.root_workdir, folder):
+        await settle_provider_usage(ctx, tracker)
+        return True
+    if not path.exists():
+        return not marker.exists() or json.loads(marker.read_text()).get("settled") is True
+    rows = latest_attempts(path)
+    from mathagents.provider_trace import ProviderTrace
+    for invocation in dict.fromkeys(r["invocation_id"] for r in rows):
+        ProviderTrace.restore(path, invocation).estimate_terminal_usage()
+    rows = latest_attempts(path)
+    await settle_provider_usage(ctx, tracker, call_ids={r.get("call_id") or r["invocation_id"] for r in rows})
+    if rows and provider_attempts_settled(rows):
+        return True
+    return bool(not rows and marker.exists() and json.loads(marker.read_text()).get("settled") is True)
+
+
+def _reconciliation_identity(root, folder):
+    root, folder = Path(root).resolve(), Path(folder).resolve()
+    if folder.parent != root / "agents" or not folder.is_dir():
+        raise ValueError("Select an existing call directory directly under RUN_DIR/agents")
+    evidence = {name: hashlib.sha256((folder / name).read_bytes()).hexdigest()
+                if (folder / name).exists() else None
+                for name in ("input.json", "provider-attempts.jsonl")}
+    identity = {"workdir": str(folder.relative_to(root)), "evidence": evidence}
+    key = "api-" + hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    return identity, key
+
+
+def _operator_reconciled(root, folder):
+    receipt = folder / "provider-reconciliation.json"
+    if not receipt.exists():
+        return False
+    identity, key = _reconciliation_identity(root, folder)
+    saved = json.loads(receipt.read_text())
+    ledger = Path(root) / "recovery-debits.json"
+    debits = json.loads(ledger.read_text()) if ledger.exists() else {}
+    amount = saved.get("unreported_allowance_usd")
+    return (saved.get("identity") == identity and saved.get("debit_key") == key
+            and saved.get("workers_stopped") is True and saved.get("provider_work_terminal") is True
+            and type(amount) in (int, float) and math.isfinite(amount) and amount >= 0
+            and debits.get(key, {}).get("cost_usd") == amount)
+
+
+def reconcile_stopped_provider_call(root, folder, *, workers_stopped=False,
+                                    provider_work_terminal=False, unreported_allowance_usd):
+    """Operator-only recovery after independently settling remote provider work."""
+    from proofstack.atomic import write_text_atomic
+    if not workers_stopped or not provider_work_terminal:
+        raise ValueError("Confirm both stopped local workers and terminal remote provider work")
+    amount = unreported_allowance_usd
+    if type(amount) not in (int, float) or not math.isfinite(amount) or amount < 0:
+        raise ValueError("Unreported allowance must be finite and nonnegative")
+    root, folder = Path(root).resolve(), Path(folder).resolve()
+    identity, key = _reconciliation_identity(root, folder)
+    backend = root / "execution-backend.json"
+    if backend.exists() and json.loads(backend.read_text()).get("backend") == "subscription":
+        raise ValueError("Use reconcile_subscription.py for subscription runs")
+    with (root / ".api-reconciliation.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        ledger = root / "recovery-debits.json"
+        debits = json.loads(ledger.read_text()) if ledger.exists() else {}
+        if key in debits and debits[key].get("cost_usd") != amount:
+            raise ValueError("This evidence already has a different recovery debit")
+        if key not in debits:
+            debits[key] = {"cost_usd": amount, "reason": "Operator reconciliation: " + identity["workdir"]}
+            write_text_atomic(ledger, json.dumps(debits, sort_keys=True))
+        saved = {"identity": identity, "debit_key": key, "workers_stopped": True,
+                 "provider_work_terminal": True, "unreported_allowance_usd": amount}
+        write_text_atomic(folder / "provider-reconciliation.json", json.dumps(saved, sort_keys=True))
+        return saved
 
 
 def _normalized_usage(payload):
@@ -186,9 +307,11 @@ async def settle_provider_usage(ctx, tracker, *, call_ids=None, emitter=None):
                 call_id, payload = adjustment["call_id"], adjustment["payload"]
                 if call_id.startswith("recovery:"):
                     continue  # Legacy debits stay in their own durable ledger.
-                if call_ids is not None and (call_id not in call_ids or (
-                        payload["usage_unavailable"] and not payload.get("cost_estimated"))):
+                if call_ids is not None and call_id not in call_ids:
                     continue
+                # Charge known usage even if another attempt has unknown usage.
+                # Settlement eligibility is a separate check; this is a floor,
+                # never a claim that the unresolved work was free.
                 if not any(payload.get(k, 0) for k in ("cost_usd", "in_tokens", "out_tokens", "reasoning_tokens")):
                     continue
                 await emitter.emit("model.call", {

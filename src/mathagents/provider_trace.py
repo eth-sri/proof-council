@@ -1,6 +1,7 @@
 """Per-invocation, append-only provider accounting independent of debug logs."""
 from contextvars import ContextVar
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -15,6 +16,34 @@ from loguru import logger
 active_trace: ContextVar["ProviderTrace | None"] = ContextVar("provider_trace", default=None)
 active_attempt: ContextVar[tuple | None] = ContextVar("provider_attempt", default=None)
 COUNTS = ("input_tokens", "output_tokens", "cached_input_tokens", "cached_write_tokens", "reasoning_tokens")
+# A planning heuristic, not measured throughput or a guaranteed billing bound.
+ESTIMATED_OUTPUT_TOKENS_PER_SECOND = 50
+PRE_INFERENCE_REJECTIONS = {"context_length_exceeded", "invalid_file", "file_not_found", "array_above_max_length"}
+
+
+def _terminal_estimate(row):
+    start, end = row.get("request_started_at"), row.get("terminal_observed_at")
+    input_cost, output_rate = row.get("estimate_input_usd"), row.get("estimate_output_usd_per_token")
+    if not all(type(x) in (int, float) and math.isfinite(x) and x >= 0
+               for x in (start, end, input_cost, output_rate)):
+        return {}
+    elapsed = max(0.0, end - start)
+    visible = row.get("estimate_visible_output_tokens", 0)
+    allowance = row.get("estimate_output_allowance_tokens", 0)
+    if any(type(x) is not int or x < 0 for x in (visible, allowance)):
+        return {}
+    unseen = 0 if row.get("pre_inference_rejection") else min(
+        allowance, math.ceil(min(elapsed, allowance / ESTIMATED_OUTPUT_TOKENS_PER_SECOND)
+                             * ESTIMATED_OUTPUT_TOKENS_PER_SECOND))
+    # Visible reasoning is already output: do not add it a second time.
+    outputs = max(visible, unseen)
+    cost = (0 if row.get("pre_inference_rejection") else input_cost) + outputs * output_rate
+    if not math.isfinite(cost):
+        return {}
+    return {"terminal_usage_estimate_usd": cost,
+            "estimate_output_tokens": outputs, "estimate_elapsed_s": elapsed,
+            "estimate_output_tokens_per_second": ESTIMATED_OUTPUT_TOKENS_PER_SECOND,
+            "terminal_estimate_source": "request_elapsed_v1"}
 
 
 def _bounded_tool_evidence(item):
@@ -142,7 +171,37 @@ class ProviderTrace:
             self._latest_request = key
             self.completed_report = None
             self.update(key, provider=client.api, model=payload.get("model", client.model),
-                        reasoning=payload.get("reasoning"), outcome="started")
+                        reasoning=payload.get("reasoning"), outcome="started", ever_in_progress=False,
+                        request_started_at=time.time())
+            # Save pricing while the exact client/model is available. Resume can
+            # settle a terminal response without credentials or another request.
+            if callable(getattr(client, "_get_cost", None)):
+                from .api_client import _estimate_salvaged_usage
+                inputs, _ = _estimate_salvaged_usage(payload, [])
+                output_allowance = payload.get("max_output_tokens", 0)
+                if type(output_allowance) is not int or output_allowance < 0:
+                    output_allowance = 0
+                input_cost = float(client._get_cost(inputs, 0, 0, 0))
+                output_rate = float(client._get_cost(inputs, 1, 0, 0)) - input_cost
+                if all(math.isfinite(x) and x >= 0 for x in (input_cost, output_rate)):
+                    self.update(key, estimate_input_usd=input_cost, estimate_output_usd_per_token=output_rate,
+                                estimate_input_tokens=inputs,
+                                estimate_output_allowance_tokens=output_allowance,
+                                terminal_estimate_source="request_elapsed_v1")
+
+    def estimate_terminal_usage(self):
+        with self.lock:
+            for key, row in list(self.attempts.items()):
+                if (row.get("provider") == "openai" and row.get("response_id")
+                        and row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
+                        and row.get("usage_unavailable", True) and not row.get("cost_estimated")):
+                    fields = _terminal_estimate(row)
+                    estimate = fields.get("terminal_usage_estimate_usd")
+                    if estimate is None or not math.isfinite(estimate):
+                        continue
+                    self.update(key, **fields, cost=max(estimate, row.get("cost", 0)), cost_estimated=True,
+                                estimated_cost_usd=estimate, reconciliation_pending=False,
+                                estimate_reason="terminal_response_without_usage")
 
     def response(self, client, ts, idx, response):
         if not isinstance(response, dict):
@@ -151,8 +210,7 @@ class ProviderTrace:
         self._record_usage(client, key, response)
         # Persist a final report before any bounded artifact I/O can be interrupted.
         with self.lock:
-            if self._latest_request in (None, key):
-                self._retain_completed_report(response)
+            self._retain_completed_report(response, key)
         if self.on_response is not None:
             try:
                 self.on_response(client, self)
@@ -161,10 +219,9 @@ class ProviderTrace:
             except Exception as exc:
                 logger.warning("Could not capture provider tool evidence: {}", type(exc).__name__)
             with self.lock:
-                if self._latest_request in (None, key):
-                    self._retain_completed_report(response)
+                self._retain_completed_report(response, key)
 
-    def _retain_completed_report(self, response):
+    def _retain_completed_report(self, response, key):
         output = response.get("output") or []
         if response.get("status") == "completed" and not any(item.get("type") == "function_call" for item in output):
             text = "\n\n".join(
@@ -172,18 +229,30 @@ class ProviderTrace:
                 for part in item.get("content", []) if part.get("type") == "output_text"
             )
             if text.strip() and len(text.encode("utf-8")) <= 2_000_000:
-                self.completed_report = text
+                latest = self._latest_request in (None, key)
+                if latest:
+                    self.completed_report = text
                 if self.path is not None:
                     tmp = None
                     try:
                         self.path.parent.mkdir(parents=True, exist_ok=True)
+                        attempt = self.attempts[key]["attempt_id"]
+                        report = {"invocation_id": self.id, "attempt_id": attempt, "response_id": response.get("id"),
+                                  "report": text, "tool_evidence": self.tool_evidence()}
                         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent, delete=False) as f:
                             tmp = f.name
-                            json.dump({"invocation_id": self.id, "response_id": response.get("id"),
-                                       "report": text, "tool_evidence": self.tool_evidence()}, f)
+                            json.dump(report, f)
                             f.flush()
                             os.fsync(f.fileno())
-                        os.replace(tmp, self.path.parent / f"provider-completed-{self.id}.json")
+                        suffix = hashlib.sha256(attempt.encode()).hexdigest()
+                        os.replace(tmp, self.path.parent / f"provider-completed-{self.id}-{suffix}.json")
+                        if latest:
+                            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent, delete=False) as f:
+                                tmp = f.name
+                                json.dump(report, f)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.replace(tmp, self.path.parent / f"provider-completed-{self.id}.json")
                     except OSError as exc:
                         logger.warning("Could not persist supplementary completed provider report: {}", type(exc).__name__)
                     finally:
@@ -216,6 +285,18 @@ class ProviderTrace:
                 incoming = {item.get("id") for item in evidence}
                 fields["code_interpreter_calls"] = [item for item in previous if item.get("id") not in incoming] + evidence
         usage = response.get("usage")
+        if (response.get("status") in {"failed", "cancelled", "incomplete", "completed"}
+                and (usage is None or response.get("usage_estimated"))):
+            from .api_client import _estimate_salvaged_usage
+            with self.lock:
+                row = self.attempts.get(key, {})
+                _, outputs = _estimate_salvaged_usage({}, response.get("output") or [])
+                error = response.get("error") or {}
+                fields.update(terminal_observed_at=row.get("terminal_observed_at", time.time()),
+                              estimate_visible_output_tokens=max(outputs, row.get("estimate_visible_output_tokens", 0)),
+                              pre_inference_rejection=(error.get("code") in PRE_INFERENCE_REJECTIONS
+                                  and not response.get("output") and not row.get("ever_in_progress")))
+                fields.update(_terminal_estimate({**row, **fields}))
         google_usage = response.get("usageMetadata")
         if google_usage is not None:
             usage = {
@@ -229,7 +310,13 @@ class ProviderTrace:
             fields.update(input_tokens=inputs, output_tokens=outputs, cached_input_tokens=cached,
                           cached_write_tokens=written, reasoning_tokens=client._extract_reasoning_tokens(usage),
                           cost=client._get_cost(inputs, outputs, cached, written),
-                          usage_unavailable=bool(response.get("usage_partial", False)))
+                          usage_unavailable=bool(response.get("usage_partial", False) or response.get("usage_estimated", False)))
+            if response.get("usage_estimated"):
+                with self.lock:
+                    allowance = fields.get("terminal_usage_estimate_usd", 0)
+                fields["cost"] = max(fields["cost"], allowance)
+                fields.update(cost_estimated=True, estimated_cost_usd=fields["cost"],
+                              estimate_reason="salvaged_response_text", reconciliation_pending=False)
             with self.lock:
                 previous = self.attempts.get(key, {})
                 for name in (*COUNTS, "cost"):
@@ -237,9 +324,14 @@ class ProviderTrace:
         for name in ("id", "status", "stop_reason"):
             if response.get(name) is not None:
                 fields["response_id" if name == "id" else name] = response[name]
+        if response.get("status") == "in_progress":
+            fields["ever_in_progress"] = True
         candidates = response.get("candidates") or []
         if candidates:
             fields["finish_reason"] = candidates[0].get("finishReason")
+        choices = response.get("choices") or []
+        if choices:
+            fields["chat_completion_terminal"] = all(choice.get("finish_reason") is not None for choice in choices)
         fields["outcome"] = "error" if response.get("exception") or response.get("error") else "response"
         self.update(key, **fields)
 

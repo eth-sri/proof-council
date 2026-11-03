@@ -72,6 +72,14 @@ class JSONLSink:
         return cls(events_path=events_path, blobs_dir=blobs_dir)
 
     async def write(self, record: dict[str, Any]) -> None:
+        if record.get("kind") == "model.call" and record.get("payload", {}).get("subscription"):
+            from proofstack.atomic import write_text_atomic
+            record = {**record, "subscription_usage_id": new_call_id()}
+            directory = self.events_path.parent / "subscription_usage"
+            directory.mkdir(parents=True, exist_ok=True)
+            # The supplementary JSONL may be torn at a crash. Keep metering in
+            # an independent atomic receipt before attempting that append.
+            write_text_atomic(directory / f"{record['subscription_usage_id']}.json", json.dumps(record, default=str))
         record = self._spill_payload(record)
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         async with self._lock:

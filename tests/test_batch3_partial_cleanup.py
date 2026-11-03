@@ -411,14 +411,15 @@ def test_mechanical_repair_cap_preserves_checkpoint(pipeline, monkeypatch, cap):
     assert "Oversized" not in out.answer_tex.read_text()
 
 
-def test_exhausted_usd_does_not_start_a_mechanical_repair(pipeline, monkeypatch):
+@pytest.mark.parametrize("kind", ["usd", "api_equivalent_usd"])
+def test_exhausted_usd_does_not_start_a_mechanical_repair(pipeline, monkeypatch, kind):
     execute, calls, _, options, _, agent = pipeline
     options["research_error"] = BudgetExhausted("run", "usd", 85, 85)
 
     async def rewrite(self, inp):
         calls["partial"] += 1
         self.tracker.add_usd(100)
-        exc = BudgetExhausted("run", "usd", 100, 120)
+        exc = BudgetExhausted("run", kind, 100, 120)
         exc.completed_output = self.Outputs(text=TEX.replace("Proof.", "Oversized argument."))
         raise exc
 

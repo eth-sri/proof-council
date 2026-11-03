@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import suppress
 from typing import Literal
 
 from mathagents.api_client import _is_context_length_error
@@ -24,6 +25,7 @@ class Batch3CleanupCritic(ACCritic):
         baseline_tex: str = ""
         compile_feedback: str = ""
         editor_response: str = ""
+        baseline_provenance: str = ""
 
     class Outputs(ACCritic.Outputs):
         disposition: Literal["accept", "repair", "restore", "research", "invalid"] = "invalid"
@@ -39,6 +41,10 @@ class Batch3CleanupCritic(ACCritic):
         # Each editorial invocation has its own instance. Retain substantive
         # rejections even if subsequent accounting or logging is interrupted.
         self.completed_review = self.parse_output(raw_text, inp)
+        from proofstack.atomic import write_text_atomic
+        # This supplementary checkpoint must not prevent metering the paid call.
+        with suppress(OSError, ValueError):
+            write_text_atomic(self.workdir / "completed_review.json", self.completed_review.model_dump_json())
 
     @staticmethod
     def _reviews(inp):
@@ -107,7 +113,9 @@ class Batch3CleanupCritic(ACCritic):
             # Editorial review owns its lossless baseline/findings policy;
             # it must not use the research critic's fresh-review fallback.
             return await APICallAgent.run(self, inp)
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(getattr(exc, "completed_report", None), str):
+                self._on_response(exc.completed_report, inp)
             if _is_context_length_error(exc):
                 raise CleanupContextTooLarge(
                     "Provider rejected the cleanup critic context; do not retry the unchanged packet: " + str(exc)
@@ -153,6 +161,8 @@ answer_ready tag or other text after the cleanup verdict.
         if baseline:
             prompt += "\n# Pre-rewrite baseline (not assumed correct)\n" + baseline
         prompt += "\n# Candidate manuscript\n" + inp.answer_tex
+        if inp.baseline_provenance:
+            prompt += "\n# Baseline review provenance (not proof of correctness)\n" + inp.baseline_provenance
         prompt += "\n# LaTeX contract\n" + render_firstproof_latex_contract(inp.page_limit)
         prompt += "\n# Mechanical checks\n" + inp.compile_feedback
         if inp.editor_response:

@@ -206,10 +206,18 @@ class APICallAgent(Agent):
         trace = ProviderTrace(self.workdir / "provider-attempts.jsonl",
                               run_id=self.ctx.root_workdir.name, agent=self.workdir.name, call_id=call_id,
                               on_failure=attempt_failed, on_response=self._on_provider_response)
+        self._save_provider_settlement(False)
         token = active_trace.set(trace)
         task = asyncio.create_task(asyncio.to_thread(query, client, messages))
         try:
-            return await asyncio.shield(task)
+            result = await asyncio.shield(task)
+            trace.estimate_terminal_usage()
+            if isinstance(result, tuple) and len(result) == 3 and isinstance(result[2], dict):
+                cost = dict(result[2])
+                for key in ("cost", "input_tokens", "output_tokens", "reasoning_tokens"):
+                    cost[key] = max(cost.get(key, 0) or 0, trace.totals()[key])
+                result = (*result[:2], cost)
+            return result
         except asyncio.CancelledError as exc:
             # Cancelling to_thread does not stop its provider polling loop.
             with contextlib.suppress(Exception):
@@ -226,6 +234,9 @@ class APICallAgent(Agent):
                 # Cancellation was already delivered before settlement began.
                 # A failed append must not turn this stop into a retryable error.
                 raise exc from accounting_error
+            from proofstack.provider_accounting import provider_attempts_settled
+            exc.provider_usage_resolved = task.done() and provider_attempts_settled(trace.attempts.values())
+            self._save_provider_settlement(exc.provider_usage_resolved)
             with contextlib.suppress(Exception):
                 await self.events.emit("model.call.cancelled", {
                     "model": getattr(client, "model", str(self.MODEL)),
@@ -235,22 +246,34 @@ class APICallAgent(Agent):
             raise
         except Exception as exc:
             if isinstance(getattr(exc, "cost", None), dict):
-                # Author owns attachment-rejection charging; enrich its receipt
-                # rather than charge the same response twice.
+                # Preserve attachment-rejection usage for Author's receipt too;
+                # the call-ID ledger deduplicates its later accounting.
                 totals = trace.totals()
                 for name, value in totals.items():
                     if name in exc.cost and isinstance(value, (int, float)):
                         exc.cost[name] = max(exc.cost[name] or 0, value)
-            else:
-                await self._charge_failed_provider_trace(trace, client, call_id, "failed")
+            await self._charge_failed_provider_trace(trace, client, call_id, "failed")
+            from proofstack.provider_accounting import provider_attempts_settled
+            exc.provider_usage_resolved = task.done() and provider_attempts_settled(trace.attempts.values())
+            self._save_provider_settlement(exc.provider_usage_resolved)
             raise
         finally:
+            from proofstack.provider_accounting import provider_attempts_settled
+            self._provider_query_settled = task.done() and provider_attempts_settled(trace.attempts.values())
             self._provider_tool_evidence = trace.tool_evidence()
             active_trace.reset(token)
             # Retrieve a late exception without making shutdown await that task.
             task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
 
+    def _save_provider_settlement(self, settled):
+        from proofstack.atomic import write_text_atomic
+        # Supplementary evidence must not replace cancellation or a paid reply.
+        # Resume re-reads the strict provider attempts ledger independently.
+        with contextlib.suppress(OSError):
+            write_text_atomic(self.workdir / "provider-settlement.json", json.dumps({"settled": bool(settled)}))
+
     async def _charge_failed_provider_trace(self, trace, client, call_id, status):
+        trace.estimate_terminal_usage()
         totals = trace.totals()
         if not totals["provider_attempts"]:
             return
@@ -265,6 +288,9 @@ class APICallAgent(Agent):
 
     async def _record_model_usage(self, payload, *, call_id):
         await record_provider_usage(self.ctx, self.tracker, payload, call_id=call_id, emitter=self.events)
+        if payload.get("status") not in {"failed", "cancelled"}:
+            self._save_provider_settlement(
+                getattr(self, "_provider_query_settled", False))
 
     def _limit_client_deadline(self, cfg):
         remaining = self.tracker.remaining_wallclock_s()
@@ -278,6 +304,8 @@ class APICallAgent(Agent):
         return cfg
 
     async def _get_client(self) -> Any:
+        if self.ctx.execution_backend == "subscription":
+            raise RuntimeError("Paid API clients are forbidden in subscription mode")
         if self._client is not None:
             return self._client
         spec = self.ctx.model_for(self, self.MODEL)

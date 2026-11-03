@@ -50,7 +50,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Self, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -415,6 +415,10 @@ class ACWorkflow(Agent):
     DEFAULT_FULL_CRITIC_INTERVAL: ClassVar[int] = 3
 
     class Inputs(BaseModel):
+        execution_backend: Literal["api", "subscription"] = "api"
+        subscription_planning_usd: float = Field(default=1000, gt=0, allow_inf_nan=False)
+        subscription_max_parallel: int = Field(default=2, ge=1, le=16)
+        subscription_call_seconds: int = Field(default=5400, ge=1)
         problem: str
         problem_id: str
         n_rounds: int = Field(default=5, ge=1, le=500)
@@ -1337,6 +1341,8 @@ class ACWorkflow(Agent):
                     )
                     final_critic_mode_run = "skipped_budget_exhausted"
                 except Exception as e:
+                    if getattr(e, "requires_reconciliation", False):
+                        raise
                     await self.events.emit(
                         "ac.final_critic_failed",
                         {"type": type(e).__name__, "msg": str(e)},
@@ -1408,6 +1414,8 @@ class ACWorkflow(Agent):
             )
 
         except (BudgetExhausted, asyncio.TimeoutError, Exception) as e:
+            if getattr(e, "requires_reconciliation", False):
+                raise
             # ``asyncio.CancelledError`` is INTENTIONALLY not caught
             # here: external cancellation (runner shutdown, server stop,
             # parent task cancel) must reach the caller as a real
@@ -1519,7 +1527,7 @@ class ACWorkflow(Agent):
         node = self.tracker
         while node.parent is not None:
             node = node.parent
-        used = float(node.counters.usd)
+        used = float(node.planning_usd)
         max_usd = (
             float(node.spec.max_usd)
             if node.spec is not None and node.spec.max_usd is not None
@@ -2095,8 +2103,11 @@ class ACWorkflow(Agent):
         startup error (e.g. missing docker image, missing codex binary)
         from cancelling the Critic and aborting the whole round.
         """
+        from proofstack.subscription import call_allowance, run_with_nominal_allowance
+        share = (call_allowance(self.tracker) / (1 + bool(run_council) + bool(run_compute))
+                 if self.ctx.execution_backend == "subscription" else None)
         critic_task = asyncio.create_task(
-            self.critic(
+            run_with_nominal_allowance(self.critic, share, lambda: self.critic(
                 **self._critic_inputs(
                     inp=inp, workspace=workspace,
                     author_thinking=author_k.thinking_summary,
@@ -2105,7 +2116,7 @@ class ACWorkflow(Agent):
                     round=round,
                     omit_author_thinking=omit_author_thinking,
                 )
-            ),
+            )),
             name=f"ACCritic-r{round}",
         )
         council_task: asyncio.Task | None = None
@@ -2114,14 +2125,14 @@ class ACWorkflow(Agent):
                 author_k.council_to or list(inp.council_models)
             )
             council_task = asyncio.create_task(
-                self._safe_council(
+                run_with_nominal_allowance(self.council, share, lambda: self._safe_council(
                     round=round,
                     author_question=author_k.council_question or "",
                     answer_tex=author_k.answer_tex,
                     research_notes_tex=author_k.research_notes_tex,
                     references_bib=author_k.references_bib,
                     member_models=member_models,
-                ),
+                )),
                 name=f"Council-r{round}",
             )
         compute_task: asyncio.Task | None = None
@@ -2129,7 +2140,7 @@ class ACWorkflow(Agent):
             compute_workspace = workspace / "compute"
             compute_workspace.mkdir(parents=True, exist_ok=True)
             compute_task = asyncio.create_task(
-                self._safe_compute(
+                run_with_nominal_allowance(self.compute, share, lambda: self._safe_compute(
                     inp=inp,
                     round=round,
                     instructions=author_k.compute_instructions or "",
@@ -2137,7 +2148,7 @@ class ACWorkflow(Agent):
                     research_notes_tex=author_k.research_notes_tex,
                     references_bib=author_k.references_bib,
                     compute_workspace=compute_workspace,
-                ),
+                )),
                 name=f"Compute-r{round}",
             )
 
@@ -2154,6 +2165,8 @@ class ACWorkflow(Agent):
             for t in tasks:
                 if not t.done():
                     t.cancel()
+            from .async_helpers import _join_tasks
+            await _join_tasks(tasks)
             raise
 
         # Cancel anything still pending. With the safe wrappers above,
@@ -2178,6 +2191,8 @@ class ACWorkflow(Agent):
             if t.cancelled():
                 continue
             exc = t.exception()
+            if getattr(exc, "requires_reconciliation", False):
+                raise exc
             if isinstance(exc, BudgetExhausted) and exc.scope == "run":
                 raise exc
 
@@ -2225,7 +2240,7 @@ class ACWorkflow(Agent):
     ):
         """Run Council with non-fatal exceptions swallowed.
 
-        Only ``CancelledError`` and run-scope ``BudgetExhausted``
+        Reconciliation errors, ``CancelledError`` and run-scope ``BudgetExhausted``
         propagate; everything else is logged as ``ac.council_failed``
         and returns ``None`` so the Critic can complete unmolested.
         """
@@ -2248,6 +2263,8 @@ class ACWorkflow(Agent):
             )
             return None
         except Exception as e:
+            if getattr(e, "requires_reconciliation", False):
+                raise
             await self.events.emit(
                 "ac.council_failed",
                 {"round": round, "type": type(e).__name__, "msg": str(e)},
@@ -2327,6 +2344,8 @@ class ACWorkflow(Agent):
                 error=f"BudgetExhausted({e.scope}): {e}",
             )
         except Exception as e:
+            if getattr(e, "requires_reconciliation", False):
+                raise
             await self.events.emit(
                 "ac.compute_failed",
                 {"round": round, "type": type(e).__name__, "msg": str(e)},

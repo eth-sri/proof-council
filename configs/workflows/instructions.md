@@ -96,10 +96,17 @@ started only when the Author emits a non-empty `<compute_agent>` request. This
 changes the research strategy compared with always-on Compute and should be
 called out when comparing runs.
 
-Codex subscription calls record tokens and an `api_equivalent_usd` estimate but
+In the default API workflow, Codex subscription Compute calls record tokens and an `api_equivalent_usd` estimate but
 add `$0` to actual spend. Consequently `budget.max_usd` limits paid API calls,
 not subscription Compute time. Use `max_wallclock_s`, `max_tokens`, Compute hard
 timeouts, and workspace limits as the subscription backstops.
+
+For the entire single-author research/cleanup workflow to use subscriptions,
+set `execution_backend: subscription`. This is a separate, fail-closed routing
+policy, not an API fallback preference. It uses `subscription_planning_usd`
+(default 1000) as an API-equivalent planning allowance for phase allocation;
+actual API spend stays zero. See [Subscription mode](../../docs/subscription_mode.md)
+for authentication, limits, resume behavior, and supported workflows.
 
 ## Prompt components
 

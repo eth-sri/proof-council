@@ -90,6 +90,9 @@ class RunContext:
     component_configs: dict[str, dict[str, Any]] = field(default_factory=dict)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     monitor: Any | None = None
+    execution_backend: Literal["api", "subscription"] = "api"
+    subscription_config: dict[str, Any] = field(default_factory=dict)
+    subscription_limiter: Any | None = None
     # Optional enclosing-workflow export check; returns feedback for the next Author.
     author_checkpoint: Callable[[Path, int], Awaitable[str]] | None = None
     _agent_call_counts: dict[str, int] = field(default_factory=dict)
@@ -186,10 +189,15 @@ class RunContext:
     def model_for(self, agent: "Agent", default: ModelSpec) -> ModelSpec:
         """Look up an override by instance/class key, then ``"*"``,
         then the agent's configured default."""
-        for key in reversed(_agent_lookup_keys(agent)):
+        return self.model_for_class(type(agent), agent.name, default)
+
+    def model_for_class(self, cls: type, name: str, default: ModelSpec | None = None,
+                        *, include_wildcard=True) -> ModelSpec | None:
+        """Resolve inherited model settings without constructing another agent."""
+        for key in (name, cls.__name__, cls.__qualname__, f"{cls.__module__}.{cls.__qualname__}"):
             if key in self.model_overrides:
                 return self.model_overrides[key]
-        if "*" in self.model_overrides:
+        if include_wildcard and "*" in self.model_overrides:
             return self.model_overrides["*"]
         return default
 

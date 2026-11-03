@@ -1,0 +1,62 @@
+"""An ordinary fresh critic, isolated from research-review receipts and caches."""
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+from proofstack.agents.ac.critic import ACCritic
+from proofstack.agents.dag_workflow import _deep_merge
+from proofstack.context import component_config_for_class
+
+
+class FinalStatelessCritic(ACCritic):
+    cache_enabled = False
+
+    def _cache_config_snapshot(self):
+        return {**super()._cache_config_snapshot(), "verdict_attempt": getattr(self, "verdict_attempt", 0)}
+
+    def __init__(self, ctx, **kwargs):
+        defaults = component_config_for_class(ctx.component_configs, ACCritic, "ACCritic")
+        configured = _deep_merge({"FinalStatelessCritic": defaults}, ctx.component_configs)
+        overrides = dict(ctx.model_overrides)
+        inherited = ctx.model_for_class(ACCritic, "ACCritic")
+        if inherited is not None:
+            overrides.setdefault("FinalStatelessCritic", ctx.model_for_class(
+                type(self), kwargs.get("name", type(self).__name__), inherited, include_wildcard=False))
+        super().__init__(replace(ctx, component_configs=configured, model_overrides=overrides), **kwargs)
+
+    def _recovery_checkpoint(self, inp):
+        path = super()._recovery_checkpoint(inp)
+        root = self.ctx.root_workdir / "final_stateless_review" / "critic_receipts"
+        if attempt := getattr(self, "verdict_attempt", 0):
+            root = root / f"verdict-retry-{attempt}"
+        return root / path.name
+
+    async def recover_completed(self, inp, *, deadline=None, cutoff=None):
+        """Recover within the saved review/retrieval windows, never past cutoff."""
+        if self.ctx.execution_backend == "subscription":
+            from proofstack.subscription import recover_model_role
+            raw = recover_model_role(self, inp)
+            return self.parse_output(raw["text"], inp) if raw is not None else None
+        try:
+            return await super().run(inp, recover_only=True, recovery_deadline=deadline, recovery_cutoff=cutoff)
+        except RuntimeError as exc:
+            raise FinalReviewBlocked(str(exc)) from exc
+
+
+class FinalReviewBlocked(RuntimeError):
+    requires_reconciliation = True
+
+
+class FinalReviewState(BaseModel):
+    key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    review_input: ACCritic.Inputs
+    status: Literal["pending", "completed"] = "pending"
+    review: ACCritic.Outputs | None = None
+    max_usd: float = Field(gt=0, allow_inf_nan=False)
+    initial_spend: float = Field(ge=0, allow_inf_nan=False)
+    deadline_unix_s: float = Field(gt=0, allow_inf_nan=False)
+    attempt: int = Field(default=0, ge=0, le=1)
+    previous_review: ACCritic.Outputs | None = None
