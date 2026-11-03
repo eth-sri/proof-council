@@ -1484,11 +1484,11 @@ class FirstProofBatch3Workflow(Agent):
                         round_bound = min(500, max(round_bound + inp.n_rounds,
                                                    out.rounds_completed + inp.n_rounds))
                         continue
-                    # Preserve time for the one-shot partial rewrite even if an
-                    # editorial candidate arrives near the research cutoff.
+                    # A final rejection still needs the full partial rewrite
+                    # window, so its reserve is additional to the final review.
                     cleanup_end = deadline - max(inp.partial_cleanup_seconds,
                                                  min(3600.0, max(0.0, deadline - time.monotonic()) * 0.1))
-                    cleanup_end = min(cleanup_end, deadline - final_window)
+                    cleanup_end = min(cleanup_end, deadline - inp.partial_cleanup_seconds - final_window)
                     disposition, candidate, pages, review = await self._phase(
                         "candidate_cleanup", usd=self._remaining_usd() - reserve, deadline=cleanup_end,
                         call=lambda ctx: self._candidate_loop(ctx, inp, document, notes, episode=episode, deadline=cleanup_end),

@@ -12,7 +12,7 @@ from proofstack.agents.final_stateless_review import FinalReviewBlocked, FinalSt
 from proofstack.agents.firstproof_batch3 import FirstProofBatch3Workflow
 from proofstack.budget import BudgetExhausted
 from proofstack.kinds.api_call import APICallAgent
-from test_firstproof_batch3 import ORIGINAL, TEX, pipeline
+from test_firstproof_batch3 import ORIGINAL, TEX, pipeline, workflow_clock
 from test_proof_simplification import simplification
 
 
@@ -65,9 +65,91 @@ def test_reserves_are_withheld_from_earlier_phases(simplification):
     phases = [e["payload"] for e in events if e["kind"] == "batch3.phase_start"]
     cleanup = next(e for e in phases if e["phase"] == "candidate_cleanup")
     assert cleanup["max_usd"] == 49
-    assert cleanup["max_wallclock_s"] <= 875
+    assert cleanup["max_wallclock_s"] <= 775
     final = next(e for e in phases if e["phase"] == "final_stateless_review")
     assert 0 < final["max_wallclock_s"] <= 120
+
+
+@pytest.mark.parametrize("mode", ["disabled", "explicit", "simplification"])
+@pytest.mark.parametrize("partial_seconds", [0, 20, 200])
+def test_editorial_deadline_preserves_additive_reserves(simplification, workflow_clock, monkeypatch, mode, partial_seconds):
+    execute, calls, _, _, _, agent = simplification
+    start = workflow_clock.now
+    phase = agent._phase
+    deadlines = {}
+
+    async def observed(name, **kwargs):
+        deadlines[name] = kwargs["deadline"] - start
+        return await phase(name, **kwargs)
+
+    monkeypatch.setattr(agent, "_phase", observed)
+    out = asyncio.run(execute(max_wallclock_s=600, partial_cleanup_seconds=partial_seconds,
+                             final_stateless_review=mode == "explicit",
+                             simplification_rounds=1 if mode == "simplification" else 0))
+    assert out.submission_approved
+    if mode == "disabled":
+        # Retain the existing 10% cushion when it exceeds the partial reserve.
+        assert deadlines["candidate_cleanup"] == (400 if partial_seconds == 200 else 540)
+        assert calls["final_critic"] == 0
+    else:
+        assert deadlines["candidate_cleanup"] == 475 - partial_seconds
+        assert deadlines["research"] == 475 - partial_seconds
+        assert calls["final_critic"] == 1
+
+
+@pytest.mark.parametrize("mode", ["explicit", "simplification"])
+@pytest.mark.parametrize("resume", [False, True])
+def test_late_final_rejection_leaves_full_partial_window(simplification, workflow_clock, monkeypatch, mode, resume):
+    execute, calls, seen, options, ctx, agent = simplification
+    options["final_verdicts"] = [False]
+    start = workflow_clock.now
+    monkeypatch.setattr("proofstack.agents.firstproof_batch3.time.time", lambda: 1_000_000 + workflow_clock.now - start)
+    phase, partial = agent._phase, agent._partial
+    deadlines, partial_windows = {}, []
+    interrupted = False
+
+    async def observed(name, **kwargs):
+        nonlocal interrupted
+        deadlines[name] = kwargs["deadline"] - start
+        if name == "candidate_cleanup" and resume and not interrupted:
+            interrupted = True
+            raise asyncio.CancelledError
+        result = await phase(name, **kwargs)
+        if name in {"candidate_cleanup", "final_stateless_review"}:
+            # Complete both phases just before their full allocated windows end.
+            workflow_clock.now = kwargs["deadline"] - 1
+        return result
+
+    async def observed_partial(*args, **kwargs):
+        partial_windows.append(kwargs["deadline"] - workflow_clock.now)
+        return await partial(*args, **kwargs)
+
+    monkeypatch.setattr(agent, "_phase", observed)
+    monkeypatch.setattr(agent, "_partial", observed_partial)
+    inputs = {"max_wallclock_s": 600, "partial_cleanup_seconds": 200,
+              "final_stateless_review": mode == "explicit",
+              "simplification_rounds": 1 if mode == "simplification" else 0}
+    if resume:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(execute(**inputs))
+        workflow_clock.now += 50
+        # Resume cannot disable the saved gate, widen its window, or reset the clock.
+        inputs.update(resume_run=True, final_stateless_review=False, simplification_rounds=0,
+                      final_review_seconds=300, final_review_export_seconds=10)
+    out = asyncio.run(execute(**inputs))
+    assert deadlines["candidate_cleanup"] == pytest.approx(275)
+    assert deadlines["final_stateless_review"] == pytest.approx(394)
+    assert partial_windows == pytest.approx([207])  # 200 partial + 5 export + two one-second margins.
+    assert out.partial_ready and not out.submission_approved
+    assert calls["research"] == (2 if resume else 1)
+    assert calls["final_critic"] == calls["partial"] == 1
+    assert "Final stateless critic" in seen["prompts"][-1]
+    schedule = json.loads((ctx.root_workdir / "batch3-schedule.json").read_text())
+    assert schedule["run_deadline_unix_s"] == 1_000_600
+    assert schedule["research_deadline_unix_s"] == 1_000_275
+    assert schedule["initial_usd"] == 100 and schedule["partial_reserve_usd"] == 15
+    assert schedule["final_review_reserve_usd"] == 10
+    assert schedule["final_review_seconds"] == 120 and schedule["final_review_export_seconds"] == 5
 
 
 @pytest.mark.parametrize("overrides", [

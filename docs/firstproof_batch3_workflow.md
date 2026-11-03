@@ -614,6 +614,9 @@ editorial work; cleanup is not a separate additional budget.
 - Candidate cleanup first publishes a checked, labelled baseline and leaves
   the larger of `partial_cleanup_seconds` and an hour (10% of remaining time
   for shorter runs) for partial cleanup.
+  With the final gate enabled, it also stops no later than the run deadline minus
+  `partial_cleanup_seconds + final_review_seconds + final_review_export_seconds`,
+  so a final rejection cannot consume the partial-cleanup time reserve.
   Bibliographies are embedded before the fallback is checked. Timeout or
   interruption cannot erase an already published valid fallback.
 - `n_rounds=50` is a research continuation chunk, not a new run or budget.
