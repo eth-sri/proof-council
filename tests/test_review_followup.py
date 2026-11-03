@@ -169,9 +169,10 @@ def test_terminal_text_estimate_and_local_replay(tmp_path, monkeypatch, status):
 
 @pytest.mark.parametrize("finish,usage", [("stop", True), ("length", True), ("tool_calls", True),
                                           (None, True), ("stop", False)])
-def test_chat_completion_settlement(tmp_path, monkeypatch, finish, usage):
-    monkeypatch.setenv("OPENAI_API_KEY", "synthetic")
-    client = APIClient(api="openai", model="synthetic", use_openai_responses_api=False)
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "together"])
+def test_chat_completion_settlement(tmp_path, monkeypatch, finish, usage, provider):
+    monkeypatch.setenv(f"{provider.upper()}_API_KEY", "synthetic")
+    client = APIClient(api=provider, model="synthetic", use_openai_responses_api=False)
     trace = ProviderTrace(tmp_path / "attempts.jsonl")
     trace.request(client, "chat", 0, {})
     trace.response(client, "chat", 0, {"id": "chatcmpl-synthetic", "choices": [

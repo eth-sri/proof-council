@@ -18,10 +18,11 @@ logger = logging.getLogger(__name__)
 
 
 def provider_attempt_terminal(row):
+    if row.get("chat_completion_terminal") is True:
+        return True
     provider = row.get("provider", "openai")
     if provider == "openai":
-        return (row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
-                or row.get("chat_completion_terminal") is True)
+        return row.get("status") in {"failed", "cancelled", "incomplete", "completed"}
     if provider == "anthropic":
         return row.get("stop_reason") in {
             "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal",

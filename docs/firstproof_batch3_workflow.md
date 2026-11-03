@@ -927,11 +927,11 @@ previously accepted simplifications, including after the research cutoff.
 The Third Batch workflow update (PR #14) no longer applies a full-context charge
 for usage-less terminal rows that lack saved pricing/timing evidence. An older
 run resumed across the upgrade can therefore stop with
-`Fresh critic recovery has unresolved provider work` or
-`Saved critic has unresolved provider work`, including in ordinary API mode
-with simplification and the final gate disabled. This is an accounting hold, not
-a mathematical rejection. Fresh runs do not need this migration step, and known
-usage or previously recorded charges are not refunded.
+`Fresh critic recovery has unresolved provider work`, including in ordinary API
+mode with simplification and the final gate disabled. Final-gate recovery can
+instead report `Saved critic has unresolved provider work`. Both messages indicate
+an accounting hold, not a mathematical rejection. Fresh runs do not need this
+migration step, and known usage or previously recorded charges are not refunded.
 
 Prefer completing active runs on their original revision. Before migrating,
 preserve their artifacts, checkpoints and spending ledger; do not delete or

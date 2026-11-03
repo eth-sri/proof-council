@@ -43,7 +43,7 @@ class Batch3CleanupCritic(ACCritic):
         self.completed_review = self.parse_output(raw_text, inp)
         from proofstack.atomic import write_text_atomic
         # This supplementary checkpoint must not prevent metering the paid call.
-        with suppress(OSError):
+        with suppress(OSError, ValueError):
             write_text_atomic(self.workdir / "completed_review.json", self.completed_review.model_dump_json())
 
     @staticmethod

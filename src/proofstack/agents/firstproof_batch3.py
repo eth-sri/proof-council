@@ -672,6 +672,7 @@ class FirstProofBatch3Workflow(Agent):
             folders = list((self.ctx.root_workdir / "agents").glob(f"{state.call_agent}-c*")) if state.call_agent else []
             settled = False
             subscription_output = None
+            rows = []
             if len(folders) == 1:
                 folder = folders[0]
                 if self.ctx.execution_backend != "subscription":
@@ -716,6 +717,12 @@ class FirstProofBatch3Workflow(Agent):
             if not settled:
                 raise SimplificationInterrupted(
                     f"Interrupted simplification {state.stage} call; reconcile provider work before paid retries: {path}"
+                )
+            # Settling its charge cannot replace a completed mathematical verdict.
+            if role == "critic" and state.review is None and any(
+                    row.get("status") == "completed" or row.get("chat_completion_terminal") is True for row in rows):
+                raise SimplificationInterrupted(
+                    f"Completed simplification critic has no recoverable verdict; restore its report before resuming: {path}"
                 )
             state.call_pending = False
             state.stop_reason = "Interrupted call settled; optional simplification stopped"
